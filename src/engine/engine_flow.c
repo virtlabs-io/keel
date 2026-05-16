@@ -668,10 +668,12 @@ keel_flow_result_t keel_engine_flow_resume_auth(
     keel_session_flow_t* sf,
     keel_session_t* session)
 {
-    /* Drain the eventfd (must read 8 bytes) */
+    /* Drain the eventfd (must read 8 bytes). The fd is set non-blocking at
+     * creation in the auth-pool thread, so this read either returns 8 bytes
+     * (signalled) or fails with EAGAIN — it cannot block the reactor. */
     if (sf->auth_notify_fd >= 0) {
         uint64_t val;
-        ssize_t n = read(sf->auth_notify_fd, &val, sizeof(val));
+        ssize_t n = read(sf->auth_notify_fd, &val, sizeof(val)); /* NOLINT(keel-blocking) */
         (void)n; /* eventfd drain; EAGAIN is harmless if pool thread hasn't written yet */
         close(sf->auth_notify_fd);
         sf->auth_notify_fd = -1;

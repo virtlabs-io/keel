@@ -4495,10 +4495,12 @@ void keel_worker_stop(keel_worker_t* worker)
     worker->state = KEEL_WORKER_STOPPING;
     
 #ifdef __linux__
-    /* Wake up the worker if it's blocked */
+    /* Wake up the worker if it's blocked. 8-byte eventfd add can never
+     * block: the kernel buffer is always able to accept it (sem-mode is
+     * disabled here). */
     if (worker->eventfd >= 0) {
         uint64_t val = 1;
-        ssize_t r = write(worker->eventfd, &val, sizeof(val));
+        ssize_t r = write(worker->eventfd, &val, sizeof(val)); /* NOLINT(keel-blocking) */
         (void)r;
     }
 #endif
@@ -4511,7 +4513,8 @@ void keel_worker_drain(keel_worker_t* worker)
 #ifdef __linux__
     if (worker->eventfd >= 0) {
         uint64_t val = 1;
-        ssize_t r = write(worker->eventfd, &val, sizeof(val));
+        /* 8-byte eventfd add never blocks; see keel_worker_stop above. */
+        ssize_t r = write(worker->eventfd, &val, sizeof(val)); /* NOLINT(keel-blocking) */
         (void)r;
     }
 #endif
