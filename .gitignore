@@ -50,6 +50,8 @@ _deps/
 *.gcno
 coverage/
 lcov.info
+coverage.info
+coverage-filtered.info
 
 # Profiling
 *.prof

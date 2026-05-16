@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,22 @@ extern "C" {
 /* ============================================================================
  * String Utilities
  * ============================================================================ */
+
+/**
+ * @brief Return an empty non-owning string slice.
+ *
+ * @return Zero-length string slice.
+ */
+keel_str_t keel_str_empty(void);
+
+/**
+ * @brief Construct a non-owning string slice from bytes and an explicit length.
+ *
+ * @param data Byte pointer; NULL is treated as empty.
+ * @param len Number of bytes in data.
+ * @return Non-owning string slice.
+ */
+keel_str_t keel_str_from_parts(const char* data, size_t len);
 
 /**
  * @brief Compare two immutable string slices for byte-for-byte equality.
@@ -50,6 +67,30 @@ extern "C" {
  * @return true when both slices have the same length and identical bytes.
  */
 bool keel_str_eq(keel_str_t a, keel_str_t b);
+
+/**
+ * @brief Compare a string slice with a null-terminated C string.
+ *
+ * @param str String slice.
+ * @param cstr Null-terminated string.
+ * @return true when contents match exactly.
+ */
+bool keel_str_eq_cstr(keel_str_t str, const char* cstr);
+
+/**
+ * @brief Compare two string slices lexicographically.
+ */
+int keel_str_cmp(keel_str_t a, keel_str_t b);
+
+/**
+ * @brief Compare a string slice with a null-terminated C string.
+ */
+int keel_str_cmp_cstr(keel_str_t str, const char* cstr);
+
+/**
+ * @brief Compare two string slices case-insensitively using ASCII folding.
+ */
+int keel_str_casecmp(keel_str_t a, keel_str_t b);
 
 /**
  * @brief Compare two string slices case-insensitively using ASCII folding.
@@ -107,6 +148,26 @@ bool keel_str_contains(keel_str_t haystack, keel_str_t needle);
 keel_ssize_t keel_str_find(keel_str_t haystack, keel_str_t needle);
 
 /**
+ * @brief Find the first exact byte match of a character.
+ */
+ssize_t keel_str_find_char(keel_str_t str, char c);
+
+/**
+ * @brief Find the last exact byte match of a character.
+ */
+ssize_t keel_str_rfind_char(keel_str_t str, char c);
+
+/**
+ * @brief Test whether a string contains a given character.
+ */
+bool keel_str_contains_char(keel_str_t str, char c);
+
+/**
+ * @brief Return a non-owning substring slice.
+ */
+keel_str_t keel_str_substr(keel_str_t str, size_t start, size_t len);
+
+/**
  * @brief Remove leading and trailing ASCII whitespace without copying.
  *
  * The returned slice still aliases the original storage.
@@ -115,6 +176,16 @@ keel_ssize_t keel_str_find(keel_str_t haystack, keel_str_t needle);
  * @return Trimmed view into the original bytes.
  */
 keel_str_t keel_str_trim(keel_str_t str);
+
+/**
+ * @brief Remove leading ASCII whitespace without copying.
+ */
+keel_str_t keel_str_trim_left(keel_str_t str);
+
+/**
+ * @brief Remove trailing ASCII whitespace without copying.
+ */
+keel_str_t keel_str_trim_right(keel_str_t str);
 
 /**
  * @brief Split a string incrementally using an in-place iterator state.
@@ -142,6 +213,66 @@ bool keel_str_split(keel_str_t* remaining, char delim, keel_str_t* part);
  *         failure.
  */
 char* keel_str_dup(keel_str_t str);
+
+/**
+ * @brief Release storage owned by a heap-backed string slice.
+ */
+void keel_str_free(keel_str_t* str);
+
+/**
+ * @brief Copy a string slice into a new null-terminated C string.
+ */
+char* keel_str_to_cstr(keel_str_t str);
+
+/**
+ * @brief Format a heap-backed string slice with printf-style arguments.
+ */
+keel_str_t keel_str_printf(const char* fmt, ...);
+
+/**
+ * @brief Concatenate two string slices into a heap-backed string.
+ */
+keel_str_t keel_str_concat(keel_str_t a, keel_str_t b);
+
+/**
+ * @brief Join string slices with a separator into a heap-backed string.
+ */
+keel_str_t keel_str_join(const keel_str_t* parts, size_t count, keel_str_t sep);
+
+/**
+ * @brief Parse a signed 64-bit integer from a string slice.
+ */
+bool keel_str_to_int64(keel_str_t str, int64_t* out);
+
+/**
+ * @brief Parse an unsigned 64-bit integer from a string slice.
+ */
+bool keel_str_to_uint64(keel_str_t str, uint64_t* out);
+
+/**
+ * @brief Parse a double from a string slice.
+ */
+bool keel_str_to_double(keel_str_t str, double* out);
+
+/**
+ * @brief Convert a string slice to lowercase into heap-backed storage.
+ */
+keel_str_t keel_str_tolower(keel_str_t str);
+
+/**
+ * @brief Convert a string slice to uppercase into heap-backed storage.
+ */
+keel_str_t keel_str_toupper(keel_str_t str);
+
+/**
+ * @brief Hex-encode bytes into heap-backed lowercase text.
+ */
+keel_str_t keel_str_to_hex(const uint8_t* data, size_t len);
+
+/**
+ * @brief Decode hex text into a caller-owned byte buffer.
+ */
+bool keel_str_from_hex(keel_str_t hex, uint8_t* out, size_t* out_len);
 
 /* ============================================================================
  * Buffer Utilities
