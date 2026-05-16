@@ -53,6 +53,7 @@ PG_DBNAME  = "testdb"
 # Locate compose file relative to this test file
 _REPO_ROOT    = Path(__file__).resolve().parent.parent.parent
 _AUTH_COMPOSE = str(_REPO_ROOT / "docker" / "compose" / "pg-auth-test.yml")
+_DOCKERFILE   = str(_REPO_ROOT / "docker" / "Dockerfile.linux")
 
 # Allow extra time for the auth compose stack to start (Docker + KEEL init)
 pytestmark = pytest.mark.timeout(300)
@@ -142,6 +143,36 @@ def _simple_query(conn: psycopg2.extensions.connection) -> str:
     return str(row[0]) if row else ""
 
 
+def _ensure_keel_image() -> None:
+    """Ensure the local keel:linux image exists for pg-auth-test compose."""
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", "keel:linux"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if inspect.returncode == 0:
+        return
+
+    build = subprocess.run(
+        [
+            "docker", "build",
+            "--target", "runner",
+            "--tag", "keel:linux",
+            "--file", _DOCKERFILE,
+            str(_REPO_ROOT),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if build.returncode != 0:
+        raise RuntimeError(
+            "Failed to build keel:linux image for enterprise auth e2e:\n"
+            f"{build.stderr[-3000:]}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -149,6 +180,11 @@ def _simple_query(conn: psycopg2.extensions.connection) -> str:
 @pytest.fixture(scope="session", autouse=True)
 def wait_for_keel_instances() -> Generator[None, None, None]:
     """Start the pg-auth-test compose stack and wait for all four KEEL auth instances."""
+    try:
+        _ensure_keel_image()
+    except Exception as exc:
+        pytest.fail(str(exc))
+
     # Start (or ensure running) the auth compose stack
     proc = subprocess.run(
         ["docker", "compose", "-f", _AUTH_COMPOSE,
