@@ -16,7 +16,6 @@ src/engine/engine_flow.c:674:read
 src/engine/engine_flow.c:761:send
 src/engine/engine_flow.c:767:recv
 src/engine/engine_flow.c:2555:send
-src/engine/engine_flow.c:2567:recv
 src/engine/engine_flow.c:2610:send
 src/engine/engine_flow.c:2617:recv
 src/engine/engine_scatter.c:587:recv
@@ -33,7 +32,6 @@ src/worker/migration.c:336:write
 src/worker/worker.c:117:select
 src/worker/worker.c:2070:send
 src/worker/worker.c:2075:send
-src/worker/worker.c:2264:recv
 src/worker/worker.c:2850:send
 src/worker/worker.c:4501:write
 src/worker/worker.c:4514:write

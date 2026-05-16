@@ -94,7 +94,20 @@ scan_one() {
         BEGIN {
             io_re      = "\\<(recv|send|read|write|recvfrom|sendto|recvmsg|sendmsg|readv|writev)[[:space:]]*\\("
             always_re  = "\\<(select|pselect|poll|ppoll|epoll_wait|sleep|usleep|nanosleep|clock_nanosleep|keel_fd_wait)[[:space:]]*\\("
+            pend_call  = ""
+            pend_line  = 0
+            pend_text  = ""
         }
+
+        function emit_pending() {
+            if (pend_call != "") {
+                printf "%s:%d:%s\t%s\n", rel, pend_line, pend_call, pend_text
+                pend_call = ""
+                pend_line = 0
+                pend_text = ""
+            }
+        }
+
         {
             line = $0
 
@@ -103,36 +116,57 @@ scan_one() {
             sub(/^[[:space:]]+/, "", s)
             if (s == "" || s ~ /^\/\// || s ~ /^\/\*/ || s ~ /^\*/) next
 
-            # Per-line NOLINT escape hatch.
-            if (index(line, "NOLINT(keel-blocking)") > 0) next
-
             # Strip string literals so log messages cannot accidentally
             # whitelist (via embedded "MSG_DONTWAIT") or trigger (via
             # embedded "send(...)") the linter.
             cleaned = line
             gsub(/"[^"]*"/, "\"\"", cleaned)
 
-            call = ""
+            # Per-line NOLINT escape hatch: clears any pending I/O call too
+            # (the annotation covers the whole statement).
+            if (index(line, "NOLINT(keel-blocking)") > 0) {
+                pend_call = ""
+                next
+            }
 
-            # I/O calls: allowed if MSG_DONTWAIT is on the line.
-            if (match(cleaned, io_re)) {
-                if (index(cleaned, "MSG_DONTWAIT") == 0) {
-                    tok = substr(cleaned, RSTART, RLENGTH)
-                    sub(/[[:space:]]*\($/, "", tok)
-                    call = tok
+            # If a previous line opened an I/O call that has not yet been
+            # resolved, look for MSG_DONTWAIT or the statement terminator.
+            if (pend_call != "") {
+                if (index(cleaned, "MSG_DONTWAIT") > 0) {
+                    pend_call = ""
+                } else if (index(cleaned, ";") > 0) {
+                    emit_pending()
+                }
+                # Otherwise the statement is still in progress; keep waiting.
+            }
+
+            # First I/O call on this line (only when nothing is pending,
+            # to avoid double-counting on continuation lines).
+            if (pend_call == "" && match(cleaned, io_re)) {
+                tok = substr(cleaned, RSTART, RLENGTH)
+                sub(/[[:space:]]*\($/, "", tok)
+                if (index(cleaned, "MSG_DONTWAIT") > 0) {
+                    # Nonblocking — accept.
+                } else if (index(cleaned, ";") > 0) {
+                    printf "%s:%d:%s\t%s\n", rel, NR, tok, line
+                } else {
+                    pend_call = tok
+                    pend_line = NR
+                    pend_text = line
                 }
             }
 
-            # Always-forbidden calls.
-            if (call == "" && match(cleaned, always_re)) {
-                tok = substr(cleaned, RSTART, RLENGTH)
-                sub(/[[:space:]]*\($/, "", tok)
-                call = tok
+            # Always-forbidden calls (no flag form exists, so no need to
+            # track across lines for whitelisting).
+            if (match(cleaned, always_re)) {
+                tok2 = substr(cleaned, RSTART, RLENGTH)
+                sub(/[[:space:]]*\($/, "", tok2)
+                printf "%s:%d:%s\t%s\n", rel, NR, tok2, line
             }
+        }
 
-            if (call != "") {
-                printf "%s:%d:%s\t%s\n", rel, NR, call, line
-            }
+        END {
+            emit_pending()
         }
     ' "$file"
 }
