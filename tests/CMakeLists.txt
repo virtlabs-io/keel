@@ -2141,6 +2141,21 @@ set_tests_properties(check_forbidden_syscalls PROPERTIES
     TIMEOUT 30
 )
 
+# =============================================================================
+# Reactor-blocking lint — forbid blocking syscalls in hot-path files.
+# Pre-existing violations are listed in scripts/forbidden_blocking_baseline.txt
+# and are expected to shrink to zero during the v0.2 reactor refactor.
+# =============================================================================
+add_test(
+    NAME  check_forbidden_blocking
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_forbidden_blocking.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_forbidden_blocking PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
 # build_tests — compile every test executable without running them.
 # Use this before ctest when the build was configured with a specific --target
 # (e.g. --target keel) that skips test binaries:

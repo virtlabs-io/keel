@@ -5,9 +5,9 @@ env:
 
 on:
   push:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
   pull_request:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,12 +28,25 @@ jobs:
         run: bash scripts/check_forbidden_syscalls.sh
 
   # ===========================================================================
+  # Reactor-blocking lint — no blocking I/O in hot-path files.
+  # Pre-existing violations are baselined; this gate prevents regressions.
+  # ===========================================================================
+  lint-blocking-hotpath:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check forbidden blocking calls in hot-path files
+        run: bash scripts/check_forbidden_blocking.sh
+
+  # ===========================================================================
   # Build + Unit Tests (Release with debug info)
   # ===========================================================================
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
 
     steps:
       - name: Checkout
@@ -75,7 +88,7 @@ jobs:
   sanitizer-asan:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
@@ -130,7 +143,7 @@ jobs:
   sanitizer-tsan:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
@@ -187,7 +200,7 @@ jobs:
   sanitizer-msan:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
