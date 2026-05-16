@@ -4979,7 +4979,7 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
      * the allocator misinterpret glibc's malloc-chunk header as a
      * corrupted keel header (size_field/magic look like garbage),
      * producing spurious "Invalid memory block in free" errors. */
-    free(body);
+    free(body); /* NOLINT(keel-syscall) */
 }
 
 /* ============================================================================
@@ -5142,7 +5142,7 @@ static void write_status_json(keel_admin_t *admin, int fd) {
     /* See comment in handle_prom_http(): open_memstream() returns a
      * libc-malloc'd buffer that must be released with free(), not
      * keel_free(). */
-    free(body);
+    free(body); /* NOLINT(keel-syscall) */
 }
 
 /**

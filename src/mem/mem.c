@@ -34,7 +34,7 @@
  * Kept out of the hot path: only invoked from corruption-detection
  * paths in keel_free / keel_realloc.
  * ---------------------------------------------------------------------- */
-static void keel_mem_log_backtrace(int cat, const char* label) {
+static void keel_mem_log_backtrace(keel_log_category_t cat, const char* label) {
     void* frames[32];
     int   n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
     char** syms = backtrace_symbols(frames, n);
