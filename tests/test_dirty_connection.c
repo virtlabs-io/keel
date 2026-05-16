@@ -27,6 +27,7 @@
 #include "test_utils.h"
 #include "keel/engine/backend_pool.h"
 #include "keel/reactor/reactor.h"
+#include "keel/protocol/protocol_flow.h"
 #include "keel/mem/mem.h"
 
 #include <fcntl.h>
@@ -39,6 +40,35 @@
  * Helpers — from test_pool_correctness.c pattern
  * ============================================================================
  */
+
+/* ---- Minimal stub flow vtable for cleanup unit tests ---- *
+ * backend_pool_prepare_cleanup_locked() needs a non-NULL flow_vt with at
+ * least build_cleanup() (returns >0 bytes) and drain_cleanup_response()
+ * (non-NULL).  The test does not drive real protocol I/O, so a one-byte
+ * stub message and an immediate COMPLETE drain are sufficient.
+ */
+static ssize_t stub_build_cleanup(void *ctx, keel_cleanup_reason_t reason,
+                                   uint8_t *buf, size_t buf_len)
+{
+    (void)ctx; (void)reason;
+    if (buf_len < 1) return -1;
+    buf[0] = 0x58; /* arbitrary byte — never actually sent in unit tests */
+    return 1;
+}
+
+static keel_proto_drain_result_t stub_drain_cleanup(
+        void *ctx, keel_proto_drain_state_t *state,
+        const uint8_t *data, size_t len, size_t *consumed_out)
+{
+    (void)ctx; (void)state; (void)data;
+    if (consumed_out) *consumed_out = len;
+    return KEEL_PROTO_DRAIN_COMPLETE;
+}
+
+static const keel_proto_flow_vtable_t s_stub_flow_vt = {
+    .build_cleanup         = stub_build_cleanup,
+    .drain_cleanup_response = stub_drain_cleanup,
+};
 
 /**
  * @brief Build a synthetic backend pool with socketpair-backed connections.
@@ -84,6 +114,7 @@ static backend_pool_t *make_pool(size_t n, int backend_fds[])
         pool->reactor = keel_reactor_create(&rcfg);
         TEST_ASSERT_NOT_NULL(pool->reactor);
     }
+    pool->flow_vt    = &s_stub_flow_vt;
     pool->connections = keel_calloc(n, sizeof(backend_conn_t));
     pool->total_count = n;
 
