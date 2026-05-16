@@ -221,6 +221,7 @@ COPY cmake/           cmake/
 COPY include/         include/
 COPY src/             src/
 COPY tests/           tests/
+COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/keel/     docker/keel/
 
@@ -243,6 +244,7 @@ RUN ls -lh build-linux/src/main/keel
 FROM builder AS tester
 
 WORKDIR /keel/build-linux
+ENV KEEL_TEST_ALLOW_RELAXED_NO_NEW_PRIVS=1
 
 # Runs every test and prints detailed output on failure
 RUN ctest --output-on-failure -j"$(nproc)"
