@@ -155,10 +155,10 @@ typedef struct keel_session_flow {
     const uint8_t*                 stmt_replay_orig_msg;
     size_t                         stmt_replay_orig_len;
     uint64_t                       stmt_replay_hash;
-    bool                           stmt_replay_needs_discard; /**< True: waiting for DISCARD ALL ReadyForQuery
-                                                               *   before sending replay Parse msgs.  Set when
-                                                               *   backend was borrowed with a different stmt hash
-                                                               *   (needs_discard_all), cleared after 'Z' arrives. */
+    bool                           stmt_replay_needs_cleanup; /**< True: waiting for plugin cleanup to finish
+                                                               *   before replaying protocol-owned prepared state.
+                                                               *   Set when a borrowed backend still carries
+                                                               *   incompatible session state. */
     /* ---- Replication uncertainty tracking (spec §TXN-TRACK) ----
      *
      * When transaction_tracking = on, KEEL intercepts COMMIT queries and
@@ -205,11 +205,8 @@ typedef struct keel_session_flow {
                                                                *   before forwarding orig_msg; otherwise it leaks
                                                                *   into the WAIT_BACKEND response stream and keel
                                                                *   erroneously treats it as an early end-of-txn. */
-    uint32_t                       discard_skip_bytes;        /**< Bytes remaining in the current partially-
-                                                               *   consumed backend message during DISCARD ALL
-                                                               *   scanning.  Non-zero means: skip this many bytes
-                                                               *   (continuation of a message whose header was seen
-                                                               *   in a prior recv) before resuming message parsing. */
+    keel_proto_drain_state_t       stmt_cleanup_drain_state; /**< Opaque plugin parser state while draining
+                                                              *   setup cleanup before replay/original bytes. */
 
     /* Deferred send state: when a non-blocking send can't complete
      * immediately, the unsent data is saved here and the worker

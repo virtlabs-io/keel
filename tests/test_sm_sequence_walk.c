@@ -227,9 +227,9 @@ static void test_phase_illegal_exhaustive(void)
 
 /* Replay adjacency (from state_machine.c) */
 static const keel_replay_state_t replay_adj[][3] = {
-    /* NONE →              */ { KEEL_REPLAY_DISCARD_PENDING, KEEL_REPLAY_SENDING, -1 },
-    /* DISCARD_PENDING →   */ { KEEL_REPLAY_DISCARD_SENT,    KEEL_REPLAY_NONE, -1 },
-    /* DISCARD_SENT →      */ { KEEL_REPLAY_SENDING,         KEEL_REPLAY_NONE, -1 },
+    /* NONE →              */ { KEEL_REPLAY_CLEANUP_PENDING, KEEL_REPLAY_SENDING, -1 },
+    /* CLEANUP_PENDING →   */ { KEEL_REPLAY_CLEANUP_SENT,    KEEL_REPLAY_NONE, -1 },
+    /* CLEANUP_SENT →      */ { KEEL_REPLAY_SENDING,         KEEL_REPLAY_NONE, -1 },
     /* SENDING →           */ { KEEL_REPLAY_WAITING,         KEEL_REPLAY_NONE, -1 },
     /* WAITING →           */ { KEEL_REPLAY_RFQ_PENDING,     KEEL_REPLAY_NONE, -1 },
     /* RFQ_PENDING →       */ { KEEL_REPLAY_COMPLETE,        KEEL_REPLAY_NONE, -1 },
@@ -246,20 +246,20 @@ static void set_replay_derived(keel_session_flow_t* sf, keel_replay_state_t stat
 {
     /* Reset all replay fields */
     sf->stmt_replay_len = 0;
-    sf->stmt_replay_needs_discard = false;
+    sf->stmt_replay_needs_cleanup = false;
     sf->stmt_replay_rfq_pending = false;
     sf->stmt_replay_count = 0;
 
     switch (state) {
     case KEEL_REPLAY_NONE:
         break;
-    case KEEL_REPLAY_DISCARD_PENDING:
+    case KEEL_REPLAY_CLEANUP_PENDING:
         sf->stmt_replay_len = 1;
-        sf->stmt_replay_needs_discard = true;
+        sf->stmt_replay_needs_cleanup = true;
         break;
-    case KEEL_REPLAY_DISCARD_SENT:
+    case KEEL_REPLAY_CLEANUP_SENT:
         sf->stmt_replay_len = 1;
-        sf->stmt_replay_needs_discard = true;
+        sf->stmt_replay_needs_cleanup = true;
         sf->stmt_replay_rfq_pending = true;
         break;
     case KEEL_REPLAY_SENDING:
@@ -288,16 +288,16 @@ static void test_replay_full_chain(void)
 
     keel_session_flow_t sf = make_sf();
 
-    /* NONE → DISCARD_PENDING */
+    /* NONE → CLEANUP_PENDING */
     set_replay_derived(&sf, KEEL_REPLAY_NONE);
-    TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_DISCARD_PENDING, NULL), 0);
+    TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_CLEANUP_PENDING, NULL), 0);
 
-    /* DISCARD_PENDING → DISCARD_SENT */
-    set_replay_derived(&sf, KEEL_REPLAY_DISCARD_PENDING);
-    TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_DISCARD_SENT, NULL), 0);
+    /* CLEANUP_PENDING → CLEANUP_SENT */
+    set_replay_derived(&sf, KEEL_REPLAY_CLEANUP_PENDING);
+    TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_CLEANUP_SENT, NULL), 0);
 
-    /* DISCARD_SENT → SENDING */
-    set_replay_derived(&sf, KEEL_REPLAY_DISCARD_SENT);
+    /* CLEANUP_SENT → SENDING */
+    set_replay_derived(&sf, KEEL_REPLAY_CLEANUP_SENT);
     TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_SENDING, NULL), 0);
 
     /* SENDING → WAITING */
@@ -367,8 +367,8 @@ static void test_replay_illegal_exhaustive(void)
 
     /* Derivable states: 6 (NONE through RFQ_PENDING, excluding COMPLETE).
      * Non-self edges per state: 6. Total non-self = 6×6 = 36.
-     * Legal edges from derivable states: NONE:2, DISCARD_PENDING:2,
-     * DISCARD_SENT:2, SENDING:2, WAITING:2, RFQ_PENDING:2 = 12.
+     * Legal edges from derivable states: NONE:2, CLEANUP_PENDING:2,
+     * CLEANUP_SENT:2, SENDING:2, WAITING:2, RFQ_PENDING:2 = 12.
      * Illegal = 36 - 12 = 24. */
     TEST_ASSERT_EQ(illegal_count, 24);
 

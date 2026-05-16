@@ -104,8 +104,8 @@ static void test_replay_state_names(void)
     TEST_BEGIN("replay state names");
 
     TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_NONE), "NONE");
-    TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_DISCARD_PENDING), "DISCARD_PENDING");
-    TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_DISCARD_SENT), "DISCARD_SENT");
+    TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_CLEANUP_PENDING), "CLEANUP_PENDING");
+    TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_CLEANUP_SENT), "CLEANUP_SENT");
     TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_SENDING), "SENDING");
     TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_WAITING), "WAITING");
     TEST_ASSERT_STR_EQ(keel_replay_state_name(KEEL_REPLAY_RFQ_PENDING), "RFQ_PENDING");
@@ -143,7 +143,7 @@ static void test_quarantine_names(void)
     TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_REPLAY_MISMATCH), "REPLAY_MISMATCH");
     TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_PROTOCOL_DESYNC), "PROTOCOL_DESYNC");
     TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_TLS_MISMATCH), "TLS_MISMATCH");
-    TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_FAILED_DISCARD), "FAILED_DISCARD");
+    TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_FAILED_CLEANUP), "FAILED_CLEANUP");
     TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_FAILED_SYNC), "FAILED_SYNC");
     TEST_ASSERT_STR_EQ(keel_quarantine_reason_name(KEEL_QUARANTINE_COUNT), "UNKNOWN");
 
@@ -289,8 +289,8 @@ static void test_derive_replay_discard_pending(void)
     TEST_BEGIN("derive replay — discard pending");
     keel_session_flow_t sf = make_sf();
     sf.stmt_replay_len = 100;
-    sf.stmt_replay_needs_discard = true;
-    TEST_ASSERT_EQ(keel_derive_replay_state(&sf), KEEL_REPLAY_DISCARD_PENDING);
+    sf.stmt_replay_needs_cleanup = true;
+    TEST_ASSERT_EQ(keel_derive_replay_state(&sf), KEEL_REPLAY_CLEANUP_PENDING);
     TEST_END();
 }
 
@@ -740,9 +740,9 @@ static void test_replay_transitions_legal(void)
     /* NONE → SENDING */
     TEST_ASSERT_EQ(keel_session_transition_replay(&sf, KEEL_REPLAY_SENDING, &j), 0);
 
-    /* Also test NONE → DISCARD_PENDING */
+    /* Also test NONE → CLEANUP_PENDING */
     keel_session_flow_t sf2 = make_sf();
-    TEST_ASSERT_EQ(keel_session_transition_replay(&sf2, KEEL_REPLAY_DISCARD_PENDING, NULL), 0);
+    TEST_ASSERT_EQ(keel_session_transition_replay(&sf2, KEEL_REPLAY_CLEANUP_PENDING, NULL), 0);
     TEST_END();
 }
 

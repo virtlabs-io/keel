@@ -17,17 +17,20 @@
  *
  * Tests:
  *   1. Clean connection (state_hash == 0) → borrowable immediately
- *   2. Dirty connection (state_hash != 0) → NOT on clean_list
- *   3. Dirty connection → moves to CLEANING after return
+ *   2. Dirty connection (state_hash != 0) → enters reactor-owned CLEANING
+ *   3. CLEANING connection remains unborrowable until cleanup RFQ(I)
  *   4. clean_gen monotonically increments on each return
  *   5. Cross-session isolation: session A's state does not leak to session B
- *   6. Connection returned `in_transaction=true` performs ROLLBACK first
+ *   6. Connection returned `in_transaction=true` is not clean-list borrowable
  */
 
 #include "test_utils.h"
 #include "keel/engine/backend_pool.h"
+#include "keel/reactor/reactor.h"
+#include "keel/protocol/protocol_flow.h"
 #include "keel/mem/mem.h"
 
+#include <fcntl.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
@@ -37,6 +40,35 @@
  * Helpers — from test_pool_correctness.c pattern
  * ============================================================================
  */
+
+/* ---- Minimal stub flow vtable for cleanup unit tests ---- *
+ * backend_pool_prepare_cleanup_locked() needs a non-NULL flow_vt with at
+ * least build_cleanup() (returns >0 bytes) and drain_cleanup_response()
+ * (non-NULL).  The test does not drive real protocol I/O, so a one-byte
+ * stub message and an immediate COMPLETE drain are sufficient.
+ */
+static ssize_t stub_build_cleanup(void *ctx, keel_cleanup_reason_t reason,
+                                   uint8_t *buf, size_t buf_len)
+{
+    (void)ctx; (void)reason;
+    if (buf_len < 1) return -1;
+    buf[0] = 0x58; /* arbitrary byte — never actually sent in unit tests */
+    return 1;
+}
+
+static keel_proto_drain_result_t stub_drain_cleanup(
+        void *ctx, keel_proto_drain_state_t *state,
+        const uint8_t *data, size_t len, size_t *consumed_out)
+{
+    (void)ctx; (void)state; (void)data;
+    if (consumed_out) *consumed_out = len;
+    return KEEL_PROTO_DRAIN_COMPLETE;
+}
+
+static const keel_proto_flow_vtable_t s_stub_flow_vt = {
+    .build_cleanup         = stub_build_cleanup,
+    .drain_cleanup_response = stub_drain_cleanup,
+};
 
 /**
  * @brief Build a synthetic backend pool with socketpair-backed connections.
@@ -50,6 +82,14 @@
  *                     peer-side FD for each connection.
  * @return Heap-allocated pool.  Caller must destroy via destroy_pool().
  */
+
+static void make_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 static backend_pool_t *make_pool(size_t n, int backend_fds[])
 {
     backend_pool_config_t cfg = {
@@ -60,6 +100,21 @@ static backend_pool_t *make_pool(size_t n, int backend_fds[])
 
     backend_pool_t *pool = keel_calloc(1, sizeof(backend_pool_t));
     pool->config     = cfg;
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&pool->lock, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
+    {
+        keel_reactor_config_t rcfg = KEEL_REACTOR_CONFIG_DEFAULT;
+        rcfg.type = KEEL_REACTOR_EPOLL;
+        rcfg.max_fds = 128;
+        pool->reactor = keel_reactor_create(&rcfg);
+        TEST_ASSERT_NOT_NULL(pool->reactor);
+    }
+    pool->flow_vt    = &s_stub_flow_vt;
     pool->connections = keel_calloc(n, sizeof(backend_conn_t));
     pool->total_count = n;
 
@@ -70,6 +125,8 @@ static backend_pool_t *make_pool(size_t n, int backend_fds[])
             backend_fds[i] = -1;
             continue;
         }
+        make_nonblocking(sv[0]);
+        make_nonblocking(sv[1]);
         pool->connections[i].fd   = sv[0];
         backend_fds[i]            = sv[1];
         pool->connections[i].pool = pool;
@@ -99,11 +156,16 @@ static backend_pool_t *make_pool(size_t n, int backend_fds[])
  */
 static void destroy_pool(backend_pool_t *pool, int backend_fds[], size_t n)
 {
+    if (pool->reactor) {
+        keel_reactor_destroy(pool->reactor);
+        pool->reactor = NULL;
+    }
     for (size_t i = 0; i < n; i++) {
         if (pool->connections[i].fd >= 0) close(pool->connections[i].fd);
         if (backend_fds[i] >= 0) close(backend_fds[i]);
     }
     keel_free(pool->connections);
+    pthread_mutex_destroy(&pool->lock);
     keel_free(pool);
 }
 
@@ -138,12 +200,12 @@ static void test_clean_connection_borrowable(void)
 }
 
 /* ============================================================================
- * Test 2 — Dirty connection (state_hash != 0) moves to dirty_list on return
+ * Test 2 — Dirty connection (state_hash != 0) enters CLEANING on return
  * ============================================================================
  */
 static void test_dirty_connection_quarantined(void)
 {
-    TEST_BEGIN("dirty_conn: connection with non-zero state_hash moves to dirty_list");
+    TEST_BEGIN("dirty_conn: connection with non-zero state_hash enters CLEANING");
 
     keel_mem_init(NULL);
 
@@ -161,29 +223,11 @@ static void test_dirty_connection_quarantined(void)
     /* Return the dirty connection — it should NOT go to clean_list */
     backend_pool_return(pool, conn, false);
 
-    /* The returned dirty connection must either be on dirty_list or in CLEANING */
-    bool on_dirty_or_cleaning = false;
-
-    /* Check dirty_list */
-    for (backend_conn_t *c = pool->dirty_list; c != NULL; c = c->next) {
-        if (c == conn) {
-            on_dirty_or_cleaning = true;
-            break;
-        }
-    }
-
-    /* Or in CLEANING state */
-    if (!on_dirty_or_cleaning &&
-        atomic_load(&conn->state) == BACKEND_CONN_CLEANING) {
-        on_dirty_or_cleaning = true;
-    }
-
-    /* Or state_hash was reset to 0 (DISCARD ALL completed synchronously) */
-    if (!on_dirty_or_cleaning && conn->current_state_hash == 0) {
-        on_dirty_or_cleaning = true; /* clean after synchronous discard */
-    }
-
-    TEST_ASSERT(on_dirty_or_cleaning);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_SEND);
+    TEST_ASSERT(conn->cleanup_io_armed);
+    TEST_ASSERT_EQ(pool->cleaning_count, (size_t)1);
+    TEST_ASSERT_EQ(pool->dirty_count, (size_t)0);
 
     destroy_pool(pool, bfds, 2);
     keel_mem_shutdown();
@@ -272,8 +316,7 @@ static void test_cross_session_state_isolation(void)
 }
 
 /* ============================================================================
- * Test 5 — Connection returned while in_transaction=true goes to dirty_list
- *           (ROLLBACK must be issued before reuse)
+ * Test 5 — Connection returned while in_transaction=true is not clean borrowable
  * ============================================================================
  */
 static void test_transaction_leaked_on_disconnect(void)
@@ -291,7 +334,7 @@ static void test_transaction_leaked_on_disconnect(void)
     /* Simulate: client disconnected in the middle of a transaction */
     conn->in_transaction = true;
 
-    /* Return with in_transaction=true → pool MUST send ROLLBACK before reuse */
+    /* Return with in_transaction=true → pool must not make it clean-borrowable */
     backend_pool_return(pool, conn, true /* in_transaction */);
 
     /* The connection must NOT be immediately on the clean list */
