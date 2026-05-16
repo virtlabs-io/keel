@@ -11,7 +11,7 @@
  * - Transaction-aware session pinning
  * - State tracking (clean, transaction-pinned, state-pinned)
  * - Prepared statement virtualization
- * - DISCARD ALL on connection return
+ * - Reactor-owned DISCARD ALL cleanup on stateful connection return
  */
 
 #ifndef KEEL_BACKEND_POOL_H
@@ -54,6 +54,17 @@ typedef enum backend_conn_state {
 } backend_conn_state_t;
 
 /**
+ * @brief Reactor-owned cleanup sub-state for BACKEND_CONN_CLEANING slots.
+ */
+typedef enum backend_cleanup_state {
+    BACKEND_CLEANUP_NONE = 0,       /**< No cleanup operation in flight */
+    BACKEND_CLEANUP_SEND,           /**< Sending cleanup SQL to backend */
+    BACKEND_CLEANUP_DRAIN,          /**< Draining cleanup responses until RFQ(I) */
+} backend_cleanup_state_t;
+
+#define KEEL_BACKEND_CLEANUP_RECV_BUFSZ 1024
+
+/**
  * @brief Backend connection
  */
 typedef struct backend_conn {
@@ -81,6 +92,18 @@ typedef struct backend_conn {
     struct state_profile*   profile;            /**< Connection state profile (spec §5) */
     struct backend_pool*    pool;               /**< Pool this connection belongs to */
     struct backend_conn*    next;               /**< Next in linked list */
+
+    backend_cleanup_state_t cleanup_state;      /**< CLEANING sub-state */
+    bool                    cleanup_io_armed;   /**< true while reactor send/recv is outstanding */
+    size_t                  cleanup_send_off;   /**< Bytes of cleanup command already sent */
+    uint64_t                cleanup_started_ms; /**< Timeout anchor for reactor-owned cleanup */
+    uint8_t                 cleanup_recv_buf[KEEL_BACKEND_CLEANUP_RECV_BUFSZ];
+    uint8_t                 cleanup_hdr[5];     /**< Partial PostgreSQL message header */
+    uint8_t                 cleanup_hdr_len;    /**< Bytes currently in cleanup_hdr */
+    uint8_t                 cleanup_msg_type;   /**< Current message type while draining */
+    uint8_t                 cleanup_rfq_status; /**< ReadyForQuery tx status byte */
+    uint32_t                cleanup_msg_len;    /**< Current PG message length, including len word */
+    uint32_t                cleanup_msg_seen;   /**< Payload bytes consumed for current message */
 } backend_conn_t;
 
 /**
@@ -312,8 +335,9 @@ backend_conn_t* backend_pool_borrow_pinned(backend_pool_t* pool, void* session);
 /**
  * @brief Return a connection to the pool
  *
- * If in_transaction is true, connection stays pinned.
- * Otherwise, runs DISCARD ALL and returns to idle list.
+ * If in_transaction is true, connection stays pinned. Otherwise, clean
+ * connections return to an idle list immediately and dirty/stateful
+ * connections enter reactor-owned cleanup before becoming borrowable.
  *
  * @param pool Pool to return to
  * @param conn Connection to return
@@ -338,23 +362,21 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
 void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn);
 
 /**
- * @brief Drain connections in CLEANING state
+ * @brief Supervise connections in CLEANING state
  *
- * Polls connections that have DISCARD ALL in-flight.  If the backend has
- * responded with ReadyForQuery('I'), the connection is reclaimed to the
- * clean list.  Connections stuck in CLEANING beyond the cleanup timeout
- * are closed.  Should be called periodically from the refill timer.
+ * Cleanup send/drain I/O is owned by reactor callbacks. This periodic
+ * supervisor only enforces timeouts and re-arms stalled cleanup operations.
  *
  * @param pool Pool
- * @return Number of connections reclaimed to clean_list
+ * @return Number of cleanup slots closed by the supervisor
  */
 size_t backend_pool_drain_cleaning(backend_pool_t* pool);
 
 /**
  * @brief Release all connections for a session
  *
- * Called when a client disconnects. Sends ROLLBACK if in transaction,
- * DISCARD ALL, and returns connections to the pool.
+ * Called when a client disconnects. Unsafe pinned connections are closed and
+ * replaced asynchronously rather than synchronously cleaned on the worker path.
  *
  * @param pool Pool
  * @param session Session being released

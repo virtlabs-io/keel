@@ -15,6 +15,8 @@
 #   recvfrom, sendto, recvmsg, sendmsg, readv, writev
 #       → allowed if the same line also contains MSG_DONTWAIT
 #         (the kernel's explicit nonblocking flag)
+#       → src/worker/backend_pool.c is stricter: direct backend I/O is
+#         forbidden except a one-byte MSG_PEEK | MSG_DONTWAIT liveness probe.
 #
 #   select, pselect, poll, ppoll, epoll_wait,
 #   sleep, usleep, nanosleep, clock_nanosleep,
@@ -87,7 +89,8 @@ HOT_PATH_FILES=(
 # Single-pass awk scanner: emits one line per violation in the form
 #   <relpath>:<lineno>:<callname>\t<source line>
 # Comments and NOLINT-annotated lines are skipped.  recv/send-family calls
-# that contain MSG_DONTWAIT on the same line are skipped.
+# that contain MSG_DONTWAIT on the same line are skipped.  backend_pool.c is
+# stricter because pool cleanup and reuse must be reactor-owned.
 scan_one() {
     local relpath="$1"
     local file="$ROOT/$relpath"
@@ -135,8 +138,14 @@ scan_one() {
 
             # If a previous line opened an I/O call that has not yet been
             # resolved, look for MSG_DONTWAIT or the statement terminator.
+            # backend_pool.c forbids multi-line direct socket I/O outright; the
+            # allowed peek probe is intentionally small and on one line.
             if (pend_call != "") {
-                if (index(cleaned, "MSG_DONTWAIT") > 0) {
+                if (rel == "src/worker/backend_pool.c") {
+                    if (index(cleaned, ";") > 0) {
+                        emit_pending()
+                    }
+                } else if (index(cleaned, "MSG_DONTWAIT") > 0) {
                     pend_call = ""
                 } else if (index(cleaned, ";") > 0) {
                     emit_pending()
@@ -149,7 +158,19 @@ scan_one() {
             if (pend_call == "" && match(cleaned, io_re)) {
                 tok = substr(cleaned, RSTART, RLENGTH)
                 sub(/[[:space:]]*\($/, "", tok)
-                if (index(cleaned, "MSG_DONTWAIT") > 0) {
+                if (rel == "src/worker/backend_pool.c") {
+                    if (tok == "recv" &&
+                        index(cleaned, "MSG_PEEK") > 0 &&
+                        index(cleaned, "MSG_DONTWAIT") > 0) {
+                        # Allowed non-consuming liveness probe.
+                    } else if (index(cleaned, ";") > 0) {
+                        printf "%s:%d:%s\t%s\n", rel, NR, tok, line
+                    } else {
+                        pend_call = tok
+                        pend_line = NR
+                        pend_text = line
+                    }
+                } else if (index(cleaned, "MSG_DONTWAIT") > 0) {
                     # Nonblocking — accept.
                 } else if (index(cleaned, ";") > 0) {
                     printf "%s:%d:%s\t%s\n", rel, NR, tok, line
@@ -275,7 +296,7 @@ case "$MODE" in
             printf '  1. Replacing the blocking call with an io_uring/reactor\n'
             printf '     state-machine step (preferred).\n'
             printf '  2. Adding MSG_DONTWAIT to a recv/send/recvmsg/sendmsg call\n'
-            printf '     whose fd is guaranteed nonblocking.\n'
+            printf '     whose fd is guaranteed nonblocking (outside backend_pool.c).\n'
             printf '  3. Annotating the line with /* NOLINT(keel-blocking) */\n'
             printf '     and a comment explaining why the call cannot block.\n'
             printf '\n'

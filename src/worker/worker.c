@@ -1975,38 +1975,13 @@ static void session_idle_timeout_cb(void* userdata)
     KEEL_LOG_WARN(KEEL_LOG_CAT_CONN, "Worker %u: zombie reaper — session %lu idle for >%u ms, closing",
                 worker->id, (unsigned long)session->id, worker->idle_timeout_ms);
 
-    /* If we hold a backend that's in a transaction, send cleanup first.
-     * Use the plugin's build_cleanup (ROLLBACK; DISCARD ALL for PG,
-     * COM_RESET_CONNECTION for MySQL) rather than a hardcoded PG query.
-     * After cleanup, close_session will find !in_transaction and return
-     * the backend to the pool instead of hard-closing it. */
+    /* If an idle timeout catches an open transaction, do not issue cleanup SQL
+     * from the timer callback. close_session() routes this through
+     * backend_cleanup_and_return(), which closes the unsafe backend and lets the
+     * async refill path replace it. */
     if (session->backend_conn && session->in_transaction) {
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, proxy_orphaned_transactions_total);
-        backend_conn_t* be_conn = session->backend_conn;
-        if (recv_ctx != NULL &&
-            recv_ctx->flow.flow != NULL &&
-            recv_ctx->flow.flow->build_cleanup != NULL &&
-            be_conn->fd >= 0) {
-            uint8_t cleanup_buf[256];
-            ssize_t cn = recv_ctx->flow.flow->build_cleanup(
-                    recv_ctx->flow.ctx, KEEL_CLEANUP_TIMEOUT,
-                    cleanup_buf, sizeof(cleanup_buf));
-            if (cn > 0)
-                (void)send(be_conn->fd, cleanup_buf, (size_t)cn,
-                           MSG_NOSIGNAL | MSG_DONTWAIT);
-        } else {
-            /* Fallback: hardcoded PG ROLLBACK for legacy/no-vtable path */
-            if (be_conn->fd >= 0) {
-                const char rollback_q[] = "Q\0\0\0\x0eROLLBACK;\0";
-                (void)send(be_conn->fd, rollback_q, sizeof(rollback_q) - 1,
-                           MSG_NOSIGNAL | MSG_DONTWAIT);
-            }
-        }
-        /* Drain response (ReadyForQuery / OK) — non-blocking */
-        char drain[256];
-        (void)recv(be_conn->fd, drain, sizeof(drain), MSG_DONTWAIT);
-        session->in_transaction = false;
     }
 
     close_session(worker, session, recv_ctx);

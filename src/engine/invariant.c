@@ -193,6 +193,9 @@ enum {
     KEEL_PINV_BORROWABLE_HAS_OWNER   = (1 << 4),
     KEEL_PINV_CLEAN_LIST_DIRTY       = (1 << 5),
     KEEL_PINV_DIRTY_LIST_CLEAN       = (1 << 6),
+    KEEL_PINV_LIST_DUPLICATE         = (1 << 7),
+    KEEL_PINV_CLEANING_BORROWABLE    = (1 << 8),
+    KEEL_PINV_CLEANUP_STATE_INVALID  = (1 << 9),
 };
 
 /**
@@ -272,6 +275,57 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
             if (v) break;
             c = c->next;
         }
+    }
+
+    /* When the pool owns a real connection array, enforce the stronger
+     * ownership model: each backend may appear on at most one borrowable list,
+     * and non-IDLE states must not be linked from any borrowable list. */
+    if (pool->connections && pool->total_count > 0) {
+        size_t actual_cleaning = 0;
+        size_t actual_clean_list = 0;
+        size_t actual_dirty_list = 0;
+
+        for (const backend_conn_t *c = pool->clean_list; c; c = c->next)
+            actual_clean_list++;
+        for (const backend_conn_t *c = pool->dirty_list; c; c = c->next)
+            actual_dirty_list++;
+
+        if (actual_clean_list != pool->clean_count ||
+            actual_dirty_list != pool->dirty_count) {
+            v |= KEEL_PINV_COUNT_MISMATCH;
+        }
+
+        for (size_t i = 0; i < pool->total_count; i++) {
+            const backend_conn_t *slot = &pool->connections[i];
+            unsigned refs = 0;
+            for (const backend_conn_t *c = pool->clean_list; c; c = c->next)
+                if (c == slot) refs++;
+            for (const backend_conn_t *c = pool->idle_list; c; c = c->next)
+                if (c == slot) refs++;
+            for (const backend_conn_t *c = pool->dirty_list; c; c = c->next)
+                if (c == slot) refs++;
+
+            backend_conn_state_t s = atomic_load(&((backend_conn_t *)slot)->state);
+            if (refs > 1)
+                v |= KEEL_PINV_LIST_DUPLICATE;
+            if (refs > 0 && s != BACKEND_CONN_IDLE)
+                v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
+
+            if (s == BACKEND_CONN_CLEANING) {
+                actual_cleaning++;
+                if (refs > 0)
+                    v |= KEEL_PINV_CLEANING_BORROWABLE;
+                if (slot->pinned_session || slot->hard_pinned)
+                    v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
+                if (slot->cleanup_state == BACKEND_CLEANUP_NONE)
+                    v |= KEEL_PINV_CLEANUP_STATE_INVALID;
+            } else if (slot->cleanup_state != BACKEND_CLEANUP_NONE) {
+                v |= KEEL_PINV_CLEANUP_STATE_INVALID;
+            }
+        }
+
+        if (actual_cleaning != pool->cleaning_count)
+            v |= KEEL_PINV_COUNT_MISMATCH;
     }
 
     return v;

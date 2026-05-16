@@ -18,8 +18,10 @@
 
 #include "keel/engine/backend_pool.h"
 #include "keel/engine/backend_connect.h"
+#include "keel/engine/invariant.h"
 #include "keel/protocol/backend_auth.h"
 #include "keel/protocol/protocol_flow.h"
+#include "keel/reactor/reactor.h"
 #include "keel/log/log.h"
 #include "keel/util/util.h"
 #include "keel/session/state_profile.h"
@@ -56,8 +58,12 @@
 
 #define POOL_CLEANING_DEC(pool) \
     do { \
-        (pool)->cleaning_count--; \
-        if ((pool)->stats_ctx) \
+        bool _keel_dec_cleaning = false; \
+        if ((pool)->cleaning_count > 0) { \
+            (pool)->cleaning_count--; \
+            _keel_dec_cleaning = true; \
+        } \
+        if (_keel_dec_cleaning && (pool)->stats_ctx) \
             KEEL_STAT_GAUGE_DEC((pool)->stats_ctx, backends_cleaning); \
     } while (0)
 
@@ -73,69 +79,364 @@
 
 /* All backend connect/startup is now async via backend_connect_async.c */
 
-/* Cleanup timeout in milliseconds - keep very short to avoid blocking reactor */
-#define BACKEND_CLEANUP_TIMEOUT_MS 50
+/* Cleanup timeout in milliseconds. Cleanup I/O is reactor-owned; this bounds
+ * sockets that stop making progress after entering CLEANING. */
+#define BACKEND_CLEANUP_TIMEOUT_MS 5000
+
+static const uint8_t pg_discard_all_msg[] = {
+    'Q', 0, 0, 0, 17,
+    'D','I','S','C','A','R','D',' ','A','L','L',';', 0
+};
 
 /**
  * @brief Get current time in milliseconds (monotonic)
  */
 static uint64_t get_time_ms(void) { return keel_time_now_ms(); }
 
+static void backend_pool_cleanup_send_cb(void* userdata, int result);
+static void backend_pool_cleanup_recv_cb(void* userdata, int result);
+
+static void backend_pool_cleanup_reset(backend_conn_t* conn)
+{
+    if (!conn) return;
+    conn->cleanup_state = BACKEND_CLEANUP_NONE;
+    conn->cleanup_io_armed = false;
+    conn->cleanup_send_off = 0;
+    conn->cleanup_started_ms = 0;
+    conn->cleanup_hdr_len = 0;
+    conn->cleanup_msg_type = 0;
+    conn->cleanup_rfq_status = 0;
+    conn->cleanup_msg_len = 0;
+    conn->cleanup_msg_seen = 0;
+}
+
+static void backend_pool_wake_one_locked(backend_pool_t* pool)
+{
+    if (!pool->wait_queue_head || !pool->wait_callback) {
+        KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
+            "pool wake_waiter: no waiters (active=%zu clean=%zu wait=%zu)",
+            pool->active_count, pool->clean_count, pool->wait_queue_size);
+        return;
+    }
+
+    pool_waiter_t* waiter = pool->wait_queue_head;
+    pool->wait_queue_head = waiter->next;
+    if (!pool->wait_queue_head)
+        pool->wait_queue_tail = NULL;
+    pool->wait_queue_size--;
+
+    pool->wait_callback(waiter->session, waiter->userdata);
+    if (pool->waiter_pool) {
+        keel_pool_free(pool->waiter_pool, waiter);
+    } else {
+        keel_free(waiter);
+    }
+}
+
+static void backend_pool_close_cleaning_locked(backend_pool_t* pool,
+                                               backend_conn_t* conn)
+{
+    POOL_CLEANING_DEC(pool);
+    POOL_REUSE_FAIL_INC(pool);
+    backend_pool_cleanup_reset(conn);
+    conn->current_state_hash = 0;
+    conn->stmt_set_hash = 0;
+    conn->needs_sync = false;
+    conn->needs_discard_all = false;
+    conn->pinned_session = NULL;
+    conn->in_transaction = false;
+    conn->hard_pinned = false;
+    if (conn->profile)
+        state_profile_clear(conn->profile);
+    if (conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
+    atomic_store(&conn->state, BACKEND_CONN_CLOSED);
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+}
+
+static void backend_pool_reclaim_clean_locked(backend_pool_t* pool,
+                                              backend_conn_t* conn)
+{
+    POOL_CLEANING_DEC(pool);
+    backend_pool_cleanup_reset(conn);
+    conn->current_state_hash = 0;
+    conn->stmt_set_hash = 0;
+    conn->needs_sync = false;
+    conn->needs_discard_all = false;
+    conn->pinned_session = NULL;
+    conn->in_transaction = false;
+    conn->hard_pinned = false;
+    conn->last_used = get_time_ms();
+    if (conn->profile)
+        state_profile_clear(conn->profile);
+
+    atomic_store(&conn->state, BACKEND_CONN_IDLE);
+    conn->next = pool->clean_list;
+    pool->clean_list = conn;
+    pool->clean_count++;
+
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+    backend_pool_wake_one_locked(pool);
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+}
+
+static int cleanup_finish_pg_msg(backend_conn_t* conn)
+{
+    switch (conn->cleanup_msg_type) {
+    case 'C': /* CommandComplete */
+    case 'N': /* NoticeResponse: parsed and absorbed during cleanup */
+    case 'S': /* ParameterStatus after reset/discard */
+        return 0;
+
+    case 'Z': /* ReadyForQuery */
+        if (conn->cleanup_msg_len != 5)
+            return -1;
+        return conn->cleanup_rfq_status == 'I' ? 1 : -1;
+
+    case 'E': /* ErrorResponse */
+    case 'A': /* NotificationResponse: meaningful async payload, no owner */
+        return -1;
+
+    default:
+        return -1;
+    }
+}
+
+static void cleanup_reset_msg_parser(backend_conn_t* conn)
+{
+    conn->cleanup_hdr_len = 0;
+    conn->cleanup_msg_type = 0;
+    conn->cleanup_rfq_status = 0;
+    conn->cleanup_msg_len = 0;
+    conn->cleanup_msg_seen = 0;
+}
+
 /**
- * @brief Parse PostgreSQL message to check for ReadyForQuery with tx_status='I'
+ * @brief Parse backend cleanup bytes without discarding opaque protocol data.
  *
- * This is the authoritative "reusable gate" check for PostgreSQL.
- * Returns:
- *   1  = ReadyForQuery with tx_status='I' found (safe to reuse)
- *   0  = No ReadyForQuery yet, need more data
- *  -1  = Error or ReadyForQuery with tx_status != 'I' (need ROLLBACK first)
+ * Returns 1 after a complete ReadyForQuery('I'), 0 when the current stream is
+ * valid but incomplete, and -1 on protocol/error/async-notification data that
+ * cannot be safely owned by the pool.
  */
-/**
- * @brief Inspect PostgreSQL cleanup traffic for a reusable `ReadyForQuery`.
- *
- * PostgreSQL's `ReadyForQuery` message is the authoritative signal that the
- * server is back at a stable transaction boundary. KEEL only treats `tx_status`
- * `I` as safely reusable; any other outcome means the connection remains dirty
- * or errored.
- *
- * @param data Response bytes to inspect.
- * @param len Length of `data`.
- * @return `1` when the backend is confirmed reusable, `0` when more bytes are
- *         needed, or `-1` on cleanup failure / non-reusable state.
- */
-static int check_pg_reusable_gate(const uint8_t* data, size_t len)
+static int cleanup_parse_pg_bytes(backend_conn_t* conn,
+                                  const uint8_t* data,
+                                  size_t len)
 {
     size_t pos = 0;
-    while (pos + 5 <= len) {
-        uint8_t msg_type = data[pos];
-        uint32_t msg_len = ((uint32_t)data[pos+1] << 24) |
-                           ((uint32_t)data[pos+2] << 16) |
-                           ((uint32_t)data[pos+3] << 8) |
-                           ((uint32_t)data[pos+4]);
 
-        if (msg_len < 4 || pos + 1 + msg_len > len) {
-            /* Incomplete message */
+    while (pos < len) {
+        if (conn->cleanup_hdr_len < sizeof(conn->cleanup_hdr)) {
+            size_t need = sizeof(conn->cleanup_hdr) - conn->cleanup_hdr_len;
+            size_t take = (len - pos < need) ? (len - pos) : need;
+            memcpy(conn->cleanup_hdr + conn->cleanup_hdr_len, data + pos, take);
+            conn->cleanup_hdr_len += (uint8_t)take;
+            pos += take;
+
+            if (conn->cleanup_hdr_len < sizeof(conn->cleanup_hdr))
+                return 0;
+
+            conn->cleanup_msg_type = conn->cleanup_hdr[0];
+            conn->cleanup_msg_len =
+                ((uint32_t)conn->cleanup_hdr[1] << 24) |
+                ((uint32_t)conn->cleanup_hdr[2] << 16) |
+                ((uint32_t)conn->cleanup_hdr[3] << 8) |
+                ((uint32_t)conn->cleanup_hdr[4]);
+            conn->cleanup_msg_seen = 0;
+
+            if (conn->cleanup_msg_len < 4)
+                return -1;
+        }
+
+        uint32_t payload_len = conn->cleanup_msg_len - 4;
+        uint32_t remaining = payload_len - conn->cleanup_msg_seen;
+        size_t take = (len - pos < remaining) ? (len - pos) : remaining;
+
+        if (conn->cleanup_msg_type == 'Z' &&
+            conn->cleanup_msg_seen == 0 &&
+            take > 0) {
+            conn->cleanup_rfq_status = data[pos];
+        }
+
+        pos += take;
+        conn->cleanup_msg_seen += (uint32_t)take;
+
+        if (conn->cleanup_msg_seen < payload_len)
             return 0;
-        }
 
-        if (msg_type == 'Z' && msg_len >= 5) {
-            /* ReadyForQuery: check tx_status byte */
-            char tx_status = (char)data[pos + 5];
-            if (tx_status == 'I') {
-                return 1;  /* IDLE — safe to reuse */
-            } else {
-                return -1; /* In transaction or error — not reusable */
-            }
+        int gate = cleanup_finish_pg_msg(conn);
+        cleanup_reset_msg_parser(conn);
+        if (gate != 0) {
+            if (gate == 1 && pos != len)
+                return -1; /* stale bytes after RFQ: no safe owner */
+            return gate;
         }
-
-        if (msg_type == 'E') {
-            /* Error message during cleanup — connection may be unusable */
-            return -1;
-        }
-
-        pos += 1 + msg_len;
     }
-    return 0; /* No ReadyForQuery yet */
+
+    return 0;
+}
+
+static bool backend_pool_arm_cleanup_recv_locked(backend_pool_t* pool,
+                                                 backend_conn_t* conn);
+
+static bool backend_pool_arm_cleanup_send_locked(backend_pool_t* pool,
+                                                 backend_conn_t* conn)
+{
+    if (!pool->reactor || conn->fd < 0) {
+        backend_pool_close_cleaning_locked(pool, conn);
+        return false;
+    }
+
+    size_t remaining = sizeof(pg_discard_all_msg) - conn->cleanup_send_off;
+    if (remaining == 0)
+        return backend_pool_arm_cleanup_recv_locked(pool, conn);
+
+    conn->cleanup_state = BACKEND_CLEANUP_SEND;
+    conn->cleanup_io_armed = true;
+    int rc = keel_reactor_send(pool->reactor, conn->fd,
+                               pg_discard_all_msg + conn->cleanup_send_off,
+                               remaining, MSG_NOSIGNAL,
+                               conn, backend_pool_cleanup_send_cb);
+    if (rc < 0) {
+        conn->cleanup_io_armed = false;
+        backend_pool_close_cleaning_locked(pool, conn);
+        return false;
+    }
+    return true;
+}
+
+static bool backend_pool_arm_cleanup_recv_locked(backend_pool_t* pool,
+                                                 backend_conn_t* conn)
+{
+    if (!pool->reactor || conn->fd < 0) {
+        backend_pool_close_cleaning_locked(pool, conn);
+        return false;
+    }
+
+    conn->cleanup_state = BACKEND_CLEANUP_DRAIN;
+    conn->cleanup_io_armed = true;
+    int rc = keel_reactor_recv(pool->reactor, conn->fd,
+                               conn->cleanup_recv_buf,
+                               sizeof(conn->cleanup_recv_buf),
+                               0, conn, backend_pool_cleanup_recv_cb);
+    if (rc < 0) {
+        conn->cleanup_io_armed = false;
+        backend_pool_close_cleaning_locked(pool, conn);
+        return false;
+    }
+    return true;
+}
+
+static void backend_pool_enter_cleanup_locked(backend_pool_t* pool,
+                                              backend_conn_t* conn)
+{
+    conn->next = NULL;
+    backend_pool_cleanup_reset(conn);
+    conn->cleanup_state = BACKEND_CLEANUP_SEND;
+    conn->cleanup_started_ms = get_time_ms();
+    conn->last_used = conn->cleanup_started_ms;
+    POOL_CLEANING_INC(pool);
+    backend_pool_arm_cleanup_send_locked(pool, conn);
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+}
+
+static bool backend_pool_kick_dirty_cleanups_locked(backend_pool_t* pool)
+{
+    bool kicked = false;
+    backend_conn_t** prev = &pool->dirty_list;
+    backend_conn_t* conn = pool->dirty_list;
+
+    while (conn) {
+        backend_conn_t* next = conn->next;
+        backend_conn_state_t expected = BACKEND_CONN_IDLE;
+        if (atomic_compare_exchange_strong(&conn->state,
+                                           &expected,
+                                           BACKEND_CONN_CLEANING)) {
+            *prev = next;
+            if (pool->dirty_count > 0)
+                pool->dirty_count--;
+            backend_pool_enter_cleanup_locked(pool, conn);
+            kicked = true;
+            conn = *prev;
+            continue;
+        }
+
+        prev = &conn->next;
+        conn = next;
+    }
+
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+    return kicked;
+}
+
+static void backend_pool_cleanup_send_cb(void* userdata, int result)
+{
+    backend_conn_t* conn = (backend_conn_t*)userdata;
+    if (!conn || !conn->pool) return;
+    backend_pool_t* pool = conn->pool;
+
+    pthread_mutex_lock(&pool->lock);
+    if (atomic_load(&conn->state) != BACKEND_CONN_CLEANING ||
+        conn->cleanup_state != BACKEND_CLEANUP_SEND ||
+        !conn->cleanup_io_armed) {
+        pthread_mutex_unlock(&pool->lock);
+        return;
+    }
+
+    conn->cleanup_io_armed = false;
+    if (result <= 0) {
+        backend_pool_close_cleaning_locked(pool, conn);
+        pthread_mutex_unlock(&pool->lock);
+        return;
+    }
+
+    size_t remaining = sizeof(pg_discard_all_msg) - conn->cleanup_send_off;
+    if ((size_t)result > remaining) {
+        backend_pool_close_cleaning_locked(pool, conn);
+        pthread_mutex_unlock(&pool->lock);
+        return;
+    }
+
+    conn->cleanup_send_off += (size_t)result;
+    if (conn->cleanup_send_off < sizeof(pg_discard_all_msg)) {
+        backend_pool_arm_cleanup_send_locked(pool, conn);
+    } else {
+        backend_pool_arm_cleanup_recv_locked(pool, conn);
+    }
+    pthread_mutex_unlock(&pool->lock);
+}
+
+static void backend_pool_cleanup_recv_cb(void* userdata, int result)
+{
+    backend_conn_t* conn = (backend_conn_t*)userdata;
+    if (!conn || !conn->pool) return;
+    backend_pool_t* pool = conn->pool;
+
+    pthread_mutex_lock(&pool->lock);
+    if (atomic_load(&conn->state) != BACKEND_CONN_CLEANING ||
+        conn->cleanup_state != BACKEND_CLEANUP_DRAIN ||
+        !conn->cleanup_io_armed) {
+        pthread_mutex_unlock(&pool->lock);
+        return;
+    }
+
+    conn->cleanup_io_armed = false;
+    if (result <= 0) {
+        backend_pool_close_cleaning_locked(pool, conn);
+        pthread_mutex_unlock(&pool->lock);
+        return;
+    }
+
+    int gate = cleanup_parse_pg_bytes(conn, conn->cleanup_recv_buf, (size_t)result);
+    if (gate == 1) {
+        backend_pool_reclaim_clean_locked(pool, conn);
+    } else if (gate < 0) {
+        backend_pool_close_cleaning_locked(pool, conn);
+    } else {
+        backend_pool_arm_cleanup_recv_locked(pool, conn);
+    }
+    pthread_mutex_unlock(&pool->lock);
 }
 
 /* ============================================================================
@@ -452,84 +753,9 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
         }
     }
 
-    /* Try dirty_list — attempt non-blocking DISCARD ALL.
-     * If the cleanup can't complete immediately (backend hasn't responded),
-     * just close the connection.  The async refill timer will replace it
-     * without blocking the reactor thread. */
-    {
-        backend_conn_t** prev_d = &pool->dirty_list;
-        conn = pool->dirty_list;
-        while (conn) {
-            backend_conn_state_t expected = BACKEND_CONN_IDLE;
-            if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
-                *prev_d = conn->next;
-                pool->dirty_count--;
-                conn->next = NULL;
-                
-                /* Non-blocking cleanup: send DISCARD ALL, immediately
-                 * try to read the response. */
-                static const uint8_t discard_cmd[] = {
-                    'Q', 0, 0, 0, 17,
-                    'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
-                                  MSG_NOSIGNAL | MSG_DONTWAIT);
-                if (ws == (ssize_t)sizeof(discard_cmd)) {
-                    /* Try non-blocking read for ReadyForQuery */
-                    uint8_t rbuf[512];
-                    ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
-                    if (rr > 0) {
-                        int gate = check_pg_reusable_gate(rbuf, (size_t)rr);
-                        if (gate == 1) {
-                            conn->current_state_hash = 0;
-                            conn->stmt_set_hash = 0;
-                            if (conn->profile) state_profile_clear(conn->profile);
-                            conn->needs_sync = (required_state_hash != 0);
-                            pool->active_count++;
-                            pthread_mutex_unlock(&pool->lock);
-                            return conn;
-                        }
-                        if (gate == -1) {
-                            /* Actual error — close */
-                            close(conn->fd);
-                            conn->fd = -1;
-                            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                            prev_d = &pool->dirty_list;
-                            conn   = pool->dirty_list;
-                            continue;
-                        }
-                        /* gate == 0: partial response — enter CLEANING so
-                         * drain_cleaning() can finish it asynchronously. */
-                    } else if (rr == 0 || (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                        /* EOF or error — close */
-                        close(conn->fd);
-                        conn->fd = -1;
-                        atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                        prev_d = &pool->dirty_list;
-                        conn   = pool->dirty_list;
-                        continue;
-                    }
-                    /* rr < 0 EAGAIN or gate==0: DISCARD ALL in flight.
-                     * Enter CLEANING state; drain_cleaning() will reclaim. */
-                    conn->last_used = get_time_ms();
-                    atomic_store(&conn->state, BACKEND_CONN_CLEANING);
-                    POOL_CLEANING_INC(pool);
-                } else {
-                    /* send failed — close */
-                    close(conn->fd);
-                    conn->fd = -1;
-                    atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                }
-                /* Either entered CLEANING or closed — restart scan from head
-                 * so prev_d stays valid after the node was spliced out above. */
-                prev_d = &pool->dirty_list;
-                conn   = pool->dirty_list;
-                continue;
-            }
-            prev_d = &conn->next;
-            conn = conn->next;
-        }
-    }
+    /* Dirty connections are not borrowable.  Kick reactor-owned cleanup and
+     * make the caller wait for a later RFQ(I)-confirmed clean return. */
+    backend_pool_kick_dirty_cleanups_locked(pool);
 
     /* No idle connections - rely on async refill timer to reconnect closed slots.
      * We no longer do synchronous connect here because it blocks the reactor thread.
@@ -553,7 +779,7 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
  * statements are in use:
  *   1. Exact `stmt_set_hash` match — no replay required.
  *   2. Statement-clean connection (`stmt_set_hash == 0`) — replay safe.
- *   3. Dirty connection — inline `DISCARD ALL`, then replay.
+ *   3. Dirty connection — start reactor-owned cleanup and wait.
  *   4. Any idle connection with a differing hash — marked for `DISCARD ALL`
  *      by the engine before replay.
  *
@@ -686,74 +912,10 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
         }
     }
 
-    /* Step 3: Try dirty_list — same inline DISCARD ALL as backend_pool_borrow.
-     * A dirty backend has no named statements after cleanup, so replay is safe. */
-    {
-        backend_conn_t** prev_d = &pool->dirty_list;
-        backend_conn_t*  conn   = pool->dirty_list;
-        while (conn) {
-            backend_conn_state_t expected = BACKEND_CONN_IDLE;
-            if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
-                *prev_d = conn->next;
-                pool->dirty_count--;
-                conn->next = NULL;
-
-                static const uint8_t discard_cmd[] = {
-                    'Q', 0, 0, 0, 17,
-                    'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
-                                  MSG_NOSIGNAL | MSG_DONTWAIT);
-                if (ws == (ssize_t)sizeof(discard_cmd)) {
-                    uint8_t rbuf[512];
-                    ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
-                    if (rr > 0) {
-                        int gate = check_pg_reusable_gate(rbuf, (size_t)rr);
-                        if (gate == 1) {
-                            conn->current_state_hash = 0;
-                            conn->stmt_set_hash = 0;
-                            if (conn->profile) state_profile_clear(conn->profile);
-                            conn->needs_sync = false;
-                            pool->active_count++;
-                            *out_needs_replay = (required_stmt_hash != 0);
-                            pthread_mutex_unlock(&pool->lock);
-                            return conn;
-                        }
-                        if (gate == -1) {
-                            /* Actual error — close */
-                            close(conn->fd);
-                            conn->fd = -1;
-                            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                            prev_d = &pool->dirty_list;
-                            conn   = pool->dirty_list;
-                            continue;
-                        }
-                        /* gate == 0: partial — enter CLEANING */
-                    } else if (rr == 0 || (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                        close(conn->fd);
-                        conn->fd = -1;
-                        atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                        prev_d = &pool->dirty_list;
-                        conn   = pool->dirty_list;
-                        continue;
-                    }
-                    /* EAGAIN or partial — enter CLEANING for async completion */
-                    conn->last_used = get_time_ms();
-                    atomic_store(&conn->state, BACKEND_CONN_CLEANING);
-                    POOL_CLEANING_INC(pool);
-                } else {
-                    close(conn->fd);
-                    conn->fd = -1;
-                    atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                }
-                prev_d = &pool->dirty_list;
-                conn   = pool->dirty_list;
-                continue;
-            }
-            prev_d = &conn->next;
-            conn   = conn->next;
-        }
-    }
+    /* Step 3: dirty_list entries require reactor-owned cleanup before any
+     * replay can be considered safe.  Start cleanup and let the waiter retry
+     * after RFQ(I) moves the slot to clean_list. */
+    backend_pool_kick_dirty_cleanups_locked(pool);
 
     /* Step 4: Last resort — grab any idle backend with a non-zero stmt hash.
      *
@@ -866,7 +1028,7 @@ backend_conn_t* backend_pool_borrow_pinned(backend_pool_t* pool, void* session)
  * Uses a five-step strategy to find the best connection for the given
  * state profile: (1) clean connection for empty profiles, (2) exact profile
  * match on the idle list, (3) any clean connection (needs sync), (4) any idle
- * connection (needs sync), (5) dirty connection (inline `DISCARD ALL`).
+ * connection (needs sync), (5) dirty connection cleanup kick.
  *
  * @param pool Pool to borrow from.
  * @param profile Desired session-state profile, or `NULL` / empty for a
@@ -962,73 +1124,9 @@ backend_conn_t* backend_pool_borrow_profiled(backend_pool_t* pool,
         }
     }
 
-    /* Step 5: Take dirty connection — non-blocking DISCARD ALL attempt */
-    {
-        backend_conn_t** prev_d = &pool->dirty_list;
-        conn = pool->dirty_list;
-        while (conn) {
-            backend_conn_state_t expected = BACKEND_CONN_IDLE;
-            if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
-                *prev_d = conn->next;
-                pool->dirty_count--;
-                conn->next = NULL;
-                conn->needs_sync = true;
-
-                /* Non-blocking DISCARD ALL */
-                static const uint8_t discard_cmd[] = {
-                    'Q', 0, 0, 0, 17,
-                    'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
-                                  MSG_NOSIGNAL | MSG_DONTWAIT);
-                if (ws == (ssize_t)sizeof(discard_cmd)) {
-                    uint8_t rbuf[512];
-                    ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
-                    if (rr > 0) {
-                        int gate = check_pg_reusable_gate(rbuf, (size_t)rr);
-                        if (gate == 1) {
-                            conn->current_state_hash = 0;
-                            if (conn->profile) state_profile_clear(conn->profile);
-                            pool->active_count++;
-                            pthread_mutex_unlock(&pool->lock);
-                            return conn;
-                        }
-                        if (gate == -1) {
-                            /* Actual error — close */
-                            close(conn->fd);
-                            conn->fd = -1;
-                            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                            prev_d = &pool->dirty_list;
-                            conn = pool->dirty_list;
-                            continue;
-                        }
-                        /* gate == 0: partial — enter CLEANING */
-                    } else if (rr == 0 || (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                        close(conn->fd);
-                        conn->fd = -1;
-                        atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                        prev_d = &pool->dirty_list;
-                        conn = pool->dirty_list;
-                        continue;
-                    }
-                    /* EAGAIN or partial — enter CLEANING for async completion */
-                    conn->last_used = get_time_ms();
-                    atomic_store(&conn->state, BACKEND_CONN_CLEANING);
-                    POOL_CLEANING_INC(pool);
-                } else {
-                    /* send failed — close */
-                    close(conn->fd);
-                    conn->fd = -1;
-                    atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-                }
-                prev_d = &pool->dirty_list;
-                conn = pool->dirty_list;
-                continue;
-            }
-            prev_d = &conn->next;
-            conn = conn->next;
-        }
-    }
+    /* Step 5: Dirty connections are quarantined into CLEANING and become
+     * borrowable only after the reactor drains DISCARD ALL to RFQ(I). */
+    backend_pool_kick_dirty_cleanups_locked(pool);
 
     /* No idle connections available.  The caller will queue in the wait
      * queue, and the async refill timer will grow the pool from
@@ -1054,7 +1152,8 @@ backend_conn_t* backend_pool_borrow_profiled(backend_pool_t* pool,
  *   by `stmt_set_hash` so a future session with the same statements avoids
  *   replay.
  * - Connections with general session state (`SET` vars, temp tables) enter
- *   `CLEANING` state and receive a non-blocking `DISCARD ALL`.
+ *   a reactor-owned `CLEANING` state machine that sends `DISCARD ALL` and
+ *   drains protocol responses to ReadyForQuery('I') before reuse.
  *
  * One waiting session is woken after a successful return.
  *
@@ -1073,6 +1172,7 @@ void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn)
     pthread_mutex_lock(&pool->lock);
     if (pool->active_count > 0)
         pool->active_count--;
+    KEEL_CHECK_POOL_INVARIANTS(pool);
     pthread_mutex_unlock(&pool->lock);
 }
 
@@ -1086,6 +1186,7 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
     if (in_transaction) {
         /* Transaction pinned - cannot return to pool */
         atomic_store(&conn->state, BACKEND_CONN_TXN_PINNED);
+        KEEL_CHECK_POOL_INVARIANTS(pool);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
@@ -1100,11 +1201,34 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
         pool->pinned_count--;
     conn->pinned_session = NULL;
     conn->last_used = get_time_ms();
-    pool->active_count--;
+    if (pool->active_count > 0)
+        pool->active_count--;
 
     /* Fast path: connection is already clean — no DISCARD ALL needed */
     if (conn->current_state_hash == 0 &&
         (!conn->profile || conn->profile->count == 0)) {
+        if (!conn_is_alive(conn->fd)) {
+            POOL_REUSE_FAIL_INC(pool);
+            if (conn->fd >= 0) {
+                close(conn->fd);
+                conn->fd = -1;
+            }
+            backend_pool_cleanup_reset(conn);
+            conn->needs_sync = false;
+            conn->needs_discard_all = false;
+            conn->in_transaction = false;
+            conn->hard_pinned = false;
+            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
+            KEEL_CHECK_POOL_INVARIANTS(pool);
+            pthread_mutex_unlock(&pool->lock);
+            return;
+        }
+
+        conn->needs_sync = false;
+        conn->needs_discard_all = false;
+        conn->in_transaction = false;
+        conn->hard_pinned = false;
+
         if (conn->stmt_set_hash == 0) {
             /* Truly clean — return to clean list */
             atomic_store(&conn->state, BACKEND_CONN_IDLE);
@@ -1119,17 +1243,6 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
              * Put on idle_list keyed by stmt_set_hash so a session with the
              * same set of prepared statements can borrow it without replay.
              * DO NOT send DISCARD ALL — that would destroy the statements. */
-
-            /* Drain any stale data (async notices, leftover bytes) from the
-             * backend socket before parking.  Without this, a wake_waiter →
-             * Step 4 borrow → DISCARD ALL sequence reads stale bytes instead
-             * of the DISCARD ALL response, causing protocol desync. */
-            {
-                uint8_t drain_buf[512];
-                while (recv(conn->fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0)
-                    ;  /* discard */
-            }
-
             atomic_store(&conn->state, BACKEND_CONN_IDLE);
             conn->next = pool->idle_list;
             pool->idle_list = conn;
@@ -1140,109 +1253,20 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
         goto wake_waiter;
     }
 
-    /* Connection has session state — must run DISCARD ALL before reuse.
-     * Transition to CLEANING state so borrowers cannot see this connection
-     * until cleanup is confirmed by a ReadyForQuery('I') from the backend.
-     * Use a single-statement simple query: multi-statement queries wrap
-     * DISCARD ALL in an implicit transaction (isTopLevel=false) which causes
-     * PostgreSQL to reject it even when the backend is idle. */
+    /* Connection has session state — it is not borrowable again until the
+     * reactor-owned cleanup state machine sends DISCARD ALL and drains all
+     * PostgreSQL protocol responses to ReadyForQuery('I'). */
     atomic_store(&conn->state, BACKEND_CONN_CLEANING);
-    POOL_CLEANING_INC(pool);
-
-    /* Non-blocking cleanup: single-statement DISCARD ALL clears prepared
-     * statements, temp tables, and SET parameters. */
-    static const uint8_t discard_cmd[] = {
-        'Q', 0, 0, 0, 17,
-        'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-    };
-    ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
-                      MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (ws != (ssize_t)sizeof(discard_cmd)) {
-        /* Send failed — close the connection */
-        POOL_CLEANING_DEC(pool);
-        POOL_REUSE_FAIL_INC(pool);
-        if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-        atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-        pthread_mutex_unlock(&pool->lock);
-        return;
-    }
-
-    /* Try non-blocking read for immediate ReadyForQuery */
-    uint8_t rbuf[512];
-    ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
-    if (rr > 0) {
-        int gate = check_pg_reusable_gate(rbuf, (size_t)rr);
-        if (gate == 1) {
-            /* DISCARD ALL confirmed immediately — connection is clean */
-            POOL_CLEANING_DEC(pool);
-            conn->current_state_hash = 0;
-            conn->stmt_set_hash = 0;
-            if (conn->profile) state_profile_clear(conn->profile);
-            conn->hard_pinned = false;
-            atomic_store(&conn->state, BACKEND_CONN_IDLE);
-            conn->next = pool->clean_list;
-            pool->clean_list = conn;
-            pool->clean_count++;
-            goto wake_waiter;
-        }
-        if (gate == -1) {
-            /* Actual error response — close */
-            POOL_CLEANING_DEC(pool);
-            POOL_REUSE_FAIL_INC(pool);
-            if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-            pthread_mutex_unlock(&pool->lock);
-            return;
-        }
-        /* gate == 0: partial response (e.g. got 'C' CommandComplete but not
-         * yet 'Z'('I')).  Fall through to stay in CLEANING state so
-         * drain_cleaning() can finish reading the rest. */
-    }
-
-    /* rr == 0 (EOF) or rr < 0 non-EAGAIN: close immediately.
-     * rr < 0 EAGAIN or gate==0: DISCARD ALL sent, still waiting for response.
-     * Leave in CLEANING state — drain_cleaning() will poll on next tick. */
-    if (rr == 0 || (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        POOL_CLEANING_DEC(pool);
-        POOL_REUSE_FAIL_INC(pool);
-        if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-        atomic_store(&conn->state, BACKEND_CONN_CLOSED);
-        pthread_mutex_unlock(&pool->lock);
-        return;
-    }
-
-    /* EAGAIN or partial response — DISCARD ALL sent, full response pending.
-     * Connection stays in CLEANING state (not on any list).
-     * backend_pool_drain_cleaning() will poll it on the next refill-timer
-     * tick (~100ms). */
+    backend_pool_enter_cleanup_locked(pool, conn);
     KEEL_DEBUG_LOG("Connection %d entering CLEANING state (gen=%lu)\n",
                   conn->fd, (unsigned long)conn->clean_gen);
+    KEEL_CHECK_POOL_INVARIANTS(pool);
     pthread_mutex_unlock(&pool->lock);
     return;
 
 wake_waiter:
-    /* Wake ONE waiting session.  The callback will call borrow() and will
-     * find the connection we just placed on the idle list above.  Because
-     * workers are single-threaded, no other code path can steal it. */
-    if (pool->wait_queue_head && pool->wait_callback) {
-        pool_waiter_t* waiter = pool->wait_queue_head;
-        pool->wait_queue_head = waiter->next;
-        if (!pool->wait_queue_head) {
-            pool->wait_queue_tail = NULL;
-        }
-        pool->wait_queue_size--;
-        
-        pool->wait_callback(waiter->session, waiter->userdata);
-        if (pool->waiter_pool) {
-            keel_pool_free(pool->waiter_pool, waiter);
-        } else {
-            keel_free(waiter);
-        }
-    } else {
-        KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
-            "pool wake_waiter: no waiters (active=%zu clean=%zu wait=%zu)",
-            pool->active_count, pool->clean_count, pool->wait_queue_size);
-    }
+    backend_pool_wake_one_locked(pool);
+    KEEL_CHECK_POOL_INVARIANTS(pool);
     pthread_mutex_unlock(&pool->lock);
 }
 
@@ -1251,92 +1275,51 @@ wake_waiter:
  * ============================================================================ */
 
 /**
- * @brief Poll connections in CLEANING state for DISCARD ALL completion
+ * @brief Supervise reactor-owned cleanup slots.
  *
- * Called periodically from the refill timer (~100ms).  For each connection
- * in CLEANING state, do a non-blocking recv to check if the backend has
- * responded to DISCARD ALL.  If confirmed (ReadyForQuery 'I'), transition
- * to IDLE and place on clean_list.  If the connection has been stuck in
- * CLEANING for > BACKEND_CLEANUP_TIMEOUT_MS, close it.
+ * Called periodically from the refill timer. Cleanup I/O is performed only by
+ * reactor callbacks; this function enforces timeout ownership and re-arms any
+ * CLEANING slot that is waiting for the reactor but has no outstanding op.
  *
- * @return Number of connections reclaimed
+ * @return Number of timed-out/invalid cleanup slots closed
  */
 size_t backend_pool_drain_cleaning(backend_pool_t* pool)
 {
     if (!pool || pool->cleaning_count == 0) return 0;
 
+    pthread_mutex_lock(&pool->lock);
     uint64_t now = get_time_ms();
-    size_t reclaimed = 0;
+    size_t closed = 0;
 
     for (size_t i = 0; i < pool->total_count; i++) {
         backend_conn_t* conn = &pool->connections[i];
         if (atomic_load(&conn->state) != BACKEND_CONN_CLEANING) continue;
 
         /* Timeout check: if stuck in CLEANING too long, close it */
-        if (conn->last_used > 0 && (now - conn->last_used) > BACKEND_CLEANUP_TIMEOUT_MS) {
-            POOL_CLEANING_DEC(pool);
-            POOL_REUSE_FAIL_INC(pool);
-            if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
+        if (conn->cleanup_started_ms > 0 &&
+            (now - conn->cleanup_started_ms) > BACKEND_CLEANUP_TIMEOUT_MS) {
+            backend_pool_close_cleaning_locked(pool, conn);
             KEEL_DEBUG_LOG("Connection CLEANING timeout — closed (gen=%lu)\n",
                           (unsigned long)conn->clean_gen);
+            closed++;
             continue;
         }
 
-        /* Non-blocking recv for ReadyForQuery */
-        uint8_t rbuf[512];
-        ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
-
-        if (rr > 0) {
-            int gate = check_pg_reusable_gate(rbuf, (size_t)rr);
-            if (gate == 1) {
-                /* DISCARD ALL confirmed — reclaim to clean_list */
-                POOL_CLEANING_DEC(pool);
-                conn->current_state_hash = 0;
-                conn->stmt_set_hash = 0;
-                if (conn->profile) state_profile_clear(conn->profile);
-                conn->hard_pinned = false;
-                conn->last_used = now;
-                atomic_store(&conn->state, BACKEND_CONN_IDLE);
-                conn->next = pool->clean_list;
-                pool->clean_list = conn;
-                pool->clean_count++;
-                reclaimed++;
-
-                /* Wake a waiter if available */
-                if (pool->wait_queue_head && pool->wait_callback) {
-                    pool_waiter_t* waiter = pool->wait_queue_head;
-                    pool->wait_queue_head = waiter->next;
-                    if (!pool->wait_queue_head) pool->wait_queue_tail = NULL;
-                    pool->wait_queue_size--;
-                    pool->wait_callback(waiter->session, waiter->userdata);
-                    if (pool->waiter_pool) {
-                        keel_pool_free(pool->waiter_pool, waiter);
-                    } else {
-                        keel_free(waiter);
-                    }
-                }
-            } else if (gate == -1) {
-                /* Actual error response — close */
-                POOL_CLEANING_DEC(pool);
-                POOL_REUSE_FAIL_INC(pool);
-                if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-                atomic_store(&conn->state, BACKEND_CONN_CLOSED);
+        if (!conn->cleanup_io_armed) {
+            if (conn->cleanup_state == BACKEND_CLEANUP_SEND) {
+                backend_pool_arm_cleanup_send_locked(pool, conn);
+            } else if (conn->cleanup_state == BACKEND_CLEANUP_DRAIN) {
+                backend_pool_arm_cleanup_recv_locked(pool, conn);
+            } else {
+                backend_pool_close_cleaning_locked(pool, conn);
+                closed++;
             }
-            /* gate == 0: partial response (e.g. got 'C' ROLLBACK but not yet
-             * 'C' DISCARD ALL + 'Z'('I')).  Leave in CLEANING — we'll poll
-             * again on the next drain_cleaning tick. */
-        } else if (rr == 0) {
-            /* EOF — backend closed */
-            POOL_CLEANING_DEC(pool);
-            POOL_REUSE_FAIL_INC(pool);
-            if (conn->fd >= 0) { close(conn->fd); conn->fd = -1; }
-            atomic_store(&conn->state, BACKEND_CONN_CLOSED);
         }
-        /* rr < 0 with EAGAIN: still waiting, leave in CLEANING */
     }
 
-    return reclaimed;
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+    pthread_mutex_unlock(&pool->lock);
+    return closed;
 }
 
 /**
@@ -1538,6 +1521,8 @@ void backend_pool_get_stats(backend_pool_t* pool, backend_pool_stats_t* stats)
     stats->active_connections = pool->active_count;
     stats->idle_connections = idle;
     stats->waiting_sessions = pool->wait_queue_size;
+    stats->cleaning_count = pool->cleaning_count;
+    stats->pinned_count = pool->pinned_count;
 }
 
 /* ============================================================================
