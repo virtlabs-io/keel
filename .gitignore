@@ -36,6 +36,7 @@ _deps/
 .project
 .cproject
 .copilot/
+.codex/
 .settings/
 *.sublime-*
 

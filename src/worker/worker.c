@@ -2158,7 +2158,7 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
 
         uint8_t wait_kind = WAIT_BACKEND_KIND_QUERY;
         if (fr == KEEL_FLOW_WAIT_STMT_REPLAY)
-            wait_kind = recv_ctx->flow.stmt_replay_needs_discard
+            wait_kind = recv_ctx->flow.stmt_replay_needs_cleanup
                         ? WAIT_BACKEND_KIND_DISCARD
                         : WAIT_BACKEND_KIND_REPLAY;
         stats_mark_wait_backend_begin(recv_ctx, wait_kind);
@@ -2542,7 +2542,7 @@ static void on_deferred_send_complete(void* userdata, int result)
                 return;
             }
                 uint8_t wait_kind = (resume == KEEL_FLOW_WAIT_STMT_REPLAY)
-                                          ? (recv_ctx->flow.stmt_replay_needs_discard
+                                          ? (recv_ctx->flow.stmt_replay_needs_cleanup
                                               ? WAIT_BACKEND_KIND_DISCARD
                                               : WAIT_BACKEND_KIND_REPLAY)
                                           : WAIT_BACKEND_KIND_QUERY;
@@ -2853,7 +2853,7 @@ static void on_client_recv_complete(void* userdata, int result)
         }
 
           uint8_t wait_kind = (fr == KEEL_FLOW_WAIT_STMT_REPLAY)
-                                     ? (recv_ctx->flow.stmt_replay_needs_discard
+                                     ? (recv_ctx->flow.stmt_replay_needs_cleanup
                                          ? WAIT_BACKEND_KIND_DISCARD
                                          : WAIT_BACKEND_KIND_REPLAY)
                                      : WAIT_BACKEND_KIND_QUERY;

@@ -11,7 +11,7 @@
  * - Transaction-aware session pinning
  * - State tracking (clean, transaction-pinned, state-pinned)
  * - Prepared statement virtualization
- * - Reactor-owned DISCARD ALL cleanup on stateful connection return
+ * - Reactor-owned protocol cleanup on stateful connection return
  */
 
 #ifndef KEEL_BACKEND_POOL_H
@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <netinet/in.h>
 #include "keel/protocol/tls_context.h"
+#include "keel/protocol/protocol_flow.h"
 #include "keel/core/cloud_auth.h"
 
 /* Forward declare state profile */
@@ -49,7 +50,7 @@ typedef enum backend_conn_state {
     BACKEND_CONN_TXN_PINNED,        /**< Pinned to session due to transaction */
     BACKEND_CONN_STATE_PINNED,      /**< Pinned due to SET variables or prepared statements */
     BACKEND_CONN_SYNCING,           /**< Synchronizing state before query */
-    BACKEND_CONN_CLEANING,          /**< DISCARD ALL sent, awaiting response */
+    BACKEND_CONN_CLEANING,          /**< Cleanup command sent, awaiting response */
     BACKEND_CONN_CLOSED,            /**< Connection closed/failed */
 } backend_conn_state_t;
 
@@ -58,11 +59,12 @@ typedef enum backend_conn_state {
  */
 typedef enum backend_cleanup_state {
     BACKEND_CLEANUP_NONE = 0,       /**< No cleanup operation in flight */
-    BACKEND_CLEANUP_SEND,           /**< Sending cleanup SQL to backend */
-    BACKEND_CLEANUP_DRAIN,          /**< Draining cleanup responses until RFQ(I) */
+    BACKEND_CLEANUP_SEND,           /**< Sending plugin-built cleanup command */
+    BACKEND_CLEANUP_DRAIN,          /**< Draining cleanup responses via plugin */
 } backend_cleanup_state_t;
 
 #define KEEL_BACKEND_CLEANUP_RECV_BUFSZ 1024
+#define KEEL_BACKEND_CLEANUP_CMD_BUFSZ 2048
 
 /**
  * @brief Backend connection
@@ -73,18 +75,18 @@ typedef struct backend_conn {
     uint64_t                current_state_hash; /**< Hash of SET variables */
     uint64_t                stmt_set_hash;      /**< Hash of named prepared statements on this backend.
                                                  *   Non-zero means the backend has prepared statements
-                                                 *   and must NOT receive DISCARD ALL on pool return —
+                                                 *   and must not receive full cleanup on pool return —
                                                  *   the stmts are kept for reuse by matching sessions.
-                                                 *   Cleared when DISCARD ALL is sent. */
+                                                 *   Cleared when full cleanup is sent. */
     bool                    in_transaction;     /**< Inside BEGIN...COMMIT */
     bool                    needs_sync;         /**< Needs state sync before use */
     bool                    hard_pinned;        /**< Exclusively owned by session (spec §16) */
-    bool                    needs_discard_all;  /**< Borrowed with a different stmt hash — engine must
-                                                 *   send DISCARD ALL before replaying prepared stmts.
+    bool                    needs_full_cleanup;  /**< Borrowed with a different stmt hash — engine must
+                                                 *   run full cleanup before replaying prepared stmts.
                                                  *   Set by borrow_with_stmts Step 4; cleared by engine. */
-    uint32_t                backend_pid;        /**< PG BackendKeyData PID (for cancel forwarding) */
-    uint32_t                cancel_secret;      /**< PG BackendKeyData secret key */
-    uint32_t                my_connection_id;   /**< MySQL connection ID (for KILL QUERY) */
+    uint32_t                backend_pid;        /**< Protocol backend id for cancel forwarding */
+    uint32_t                cancel_secret;      /**< Protocol cancel secret when applicable */
+    uint32_t                my_connection_id;   /**< Protocol connection id for command cancellation */
     uint64_t                last_used;          /**< Timestamp of last use */
     uint64_t                created_at;         /**< Timestamp when connection was established (ms) */
     uint64_t                clean_gen;          /**< Monotonic generation counter (bumped on return) */
@@ -95,15 +97,12 @@ typedef struct backend_conn {
 
     backend_cleanup_state_t cleanup_state;      /**< CLEANING sub-state */
     bool                    cleanup_io_armed;   /**< true while reactor send/recv is outstanding */
+    uint8_t                 cleanup_send_buf[KEEL_BACKEND_CLEANUP_CMD_BUFSZ];
+    size_t                  cleanup_send_len;   /**< Bytes valid in cleanup_send_buf */
     size_t                  cleanup_send_off;   /**< Bytes of cleanup command already sent */
     uint64_t                cleanup_started_ms; /**< Timeout anchor for reactor-owned cleanup */
     uint8_t                 cleanup_recv_buf[KEEL_BACKEND_CLEANUP_RECV_BUFSZ];
-    uint8_t                 cleanup_hdr[5];     /**< Partial PostgreSQL message header */
-    uint8_t                 cleanup_hdr_len;    /**< Bytes currently in cleanup_hdr */
-    uint8_t                 cleanup_msg_type;   /**< Current message type while draining */
-    uint8_t                 cleanup_rfq_status; /**< ReadyForQuery tx status byte */
-    uint32_t                cleanup_msg_len;    /**< Current PG message length, including len word */
-    uint32_t                cleanup_msg_seen;   /**< Payload bytes consumed for current message */
+    keel_proto_drain_state_t cleanup_drain_state; /**< Protocol-owned cleanup drain state */
 } backend_conn_t;
 
 /**
@@ -149,7 +148,7 @@ typedef void (*backend_pool_wait_cb)(void* session, void* userdata);
  * Spec §6: The idle list is logically partitioned into three sublists:
  *   1. clean_list  — connections with no SET state (profile == NULL or empty)
  *   2. idle_list   — connections with known state profiles (bucket by hash)
- *   3. dirty_list  — connections needing DISCARD ALL before reuse
+ *   3. dirty_list  — connections needing full cleanup before reuse
  */
 typedef struct backend_pool {
     backend_pool_config_t   config;             /**< Configuration */
@@ -177,7 +176,7 @@ typedef struct backend_pool {
     size_t                  wait_queue_size;
     backend_pool_wait_cb    wait_callback;
 
-    /* Refill backoff — pause reconnects when PG rejects with "too many clients" */
+    /* Refill backoff — pause reconnects after repeated backend rejections */
     uint64_t                refill_backoff_until;  /**< Skip refill until this timestamp (ms) */
     uint32_t                refill_fail_count;     /**< Consecutive refill failures (for exp backoff) */
 
@@ -194,11 +193,9 @@ typedef struct backend_pool {
     bool                     addr_resolved;
 
     /* SCRAM-SHA-256 SaltedPassword cache (per-pool, single-threaded).
-     * PostgreSQL stores a fixed salt per user in pg_authid.rolpassword, so
-     * every connection from this pool to the same backend uses identical
-     * (salt, iterations) parameters.  Caching Hi(password, salt, iters)
-     * eliminates the blocking PKCS5_PBKDF2_HMAC call (~0.7 ms) for all
-     * pool connections after the first. */
+     * Some protocol auth paths reuse identical salt/iteration parameters for
+     * connections from this pool. Caching Hi(password, salt, iters) avoids a
+     * repeated blocking PBKDF2 call after the first connection. */
     bool                     scram_cache_valid;              /**< Cache contains a usable entry */
     int                      scram_cache_iterations;         /**< Iteration count of cached entry */
     size_t                   scram_cache_salt_len;           /**< Length of cached salt */
@@ -310,7 +307,7 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
  *   1. exact profile match in idle_list (hash equality)
  *   2. clean connection from clean_list
  *   3. any idle connection (will need sync)
- *   4. dirty connection (will need DISCARD ALL + sync)
+ *   4. dirty connection (will need full cleanup + sync)
  *   5. NULL if pool exhausted
  *
  * @param pool    Pool to borrow from

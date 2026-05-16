@@ -4179,6 +4179,120 @@ static ssize_t pgf_cleanup_slot(void* vctx, int be_fd,
     }
 }
 
+typedef struct pg_cleanup_drain_state {
+    uint8_t  hdr[5];
+    uint8_t  hdr_len;
+    uint8_t  msg_type;
+    uint8_t  rfq_status;
+    uint32_t msg_len;
+    uint32_t msg_seen;
+} pg_cleanup_drain_state_t;
+
+static int pg_cleanup_finish_msg(const pg_cleanup_drain_state_t* st)
+{
+    switch (st->msg_type) {
+    case 'C': /* CommandComplete */
+    case 'N': /* NoticeResponse */
+    case 'S': /* ParameterStatus */
+        return 0;
+    case 'Z': /* ReadyForQuery */
+        if (st->msg_len != 5)
+            return -1;
+        return st->rfq_status == 'I' ? 1 : -1;
+    case 'E': /* ErrorResponse */
+    case 'A': /* NotificationResponse: async payload has no session owner */
+        return -1;
+    default:
+        return -1;
+    }
+}
+
+static void pg_cleanup_reset_msg(pg_cleanup_drain_state_t* st)
+{
+    memset(st->hdr, 0, sizeof(st->hdr));
+    st->hdr_len = 0;
+    st->msg_type = 0;
+    st->rfq_status = 0;
+    st->msg_len = 0;
+    st->msg_seen = 0;
+}
+
+static keel_proto_drain_result_t pgf_drain_cleanup_response(
+    void* vctx,
+    keel_proto_drain_state_t* state,
+    const uint8_t* data,
+    size_t len,
+    size_t* consumed_out)
+{
+    (void)vctx;
+    if (consumed_out)
+        *consumed_out = 0;
+    if (!state || (!data && len > 0))
+        return KEEL_PROTO_DRAIN_ERROR;
+
+    pg_cleanup_drain_state_t* st = (pg_cleanup_drain_state_t*)state->opaque;
+    size_t pos = 0;
+
+    while (pos < len) {
+        if (st->hdr_len < sizeof(st->hdr)) {
+            size_t need = sizeof(st->hdr) - st->hdr_len;
+            size_t take = (len - pos < need) ? (len - pos) : need;
+            memcpy(st->hdr + st->hdr_len, data + pos, take);
+            st->hdr_len += (uint8_t)take;
+            pos += take;
+
+            if (st->hdr_len < sizeof(st->hdr)) {
+                if (consumed_out)
+                    *consumed_out = pos;
+                return KEEL_PROTO_DRAIN_MORE;
+            }
+
+            st->msg_type = st->hdr[0];
+            st->msg_len = rd32(st->hdr + 1);
+            st->msg_seen = 0;
+            st->rfq_status = 0;
+            if (st->msg_len < 4) {
+                if (consumed_out)
+                    *consumed_out = pos;
+                return KEEL_PROTO_DRAIN_ERROR;
+            }
+        }
+
+        uint32_t payload_len = st->msg_len - 4;
+        uint32_t remaining = payload_len - st->msg_seen;
+        size_t take = (len - pos < remaining) ? (len - pos) : remaining;
+
+        if (st->msg_type == 'Z' && st->msg_seen == 0 && take > 0)
+            st->rfq_status = data[pos];
+
+        pos += take;
+        st->msg_seen += (uint32_t)take;
+
+        if (st->msg_seen < payload_len) {
+            if (consumed_out)
+                *consumed_out = pos;
+            return KEEL_PROTO_DRAIN_MORE;
+        }
+
+        int gate = pg_cleanup_finish_msg(st);
+        pg_cleanup_reset_msg(st);
+        if (gate == 1) {
+            if (consumed_out)
+                *consumed_out = pos;
+            return KEEL_PROTO_DRAIN_COMPLETE;
+        }
+        if (gate < 0) {
+            if (consumed_out)
+                *consumed_out = pos;
+            return KEEL_PROTO_DRAIN_ERROR;
+        }
+    }
+
+    if (consumed_out)
+        *consumed_out = pos;
+    return KEEL_PROTO_DRAIN_MORE;
+}
+
 /* ---- probe_backend: health check via PG ---- */
 
 /**
@@ -4655,6 +4769,38 @@ static ssize_t pgf_rewrite_execute_anonymous(
     return (ssize_t)total;
 }
 
+static void pgf_captured_fe_pin_effects(void* vctx,
+                                        const uint8_t* data,
+                                        size_t len,
+                                        keel_flow_pin_reason_t* pin_update,
+                                        keel_flow_pin_reason_t* pin_clear)
+{
+    (void)vctx;
+    if (pin_update)
+        *pin_update = KEEL_FPIN_NONE;
+    if (pin_clear)
+        *pin_clear = KEEL_FPIN_NONE;
+    if (!data || !pin_clear)
+        return;
+
+    size_t pos = 0;
+    while (pos + 5 <= len) {
+        uint8_t type = data[pos];
+        uint32_t msg_len = rd32(data + pos + 1);
+        if (msg_len < 4)
+            return;
+
+        size_t frame_len = 1u + (size_t)msg_len;
+        if (pos + frame_len > len)
+            return;
+
+        if (type == 'S')
+            *pin_clear |= KEEL_FPIN_EXTENDED_PROTO;
+
+        pos += frame_len;
+    }
+}
+
 /* ---- capture_consistency_token: inline SELECT pg_current_wal_lsn() ---- */
 
 /**
@@ -5070,10 +5216,12 @@ const keel_proto_flow_vtable_t keel_proto_flow_postgres = {
     .stream_write          = pgf_stream_write,
     .end_stream            = pgf_end_stream,
     .cleanup_slot          = pgf_cleanup_slot,
+    .drain_cleanup_response = pgf_drain_cleanup_response,
     .probe_backend         = pgf_probe_backend,
     .get_backend_metadata  = pgf_get_backend_metadata,
     .get_metrics           = pgf_get_metrics,
     .notify_write_lsn      = pgf_notify_write_lsn,
     .get_stmt_replay           = pgf_get_stmt_replay,
     .rewrite_execute_anonymous = pgf_rewrite_execute_anonymous,
+    .captured_fe_pin_effects   = pgf_captured_fe_pin_effects,
 };

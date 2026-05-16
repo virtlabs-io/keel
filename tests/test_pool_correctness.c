@@ -75,6 +75,7 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
         .user = "test",
         .password = "test",
         .database = "test",
+        .protocol = "postgres",
         .min_connections = n,
         .max_connections = n,
         .max_waiting = 4,
@@ -83,6 +84,8 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
     /* Allocate pool manually (bypass actual TCP connect) */
     backend_pool_t* pool = keel_calloc(1, sizeof(backend_pool_t));
     pool->config = cfg;
+    pool->flow_vt = keel_proto_flow_get(cfg.protocol);
+    TEST_ASSERT_NOT_NULL(pool->flow_vt);
     {
         pthread_mutexattr_t attr;
         pthread_mutexattr_init(&attr);
