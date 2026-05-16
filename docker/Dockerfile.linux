@@ -198,6 +198,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing-dev \
     # ── TLS / authentication ───────────────────────────────────────────────
     libssl-dev \
+    libldap2-dev \
     # ── Wire-protocol compression ──────────────────────────────────────────
     zlib1g-dev \
     libzstd-dev \
@@ -263,6 +264,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing2 \
     libssl3 \
+    libldap2 \
     ca-certificates \
     # Wire-protocol compression runtimes
     zlib1g \
