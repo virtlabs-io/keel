@@ -2928,10 +2928,15 @@ static void scatter_extract_merge_spec_impl(const keel_sql_node_t*  ast,
                                      "%s", key_part[0] ? key_part : "value");
                             osp->has_key = false;
                         } else {
-                            /* Replacement: expr_col, key_col */
+                            /* Replacement: expr_col, key_col.
+                             * Cap each %s to keep the combined output within
+                             * sizeof(osp->replacement_sql) (256) and silence
+                             * -Wformat-truncation; expr_part/key_part are
+                             * already ≤ 127 bytes so this only truncates the
+                             * theoretical worst case. */
                             if (key_part[0]) {
                                 snprintf(osp->replacement_sql, sizeof(osp->replacement_sql),
-                                         "%s, %s", expr_part, key_part);
+                                         "%.124s, %.124s", expr_part, key_part);
                                 osp->has_key = true;
                             } else {
                                 snprintf(osp->replacement_sql, sizeof(osp->replacement_sql),

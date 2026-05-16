@@ -2253,7 +2253,7 @@ static void show_topology(keel_admin_t *admin, pgbuf_t *b) {
     }
     bool disc_active = admin->discovery && keel_discovery_is_running(admin->discovery);
     int nrows = 0;
-    char pbuf[8], nbuf[16];
+    char pbuf[8], nbuf[24];
     for (size_t i = 0; i < sp->count; i++) {
         const keel_backend_server_t *srv = &sp->servers[i];
         snprintf(pbuf, sizeof(pbuf), "%u", srv->port);
