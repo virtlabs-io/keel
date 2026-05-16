@@ -95,13 +95,15 @@ typedef struct keel_session_flow {
     uint64_t                       last_write_ns;          /**< Timestamp of last write (monotonic ns) */
     uint32_t                       sticky_primary_ttl_ms;  /**< TTL for sticky affinity (0 = disabled) */
 
-    /* Consistency token: WAL LSN (PG) or GTID (MySQL) captured after last
-     * write, used for optional read-after-write consistency checks on replicas */
+    /* Consistency token: latest known WAL LSN (PG) or GTID (MySQL), supplied
+     * by protocol injection today and by future async capture.  Replica
+     * catch-up checks must be reactor-owned before this becomes a hot-path
+     * routing guarantee. */
     keel_consistency_token_t        last_write_token;
 
     /* SSV consistency atoms: structured semantic state for the CONSISTENCY
      * domain.  Indexes match keel_ssv_consistency_key_t:
-     *   [0] WRITE_LSN   — LSN string from last committed write
+     *   [0] WRITE_LSN   — latest known LSN/GTID string
      *   [1] WRITE_LSN_TS — capture timestamp (monotonic ns)
      * These are per-session, per-worker (no locking needed). */
     keel_ssv_atom_t                 consistency_atoms[KEEL_SSV_CK__COUNT];
@@ -183,22 +185,18 @@ typedef struct keel_session_flow {
      *  0=unknown/in_progress/NULL, 1=committed, 2=aborted */
     uint8_t  indoubt_check_result;
 
-    /** When a write/DDL query is forwarded to the backend, set this flag
-     *  instead of immediately calling capture_consistency_token() on the
-     *  pool socket.  The pool socket is non-blocking at that point: recv()
-     *  would return EAGAIN and the SELECT response would later leak into the
-     *  client data stream causing protocol corruption.
-     *
-     *  The engine_flow BE path checks this flag after query_complete fires
-     *  (backend is idle), temporarily sets the socket to blocking, calls
-     *  capture_consistency_token(), and restores non-blocking. */
-    bool     capture_lsn_pending;  /**< Capture LSN/GTID after next query_complete */
+    /** When a write/DDL query is forwarded to the backend, this flag records
+     *  that a consistency token would be useful after query completion.  The
+     *  worker no longer performs inline token capture because the legacy
+     *  implementation temporarily switched the backend fd to blocking and
+     *  ran a protocol round trip on the reactor thread. */
+    bool     capture_lsn_pending;  /**< Async LSN/GTID capture wanted after query_complete */
     bool     txn_had_writes;       /**< True if a write/DDL was forwarded inside an
                                     *   explicit BEGIN…COMMIT transaction.  Defers LSN
-                                    *   capture to the COMMIT's query_complete so that
-                                    *   the captured WAL position reflects committed data
+                                    *   capture marker to the COMMIT's query_complete so
+                                    *   that future async capture observes committed data
                                     *   (not an uncommitted mid-transaction LSN).
-                                    *   Cleared on BEGINS_TX and on capture. */
+                                    *   Cleared on BEGINS_TX and on BE completion. */
 
     bool                           stmt_replay_rfq_pending;   /**< True: all ParseCompletes for the replay have
                                                                *   been received but the ReadyForQuery generated
@@ -262,7 +260,7 @@ typedef struct keel_session_flow {
      * immediately (CommandComplete/ReadyForQuery 'T') without acquiring a
      * backend.  The wire payload is buffered here.  On the next routable
      * DML/SELECT the buffered BEGIN is sent to the correct shard backend
-     * first (blocking inline drain), then the actual query follows. */
+     * first via async pre-query replay, then the actual query follows. */
     bool    begin_deferred;                  /**< true: a BEGIN is pending forwarding */
     uint8_t begin_deferred_payload[512];     /**< raw 'Q: BEGIN...' wire bytes */
     size_t  begin_deferred_payload_len;      /**< byte count (0 when begin_deferred=false) */
@@ -275,10 +273,13 @@ typedef struct keel_session_flow {
     enum {
         KEEL_PRE_QUERY_NONE         = 0,
         KEEL_PRE_QUERY_BEGIN_REPLAY = 1,
+        KEEL_PRE_QUERY_STATE_SYNC   = 2,
     } pending_pre_query;
     uint8_t pending_pre_query_buf[KEEL_PRE_QUERY_REPLAY_BUFSZ]; /**< stashed FE payload */
     size_t  pending_pre_query_len;           /**< bytes valid in stash buffer */
     size_t  pending_pre_query_absorbed;      /**< BE bytes absorbed; runaway-cap */
+    uint64_t pending_state_sync_hash;        /**< backend state hash to stamp after sync RFQ */
+    keel_flow_result_t pending_pre_query_resume; /**< Result after stashed payload is forwarded */
 
     /** eventfd for async auth (KEEL_FLOW_WAIT_AUTH).
      *  Set to ≥0 while an off-thread auth operation is in flight;

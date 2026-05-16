@@ -30,8 +30,7 @@
  *          API as test_log.c but through the util convenience
  *          wrappers).
  *
- * Note: string, buffer, and hash function tests are disabled until
- * API mismatches between headers and implementations are resolved.
+ * String helpers are covered here through the stable util.h API.
  */
 
 
@@ -44,6 +43,167 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* ============================================================================
+ * String Utility Tests
+ * ============================================================================ */
+
+static void test_string_slices(void) {
+    TEST_BEGIN("string slices");
+
+    keel_str_t empty = keel_str_empty();
+    TEST_ASSERT_EQ(empty.len, 0u);
+    TEST_ASSERT(keel_str_eq(empty, keel_str_from_parts(NULL, 99)));
+
+    keel_str_t s = keel_str_from_cstr("  Alpha,Beta,Gamma  ");
+    keel_str_t trimmed = keel_str_trim(s);
+    TEST_ASSERT(keel_str_eq_cstr(trimmed, "Alpha,Beta,Gamma"));
+    TEST_ASSERT(keel_str_starts_with(trimmed, keel_str_from_cstr("Alpha")));
+    TEST_ASSERT(!keel_str_starts_with(trimmed, keel_str_from_cstr("Beta")));
+    TEST_ASSERT(keel_str_ends_with(trimmed, keel_str_from_cstr("Gamma")));
+    TEST_ASSERT(!keel_str_ends_with(trimmed, keel_str_from_cstr("Alpha")));
+    TEST_ASSERT(keel_str_contains(trimmed, keel_str_from_cstr("Beta")));
+    TEST_ASSERT(!keel_str_contains(trimmed, keel_str_from_cstr("Delta")));
+    TEST_ASSERT_EQ(keel_str_find(trimmed, keel_str_from_cstr("Beta")), 6);
+    TEST_ASSERT_EQ(keel_str_find(trimmed, keel_str_from_cstr("missing")), -1);
+
+    TEST_ASSERT(keel_str_eq_nocase(keel_str_from_cstr("PoStGrEs"),
+                                   keel_str_from_cstr("postgres")));
+    TEST_ASSERT(!keel_str_eq_nocase(keel_str_from_cstr("postgres"),
+                                    keel_str_from_cstr("mysql")));
+
+    char* dup = keel_str_dup(trimmed);
+    TEST_ASSERT_NOT_NULL(dup);
+    TEST_ASSERT(strcmp(dup, "Alpha,Beta,Gamma") == 0);
+    keel_free(dup);
+
+    char* empty_dup = keel_str_dup(empty);
+    TEST_ASSERT_NOT_NULL(empty_dup);
+    TEST_ASSERT(strcmp(empty_dup, "") == 0);
+    keel_free(empty_dup);
+
+    TEST_END();
+}
+
+static void test_string_split_iterator(void) {
+    TEST_BEGIN("string split iterator");
+
+    keel_str_t remaining = keel_str_from_cstr("alpha,beta,,gamma");
+    keel_str_t part = keel_str_empty();
+
+    TEST_ASSERT(keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT(keel_str_eq_cstr(part, "alpha"));
+    TEST_ASSERT(keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT(keel_str_eq_cstr(part, "beta"));
+    TEST_ASSERT(keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT_EQ(part.len, 0u);
+    TEST_ASSERT(keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT(keel_str_eq_cstr(part, "gamma"));
+    TEST_ASSERT(!keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT_EQ(part.len, 0u);
+
+    remaining = keel_str_from_cstr("single");
+    TEST_ASSERT(keel_str_split(&remaining, ',', &part));
+    TEST_ASSERT(keel_str_eq_cstr(part, "single"));
+    TEST_ASSERT_EQ(remaining.len, 0u);
+    TEST_ASSERT(!keel_str_split(NULL, ',', &part));
+    TEST_ASSERT(!keel_str_split(&remaining, ',', NULL));
+
+    TEST_END();
+}
+
+static void test_string_alloc_convert_hex(void) {
+    TEST_BEGIN("string allocation, conversion, hex");
+
+    keel_str_t alpha = keel_str_from_cstr("alpha");
+    keel_str_t beta = keel_str_from_cstr("beta");
+    TEST_ASSERT(keel_str_cmp(alpha, beta) < 0);
+    TEST_ASSERT(keel_str_cmp(beta, alpha) > 0);
+    TEST_ASSERT_EQ(keel_str_cmp(alpha, keel_str_from_cstr("alpha")), 0);
+    TEST_ASSERT(keel_str_cmp_cstr(alpha, "beta") < 0);
+    TEST_ASSERT_EQ(keel_str_casecmp(keel_str_from_cstr("MiXeD"),
+                                    keel_str_from_cstr("mixed")), 0);
+
+    keel_str_t path = keel_str_from_cstr("alpha/beta/gamma");
+    TEST_ASSERT_EQ(keel_str_find_char(path, '/'), 5);
+    TEST_ASSERT_EQ(keel_str_rfind_char(path, '/'), 10);
+    TEST_ASSERT(keel_str_contains_char(path, 'g'));
+    TEST_ASSERT(!keel_str_contains_char(path, 'z'));
+    TEST_ASSERT(keel_str_eq_cstr(keel_str_substr(path, 6, 4), "beta"));
+    TEST_ASSERT_EQ(keel_str_substr(path, 99, 4).len, 0u);
+    TEST_ASSERT(keel_str_eq_cstr(keel_str_trim_left(keel_str_from_cstr("  left")),
+                                 "left"));
+    TEST_ASSERT(keel_str_eq_cstr(keel_str_trim_right(keel_str_from_cstr("right  ")),
+                                 "right"));
+
+    char* c = keel_str_to_cstr(keel_str_from_cstr("copy"));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT(strcmp(c, "copy") == 0);
+    keel_free(c);
+
+    keel_str_t formatted = keel_str_printf("route-%d-%s", 7, "ok");
+    TEST_ASSERT(keel_str_eq_cstr(formatted, "route-7-ok"));
+    keel_str_free(&formatted);
+
+    keel_str_t concat = keel_str_concat(keel_str_from_cstr("hot"),
+                                        keel_str_from_cstr("path"));
+    TEST_ASSERT(keel_str_eq_cstr(concat, "hotpath"));
+    keel_str_free(&concat);
+
+    keel_str_t parts[] = {
+        keel_str_from_cstr("a"),
+        keel_str_from_cstr("b"),
+        keel_str_from_cstr("c"),
+    };
+    keel_str_t joined = keel_str_join(parts, 3, keel_str_from_cstr(":"));
+    TEST_ASSERT(keel_str_eq_cstr(joined, "a:b:c"));
+    keel_str_free(&joined);
+    TEST_ASSERT_EQ(keel_str_join(parts, 0, keel_str_from_cstr(":")).len, 0u);
+
+    int64_t i64 = 0;
+    TEST_ASSERT(keel_str_to_int64(keel_str_from_cstr("-42"), &i64));
+    TEST_ASSERT_EQ(i64, -42);
+    TEST_ASSERT(!keel_str_to_int64(keel_str_from_cstr("42x"), &i64));
+    TEST_ASSERT(!keel_str_to_int64(keel_str_empty(), &i64));
+    TEST_ASSERT(!keel_str_to_int64(keel_str_from_cstr("1"), NULL));
+
+    uint64_t u64 = 0;
+    TEST_ASSERT(keel_str_to_uint64(keel_str_from_cstr("42"), &u64));
+    TEST_ASSERT_EQ(u64, 42ULL);
+    TEST_ASSERT(!keel_str_to_uint64(keel_str_from_cstr("42x"), &u64));
+
+    double d = 0.0;
+    TEST_ASSERT(keel_str_to_double(keel_str_from_cstr("3.5"), &d));
+    TEST_ASSERT(d > 3.49 && d < 3.51);
+    TEST_ASSERT(!keel_str_to_double(keel_str_from_cstr("3.5x"), &d));
+
+    keel_str_t lower = keel_str_tolower(keel_str_from_cstr("AbC123"));
+    TEST_ASSERT(keel_str_eq_cstr(lower, "abc123"));
+    keel_str_free(&lower);
+    keel_str_t upper = keel_str_toupper(keel_str_from_cstr("AbC123"));
+    TEST_ASSERT(keel_str_eq_cstr(upper, "ABC123"));
+    keel_str_free(&upper);
+
+    const uint8_t raw[] = { 0x00, 0xab, 0xcd, 0xff };
+    keel_str_t hex = keel_str_to_hex(raw, sizeof(raw));
+    TEST_ASSERT(keel_str_eq_cstr(hex, "00abcdff"));
+    uint8_t out[4] = {0};
+    size_t out_len = sizeof(out);
+    TEST_ASSERT(keel_str_from_hex(hex, out, &out_len));
+    TEST_ASSERT_EQ(out_len, sizeof(raw));
+    TEST_ASSERT(memcmp(out, raw, sizeof(raw)) == 0);
+    keel_str_free(&hex);
+
+    out_len = 1;
+    TEST_ASSERT(!keel_str_from_hex(keel_str_from_cstr("abcd"), out, &out_len));
+    out_len = sizeof(out);
+    TEST_ASSERT(!keel_str_from_hex(keel_str_from_cstr("abc"), out, &out_len));
+    TEST_ASSERT(!keel_str_from_hex(keel_str_from_cstr("zz"), out, &out_len));
+    TEST_ASSERT(!keel_str_from_hex(keel_str_from_cstr("00"), NULL, &out_len));
+    TEST_ASSERT(!keel_str_from_hex(keel_str_from_cstr("00"), out, NULL));
+
+    TEST_END();
+}
 
 /* ============================================================================
  * Hash Ring Tests
@@ -688,6 +848,11 @@ int main(void) {
     printf("=====================\n\n");
     
     keel_mem_init(NULL);
+
+    /* String tests */
+    test_string_slices();
+    test_string_split_iterator();
+    test_string_alloc_convert_hex();
     
     /* Hash ring tests */
     test_hash_ring_lifecycle();

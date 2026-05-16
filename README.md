@@ -25,6 +25,17 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 
 ## Features
 
+### Feature Status
+
+KEEL has a broad feature surface. The labels below keep the advertised model
+aligned with the implementation state:
+
+| Status | Meaning | Current examples |
+|--------|---------|------------------|
+| **Stable / implemented** | Production hot paths with focused tests and no known reactor-blocking calls. | Native reactor I/O, async backend connect/auth, transaction pooling, prepared-statement borrowing/replay, session-state sync, sticky-primary read-after-write safety, pool CLEANING reuse gate. |
+| **Implemented / hardening** | Code exists and has targeted tests, but feature combinations are still being hardened with invariants and failure-mode coverage. | Session-context virtualization, transaction tracking, commit-in-doubt recovery, NOTIFY/LISTEN proxying, query rules, migration/drain behavior. |
+| **Experimental / planned** | Prototype, advanced, or roadmap work that should not be treated as a default production guarantee yet. | Token-based replica catch-up via WAL LSN/GTID probes, sharding scatter-merge, multi-shard 2PC, result cache, multi-proxy cluster compression, fully reactor-owned consistency-token capture. |
+
 ### Core
 - **Native Reactor I/O** — io_uring on Linux 5.6+ (primary), kqueue on macOS, epoll as Linux fallback
 - **PostgreSQL + MySQL** — full wire protocol support for both databases from a single binary
@@ -35,8 +46,8 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Connection Migration** — idle sessions transferred between workers via Unix socketpair SCM_RIGHTS + SPSC ring buffer for runtime load rebalancing
 - **Prepared Statement Pooling** — four strategies for multiplexing PS-heavy applications: `virtualize` (replay), `pinning` (session affinity), `tracking` (simple+extended), `anonymous` (JIT rewrite) — see [PREPARED_STATEMENTS.md](docs/PREPARED_STATEMENTS.md)
 - **XID Probe + Commit-in-Doubt Recovery** — instruments COMMIT with `txid_current()` and re-queries `txid_status()` on a fresh connection if the backend dies before `ReadyForQuery` (requires `transaction_tracking = on`)
-- **Read-After-Write Consistency** — WAL LSN tokens ensure replicas have replayed the client's last write before serving reads (requires `transaction_tracking = on`)
-- **SSV (Semantic State Virtualization)** — atom-layer consistency model for prepared statement and GUC session state across pooled backends: hash-bucket pool index for O(1) backend matching, OPAQUE domain split, CONFIG domain atoms, WAL LSN integration, and semantic replay — see [SSV_POSTGRES_IMPLEMENTATION.md](docs/SSV_POSTGRES_IMPLEMENTATION.md)
+- **Read-After-Write Safety** — stable sticky-primary routing keeps reads on the primary briefly after writes; WAL LSN/GTID replica catch-up probes are experimental until token capture and replica checks are fully reactor-owned
+- **SSV (Semantic State Virtualization)** — atom-layer consistency model for prepared statement and GUC session state across pooled backends: hash-bucket pool index for O(1) backend matching, OPAQUE domain split, CONFIG domain atoms, consistency-token atom storage, and semantic replay — see [SSV_POSTGRES_IMPLEMENTATION.md](docs/SSV_POSTGRES_IMPLEMENTATION.md)
 - **io_uring Linked SQEs** — backend send+recv chained as atomic io_uring sequences (IOSQE_IO_LINK), eliminating one syscall per round-trip
 - **Registered FDs** — file descriptors pre-registered with the io_uring ring for lower per-operation kernel overhead (enabled by default)
 - **Hook Chain Fast-Path** — per-engine `hook_mask` bitmask skips hook fire calls with a single integer comparison when no hooks are registered
@@ -49,8 +60,9 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **TLS + mTLS + kTLS** — frontend TLS termination, backend TLS, optional client-cert verification, kernel TLS acceleration, cipher suite enforcement, cert hot-reload via SIGHUP, and downgrade protection
 - **Graceful Drain/Shutdown** — lifecycle state machine (CREATED → ACTIVE → DRAINING → STOPPING → STOPPED), configurable drain timeout, CID-aware force-close that protects commit-in-doubt sessions, PostgreSQL FATAL 57P03 error on drain rejection
 - **Pool Allocators** — O(1) free-list allocation for recv contexts (~400 B metadata, heap-backed I/O buffers allocated lazily) and pool waiters
-- **Non-Blocking Pool Cleanup** — dirty connection DISCARD ALL uses `MSG_DONTWAIT` (never blocks reactor)
-- **Non-Blocking State Sync** — backend state sync uses `MSG_DONTWAIT` instead of `poll()` + blocking recv
+- **Non-Blocking Pool Cleanup** — dirty connection cleanup enters `CLEANING`, sends `DISCARD ALL` with `MSG_DONTWAIT`, and only returns the backend after PostgreSQL `ReadyForQuery('I')`
+- **Non-Blocking State Sync** — backend state sync is a pre-query reactor phase; the client query is not forwarded until sync responses are drained through `ReadyForQuery`
+- **Reactor Blocking Gate** — `scripts/check_forbidden_blocking.sh` fails CI if forbidden blocking calls appear in worker/engine/pool hot-path files
 - **Session-Context Preservation** — transparent SET parameter, search_path, and session variable continuity across backend reassignment via sorted K/V state profiles, XXHash64 fingerprinting, two-pointer merge diff, and 5-tier pool borrow — see [SESSION_CONTEXT.md](docs/SESSION_CONTEXT.md)
 - **Runtime Mode Tiers** — four operating tiers (PROXY / POOL / SMART / FULL) that gate features at compile-checked hot-path macros; PROXY tier disables SQL parsing for raw throughput — see [RUNTIME_MODES.md](docs/RUNTIME_MODES.md)
 - **Cross-Feature Invariant Model** — formal 12×12 compatibility matrix with runtime checker and 20 violation classes ensuring feature combinations are safe
@@ -69,8 +81,8 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Weighted Load Balancing** — configurable weights per backend server
 - **Transaction Pinning** — server affinity maintained during open transactions
 - **FOR UPDATE Detection** — locking reads routed to primary
-- **Read-After-Write Consistency** — WAL LSN tokens ensure replicas have replayed the latest write before serving reads (requires `transaction_tracking = on`)
-- **Cross-Service Read-Your-Writes** — propagate write positions across independent services via `SET keel.read_after_lsn = '<lsn>'` and `SHOW keel.write_lsn`; intercepted at the proxy with no backend round-trip; injects LSN into the session's consistency atoms for replica-routing gate
+- **Read-After-Write Safety** — sticky-primary override is stable; WAL LSN/GTID token checks are experimental until their capture and replica probes are reactor-owned
+- **Cross-Service Read-Your-Writes** — propagate write positions across independent services via `SET keel.read_after_lsn = '<lsn>'` and `SHOW keel.write_lsn`; intercepted at the proxy with no backend round-trip; injects LSN into the session's consistency atoms for routing policy
 - **Sticky-Primary Override** — after a write, reads are temporarily pinned to primary (100 ms window) before replica routing resumes
 - **NOTIFY/LISTEN Proxying** — transparent proxy of PostgreSQL `NOTIFY` and `LISTEN`/`UNLISTEN` messages; notification payloads forwarded to all subscribed client sessions without exposing backend connection details
 - **Declarative Query Rules** — INI-based query routing, blocking, rewriting, and tagging rules; no-code alternative to Lua/Python hooks; supports regex matching, route overrides (`primary`/`replica`/`any`), hard block, and query rewriting with capture groups
@@ -146,10 +158,10 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
   ```
 - **Declarative Query Rules** — INI `[query_rule.*]` sections for no-code routing, blocking, and rewriting rules; POSIX ERE matching on SQL text, username, and database; `route_to` (primary/replica/any), `rewrite_to` (SQL replacement with capture groups), `block` (synthetic error); evaluated after parse, before normal routing; zero hook code required
 - **Online Schema Change Proxying** — detects gh-ost (`_gho`, `_ghc`) and pt-online-schema-change (`_new`, `_old`) shadow-table DML; pins the session to the primary for the migration duration; transparent to the OSC tool — no config changes required
-- **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the LSN from the most recent committed write; service A embeds the LSN in a response header, service B injects it via SET — stale reads eliminated without sticky-primary routing
+- **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the latest token known to the protocol context; token-based replica catch-up remains experimental until checks are reactor-owned
 - **NOTIFY/LISTEN Transparent Proxying** — `LISTEN`/`UNLISTEN`/`NOTIFY` intercepted at the protocol layer; LISTEN pins the session to a dedicated backend (session-mode semantics for that session only); UNLISTEN releases the pin and returns to transaction-mode pool; `UNLISTEN *` handled; sessions with active subscriptions survive idle timeout and pool drain
 - **Online Schema Change Proxying** — detects gh-ost (`_gho`, `_ghc`) and pt-online-schema-change (`_new`, `_old`) shadow-table DML; pins the session to the primary for the migration duration; transparent to the OSC tool — no config changes required
-- **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the LSN from the most recent committed write; service A embeds the LSN in a response header, service B injects it via SET — stale reads eliminated without sticky-primary routing
+- **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the latest token known to the protocol context; token-based replica catch-up remains experimental until checks are reactor-owned
 - **NOTIFY/LISTEN Transparent Proxying** — `LISTEN`/`UNLISTEN`/`NOTIFY` intercepted at the protocol layer; LISTEN pins the session to a dedicated backend (session-mode semantics for that session only); UNLISTEN releases the pin and returns to transaction-mode pool; `UNLISTEN *` handled; sessions with active subscriptions survive idle timeout and pool drain
 
 ### Extensibility
@@ -457,7 +469,7 @@ keel/
 | **Read/write splitting with replicas** | Automatic SQL classification routes SELECTs to replicas and writes to primary, with sticky-primary override and configurable weights. |
 | **ORM-heavy applications (Hibernate, GORM, SQLAlchemy, Prisma, pgx)** | `prepared_statement = virtualize` transparently replays named prepared statements on any backend; no ORM changes required. |
 | **Multi-tenant SaaS with session isolation** | Session-context preservation (SSV) keeps per-session GUCs and search_path consistent across backend reassignment. |
-| **Read-after-write consistency on replicas** | WAL LSN tokens gate replica reads on replication progress; cross-service propagation via `SET keel.read_after_lsn`. |
+| **Read-after-write safety** | Sticky-primary routing is stable after writes; cross-service LSN/GTID tokens can be stored and surfaced, while replica catch-up probes remain experimental until fully reactor-owned. |
 | **Kubernetes / cloud-native deployments** | Helm chart, CRD operator, `KEEL_*` env var config, `ghcr.io/virtlabs/keel:latest` image, K8s health endpoints, HPA integration. |
 | **AWS RDS / GCP Cloud SQL / Azure** | Cloud-native auth plugins handle IAM token generation and rotation automatically — no password rotation scripts needed. |
 | **Online schema changes (gh-ost, pt-osc)** | OSC proxying pins shadow-table queries to the primary automatically; no separate session-mode listener required. |
@@ -1164,47 +1176,6 @@ COMMIT;
 
 ## Performance
 
-### PostgreSQL
-
-Benchmarked on Linux 6.14.0 (4 workers, io_uring, transaction pooling, min_pool=20, max_pool=60):
-
-| Workload | Clients | Duration | TPS | Transactions | Failures |
-|----------|---------|----------|-----|-------------|----------|
-| SELECT-only (`-S -C`) | 3,000 | 15s | 6,809 | 102,297 | 0 |
-| SELECT-only (`-S -C`) | 3,000 | 30s | 6,818 | 204,725 | 0 |
-| SELECT-only (`-S`) | 3,000 | 30s | 8,348 | 250,440+ | 0 |
-
-**Key**: `-C` = reconnect mode (new TCP connection per transaction), `-S` = SELECT-only.
-
-### MySQL
-
-Benchmarked with sysbench (4 workers, io_uring, transaction pooling):
-
-| Workload | Threads | Topology | TPS | Latency (P95) |
-|----------|---------|----------|-----|---------------|
-| Read-only | 500 | Replication | Sustained | < 50ms |
-| Read/Write | 100 | Group Replication | Sustained | < 100ms |
-| OLTP Read | 500 | PXC 8.4 | Sustained | < 50ms |
-
-All tests ran with zero failures across consecutive runs. The proxy process survived without crashes or restarts.
-
-### PostgreSQL — sysbench oltp_read_write
-
-Benchmarked with sysbench `oltp_read_write` (io_uring reactor, transaction pooling, 4 workers).
-This workload uses **named prepared statements**, exercising the full PS virtualization path on every
-transaction. Lock-conflict `ignored errors` are row-level lock contention — identical rate when
-connecting directly to PostgreSQL.
-
-| Threads | Table Rows | Duration | Transactions | TPS | Avg Latency |
-|---------|-----------|----------|-------------|-----|-------------|
-| 1 | 1,000 | 10 s | 2,824 | 282 | 3.54 ms |
-| 4 | 1,000 | 20 s | 3,298 | 164 | 24.26 ms |
-| 4 | 10,000 | 20 s | 10,094 | 672 | 5.95 ms |
-
-FATAL errors: 0 across all runs. Higher contention at `table-size=1000` with 4 threads is
-expected — more lock conflicts drive retries. Increasing `table-size` reduces contention and
-yields higher throughput.
-
 ### Recommended Kernel Tuning
 
 For high-concurrency reconnecting workloads (`-C` flag), tune these sysctls:
@@ -1229,8 +1200,8 @@ KEEL has delivered 115+ production features across 19 major areas. See [ROADMAP.
 - [x] Horizontal sharding: shard-key extraction, modulo/hash/range strategies, scatter aggregation, multi-shard tx coordinator, admin virtual tables, hot-reload, Prometheus metrics
 - [x] Session-context preservation (SET params, search_path across backend reassignment via SSV)
 - [x] Prepared statement pooling (4 strategies: virtualize, pinning, tracking, anonymous)
-- [x] XID probe + commit-in-doubt recovery and WAL LSN read-after-write consistency
-- [x] Cross-service read-your-writes via `SET keel.read_after_lsn` / `SHOW keel.write_lsn`
+- [x] XID probe + commit-in-doubt recovery, with sticky-primary read-after-write safety
+- [x] Cross-service token parsing via `SET keel.read_after_lsn` / `SHOW keel.write_lsn`; reactor-owned replica catch-up probes remain experimental
 - [x] TLS + mTLS + kTLS with cipher enforcement, cert hot-reload, downgrade protection, built-in cert inspection
 - [x] Hook/trigger system (Lua 5.4, Python 3.x, native .so plugins at 4 pipeline stages)
 - [x] Admin console (21+ commands, virtual tables, JSON output, K8s health endpoints, keel-cli)

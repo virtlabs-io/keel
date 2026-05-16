@@ -21,6 +21,9 @@
 #   keel_fd_wait
 #       → always forbidden (no flag form exists)
 #
+#   fcntl(F_SETFL, flags & ~O_NONBLOCK)
+#       → forbidden in hot paths because subsequent I/O can block the reactor
+#
 # Exceptions
 # ----------
 #   1. Lines annotated with /* NOLINT(keel-blocking) */ are tolerated.
@@ -94,6 +97,7 @@ scan_one() {
         BEGIN {
             io_re      = "\\<(recv|send|read|write|recvfrom|sendto|recvmsg|sendmsg|readv|writev)[[:space:]]*\\("
             always_re  = "\\<(select|pselect|poll|ppoll|epoll_wait|sleep|usleep|nanosleep|clock_nanosleep|keel_fd_wait)[[:space:]]*\\("
+            clear_nb_re = "F_SETFL.*~[[:space:]]*O_NONBLOCK|~[[:space:]]*O_NONBLOCK.*F_SETFL"
             pend_call  = ""
             pend_line  = 0
             pend_text  = ""
@@ -162,6 +166,12 @@ scan_one() {
                 tok2 = substr(cleaned, RSTART, RLENGTH)
                 sub(/[[:space:]]*\($/, "", tok2)
                 printf "%s:%d:%s\t%s\n", rel, NR, tok2, line
+            }
+
+            # Clearing O_NONBLOCK makes later send/recv calls potentially
+            # blocking even if those calls are elsewhere.
+            if (match(cleaned, clear_nb_re)) {
+                printf "%s:%d:%s\t%s\n", rel, NR, "clear_nonblock", line
             }
         }
 

@@ -500,7 +500,7 @@ int keel_engine_drain(keel_engine_t* engine) {
 
         /* Sleep briefly to avoid busy-waiting */
         struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-        nanosleep(&sleep_ts, NULL);
+        nanosleep(&sleep_ts, NULL); /* NOLINT(keel-blocking): lifecycle drain loop, not worker reactor */
     }
 
     uint64_t final_active = __atomic_load_n(&engine->active_connections, __ATOMIC_RELAXED);
@@ -735,7 +735,7 @@ int keel_engine_restart_workers(keel_engine_t* engine, uint32_t drain_timeout_ms
         if (still_active == 0) break;
 
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-        nanosleep(&ts, NULL);
+        nanosleep(&ts, NULL); /* NOLINT(keel-blocking): graceful restart control loop, not worker reactor */
     } while (engine_get_time_ns() < deadline_ns);
 
     /* Phase 5 — force-stop any stragglers. */

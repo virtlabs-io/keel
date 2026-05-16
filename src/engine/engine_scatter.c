@@ -584,7 +584,7 @@ static int sc_read_full(int fd, void* buf, size_t len) {
     uint8_t* p = (uint8_t*)buf;
     size_t done = 0;
     while (done < len) {
-        ssize_t n = recv(fd, p + done, len - done, 0);
+        ssize_t n = recv(fd, p + done, len - done, 0); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) return -1;
         done += (size_t)n;
     }
@@ -595,7 +595,7 @@ static int sc_write_full(int fd, const void* buf, size_t len) {
     const uint8_t* p = (const uint8_t*)buf;
     size_t done = 0;
     while (done < len) {
-        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL);
+        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) return -1;
         done += (size_t)n;
     }
@@ -674,7 +674,7 @@ static int sc_exec_shard_pooled(
      * error, making every shard fail.  Temporarily clear O_NONBLOCK so that
      * recv() blocks until data arrives; restored at the 'done:' label below. */
     int orig_flags = fcntl(fd, F_GETFL);
-    if (orig_flags < 0 || fcntl(fd, F_SETFL, orig_flags & ~O_NONBLOCK) < 0) {
+    if (orig_flags < 0 || fcntl(fd, F_SETFL, orig_flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking): dedicated scatter worker thread */
         snprintf(errbuf, errlen, "scatter: fcntl(O_NONBLOCK) failed: %s",
                  strerror(errno));
         conn_broken = true;
@@ -888,7 +888,7 @@ static int sc_flush(sendbuf_t* sb, int fd) {
     int rc = 0;
     size_t done = 0;
     while (done < sb->len) {
-        ssize_t n = send(fd, sb->data + done, sb->len - done, MSG_NOSIGNAL);
+        ssize_t n = send(fd, sb->data + done, sb->len - done, MSG_NOSIGNAL); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) { rc = -1; break; }
         done += (size_t)n;
     }
@@ -2178,7 +2178,7 @@ int keel_engine_scatter_write(
         /* Backend connections are O_NONBLOCK; sc_exec_cmd uses blocking I/O.
          * Temporarily clear O_NONBLOCK — restored before pool return in Phase 2. */
         sh->orig_flags = fcntl(fd, F_GETFL);
-        if (sh->orig_flags < 0 || fcntl(fd, F_SETFL, sh->orig_flags & ~O_NONBLOCK) < 0) {
+        if (sh->orig_flags < 0 || fcntl(fd, F_SETFL, sh->orig_flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking): dedicated scatter worker thread */
             snprintf(sh->errbuf, sizeof sh->errbuf,
                      "scatter-write: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
             close(sh->be->fd);
