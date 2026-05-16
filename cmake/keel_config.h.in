@@ -51,6 +51,11 @@
 /* Build configuration */
 #define KEEL_BUILD_TYPE "@CMAKE_BUILD_TYPE@"
 
+/* Async pre-query replay (deferred BEGIN) inline stash buffer size, in bytes.
+ * See docs/REACTOR_BLOCKING_INVENTORY.md category A.  Overridable via
+ * -DKEEL_PRE_QUERY_REPLAY_BUFSZ=<n> at configure time. */
+#define KEEL_PRE_QUERY_REPLAY_BUFSZ @KEEL_PRE_QUERY_REPLAY_BUFSZ@
+
 /* Compiler information */
 #define KEEL_COMPILER_ID "@CMAKE_C_COMPILER_ID@"
 #define KEEL_COMPILER_VERSION "@CMAKE_C_COMPILER_VERSION@"

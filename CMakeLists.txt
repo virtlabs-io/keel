@@ -82,6 +82,13 @@ option(KEEL_ENABLE_FULL_STATS "Enable L5 SQL fingerprint aggregation" OFF)
 option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" ON)
 option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" ON)
 
+# Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
+# while the BEGIN's ReadyForQuery is being absorbed asynchronously.  Sessions
+# that exceed this buffer return a hard error; bump if you see
+# pre_query_overflow incrementing in production.
+set(KEEL_PRE_QUERY_REPLAY_BUFSZ "8192" CACHE STRING
+    "Inline byte buffer per session for async deferred-BEGIN payload stash (default 8192)")
+
 # ============================================================================
 # C Standard and Compiler Settings
 # ============================================================================

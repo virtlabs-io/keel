@@ -23,6 +23,7 @@
 #include "keel/session/session.h"
 #include "keel/session/ssv_atom.h"
 #include "keel/engine/worker.h"
+#include "keel/core/config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -265,6 +266,19 @@ typedef struct keel_session_flow {
     bool    begin_deferred;                  /**< true: a BEGIN is pending forwarding */
     uint8_t begin_deferred_payload[512];     /**< raw 'Q: BEGIN...' wire bytes */
     size_t  begin_deferred_payload_len;      /**< byte count (0 when begin_deferred=false) */
+
+    /* Async pre-query replay (PR #4 — see docs/REACTOR_BLOCKING_INVENTORY.md
+     * category A).  When set, the BE-side handler absorbs backend bytes until
+     * it sees ReadyForQuery ('Z'), then forwards `pending_pre_query_buf` to
+     * the backend before resuming normal flow.  This replaces the old
+     * blocking BEGIN+drain inline loops in resume_from_pool and on_fe_data. */
+    enum {
+        KEEL_PRE_QUERY_NONE         = 0,
+        KEEL_PRE_QUERY_BEGIN_REPLAY = 1,
+    } pending_pre_query;
+    uint8_t pending_pre_query_buf[KEEL_PRE_QUERY_REPLAY_BUFSZ]; /**< stashed FE payload */
+    size_t  pending_pre_query_len;           /**< bytes valid in stash buffer */
+    size_t  pending_pre_query_absorbed;      /**< BE bytes absorbed; runaway-cap */
 
     /** eventfd for async auth (KEEL_FLOW_WAIT_AUTH).
      *  Set to ≥0 while an off-thread auth operation is in flight;

@@ -406,6 +406,14 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         gauge_add_to(&dst->sessions_pinned,   &src->sessions_pinned);
         gauge_add_to(&dst->backends_cleaning, &src->backends_cleaning);
 
+        /* Async pre-query replay (PR #4) */
+        counter_add_to(&dst->pre_query_replay_count,    &src->pre_query_replay_count);
+        counter_add_to(&dst->pre_query_send_fail,       &src->pre_query_send_fail);
+        counter_add_to(&dst->pre_query_be_disconnect,   &src->pre_query_be_disconnect);
+        counter_add_to(&dst->pre_query_proto_violation, &src->pre_query_proto_violation);
+        counter_add_to(&dst->pre_query_overflow,        &src->pre_query_overflow);
+        counter_add_to(&dst->pre_query_runaway,         &src->pre_query_runaway);
+
         /* Connection migration */
         counter_add_to(&dst->migrations_sent,     &src->migrations_sent);
         counter_add_to(&dst->migrations_received, &src->migrations_received);

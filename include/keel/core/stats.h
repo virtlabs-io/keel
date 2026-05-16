@@ -283,6 +283,14 @@ typedef struct keel_stats_basic {
     keel_gauge_t     sessions_pinned;         /**< Currently pinned sessions */
     keel_gauge_t     backends_cleaning;       /**< Backend slots in CLEANING state */
 
+    /* -- Async pre-query replay (deferred BEGIN, PR #4) -- */
+    keel_counter_t   pre_query_replay_count;    /**< Successful BEGIN-then-payload replays */
+    keel_counter_t   pre_query_send_fail;       /**< BEGIN send failed with hard errno */
+    keel_counter_t   pre_query_be_disconnect;   /**< Backend disconnected mid-replay */
+    keel_counter_t   pre_query_proto_violation; /**< Malformed wire frame during absorption */
+    keel_counter_t   pre_query_overflow;        /**< FE payload exceeded KEEL_PRE_QUERY_REPLAY_BUFSZ */
+    keel_counter_t   pre_query_runaway;         /**< Absorbed too many bytes without ReadyForQuery */
+
     /* -- Connection migration metrics -- */
     keel_counter_t   migrations_sent;         /**< Sessions migrated away to another worker */
     keel_counter_t   migrations_received;     /**< Sessions received from another worker */

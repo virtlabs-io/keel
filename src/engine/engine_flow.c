@@ -438,7 +438,7 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
     const uint8_t* p = (const uint8_t*)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (s > 0) {
             sent += (size_t)s;
             continue;
@@ -516,6 +516,86 @@ static keel_flow_result_t defer_send(keel_session_flow_t* sf,
     sf->pending_send_fd     = fd;
     sf->pending_send_resume = resume;
     return KEEL_FLOW_SEND_PENDING;
+}
+
+/**
+ * @brief Send the deferred BEGIN asynchronously and stash the follow-up
+ *        FE payload for replay after ReadyForQuery arrives.
+ *
+ * Replaces the old blocking BEGIN+drain inline loops (engine_flow.c spec
+ * §A in docs/REACTOR_BLOCKING_INVENTORY.md, PR #4).  The caller MUST have
+ * already verified that no prepared-statement replay or DISCARD-ALL is
+ * required on this backend (those combos are not yet supported and are
+ * defended against at the call sites).
+ *
+ * On success the caller should return KEEL_FLOW_WAIT_BACKEND; the BE-side
+ * intercept in keel_engine_flow_on_be_data() absorbs the BEGIN response
+ * until 'Z' (ReadyForQuery) arrives, then forwards `follow_buf` to the
+ * backend.
+ *
+ * @param sf         Session-flow state (begin_deferred_payload* must be set).
+ * @param session    Session (server_fd must point at the assigned backend).
+ * @param follow_buf FE payload to forward AFTER the BEGIN's 'Z'.  May be
+ *                   NULL/0 for a degenerate "BEGIN with nothing to follow".
+ * @param follow_len Byte count for follow_buf.  Must be ≤
+ *                   KEEL_PRE_QUERY_REPLAY_BUFSZ or the call hard-errors.
+ *
+ * @return KEEL_FLOW_WAIT_BACKEND on success (BEGIN sent, awaiting Z),
+ *         KEEL_FLOW_SEND_PENDING if the BEGIN partially drained,
+ *         KEEL_FLOW_ERROR on overflow / send failure (counters bumped).
+ */
+static keel_flow_result_t defer_begin_replay(keel_session_flow_t* sf,
+                                             keel_session_t* session,
+                                             const uint8_t* follow_buf,
+                                             size_t follow_len)
+{
+    keel_worker_t* worker = session->worker;
+
+    if (follow_len > sizeof(sf->pending_pre_query_buf)) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: deferred-BEGIN follow-up payload %zu B exceeds stash %zu B",
+            worker ? worker->id : 0u, follow_len,
+            sizeof(sf->pending_pre_query_buf));
+        if (worker && worker->stats_ctx)
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_overflow);
+        sf->begin_deferred_payload_len = 0;
+        return KEEL_FLOW_ERROR;
+    }
+
+    /* Stash the follow-up before issuing any send, so the intercept handler
+     * has a coherent view if the BEGIN send completes synchronously and the
+     * reactor immediately delivers backend bytes. */
+    if (follow_len > 0 && follow_buf)
+        memcpy(sf->pending_pre_query_buf, follow_buf, follow_len);
+    sf->pending_pre_query_len      = follow_len;
+    sf->pending_pre_query_absorbed = 0;
+    sf->pending_pre_query          = KEEL_PRE_QUERY_BEGIN_REPLAY;
+
+    const uint8_t* bp = sf->begin_deferred_payload;
+    size_t         bl = sf->begin_deferred_payload_len;
+    sf->begin_deferred_payload_len = 0;
+
+    ssize_t s = keel_try_send_nb(session->server_fd, bp, bl);
+    if (s < 0) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: deferred-BEGIN send failed: %s",
+            worker ? worker->id : 0u, strerror(errno));
+        if (worker && worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
+            KEEL_STAT_INC(worker->stats_ctx, errors_backend);
+        }
+        sf->pending_pre_query     = KEEL_PRE_QUERY_NONE;
+        sf->pending_pre_query_len = 0;
+        return KEEL_FLOW_ERROR;
+    }
+    if ((size_t)s < bl) {
+        /* Partial drain — push the remainder through the io_uring path.
+         * On completion the worker resumes with KEEL_FLOW_WAIT_BACKEND, which
+         * lets the BE-side intercept run once bytes arrive. */
+        return defer_send(sf, session->server_fd, bp + s, bl - (size_t)s,
+                          KEEL_FLOW_WAIT_BACKEND);
+    }
+    return KEEL_FLOW_WAIT_BACKEND;
 }
 
 /* ============================================================================
@@ -752,36 +832,48 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
     session->backend_conn = be_conn;
     session->server_fd = be_conn->fd;
 
-    /* Deferred-BEGIN replay: if a BEGIN was buffered during shard deferral,
-     * send it to the backend now and drain the response synchronously before
-     * forwarding the actual pending message. */
+    /* Deferred-BEGIN replay (PR #4 — async): if a BEGIN was buffered during
+     * shard deferral, send it to the backend non-blocking and stash the
+     * pending FE message for forwarding once the backend's ReadyForQuery
+     * arrives.  The BE-side intercept in keel_engine_flow_on_be_data()
+     * absorbs the BEGIN response and replays the stashed payload.
+     *
+     * Combination with prepared-statement replay or DISCARD-ALL on the same
+     * borrow is not yet supported: deferred BEGIN happens only on the first
+     * routable query of a sharded session, before the session has pinned
+     * named prepared statements; and the pool borrow paths that set
+     * needs_discard_all are mutually exclusive with shard-deferred BEGIN.
+     * Both invariants are asserted below — violation hard-errors the
+     * session rather than silently falling back to the old blocking path. */
     if (sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
         sf->begin_deferred = false;
-        int _bfd    = session->server_fd;
-        int _bflags = fcntl(_bfd, F_GETFL);
-        if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags & ~O_NONBLOCK);
-        send(_bfd, sf->begin_deferred_payload,
-             sf->begin_deferred_payload_len, MSG_NOSIGNAL);
-        uint8_t _bbuf[256];
-        bool    _brfq  = false;
-        int     _btries = 20;
-        while (!_brfq && _btries-- > 0) {
-            ssize_t _brr = recv(_bfd, _bbuf, sizeof(_bbuf), 0);
-            if (_brr <= 0) break;
-            ssize_t _bscan = 0;
-            while (_bscan + 5 <= _brr) {
-                uint8_t  _bmt = _bbuf[_bscan];
-                uint32_t _bml = ((uint32_t)_bbuf[_bscan+1] << 24)
-                              | ((uint32_t)_bbuf[_bscan+2] << 16)
-                              | ((uint32_t)_bbuf[_bscan+3] <<  8)
-                              |  (uint32_t)_bbuf[_bscan+4];
-                if (_bmt == 'Z') { _brfq = true; break; }
-                if (_bml < 4)    break;
-                _bscan += 1 + (ssize_t)_bml;
+
+        if ((sf->pins & KEEL_FPIN_PREPARED_STMT) && flow->get_stmt_replay) {
+            uint64_t _sh = 0;
+            flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &_sh);
+            if (_sh != 0 && be_conn->stmt_set_hash != _sh) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: unsupported combo: deferred BEGIN + stmt replay",
+                    worker->id);
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                return KEEL_FLOW_ERROR;
             }
         }
-        sf->begin_deferred_payload_len = 0;
-        if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags);
+        if (be_conn->needs_discard_all) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: unsupported combo: deferred BEGIN + needs_discard_all",
+                worker->id);
+            if (worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+            return KEEL_FLOW_ERROR;
+        }
+
+        /* Query logging happens in the BE-side intercept after 'Z'; here we
+         * just queue the payload for replay.  This skips the post-BEGIN
+         * stmt-replay / DISCARD-ALL / query-log / send block below — that's
+         * intentional since we've defended-against the combos that need it. */
+        return defer_begin_replay(sf, session, pending_data, pending_len);
     }
 
     KEEL_DEBUG_LOG("W%u: resumed session %lu with BE fd=%d\n",
@@ -2554,7 +2646,7 @@ copy_scan_done:
 
                     if (sync_len > 0) {
                         /* Send sync commands to backend (non-blocking) */
-                        ssize_t ss = send(session->server_fd, sync_buf, (size_t)sync_len, MSG_NOSIGNAL);
+                        ssize_t ss = send(session->server_fd, sync_buf, (size_t)sync_len, MSG_NOSIGNAL | MSG_DONTWAIT);
                         if (ss > 0) {
                             if (worker->stats_ctx)
                                 KEEL_STAT_INC(worker->stats_ctx, state_sync_count);
@@ -2599,39 +2691,59 @@ copy_scan_done:
                 }
             }
 
-            /* Deferred-BEGIN replay: a BEGIN was buffered earlier to avoid
-             * assigning the session to a random shard before the shard key
-             * was known.  Now that we have the correct shard backend, send
-             * the BEGIN and drain its response synchronously (blocking
-             * briefly) before forwarding the actual client query. */
+            /* Deferred-BEGIN replay (PR #4 — async): a BEGIN was buffered
+             * earlier to avoid binding the session to a random shard before
+             * the shard key was known.  Now that we have the correct shard
+             * backend, send the BEGIN non-blocking and stash the upcoming
+             * client query (or full pipelined remainder) for forwarding
+             * after the BEGIN's ReadyForQuery arrives.  The BE-side
+             * intercept in keel_engine_flow_on_be_data() handles the rest.
+             *
+             * As in resume_from_pool: combos with stmt-replay or DISCARD-ALL
+             * on the same borrow are not yet supported and are defended
+             * against here. */
             if (sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
                 sf->begin_deferred = false;
-                int _bfd    = session->server_fd;
-                int _bflags = fcntl(_bfd, F_GETFL);
-                if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags & ~O_NONBLOCK);
-                send(_bfd, sf->begin_deferred_payload,
-                     sf->begin_deferred_payload_len, MSG_NOSIGNAL);
-                /* Drain backend response until ReadyForQuery */
-                uint8_t _bbuf[256];
-                bool    _brfq  = false;
-                int     _btries = 20;
-                while (!_brfq && _btries-- > 0) {
-                    ssize_t _brr = recv(_bfd, _bbuf, sizeof(_bbuf), 0);
-                    if (_brr <= 0) break;
-                    ssize_t _bscan = 0;
-                    while (_bscan + 5 <= _brr) {
-                        uint8_t  _bmt = _bbuf[_bscan];
-                        uint32_t _bml = ((uint32_t)_bbuf[_bscan+1] << 24)
-                                      | ((uint32_t)_bbuf[_bscan+2] << 16)
-                                      | ((uint32_t)_bbuf[_bscan+3] <<  8)
-                                      |  (uint32_t)_bbuf[_bscan+4];
-                        if (_bmt == 'Z') { _brfq = true; break; }
-                        if (_bml < 4)    break;
-                        _bscan += 1 + (ssize_t)_bml;
+
+                if (sf->stmt_replay_hash != 0 && flow->get_stmt_replay) {
+                    uint64_t _sh = 0;
+                    flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &_sh);
+                    if (_sh != 0 && session->backend_conn &&
+                        session->backend_conn->stmt_set_hash != _sh) {
+                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                            "W%u: unsupported combo: deferred BEGIN + stmt replay",
+                            worker->id);
+                        if (worker->stats_ctx)
+                            KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                        return KEEL_FLOW_ERROR;
                     }
                 }
-                sf->begin_deferred_payload_len = 0;
-                if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags);
+                if (session->backend_conn &&
+                    session->backend_conn->needs_discard_all) {
+                    KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                        "W%u: unsupported combo: deferred BEGIN + needs_discard_all",
+                        worker->id);
+                    if (worker->stats_ctx)
+                        KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                    return KEEL_FLOW_ERROR;
+                }
+
+                /* Stash the FE payload to be replayed after 'Z'.  Mirrors the
+                 * stmt-replay capture logic: prefer the rewritten payload if
+                 * the protocol plugin produced one, otherwise capture the
+                 * full pipelined remainder so Bind+Execute+Sync etc. all
+                 * survive the round-trip. */
+                const uint8_t* follow_buf = NULL;
+                size_t         follow_len = 0;
+                if (act.be_payload != NULL &&
+                    act.be_payload != (const uint8_t*)(data + pos)) {
+                    follow_buf = act.be_payload;
+                    follow_len = act.be_payload_len;
+                } else {
+                    follow_buf = data + pos;
+                    follow_len = len  - pos;
+                }
+                return defer_begin_replay(sf, session, follow_buf, follow_len);
             }
 
             /* ----- Query logging (after backend is connected) ----- */
@@ -3760,6 +3872,126 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             cid_pos += cm;
         }
         return KEEL_FLOW_WAIT_BACKEND;  /* wait for the rest of the response */
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Async deferred-BEGIN replay (PR #4 — docs/REACTOR_BLOCKING_INVENTORY *
+     * category A).  When defer_begin_replay() stashed an FE payload and  *
+     * shipped the BEGIN, we sit here absorbing backend bytes until       *
+     * ReadyForQuery ('Z') arrives, then forward the stashed payload.     *
+     * Any bytes after 'Z' belong to the real query response and are      *
+     * re-fed into this function via recursion.                            *
+     * ------------------------------------------------------------------ */
+    if (sf->pending_pre_query == KEEL_PRE_QUERY_BEGIN_REPLAY) {
+        if (len == 0) {
+            /* recv()==0 on backend → connection lost mid-replay. */
+            KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                "W%u: backend disconnect during deferred BEGIN replay",
+                worker->id);
+            if (worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_be_disconnect);
+            sf->pending_pre_query          = KEEL_PRE_QUERY_NONE;
+            sf->pending_pre_query_len      = 0;
+            sf->pending_pre_query_absorbed = 0;
+            return KEEL_FLOW_ERROR;
+        }
+
+        /* Runaway guard: a misbehaving / wedged backend that never sends 'Z'
+         * could pin this session indefinitely.  Cap absorption at 64 KiB
+         * (well above any legitimate BEGIN response, which is ~12 bytes:
+         *  CommandComplete "BEGIN" + ReadyForQuery 'T'). */
+        enum { KEEL_PRE_QUERY_RUNAWAY_MAX = 64u * 1024u };
+        sf->pending_pre_query_absorbed += len;
+        if (sf->pending_pre_query_absorbed > KEEL_PRE_QUERY_RUNAWAY_MAX) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: deferred BEGIN replay absorbed %zu B without "
+                "ReadyForQuery; aborting session",
+                worker->id, sf->pending_pre_query_absorbed);
+            if (worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_runaway);
+            sf->pending_pre_query          = KEEL_PRE_QUERY_NONE;
+            sf->pending_pre_query_len      = 0;
+            sf->pending_pre_query_absorbed = 0;
+            return KEEL_FLOW_ERROR;
+        }
+
+        /* Scan for ReadyForQuery in this batch. */
+        size_t pp      = 0;
+        bool   saw_rfq = false;
+        while (pp + 5 <= len) {
+            uint8_t  mt = data[pp];
+            uint32_t ml = ((uint32_t)data[pp+1] << 24)
+                        | ((uint32_t)data[pp+2] << 16)
+                        | ((uint32_t)data[pp+3] <<  8)
+                        |  (uint32_t)data[pp+4];
+            if (ml < 4) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: protocol violation during deferred BEGIN replay: "
+                    "msg type '%c' len %u < 4",
+                    worker->id, (mt >= 32 && mt < 127) ? mt : '?', ml);
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                sf->pending_pre_query          = KEEL_PRE_QUERY_NONE;
+                sf->pending_pre_query_len      = 0;
+                sf->pending_pre_query_absorbed = 0;
+                return KEEL_FLOW_ERROR;
+            }
+            if (pp + 1u + ml > len) break;  /* partial frame — wait for more */
+            pp += 1u + ml;
+            if (mt == 'Z') { saw_rfq = true; break; }
+        }
+
+        if (!saw_rfq) {
+            /* Still draining BEGIN response — wait for more BE data. */
+            return KEEL_FLOW_WAIT_BACKEND;
+        }
+
+        /* 'Z' received — clear replay state and forward the stashed FE
+         * payload before falling through to normal BE handling for any
+         * trailing bytes that may have arrived in the same batch. */
+        size_t forward_len = sf->pending_pre_query_len;
+        sf->pending_pre_query          = KEEL_PRE_QUERY_NONE;
+        sf->pending_pre_query_len      = 0;
+        sf->pending_pre_query_absorbed = 0;
+
+        if (worker->stats_ctx)
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_replay_count);
+
+        if (forward_len > 0) {
+            ssize_t fs = keel_try_send_nb(session->server_fd,
+                                          sf->pending_pre_query_buf,
+                                          forward_len);
+            if (fs < 0) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: post-BEGIN payload send failed: %s",
+                    worker->id, strerror(errno));
+                if (worker->stats_ctx) {
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
+                    KEEL_STAT_INC(worker->stats_ctx, errors_backend);
+                }
+                return KEEL_FLOW_ERROR;
+            }
+            if (worker->stats_ctx)
+                KEEL_STAT_ADD(worker->stats_ctx, bytes_backend_sent,
+                              (uint64_t)fs);
+            if ((size_t)fs < forward_len) {
+                /* Partial send — io_uring path will complete the rest, then
+                 * resume into KEEL_FLOW_WAIT_BACKEND so we can pick up the
+                 * real query response. */
+                return defer_send(sf, session->server_fd,
+                                  sf->pending_pre_query_buf + fs,
+                                  forward_len - (size_t)fs,
+                                  KEEL_FLOW_WAIT_BACKEND);
+            }
+        }
+
+        /* Any trailing bytes after 'Z' are part of the real query stream;
+         * re-enter this function on that slice rather than duplicating the
+         * downstream handling here. */
+        if (pp < len)
+            return keel_engine_flow_on_be_data(sf, session,
+                                               data + pp, len - pp);
+        return KEEL_FLOW_WAIT_BACKEND;
     }
 
     /* ------------------------------------------------------------------ *

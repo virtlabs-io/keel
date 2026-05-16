@@ -1571,6 +1571,30 @@ target_link_libraries(test_crash_recovery_matrix PRIVATE
 target_link_options(test_crash_recovery_matrix PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_crash_recovery_matrix COMMAND test_crash_recovery_matrix)
 
+# Async deferred-BEGIN pre-query replay (PR #4) regression tests
+add_executable(test_pre_query_replay test_pre_query_replay.c)
+target_link_libraries(test_pre_query_replay PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_engine_flow
+    keel_session
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_pre_query_replay PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_pre_query_replay COMMAND test_pre_query_replay)
+
 # Dual-protocol PG/MySQL separation & equivalence matrix
 add_executable(test_dual_protocol_matrix test_dual_protocol_matrix.c)
 target_link_libraries(test_dual_protocol_matrix PRIVATE
@@ -1778,6 +1802,7 @@ set_tests_properties(
     test_tls_splice_matrix
     test_session_hooks_matrix
     test_crash_recovery_matrix
+    test_pre_query_replay
     test_dual_protocol_matrix
     test_drain_shutdown
     test_graceful_restart
@@ -1871,6 +1896,7 @@ set_tests_properties(test_tls_security test_tls_ktls test_drain_shutdown
 
 set_tests_properties(test_ps_pool_matrix test_tls_splice_matrix
                      test_session_hooks_matrix test_crash_recovery_matrix
+                     test_pre_query_replay
                      test_dual_protocol_matrix test_invariant_model
     PROPERTIES LABELS "hardening")
 
@@ -2104,7 +2130,8 @@ add_custom_target(test-hardening
             test_tls_security test_tls_ktls test_drain_shutdown
             test_graceful_restart test_tls_auto
             test_ps_pool_matrix test_tls_splice_matrix test_session_hooks_matrix
-            test_crash_recovery_matrix test_dual_protocol_matrix test_invariant_model
+            test_crash_recovery_matrix test_pre_query_replay
+            test_dual_protocol_matrix test_invariant_model
             test_mem_safety
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running production-hardening tests (Spec §1-§5 Phase A/B)"
@@ -2188,6 +2215,7 @@ add_custom_target(build_tests DEPENDS
     test_connpool_exhaust
     test_connpool_stress
     test_crash_recovery_matrix
+    test_pre_query_replay
     test_dirty_connection
     test_drain_shutdown
     test_dual_protocol_matrix
