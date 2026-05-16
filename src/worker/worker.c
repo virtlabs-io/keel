@@ -1766,6 +1766,13 @@ static void backend_cleanup_and_return(keel_worker_t*        worker,
 static void close_session(keel_worker_t* worker, keel_session_t* session, 
                           recv_context_t* recv_ctx)
 {
+    if (worker && worker->server_pools) {
+        for (size_t i = 0; i < worker->server_pool_count; i++) {
+            if (worker->server_pools[i])
+                backend_pool_cancel_wait(worker->server_pools[i], session);
+        }
+    }
+
     /* If there's a pending backend/send operation, we can't free recv_ctx yet.
      * Mark it as closing and let the callback complete the cleanup. */
     if (recv_ctx && (recv_ctx->be_pending || recv_ctx->fe_pending || recv_ctx->send_pending)) {
@@ -1788,6 +1795,8 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
             if (be_conn->fd >= 0) {
                 close(be_conn->fd);
                 be_conn->fd = -1;
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
             }
             atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
             be_conn->pinned_session = NULL;
@@ -1873,6 +1882,8 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
             if (be_conn->fd >= 0) {
                 close(be_conn->fd);
                 be_conn->fd = -1;
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
             }
             atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
             be_conn->pinned_session = NULL;

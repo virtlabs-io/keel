@@ -111,6 +111,50 @@ static inline void sync_session_ssv_state(keel_session_t* session,
     session->pin_reason = (uint32_t)keel_ssv_pin_reason_from_flow_pins(sf->pins);
 }
 
+static inline void observe_pin_transition(struct keel_stats_ctx* stats,
+                                          keel_flow_pin_reason_t prev_pins,
+                                          keel_flow_pin_reason_t next_pins)
+{
+    if (!stats)
+        return;
+
+    if (prev_pins == KEEL_FPIN_NONE && next_pins != KEEL_FPIN_NONE)
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned);
+    else if (prev_pins != KEEL_FPIN_NONE && next_pins == KEEL_FPIN_NONE)
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned);
+
+    keel_flow_pin_reason_t added = next_pins & ~prev_pins;
+    if (added & KEEL_FPIN_TRANSACTION) {
+        KEEL_STAT_INC(stats, pin_reason_transaction);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_transaction);
+    }
+    if ((prev_pins & KEEL_FPIN_TRANSACTION) &&
+        !(next_pins & KEEL_FPIN_TRANSACTION))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_transaction);
+
+    if (added & KEEL_FPIN_EXTENDED_PROTO) {
+        KEEL_STAT_INC(stats, pin_reason_extended_protocol);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_extended_protocol);
+    }
+    if ((prev_pins & KEEL_FPIN_EXTENDED_PROTO) &&
+        !(next_pins & KEEL_FPIN_EXTENDED_PROTO))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_extended_protocol);
+
+    if (added & KEEL_FPIN_PREPARED_STMT) {
+        KEEL_STAT_INC(stats, pin_reason_prepared_stmt);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_prepared_stmt);
+    }
+    if ((prev_pins & KEEL_FPIN_PREPARED_STMT) &&
+        !(next_pins & KEEL_FPIN_PREPARED_STMT))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_prepared_stmt);
+
+    const keel_flow_pin_reason_t tracked =
+        KEEL_FPIN_TRANSACTION | KEEL_FPIN_EXTENDED_PROTO |
+        KEEL_FPIN_PREPARED_STMT;
+    if (added & ~tracked)
+        KEEL_STAT_INC(stats, pin_reason_other);
+}
+
 /**
  * @brief io_uring connect-completion callback that advances the cancel handshake.
  *
@@ -1600,12 +1644,7 @@ copy_scan_done:
             sf->pins |= act.pin_update;
             sf->pins &= ~act.pin_clear;
             sync_session_ssv_state(session, sf);
-            if (worker->stats_ctx) {
-                if (prev_pins == KEEL_FPIN_NONE && sf->pins != KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_pinned);
-                else if (prev_pins != KEEL_FPIN_NONE && sf->pins == KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_pinned);
-            }
+            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
         }
 
         /* Dispatch on action type */
@@ -2617,6 +2656,20 @@ copy_scan_done:
                 /* Trace event: pool borrow + route decision */
                 KEEL_TRACE_EVENT(session, "pool.borrow");
                 KEEL_TRACE_ATTR_INT(session, "pool.server_fd", be_conn->fd);
+                KEEL_TRACE_ATTR_INT(session, "pool.route", route);
+                KEEL_TRACE_ATTR_INT(session, "pool.pin_reason", session->pin_reason);
+                KEEL_TRACE_ATTR_INT(session, "pool.session_state_hash",
+                                    (int64_t)session->state_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.backend_state_hash",
+                                    (int64_t)be_conn->current_state_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.backend_stmt_hash",
+                                    (int64_t)be_conn->stmt_set_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.needs_state_sync",
+                                    be_conn->needs_sync ? 1 : 0);
+                KEEL_TRACE_ATTR_INT(session, "pool.needs_cleanup",
+                                    be_conn->needs_full_cleanup ? 1 : 0);
+                KEEL_TRACE_ATTR_INT(session, "pool.stmt_replay_hash",
+                                    (int64_t)sf->stmt_replay_hash);
 
                 /* State sync is performed later, immediately before the
                  * final client payload is forwarded, so hooks and batching
@@ -3542,6 +3595,10 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
 
     /* Mirror to session so engine drain can avoid force-closing this session */
     session->commit_in_doubt = true;
+    if (worker->stats_ctx) {
+        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_started);
+        KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_commit_in_doubt);
+    }
 
     if (sf->indoubt_xid == 0) {
         /* No XID captured — outcome truly unknown */
@@ -3553,6 +3610,11 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         if (elen > 0)
             keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
@@ -3573,6 +3635,11 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
         if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
@@ -3586,6 +3653,11 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
         if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
@@ -3597,6 +3669,11 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
         backend_pool_return(pool, check_conn, false);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_ERROR;
     }
 
@@ -3620,6 +3697,11 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
         if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
@@ -3800,6 +3882,13 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 }
                 sf->commit_in_doubt = false;
                 session->commit_in_doubt = false;
+                if (worker->stats_ctx) {
+                    if (sf->indoubt_check_result == 1 || sf->indoubt_check_result == 2)
+                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_resolved);
+                    else
+                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+                }
 
                 if (sf->indoubt_check_result == 1) {
                     /* Transaction committed — send synthetic success */
@@ -4580,12 +4669,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             sf->pins |= act.pin_update;
             sf->pins &= ~act.pin_clear;
             sync_session_ssv_state(session, sf);
-            if (worker->stats_ctx) {
-                if (prev_pins == KEEL_FPIN_NONE && sf->pins != KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_pinned);
-                else if (prev_pins != KEEL_FPIN_NONE && sf->pins == KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_pinned);
-            }
+            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
         }
         if (act.pin_clear & KEEL_FPIN_COPY) {
             sf->copy_skip = 0;      /* Reset COPY scanner state */

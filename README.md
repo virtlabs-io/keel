@@ -9,7 +9,7 @@
 
 A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, intelligent query routing, transaction pooling, automatic failover, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols.
 
-Quick Links: [Docs](docs/) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Performance](docs/PERF_STRICT_AB3_SUMMARY.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
+Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Performance](docs/PERF_STRICT_AB3_SUMMARY.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
 ## Overview
 
@@ -35,6 +35,10 @@ aligned with the implementation state:
 | **Stable / implemented** | Production hot paths with focused tests and no known reactor-blocking calls. | Native reactor I/O, async backend connect/auth, transaction pooling, prepared-statement borrowing/replay, session-state sync, sticky-primary read-after-write safety, pool CLEANING reuse gate. |
 | **Implemented / hardening** | Code exists and has targeted tests, but feature combinations are still being hardened with invariants and failure-mode coverage. | Session-context virtualization, transaction tracking, commit-in-doubt recovery, NOTIFY/LISTEN proxying, query rules, migration/drain behavior. |
 | **Experimental / planned** | Prototype, advanced, or roadmap work that should not be treated as a default production guarantee yet. | Token-based replica catch-up via WAL LSN/GTID probes, sharding scatter-merge, multi-shard 2PC, result cache, multi-proxy cluster compression, fully reactor-owned consistency-token capture. |
+
+For the full maturity inventory, failure-mode matrix, and failover semantics,
+see [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md). New production
+claims should be added there before feature docs or UI copy are expanded.
 
 ### Core
 - **Native Reactor I/O** — io_uring on Linux 5.6+ (primary), kqueue on macOS, epoll as Linux fallback
@@ -1189,15 +1193,18 @@ sudo sysctl -w net.ipv4.tcp_max_tw_buckets=10000
 
 ## Roadmap
 
-KEEL has delivered 115+ production features across 19 major areas. See [ROADMAP.md](docs/ROADMAP.md) for full details.
+KEEL has a broad implemented surface, but not every feature has the same
+production maturity. The list below is a maturity snapshot; see
+[PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) for the source of truth
+and [ROADMAP.md](docs/ROADMAP.md) for longer-term planning.
 
-### Completed Highlights
+### Maturity Snapshot
 
 - [x] io_uring share-nothing reactor with linked SQEs, registered FDs, zero-poll hot path
 - [x] Dual-protocol support (PostgreSQL v3 + MySQL client/server)
 - [x] Transaction pooling with zero-copy splice and MSG_PEEK DataRow bypass
 - [x] Full SQL lexer/parser with automatic read/write splitting
-- [x] Horizontal sharding: shard-key extraction, modulo/hash/range strategies, scatter aggregation, multi-shard tx coordinator, admin virtual tables, hot-reload, Prometheus metrics
+- [~] Horizontal sharding: shard-key extraction, modulo/hash/range strategies, scatter aggregation, multi-shard tx coordinator, admin virtual tables, hot-reload, Prometheus metrics are implemented but remain experimental for production rollouts
 - [x] Session-context preservation (SET params, search_path across backend reassignment via SSV)
 - [x] Prepared statement pooling (4 strategies: virtualize, pinning, tracking, anonymous)
 - [x] XID probe + commit-in-doubt recovery, with sticky-primary read-after-write safety
@@ -1211,7 +1218,7 @@ KEEL has delivered 115+ production features across 19 major areas. See [ROADMAP.
 - [x] Query throttling: per-rule token-bucket rate limiting via `[throttle.N]` INI
 - [x] Live SIGHUP reload (pool sizes, timeouts, weights, probes, TLS certs, log level, shard rules, query rules)
 - [x] Seccomp BPF system-call filter, privilege drop, binary hardening (PIE, Full RELRO, NX)
-- [x] Multi-proxy HA cluster: heartbeat, config gossip, peer discovery, wire-protocol compression (zlib/zstd)
+- [~] Multi-proxy HA cluster: heartbeat, config gossip, peer discovery, wire-protocol compression (zlib/zstd) is implemented but still under production hardening
 - [x] Cloud-native auth: AWS SigV4, GCP OAuth2, Azure IMDS with token caching
 - [x] Enterprise auth: PAM, LDAP, mTLS certificate identity, auth query
 - [x] Connection lifecycle management: max age, idle eviction, per-user quotas, pool prefill
@@ -1238,6 +1245,7 @@ Detailed architecture documentation is available in the [`docs/`](docs/) directo
 
 | Document | Description |
 |----------|-------------|
+| [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) | Feature maturity levels, required failure-mode matrix, failover semantics, and operator inspection contract |
 | [STARTUP.md](docs/STARTUP.md) | Startup flow, configuration parsing, memory architecture, worker initialization |
 | [CONNECTION_FLOW.md](docs/CONNECTION_FLOW.md) | Connection lifecycle, accept loop, authentication, backend pool architecture |
 | [QUERY_FLOW.md](docs/QUERY_FLOW.md) | Query execution flow, SQL analysis, routing, forwarding, result handling |

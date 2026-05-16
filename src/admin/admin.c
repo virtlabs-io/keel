@@ -956,6 +956,12 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
     ROW_COUNTER("pool_misses",       pool_misses);
     ROW_COUNTER("pool_creates",      pool_creates);
     ROW_COUNTER("pool_destroys",     pool_destroys);
+    ROW_COUNTER("pool_borrow_attempts",          pool_borrow_attempts);
+    ROW_COUNTER("pool_borrow_exact_state_match", pool_borrow_exact_state_match);
+    ROW_COUNTER("pool_borrow_exact_stmt_match",  pool_borrow_exact_stmt_match);
+    ROW_COUNTER("pool_borrow_state_replay",      pool_borrow_state_replay);
+    ROW_COUNTER("pool_borrow_stmt_replay",       pool_borrow_stmt_replay);
+    ROW_COUNTER("pool_borrow_cleanup_required",  pool_borrow_cleanup_required);
     ROW_COUNTER("queries_total",     queries_total);
     ROW_COUNTER("queries_read",      queries_read);
     ROW_COUNTER("queries_write",     queries_write);
@@ -1007,12 +1013,34 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
     ROW_COUNTER("pool_wait_resume_success",     pool_wait_resume_success);
     ROW_COUNTER("pool_wait_resume_requeues",    pool_wait_resume_requeues);
     ROW_COUNTER("pool_wait_timeout_events",     pool_wait_timeout_events);
+    ROW_COUNTER("pool_wait_cancelled",          pool_wait_cancelled);
     ROW_COUNTER("proxy_state_desync_total", proxy_state_desync_total);
     ROW_COUNTER("proxy_orphaned_transactions_total", proxy_orphaned_transactions_total);
     ROW_COUNTER("proxy_backend_reuse_failure_total", proxy_backend_reuse_failure_total);
     ROW_COUNTER("proxy_io_uring_sq_overflow_total", proxy_io_uring_sq_overflow_total);
+    ROW_COUNTER("discard_all_count", discard_all_count);
+    ROW_COUNTER("discard_all_failure", discard_all_failure);
+    ROW_COUNTER("state_sync_count", state_sync_count);
+    ROW_COUNTER("backend_close_dead_idle", backend_close_dead_idle);
+    ROW_COUNTER("backend_close_cleanup_error", backend_close_cleanup_error);
+    ROW_COUNTER("backend_close_cleanup_timeout", backend_close_cleanup_timeout);
+    ROW_COUNTER("backend_close_client_disconnect", backend_close_client_disconnect);
+    ROW_COUNTER("cleaning_timeout_total", cleaning_timeout_total);
+    ROW_COUNTER("pin_reason_transaction", pin_reason_transaction);
+    ROW_COUNTER("pin_reason_extended_protocol", pin_reason_extended_protocol);
+    ROW_COUNTER("pin_reason_prepared_stmt", pin_reason_prepared_stmt);
+    ROW_COUNTER("pin_reason_other", pin_reason_other);
+    ROW_COUNTER("commit_in_doubt_started", commit_in_doubt_started);
+    ROW_COUNTER("commit_in_doubt_resolved", commit_in_doubt_resolved);
+    ROW_COUNTER("commit_in_doubt_failed", commit_in_doubt_failed);
     ROW_COUNTER("notify_relayed",     notify_relayed);
     ROW_COUNTER("osc_sessions_detected", osc_sessions_detected);
+    ROW_GAUGE("sessions_pinned", sessions_pinned);
+    ROW_GAUGE("sessions_pinned_transaction", sessions_pinned_transaction);
+    ROW_GAUGE("sessions_pinned_extended_protocol", sessions_pinned_extended_protocol);
+    ROW_GAUGE("sessions_pinned_prepared_stmt", sessions_pinned_prepared_stmt);
+    ROW_GAUGE("sessions_commit_in_doubt", sessions_commit_in_doubt);
+    ROW_GAUGE("backends_cleaning", backends_cleaning);
     ROW_GAUGE("proxy_buffer_pool_utilization_bytes", proxy_buffer_pool_utilization_bytes);
     ROW_GAUGE("proxy_connection_age_seconds", proxy_connection_age_seconds);
     ROW_GAUGE("proxy_heartbeat_last_ns", proxy_heartbeat_last_ns);
@@ -1214,15 +1242,18 @@ static void show_pools(keel_admin_t *admin, pgbuf_t *b) {
 
     const char *cols[] = {
         "worker", "server", "host", "port",
-        "active", "idle", "cleaning", "pinned", "waiting", "total",
+        "active", "idle", "clean", "stateful", "dirty", "cleaning",
+        "pinned", "waiting", "closed", "total",
         "min", "max"
     };
-    int ncols = 12;
+    int ncols = 16;
     pg_row_desc(b, cols, ncols);
 
     int nrows = 0;
     char c_worker[24], c_srv[24], c_port[24];
-    char c_active[16], c_idle[16], c_cleaning[16], c_pinned[16], c_waiting[16], c_total[16];
+    char c_active[16], c_idle[16], c_clean[16], c_stateful[16];
+    char c_dirty[16], c_cleaning[16], c_pinned[16], c_waiting[16];
+    char c_closed[16], c_total[16];
     char c_min[16], c_max[16];
 
     for (uint32_t i = 0; i < nw; i++) {
@@ -1249,16 +1280,21 @@ static void show_pools(keel_admin_t *admin, pgbuf_t *b) {
 
             fmt_u64(c_active,   sizeof(c_active),   st.active_connections);
             fmt_u64(c_idle,     sizeof(c_idle),      st.idle_connections);
+            fmt_u64(c_clean,    sizeof(c_clean),     st.clean_connections);
+            fmt_u64(c_stateful, sizeof(c_stateful),  st.stateful_connections);
+            fmt_u64(c_dirty,    sizeof(c_dirty),     st.dirty_connections);
             fmt_u64(c_cleaning, sizeof(c_cleaning),  st.cleaning_count);
             fmt_u64(c_pinned,   sizeof(c_pinned),    st.pinned_count);
             fmt_u64(c_waiting,  sizeof(c_waiting),   st.waiting_sessions);
+            fmt_u64(c_closed,   sizeof(c_closed),    st.closed_connections);
             fmt_u64(c_total,    sizeof(c_total),     st.total_connections);
             fmt_u64(c_min,      sizeof(c_min),       pool->config.min_connections);
             fmt_u64(c_max,      sizeof(c_max),       pool->config.max_connections);
 
             const char *vals[] = {
                 c_worker, c_srv, host, port_s,
-                c_active, c_idle, c_cleaning, c_pinned, c_waiting, c_total,
+                c_active, c_idle, c_clean, c_stateful, c_dirty, c_cleaning,
+                c_pinned, c_waiting, c_closed, c_total,
                 c_min, c_max
             };
             pg_data_row(b, vals, ncols);
@@ -1291,13 +1327,14 @@ static void show_clients(keel_admin_t *admin, pgbuf_t *b) {
     const char *cols[] = {
         "id", "worker", "username", "database", "state",
         "client_fd", "server_fd", "in_txn", "query_count",
-        "age_ms", "tls", "pinned"
+        "age_ms", "tls", "pinned", "pin_reason", "commit_in_doubt"
     };
-    int ncols = 12;
+    int ncols = 14;
     pg_row_desc(b, cols, ncols);
 
     int nrows = 0;
     char c_id[20], c_wk[24], c_cfd[8], c_sfd[8], c_qc[16], c_age[20];
+    char c_pin_reason[24];
 
     for (uint32_t i = 0; i < nw; i++) {
         const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
@@ -1323,12 +1360,15 @@ static void show_clients(keel_admin_t *admin, pgbuf_t *b) {
             const char *tls   = (sess->flags & KEEL_SESSION_FLAG_SSL) ? "yes" : "no";
             const char *txn   = sess->in_transaction ? "yes" : "no";
             const char *pin   = sess->hard_pinned ? "yes" : "no";
+            snprintf(c_pin_reason, sizeof(c_pin_reason), "0x%x", sess->pin_reason);
+            const char *cid   = sess->commit_in_doubt ? "yes" : "no";
 
             const char *vals[] = {
                 c_id, c_wk,
                 sess->username[0] ? sess->username : "(none)",
                 sess->database[0] ? sess->database : "(none)",
-                state, c_cfd, c_sfd, txn, c_qc, c_age, tls, pin
+                state, c_cfd, c_sfd, txn, c_qc, c_age, tls, pin,
+                c_pin_reason, cid
             };
             pg_data_row(b, vals, ncols);
             nrows++;
@@ -4600,6 +4640,18 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         PROM_COUNTER("pool_misses",       "Pool empty, created new backend",   pool_misses);
         PROM_COUNTER("pool_creates",      "Backend connections opened",        pool_creates);
         PROM_COUNTER("pool_destroys",     "Backend connections destroyed",     pool_destroys);
+        PROM_COUNTER("pool_borrow_attempts", "Pool borrow decisions attempted", pool_borrow_attempts);
+        PROM_COUNTER("pool_borrow_exact_state_match", "Borrows satisfied by exact session-state match", pool_borrow_exact_state_match);
+        PROM_COUNTER("pool_borrow_exact_stmt_match", "Borrows satisfied by exact prepared-statement match", pool_borrow_exact_stmt_match);
+        PROM_COUNTER("pool_borrow_state_replay", "Borrows requiring state replay", pool_borrow_state_replay);
+        PROM_COUNTER("pool_borrow_stmt_replay", "Borrows requiring prepared-statement replay", pool_borrow_stmt_replay);
+        PROM_COUNTER("pool_borrow_cleanup_required", "Borrows requiring setup cleanup before use", pool_borrow_cleanup_required);
+        PROM_COUNTER("pool_wait_queue_enqueued", "Sessions enqueued waiting for backend", pool_wait_queue_enqueued);
+        PROM_COUNTER("pool_wait_queue_full_rejects", "Pool wait enqueue attempts rejected because queue was full", pool_wait_queue_full_rejects);
+        PROM_COUNTER("pool_wait_resume_success", "Pool wait callbacks that resumed with a backend", pool_wait_resume_success);
+        PROM_COUNTER("pool_wait_resume_requeues", "Pool wait callbacks that requeued because no backend was available", pool_wait_resume_requeues);
+        PROM_COUNTER("pool_wait_timeout_events", "Pool waiters expired by wait_timeout_ms", pool_wait_timeout_events);
+        PROM_COUNTER("pool_wait_cancelled", "Pool waiters cancelled because session closed", pool_wait_cancelled);
 
         PROM_COUNTER("queries_total",     "Total queries routed",              queries_total);
         PROM_COUNTER("queries_read",      "Read-only queries",                 queries_read);
@@ -4624,9 +4676,30 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         PROM_COUNTER("proxy_orphaned_transactions_total", "Sessions closed with open backend transaction", proxy_orphaned_transactions_total);
         PROM_COUNTER("proxy_backend_reuse_failure_total", "Backend cleanup/reuse failures", proxy_backend_reuse_failure_total);
         PROM_COUNTER("proxy_io_uring_sq_overflow_total", "io_uring SQ overflow events sampled by workers", proxy_io_uring_sq_overflow_total);
+        PROM_COUNTER("discard_all_count", "Full backend cleanup commands issued", discard_all_count);
+        PROM_COUNTER("discard_all_failure", "Full backend cleanup failures", discard_all_failure);
+        PROM_COUNTER("state_sync_count", "Session-state sync replays issued", state_sync_count);
+        PROM_COUNTER("backend_close_dead_idle", "Idle backends closed after liveness failure", backend_close_dead_idle);
+        PROM_COUNTER("backend_close_cleanup_error", "Backends closed after cleanup/protocol error", backend_close_cleanup_error);
+        PROM_COUNTER("backend_close_cleanup_timeout", "Backends closed after cleanup timeout", backend_close_cleanup_timeout);
+        PROM_COUNTER("backend_close_client_disconnect", "Backends closed because owning client disconnected", backend_close_client_disconnect);
+        PROM_COUNTER("cleaning_timeout_total", "Backend cleanup timeout events", cleaning_timeout_total);
+        PROM_COUNTER("pin_reason_transaction", "Transaction pin activations", pin_reason_transaction);
+        PROM_COUNTER("pin_reason_extended_protocol", "Extended protocol pin activations", pin_reason_extended_protocol);
+        PROM_COUNTER("pin_reason_prepared_stmt", "Prepared statement pin activations", pin_reason_prepared_stmt);
+        PROM_COUNTER("pin_reason_other", "Other pin reason activations", pin_reason_other);
+        PROM_COUNTER("commit_in_doubt_started", "Commit-in-doubt recovery sessions started", commit_in_doubt_started);
+        PROM_COUNTER("commit_in_doubt_resolved", "Commit-in-doubt recovery sessions resolved", commit_in_doubt_resolved);
+        PROM_COUNTER("commit_in_doubt_failed", "Commit-in-doubt recovery sessions unresolved or failed", commit_in_doubt_failed);
         PROM_GAUGE("proxy_buffer_pool_utilization_bytes", "Recv buffer pool utilization in bytes", proxy_buffer_pool_utilization_bytes);
         PROM_GAUGE("proxy_connection_age_seconds", "Oldest active frontend connection age", proxy_connection_age_seconds);
         PROM_GAUGE("proxy_heartbeat_last_ns", "Last worker heartbeat monotonic timestamp", proxy_heartbeat_last_ns);
+        PROM_GAUGE("sessions_pinned", "Sessions with any active pin reason", sessions_pinned);
+        PROM_GAUGE("sessions_pinned_transaction", "Sessions pinned by transaction state", sessions_pinned_transaction);
+        PROM_GAUGE("sessions_pinned_extended_protocol", "Sessions pinned by extended protocol", sessions_pinned_extended_protocol);
+        PROM_GAUGE("sessions_pinned_prepared_stmt", "Sessions pinned by prepared statements", sessions_pinned_prepared_stmt);
+        PROM_GAUGE("sessions_commit_in_doubt", "Sessions currently resolving commit outcome", sessions_commit_in_doubt);
+        PROM_GAUGE("backends_cleaning", "Backends in cleanup state machine", backends_cleaning);
 
         PROM_COUNTER("migrations_sent",   "Sessions migrated to another worker", migrations_sent);
         PROM_COUNTER("migrations_received","Sessions received from another worker", migrations_received);
@@ -4830,6 +4903,7 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
     /* Connection pool utilization gauges — aggregated across all workers. */
     {
         size_t pool_active = 0, pool_idle = 0, pool_total = 0;
+        size_t pool_clean = 0, pool_stateful = 0, pool_dirty = 0, pool_closed = 0;
         size_t pool_waiting = 0, pool_cleaning = 0, pool_pinned = 0;
         for (uint32_t i = 0; i < nw; i++) {
             const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
@@ -4841,6 +4915,10 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
                 backend_pool_get_stats(pool, &st);
                 pool_active   += st.active_connections;
                 pool_idle     += st.idle_connections;
+                pool_clean    += st.clean_connections;
+                pool_stateful += st.stateful_connections;
+                pool_dirty    += st.dirty_connections;
+                pool_closed   += st.closed_connections;
                 pool_total    += st.total_connections;
                 pool_waiting  += st.waiting_sessions;
                 pool_cleaning += st.cleaning_count;
@@ -4854,6 +4932,22 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         fprintf(f, "# HELP keel_pool_connections_idle Backend connections idle in pool\n");
         fprintf(f, "# TYPE keel_pool_connections_idle gauge\n");
         fprintf(f, "keel_pool_connections_idle %zu\n", pool_idle);
+
+        fprintf(f, "# HELP keel_pool_connections_clean Backend connections on clean idle list\n");
+        fprintf(f, "# TYPE keel_pool_connections_clean gauge\n");
+        fprintf(f, "keel_pool_connections_clean %zu\n", pool_clean);
+
+        fprintf(f, "# HELP keel_pool_connections_stateful Backend connections on stateful idle list\n");
+        fprintf(f, "# TYPE keel_pool_connections_stateful gauge\n");
+        fprintf(f, "keel_pool_connections_stateful %zu\n", pool_stateful);
+
+        fprintf(f, "# HELP keel_pool_connections_dirty Backend connections waiting for cleanup\n");
+        fprintf(f, "# TYPE keel_pool_connections_dirty gauge\n");
+        fprintf(f, "keel_pool_connections_dirty %zu\n", pool_dirty);
+
+        fprintf(f, "# HELP keel_pool_connections_closed Backend connection slots closed and awaiting refill\n");
+        fprintf(f, "# TYPE keel_pool_connections_closed gauge\n");
+        fprintf(f, "keel_pool_connections_closed %zu\n", pool_closed);
 
         fprintf(f, "# HELP keel_pool_connections_total Total backend connection slots\n");
         fprintf(f, "# TYPE keel_pool_connections_total gauge\n");
@@ -5023,7 +5117,7 @@ static void serve_web_ui(int fd) {
  *   "workers":         4,
  *   "uptime_seconds":  120.5,
  *   "sessions":        {"active":N,"created":N,"closed":N},
- *   "pool":            {"active":N,"idle":N,"total":N,"waiting":N},
+ *   "pool":            {"active":N,"idle":N,"cleaning":N,"pinned":N,"dirty":N,"closed":N,"total":N,"waiting":N},
  *   "queries":         {"total":N,"read":N,"write":N,"tx":N},
  *   "errors":          {"total":N,"auth":N,"timeout":N}
  * }
@@ -5067,6 +5161,7 @@ static void write_status_json(keel_admin_t *admin, int fd) {
 
     /* Aggregate pool stats across all workers. */
     size_t pool_active = 0, pool_idle = 0, pool_total = 0, pool_waiting = 0;
+    size_t pool_cleaning = 0, pool_pinned = 0, pool_dirty = 0, pool_closed = 0;
     for (uint32_t i = 0; i < nw; i++) {
         const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
         if (!w) continue;
@@ -5079,6 +5174,10 @@ static void write_status_json(keel_admin_t *admin, int fd) {
             pool_idle    += bst.idle_connections;
             pool_total   += bst.total_connections;
             pool_waiting += bst.waiting_sessions;
+            pool_cleaning += bst.cleaning_count;
+            pool_pinned   += bst.pinned_count;
+            pool_dirty    += bst.dirty_connections;
+            pool_closed   += bst.closed_connections;
         }
     }
 
@@ -5107,7 +5206,7 @@ static void write_status_json(keel_admin_t *admin, int fd) {
         "  \"workers\": %u,\n"
         "  \"uptime_seconds\": %.1f,\n"
         "  \"sessions\": {\"active\":%llu,\"created\":%llu,\"closed\":%llu},\n"
-        "  \"pool\": {\"active\":%zu,\"idle\":%zu,\"total\":%zu,\"waiting\":%zu},\n"
+        "  \"pool\": {\"active\":%zu,\"idle\":%zu,\"cleaning\":%zu,\"pinned\":%zu,\"dirty\":%zu,\"closed\":%zu,\"total\":%zu,\"waiting\":%zu},\n"
         "  \"queries\": {\"total\":%llu,\"read\":%llu,\"write\":%llu,\"tx\":%llu},\n"
         "  \"errors\": {\"total\":%llu,\"auth\":%llu,\"timeout\":%llu},\n"
         "  \"cluster\": {\"role\":\"%s\",\"term\":%llu,\"leader\":\"%s\"}\n"
@@ -5116,7 +5215,8 @@ static void write_status_json(keel_admin_t *admin, int fd) {
         (unsigned long long)sessions_active,
         (unsigned long long)sessions_created,
         (unsigned long long)sessions_closed,
-        pool_active, pool_idle, pool_total, pool_waiting,
+        pool_active, pool_idle, pool_cleaning, pool_pinned,
+        pool_dirty, pool_closed, pool_total, pool_waiting,
         (unsigned long long)queries_total,
         (unsigned long long)queries_read,
         (unsigned long long)queries_write,

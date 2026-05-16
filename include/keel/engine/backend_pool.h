@@ -230,6 +230,10 @@ typedef struct backend_pool_stats {
     size_t      total_connections;
     size_t      active_connections;
     size_t      idle_connections;
+    size_t      clean_connections;    /**< Connections on clean_list */
+    size_t      stateful_connections; /**< Connections on stateful idle_list */
+    size_t      dirty_connections;    /**< Connections awaiting cleanup kick */
+    size_t      closed_connections;   /**< Closed slots awaiting refill */
     size_t      waiting_sessions;
     size_t      cleaning_count;     /**< Slots in CLEANING state */
     size_t      pinned_count;       /**< Slots pinned to sessions */
@@ -395,6 +399,19 @@ void backend_pool_release_session(backend_pool_t* pool, void* session);
  * @return 0 on success, -1 if queue is full
  */
 int backend_pool_queue_wait(backend_pool_t* pool, void* session, void* userdata);
+
+/**
+ * @brief Cancel queued waits for a session.
+ *
+ * Used when a client disconnects while sitting in the bounded pool wait queue.
+ * Removes all matching waiters without invoking the wait callback, so the
+ * callback cannot accidentally borrow a backend for a dead session.
+ *
+ * @param pool Pool
+ * @param session Session pointer used when enqueued
+ * @return Number of removed waiters
+ */
+size_t backend_pool_cancel_wait(backend_pool_t* pool, void* session);
 
 /**
  * @brief Set the callback for when connections become available

@@ -358,6 +358,12 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->pool_destroys, &src->pool_destroys);
         counter_add_to(&dst->pool_hits,     &src->pool_hits);
         counter_add_to(&dst->pool_misses,   &src->pool_misses);
+        counter_add_to(&dst->pool_borrow_attempts,          &src->pool_borrow_attempts);
+        counter_add_to(&dst->pool_borrow_exact_state_match, &src->pool_borrow_exact_state_match);
+        counter_add_to(&dst->pool_borrow_exact_stmt_match,  &src->pool_borrow_exact_stmt_match);
+        counter_add_to(&dst->pool_borrow_state_replay,      &src->pool_borrow_state_replay);
+        counter_add_to(&dst->pool_borrow_stmt_replay,       &src->pool_borrow_stmt_replay);
+        counter_add_to(&dst->pool_borrow_cleanup_required,  &src->pool_borrow_cleanup_required);
 
         /* Sessions */
         counter_add_to(&dst->sessions_created, &src->sessions_created);
@@ -393,6 +399,7 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
 
         /* Multiplexing safety */
         counter_add_to(&dst->discard_all_count,       &src->discard_all_count);
+        counter_add_to(&dst->discard_all_failure,     &src->discard_all_failure);
         counter_add_to(&dst->state_sync_count,        &src->state_sync_count);
         counter_add_to(&dst->quarantine_count,        &src->quarantine_count);
         counter_add_to(&dst->sticky_primary_hits,     &src->sticky_primary_hits);
@@ -403,7 +410,24 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->copy_bytes_total,        &src->copy_bytes_total);
         counter_add_to(&dst->notify_relayed,          &src->notify_relayed);
         counter_add_to(&dst->osc_sessions_detected,   &src->osc_sessions_detected);
+        counter_add_to(&dst->backend_close_dead_idle,       &src->backend_close_dead_idle);
+        counter_add_to(&dst->backend_close_cleanup_error,   &src->backend_close_cleanup_error);
+        counter_add_to(&dst->backend_close_cleanup_timeout, &src->backend_close_cleanup_timeout);
+        counter_add_to(&dst->backend_close_client_disconnect,
+                       &src->backend_close_client_disconnect);
+        counter_add_to(&dst->cleaning_timeout_total,        &src->cleaning_timeout_total);
+        counter_add_to(&dst->pin_reason_transaction,       &src->pin_reason_transaction);
+        counter_add_to(&dst->pin_reason_extended_protocol, &src->pin_reason_extended_protocol);
+        counter_add_to(&dst->pin_reason_prepared_stmt,     &src->pin_reason_prepared_stmt);
+        counter_add_to(&dst->pin_reason_other,             &src->pin_reason_other);
+        counter_add_to(&dst->commit_in_doubt_started,      &src->commit_in_doubt_started);
+        counter_add_to(&dst->commit_in_doubt_resolved,     &src->commit_in_doubt_resolved);
+        counter_add_to(&dst->commit_in_doubt_failed,       &src->commit_in_doubt_failed);
         gauge_add_to(&dst->sessions_pinned,   &src->sessions_pinned);
+        gauge_add_to(&dst->sessions_pinned_transaction,       &src->sessions_pinned_transaction);
+        gauge_add_to(&dst->sessions_pinned_extended_protocol, &src->sessions_pinned_extended_protocol);
+        gauge_add_to(&dst->sessions_pinned_prepared_stmt,     &src->sessions_pinned_prepared_stmt);
+        gauge_add_to(&dst->sessions_commit_in_doubt,          &src->sessions_commit_in_doubt);
         gauge_add_to(&dst->backends_cleaning, &src->backends_cleaning);
 
         /* Async pre-query replay (PR #4) */
@@ -472,6 +496,7 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->pool_wait_resume_success,     &src->pool_wait_resume_success);
         counter_add_to(&dst->pool_wait_resume_requeues,    &src->pool_wait_resume_requeues);
         counter_add_to(&dst->pool_wait_timeout_events,     &src->pool_wait_timeout_events);
+        counter_add_to(&dst->pool_wait_cancelled,          &src->pool_wait_cancelled);
 
         /* Protocol health observability */
         counter_add_to(&dst->proxy_state_desync_total,          &src->proxy_state_desync_total);

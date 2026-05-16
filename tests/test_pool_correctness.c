@@ -39,6 +39,27 @@
  * Helpers
  * ============================================================================ */
 
+static int g_wait_order[8];
+static int g_wait_count;
+static int g_timeout_count;
+
+static void reset_wait_probe(void)
+{
+    memset(g_wait_order, 0, sizeof(g_wait_order));
+    g_wait_count = 0;
+    g_timeout_count = 0;
+}
+
+static void wait_probe_cb(void* session, void* userdata)
+{
+    if (!userdata) {
+        g_timeout_count++;
+        return;
+    }
+    if (g_wait_count < (int)(sizeof(g_wait_order) / sizeof(g_wait_order[0])))
+        g_wait_order[g_wait_count++] = *(int*)session;
+}
+
 static int reactor_tick(keel_reactor_t* r, int timeout_ms)
 {
     keel_reactor_submit(r);
@@ -688,6 +709,10 @@ static void test_get_stats_counts_connections(void)
 
     TEST_ASSERT_EQ(stats.total_connections,  3U);
     TEST_ASSERT_EQ(stats.idle_connections,   3U);
+    TEST_ASSERT_EQ(stats.clean_connections,  3U);
+    TEST_ASSERT_EQ(stats.stateful_connections, 0U);
+    TEST_ASSERT_EQ(stats.dirty_connections,  0U);
+    TEST_ASSERT_EQ(stats.closed_connections, 0U);
     TEST_ASSERT_EQ(stats.active_connections, 0U);
     TEST_ASSERT_EQ(stats.waiting_sessions,   0U);
 
@@ -825,6 +850,122 @@ static void test_user_conn_accounting(void)
 }
 
 /* ============================================================================
+ * Test: wait queue backpressure and cancellation
+ * ============================================================================ */
+
+static void test_wait_queue_is_bounded(void)
+{
+    TEST_BEGIN("wait queue is bounded by max_waiting");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 2;
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), -1);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 2U);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s1), 1U);
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s2), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_cancel_removes_dead_session(void)
+{
+    TEST_BEGIN("wait queue cancellation removes disconnected session");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), 0);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s2), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 2U);
+    TEST_ASSERT(pool->wait_queue_head->session == &s1);
+    TEST_ASSERT(pool->wait_queue_tail->session == &s3);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s1), 1U);
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s3), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT(pool->wait_queue_head == NULL);
+    TEST_ASSERT(pool->wait_queue_tail == NULL);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_timeout_no_leak(void)
+{
+    TEST_BEGIN("wait queue timeout removes all expired waiters");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+    pool->config.wait_timeout_ms = 1;
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    int s1 = 1, s2 = 2;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    for (pool_waiter_t* w = pool->wait_queue_head; w; w = w->next)
+        w->enqueue_time_ms = 0;
+
+    size_t expired = backend_pool_expire_waiters(pool);
+    TEST_ASSERT_EQ(expired, 2U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT_EQ(g_timeout_count, 2);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_fifo_resume_order(void)
+{
+    TEST_BEGIN("wait queue resumes waiters in FIFO order");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), 0);
+
+    backend_pool_return(pool, conn, false);
+    conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    backend_pool_return(pool, conn, false);
+    conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    backend_pool_return(pool, conn, false);
+
+    TEST_ASSERT_EQ(g_wait_count, 3);
+    TEST_ASSERT_EQ(g_wait_order[0], 1);
+    TEST_ASSERT_EQ(g_wait_order[1], 2);
+    TEST_ASSERT_EQ(g_wait_order[2], 3);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -850,6 +991,10 @@ int main(void)
     test_mark_transaction_transitions_state();
     test_update_state_hash_pins_connection();
     test_user_conn_accounting();
+    test_wait_queue_is_bounded();
+    test_wait_queue_cancel_removes_dead_session();
+    test_wait_queue_timeout_no_leak();
+    test_wait_queue_fifo_resume_order();
 
     printf("\n");
     return test_summary();
