@@ -34,8 +34,8 @@ static const char* const s_binding_names[] = {
 
 static const char* const s_replay_names[] = {
     [KEEL_REPLAY_NONE]            = "NONE",
-    [KEEL_REPLAY_DISCARD_PENDING] = "DISCARD_PENDING",
-    [KEEL_REPLAY_DISCARD_SENT]    = "DISCARD_SENT",
+    [KEEL_REPLAY_CLEANUP_PENDING] = "CLEANUP_PENDING",
+    [KEEL_REPLAY_CLEANUP_SENT]    = "CLEANUP_SENT",
     [KEEL_REPLAY_SENDING]         = "SENDING",
     [KEEL_REPLAY_WAITING]         = "WAITING",
     [KEEL_REPLAY_RFQ_PENDING]     = "RFQ_PENDING",
@@ -61,7 +61,7 @@ static const char* const s_quarantine_names[] = {
     [KEEL_QUARANTINE_REPLAY_MISMATCH] = "REPLAY_MISMATCH",
     [KEEL_QUARANTINE_PROTOCOL_DESYNC] = "PROTOCOL_DESYNC",
     [KEEL_QUARANTINE_TLS_MISMATCH]    = "TLS_MISMATCH",
-    [KEEL_QUARANTINE_FAILED_DISCARD]  = "FAILED_DISCARD",
+    [KEEL_QUARANTINE_FAILED_CLEANUP]  = "FAILED_CLEANUP",
     [KEEL_QUARANTINE_FAILED_SYNC]     = "FAILED_SYNC",
 };
 
@@ -279,7 +279,7 @@ keel_backend_binding_t keel_derive_binding(
  * @brief Derive the prepared-statement replay lifecycle state.
  *
  * Replay state is inferred from buffered replay payload, remaining expected
- * responses, DISCARD-ALL sequencing, and pending ReadyForQuery drainage.
+ * responses, setup-cleanup sequencing, and pending terminal drainage.
  *
  * @param sf Session flow state.
  * @return Derived replay state.
@@ -289,11 +289,11 @@ keel_replay_state_t keel_derive_replay_state(const keel_session_flow_t* sf)
     if (sf->stmt_replay_len == 0)
         return KEEL_REPLAY_NONE;
 
-    if (sf->stmt_replay_needs_discard) {
-        /* Waiting for DISCARD ALL to complete before replay */
+    if (sf->stmt_replay_needs_cleanup) {
+        /* Waiting for plugin cleanup to complete before replay */
         if (sf->stmt_replay_count == 0 && sf->stmt_replay_rfq_pending)
-            return KEEL_REPLAY_DISCARD_SENT;
-        return KEEL_REPLAY_DISCARD_PENDING;
+            return KEEL_REPLAY_CLEANUP_SENT;
+        return KEEL_REPLAY_CLEANUP_PENDING;
     }
 
     if (sf->stmt_replay_rfq_pending)
@@ -689,14 +689,14 @@ int keel_session_transition_end_txn(
 /* Replay transition validation. */
 static const bool replay_transitions[KEEL_REPLAY_COUNT][KEEL_REPLAY_COUNT] = {
     [KEEL_REPLAY_NONE] = {
-        [KEEL_REPLAY_DISCARD_PENDING] = true,
+        [KEEL_REPLAY_CLEANUP_PENDING] = true,
         [KEEL_REPLAY_SENDING] = true,
     },
-    [KEEL_REPLAY_DISCARD_PENDING] = {
-        [KEEL_REPLAY_DISCARD_SENT] = true,
+    [KEEL_REPLAY_CLEANUP_PENDING] = {
+        [KEEL_REPLAY_CLEANUP_SENT] = true,
         [KEEL_REPLAY_NONE] = true,  /* abort */
     },
-    [KEEL_REPLAY_DISCARD_SENT] = {
+    [KEEL_REPLAY_CLEANUP_SENT] = {
         [KEEL_REPLAY_SENDING] = true,
         [KEEL_REPLAY_NONE] = true,  /* abort */
     },

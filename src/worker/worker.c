@@ -1766,6 +1766,13 @@ static void backend_cleanup_and_return(keel_worker_t*        worker,
 static void close_session(keel_worker_t* worker, keel_session_t* session, 
                           recv_context_t* recv_ctx)
 {
+    if (worker && worker->server_pools) {
+        for (size_t i = 0; i < worker->server_pool_count; i++) {
+            if (worker->server_pools[i])
+                backend_pool_cancel_wait(worker->server_pools[i], session);
+        }
+    }
+
     /* If there's a pending backend/send operation, we can't free recv_ctx yet.
      * Mark it as closing and let the callback complete the cleanup. */
     if (recv_ctx && (recv_ctx->be_pending || recv_ctx->fe_pending || recv_ctx->send_pending)) {
@@ -1788,6 +1795,8 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
             if (be_conn->fd >= 0) {
                 close(be_conn->fd);
                 be_conn->fd = -1;
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
             }
             atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
             be_conn->pinned_session = NULL;
@@ -1873,6 +1882,8 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
             if (be_conn->fd >= 0) {
                 close(be_conn->fd);
                 be_conn->fd = -1;
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
             }
             atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
             be_conn->pinned_session = NULL;
@@ -1975,38 +1986,13 @@ static void session_idle_timeout_cb(void* userdata)
     KEEL_LOG_WARN(KEEL_LOG_CAT_CONN, "Worker %u: zombie reaper — session %lu idle for >%u ms, closing",
                 worker->id, (unsigned long)session->id, worker->idle_timeout_ms);
 
-    /* If we hold a backend that's in a transaction, send cleanup first.
-     * Use the plugin's build_cleanup (ROLLBACK; DISCARD ALL for PG,
-     * COM_RESET_CONNECTION for MySQL) rather than a hardcoded PG query.
-     * After cleanup, close_session will find !in_transaction and return
-     * the backend to the pool instead of hard-closing it. */
+    /* If an idle timeout catches an open transaction, do not issue cleanup SQL
+     * from the timer callback. close_session() routes this through
+     * backend_cleanup_and_return(), which closes the unsafe backend and lets the
+     * async refill path replace it. */
     if (session->backend_conn && session->in_transaction) {
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, proxy_orphaned_transactions_total);
-        backend_conn_t* be_conn = session->backend_conn;
-        if (recv_ctx != NULL &&
-            recv_ctx->flow.flow != NULL &&
-            recv_ctx->flow.flow->build_cleanup != NULL &&
-            be_conn->fd >= 0) {
-            uint8_t cleanup_buf[256];
-            ssize_t cn = recv_ctx->flow.flow->build_cleanup(
-                    recv_ctx->flow.ctx, KEEL_CLEANUP_TIMEOUT,
-                    cleanup_buf, sizeof(cleanup_buf));
-            if (cn > 0)
-                (void)send(be_conn->fd, cleanup_buf, (size_t)cn,
-                           MSG_NOSIGNAL | MSG_DONTWAIT);
-        } else {
-            /* Fallback: hardcoded PG ROLLBACK for legacy/no-vtable path */
-            if (be_conn->fd >= 0) {
-                const char rollback_q[] = "Q\0\0\0\x0eROLLBACK;\0";
-                (void)send(be_conn->fd, rollback_q, sizeof(rollback_q) - 1,
-                           MSG_NOSIGNAL | MSG_DONTWAIT);
-            }
-        }
-        /* Drain response (ReadyForQuery / OK) — non-blocking */
-        char drain[256];
-        (void)recv(be_conn->fd, drain, sizeof(drain), MSG_DONTWAIT);
-        session->in_transaction = false;
     }
 
     close_session(worker, session, recv_ctx);
@@ -2183,7 +2169,7 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
 
         uint8_t wait_kind = WAIT_BACKEND_KIND_QUERY;
         if (fr == KEEL_FLOW_WAIT_STMT_REPLAY)
-            wait_kind = recv_ctx->flow.stmt_replay_needs_discard
+            wait_kind = recv_ctx->flow.stmt_replay_needs_cleanup
                         ? WAIT_BACKEND_KIND_DISCARD
                         : WAIT_BACKEND_KIND_REPLAY;
         stats_mark_wait_backend_begin(recv_ctx, wait_kind);
@@ -2567,7 +2553,7 @@ static void on_deferred_send_complete(void* userdata, int result)
                 return;
             }
                 uint8_t wait_kind = (resume == KEEL_FLOW_WAIT_STMT_REPLAY)
-                                          ? (recv_ctx->flow.stmt_replay_needs_discard
+                                          ? (recv_ctx->flow.stmt_replay_needs_cleanup
                                               ? WAIT_BACKEND_KIND_DISCARD
                                               : WAIT_BACKEND_KIND_REPLAY)
                                           : WAIT_BACKEND_KIND_QUERY;
@@ -2878,7 +2864,7 @@ static void on_client_recv_complete(void* userdata, int result)
         }
 
           uint8_t wait_kind = (fr == KEEL_FLOW_WAIT_STMT_REPLAY)
-                                     ? (recv_ctx->flow.stmt_replay_needs_discard
+                                     ? (recv_ctx->flow.stmt_replay_needs_cleanup
                                          ? WAIT_BACKEND_KIND_DISCARD
                                          : WAIT_BACKEND_KIND_REPLAY)
                                      : WAIT_BACKEND_KIND_QUERY;

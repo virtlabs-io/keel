@@ -110,6 +110,12 @@ cd build && ctest -N
 
 KEEL currently includes **106 test suites** covering core components, protocol behavior, hardening checks, TLS/kTLS regressions, TLS security enforcement, graceful drain/shutdown, combinatorial matrix tests, formal invariant models, runtime mode tier gating, live configuration reload infrastructure, formal state machine verification (exhaustive walks, fuzz, concurrent stress), route cache correctness and adversarial collision stress, admission control, SQL admin query language, cloud-native authentication (AWS SigV4, GCP OAuth2, Azure IMDS), white-box provider internals, query result caching, comprehensive horizontal sharding (Phases 1–6: key extraction, bound parameters, unified plan API, shard rule registry, scatter fan-out), **scatter-merge aggregation engine** (end-to-end merge pipeline, prepared-statement scatter, GROUP BY + LIMIT correctness, COUNT DISTINCT, 2PC full commit/abort/crash-recovery matrix, deterministic GIDs, 64-shard boundary), **scatter Prometheus histogram** (bucket accuracy, PromQL output), **scatter SQL fuzz** (134-assertion randomized aggregate SQL generator), OOM/allocation-failure injection (systematic fault coverage via `keel_mem_set_fail_countdown()`), split-at-every-byte protocol generator testing (all PG and MySQL wire messages), connection pool exhaustion and wait-queue verification, prepared-statement replay × failover × session-hash stability (PS/failover/TLS matrix), NOTIFY/LISTEN transparent proxying, declarative INI-based query routing and rewriting rules, Online Schema Change connection affinity, cross-service Read-Your-Writes via GUC propagation, embedded web management UI (HTML/CSS/JS structure, JSON API, security hardening), plus deep unit coverage of the probe subsystem, growable byte-buffers, string hashing, encoding helpers, NUMA topology, the memory-safety layer, the I/O reactor, and the log-plugin system.
 
+Before broad feature expansion, production gates prioritize deterministic
+correctness tests for reactor ownership, pool state transitions, protocol
+fragmentation, no-blocking invariants, bounded wait queues, and cleanup/replay
+atomicity. The required failure-mode matrix is tracked in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
+
 ### Running All Unit Tests
 
 ```bash

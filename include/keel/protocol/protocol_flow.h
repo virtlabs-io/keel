@@ -277,6 +277,18 @@ typedef struct keel_be_action {
     uint64_t                commit_xid;          /**< PostgreSQL txid_current() for the in-flight COMMIT */
 } keel_be_action_t;
 
+#define KEEL_PROTO_DRAIN_STATE_BYTES 64
+
+typedef enum keel_proto_drain_result {
+    KEEL_PROTO_DRAIN_ERROR = -1,      /**< Protocol error or unsafe stream */
+    KEEL_PROTO_DRAIN_MORE = 0,        /**< Valid stream so far; wait for more bytes */
+    KEEL_PROTO_DRAIN_COMPLETE = 1,    /**< Terminal reusable boundary reached */
+} keel_proto_drain_result_t;
+
+typedef struct keel_proto_drain_state {
+    uint8_t opaque[KEEL_PROTO_DRAIN_STATE_BYTES];
+} keel_proto_drain_state_t;
+
 /* ============================================================================
  * Backend Cleanup Reason
  * ============================================================================ */
@@ -750,6 +762,29 @@ typedef struct keel_proto_flow_vtable {
     );
 
     /**
+     * @brief Drain and validate a protocol-specific cleanup response stream.
+     *
+     * Core owns the socket and passes arbitrary recv() chunks. The plugin owns
+     * wire parsing, partial-frame state in @p state, and reusable-boundary
+     * validation.
+     *
+     * @param ctx          Protocol flow context; may be NULL for pool-owned cleanup.
+     * @param state        Opaque caller-owned state, zeroed before the first chunk.
+     * @param data         Backend bytes from recv().
+     * @param len          Number of bytes in @p data.
+     * @param consumed_out Optional output: bytes consumed from @p data.
+     * @return COMPLETE when cleanup is fully drained and reusable, MORE when
+     *         more bytes are required, or ERROR when the stream is unsafe.
+     */
+    keel_proto_drain_result_t (*drain_cleanup_response)(
+        void* ctx,
+        keel_proto_drain_state_t* state,
+        const uint8_t* data,
+        size_t len,
+        size_t* consumed_out
+    );
+
+    /**
      * @brief Health-probe a backend connection.
      *
      * PG: issue "SELECT 1" + parse pg_is_in_recovery()
@@ -862,6 +897,32 @@ typedef struct keel_proto_flow_vtable {
         size_t         bind_len,
         uint8_t*       out_buf,
         size_t         out_buf_len
+    );
+
+    /**
+     * @brief Apply protocol-specific pin effects from a captured client payload.
+     *
+     * The engine sometimes has to defer a complete frontend payload while it
+     * drains setup traffic such as state sync, cleanup, or prepared-statement
+     * replay. Those deferred bytes bypass the normal frame-by-frame
+     * on_fe_msg() loop, so protocol plugins may need to inspect them and report
+     * pin updates that would otherwise be missed.
+     *
+     * OPTIONAL — may be NULL. Implementations must tolerate partial trailing
+     * frames and only report effects from complete messages.
+     *
+     * @param ctx        Protocol flow context.
+     * @param data       Captured frontend bytes.
+     * @param len        Number of bytes in @p data.
+     * @param pin_update Output pin bits to set.
+     * @param pin_clear  Output pin bits to clear.
+     */
+    void (*captured_fe_pin_effects)(
+        void*                 ctx,
+        const uint8_t*        data,
+        size_t                len,
+        keel_flow_pin_reason_t* pin_update,
+        keel_flow_pin_reason_t* pin_clear
     );
 
     /**
