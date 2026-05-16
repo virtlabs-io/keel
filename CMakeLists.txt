@@ -270,6 +270,10 @@ if(KEEL_ENABLE_COVERAGE)
     # non-atomic single-word write can race and produce values that wrap below
     # zero, causing lcov geninfo to abort with "Unexpected negative count").
     set(KEEL_COVERAGE_FLAGS --coverage -fprofile-arcs -ftest-coverage -fprofile-update=atomic)
+    # Apply globally so every static library and executable is instrumented.
+    # Per-target blocks in subdirectories are redundant but harmless.
+    add_compile_options(${KEEL_COVERAGE_FLAGS})
+    add_link_options(${KEEL_COVERAGE_FLAGS})
     message(STATUS "KEEL: Code coverage enabled")
 endif()
 
