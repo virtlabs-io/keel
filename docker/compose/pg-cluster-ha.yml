@@ -1,0 +1,241 @@
+# ============================================================================
+# KEEL Multi-Proxy HA Cluster — Docker Compose
+# ============================================================================
+# Deploys a 3-node KEEL cluster fronting a PostgreSQL primary + 2 replicas.
+#
+# Architecture:
+#   Client ──► keel-1 ──┐
+#   Client ──► keel-2 ──┤──► pgsql-01 (primary RW)
+#   Client ──► keel-3 ──┤──► pgsql-02 (replica RO)
+#                        └──► pgsql-03 (replica RO)
+#
+# Each KEEL node:
+#   - Proxies SQL traffic on port 7432
+#   - Exposes admin console on port 6433
+#   - Exposes Prometheus metrics on port 9101
+#   - Participates in cluster heartbeats on port 9100
+#
+# Usage (from project root):
+#   docker compose -f docker/compose/pg-cluster-ha.yml up -d
+#   psql -h 127.0.0.1 -p 7432 -U postgres   # connect via keel-1
+#   psql -h 127.0.0.1 -p 7433 -U postgres   # connect via keel-2
+#   psql -h 127.0.0.1 -p 7434 -U postgres   # connect via keel-3
+#
+# Admin:
+#   psql -h 127.0.0.1 -p 6433 -U admin keel  # keel-1 admin
+#   > SHOW CLUSTER;
+#   > SHOW CLUSTER STATS;
+# ============================================================================
+
+name: keel-cluster-ha
+
+services:
+
+  # ==========================================================================
+  # PostgreSQL — Primary (RW)
+  # ==========================================================================
+  pgsql-01:
+    image: postgres:17-alpine
+    container_name: keel-ha-pgsql-01
+    hostname: pgsql-01
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgsql_01_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 1gb
+
+  # ==========================================================================
+  # PostgreSQL — Replica 1 (RO)
+  # ==========================================================================
+  pgsql-02:
+    image: postgres:17-alpine
+    container_name: keel-ha-pgsql-02
+    hostname: pgsql-02
+    user: postgres
+    entrypoint: []
+    command: >
+      bash -c "
+        until pg_isready -h pgsql-01 -U postgres; do sleep 1; done
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-01 -U replicator -D /var/lib/postgresql/data -Fp -Xs -R -P --slot=replica02_init --create-slot
+        chmod 700 /var/lib/postgresql/data
+        exec postgres
+      "
+    volumes:
+      - pgsql_02_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    shm_size: 1gb
+
+  # ==========================================================================
+  # PostgreSQL — Replica 2 (RO)
+  # ==========================================================================
+  pgsql-03:
+    image: postgres:17-alpine
+    container_name: keel-ha-pgsql-03
+    hostname: pgsql-03
+    user: postgres
+    entrypoint: []
+    command: >
+      bash -c "
+        until pg_isready -h pgsql-01 -U postgres; do sleep 1; done
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-01 -U replicator -D /var/lib/postgresql/data -Fp -Xs -R -P --slot=replica03_init --create-slot
+        chmod 700 /var/lib/postgresql/data
+        exec postgres
+      "
+    volumes:
+      - pgsql_03_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    shm_size: 1gb
+
+  # ==========================================================================
+  # KEEL Node 1
+  # ==========================================================================
+  keel-1:
+    image: keel:linux
+    container_name: keel-ha-node-1
+    hostname: keel-1
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      KEEL_CLUSTER_NODE_ID: keel-1
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-2:9100,keel-3:9100"
+    ports:
+      - "7432:7432"    # SQL proxy
+      - "6433:6433"    # Admin console
+      - "9101:9101"    # Prometheus
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "6433"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+  # ==========================================================================
+  # KEEL Node 2
+  # ==========================================================================
+  keel-2:
+    image: keel:linux
+    container_name: keel-ha-node-2
+    hostname: keel-2
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      KEEL_CLUSTER_NODE_ID: keel-2
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-1:9100,keel-3:9100"
+    ports:
+      - "7433:7432"
+      - "6434:6433"
+      - "9102:9101"
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "6433"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+  # ==========================================================================
+  # KEEL Node 3
+  # ==========================================================================
+  keel-3:
+    image: keel:linux
+    container_name: keel-ha-node-3
+    hostname: keel-3
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      KEEL_CLUSTER_NODE_ID: keel-3
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-1:9100,keel-2:9100"
+    ports:
+      - "7434:7432"
+      - "6435:6433"
+      - "9103:9101"
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "6433"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+networks:
+  cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  pgsql_01_data:
+  pgsql_02_data:
+  pgsql_03_data:

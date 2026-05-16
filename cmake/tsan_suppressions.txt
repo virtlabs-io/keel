@@ -1,0 +1,24 @@
+# =============================================================================
+# ThreadSanitizer suppression file for KEEL
+# =============================================================================
+#
+# TSan suppressions silence known-benign data-race reports that originate
+# in external code (glibc, system libraries) rather than in KEEL itself.
+# Unlike the MSan ignorelist, this file is consumed at runtime via the
+# TSAN_OPTIONS environment variable:
+#   TSAN_OPTIONS="suppressions=cmake/tsan_suppressions.txt"
+#
+# The root CMakeLists.txt sets this automatically when KEEL_ENABLE_TSAN=ON.
+#
+# Suppression format:
+#   race:<function_or_symbol_name>
+#   deadlock:<function_or_symbol_name>
+#   thread:<thread_name_pattern>
+#
+# Reference:
+#   https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+# =============================================================================
+
+# glibc tzset_internal race — known upstream bug triggered by concurrent
+# localtime() calls in logging paths. Not a KEEL defect.
+race:tzset_internal

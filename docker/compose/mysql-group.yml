@@ -1,0 +1,105 @@
+# MySQL Group Replication — Multi-Primary Mode
+# 3 nodes, all read-write (multi-master)
+#
+# Ports:
+#   node1: 3306
+#   node2: 3307
+#   node3: 3308
+#
+# Group Replication internal communication: port 33061
+
+name: keel-mysql-group
+
+services:
+  # ==========================================================================
+  # Node 1 — Bootstrap node
+  # ==========================================================================
+  mgr-node1:
+    image: mysql:9
+    container_name: mgr-node1
+    hostname: mgr-node1
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mgr_node1_data:/var/lib/mysql
+      - ../mysql/config/mgr-node1.cnf:/etc/mysql/conf.d/mgr.cnf:ro
+      - ../mysql/scripts/mgr-init-node1.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3306:3306"
+    networks:
+      mysql-mgr:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ==========================================================================
+  # Node 2
+  # ==========================================================================
+  mgr-node2:
+    image: mysql:9
+    container_name: mgr-node2
+    hostname: mgr-node2
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mgr_node2_data:/var/lib/mysql
+      - ../mysql/config/mgr-node2.cnf:/etc/mysql/conf.d/mgr.cnf:ro
+      - ../mysql/scripts/mgr-init-joiner.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3307:3306"
+    networks:
+      mysql-mgr:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      mgr-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # Node 3
+  # ==========================================================================
+  mgr-node3:
+    image: mysql:9
+    container_name: mgr-node3
+    hostname: mgr-node3
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mgr_node3_data:/var/lib/mysql
+      - ../mysql/config/mgr-node3.cnf:/etc/mysql/conf.d/mgr.cnf:ro
+      - ../mysql/scripts/mgr-init-joiner.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3308:3306"
+    networks:
+      mysql-mgr:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      mgr-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+networks:
+  mysql-mgr:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  mgr_node1_data:
+  mgr_node2_data:
+  mgr_node3_data:

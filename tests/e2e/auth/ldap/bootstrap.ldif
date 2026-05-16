@@ -1,0 +1,28 @@
+# Bootstrap LDIF for KEEL auth e2e tests
+dn: ou=people,dc=keel,dc=test
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=ldapuser,ou=people,dc=keel,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: ldapuser
+sn: User
+cn: LDAP Test User
+mail: ldapuser@keel.test
+uidNumber: 10001
+gidNumber: 10001
+homeDirectory: /home/ldapuser
+userPassword: ldappass123
+
+dn: uid=ldapuser2,ou=people,dc=keel,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: ldapuser2
+sn: User2
+cn: LDAP Test User 2
+mail: ldapuser2@keel.test
+uidNumber: 10002
+gidNumber: 10001
+homeDirectory: /home/ldapuser2
+userPassword: ldappass456

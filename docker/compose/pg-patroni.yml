@@ -1,0 +1,335 @@
+# PostgreSQL HA Cluster with Patroni + etcd
+# 3 Patroni nodes with automatic failover
+#
+# PostgreSQL Ports:
+#   node1: 5432
+#   node2: 5433
+#   node3: 5434
+#
+# Patroni REST API:
+#   node1: 8008
+#   node2: 8009
+#   node3: 8010
+
+name: keel-pg-patroni
+
+services:
+  # ==========================================================================
+  # etcd - Distributed consensus store
+  # ==========================================================================
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: pg-patroni-etcd
+    hostname: etcd
+    environment:
+      ETCD_NAME: etcd0
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+      ETCD_INITIAL_CLUSTER: etcd0=http://etcd:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: pg-cluster
+      ETCD_ENABLE_V2: "true"
+    volumes:
+      - etcd_data:/etcd-data
+    ports:
+      - "2379:2379"
+    networks:
+      - pg-cluster
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Patroni Node 1
+  # ==========================================================================
+  patroni1:
+    image: postgres:16-alpine
+    container_name: pg-patroni-1
+    hostname: patroni1
+    environment:
+      PATRONI_NAME: patroni1
+      PATRONI_SCOPE: pg-cluster
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_RESTAPI_CONNECT_ADDRESS: patroni1:8008
+      PATRONI_ETCD_HOSTS: etcd:2379
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: patroni1:5432
+      PATRONI_POSTGRESQL_DATA_DIR: /var/lib/postgresql/data
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: postgres
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: replicator
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache python3 py3-pip py3-psycopg2 py3-yaml py3-urllib3 py3-requests
+        pip3 install --break-system-packages patroni[etcd]
+        cat > /etc/patroni.yml <<EOF
+        scope: pg-cluster
+        name: patroni1
+        
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: patroni1:8008
+        
+        etcd:
+          hosts: etcd:2379
+        
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              use_slots: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                wal_keep_size: 256MB
+          initdb:
+            - encoding: UTF8
+            - data-checksums
+          pg_hba:
+            - host replication replicator 0.0.0.0/0 scram-sha-256
+            - host all all 0.0.0.0/0 scram-sha-256
+          users:
+            replicator:
+              password: replicator
+              options:
+                - replication
+        
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: patroni1:5432
+          data_dir: /var/lib/postgresql/data
+          authentication:
+            superuser:
+              username: postgres
+              password: postgres
+            replication:
+              username: replicator
+              password: replicator
+          parameters:
+            unix_socket_directories: '/tmp'
+        custom_conf: /etc/postgresql/conf.d/postgresql-overrides.conf
+        EOF
+        chown -R postgres:postgres /var/lib/postgresql/data /etc/patroni.yml 2>/dev/null || true
+        chmod 700 /var/lib/postgresql/data 2>/dev/null || true
+        exec gosu postgres patroni /etc/patroni.yml
+    volumes:
+      - patroni1_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5432:5432"
+      - "8008:8008"
+    networks:
+      - pg-cluster
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ==========================================================================
+  # Patroni Node 2
+  # ==========================================================================
+  patroni2:
+    image: postgres:16-alpine
+    container_name: pg-patroni-2
+    hostname: patroni2
+    environment:
+      PATRONI_NAME: patroni2
+      PATRONI_SCOPE: pg-cluster
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache python3 py3-pip py3-psycopg2 py3-yaml py3-urllib3 py3-requests
+        pip3 install --break-system-packages patroni[etcd]
+        cat > /etc/patroni.yml <<EOF
+        scope: pg-cluster
+        name: patroni2
+        
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: patroni2:8008
+        
+        etcd:
+          hosts: etcd:2379
+        
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              use_slots: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                wal_keep_size: 256MB
+          initdb:
+            - encoding: UTF8
+            - data-checksums
+          pg_hba:
+            - host replication replicator 0.0.0.0/0 scram-sha-256
+            - host all all 0.0.0.0/0 scram-sha-256
+          users:
+            replicator:
+              password: replicator
+              options:
+                - replication
+        
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: patroni2:5432
+          data_dir: /var/lib/postgresql/data
+          authentication:
+            superuser:
+              username: postgres
+              password: postgres
+            replication:
+              username: replicator
+              password: replicator
+          parameters:
+            unix_socket_directories: '/tmp'
+        custom_conf: /etc/postgresql/conf.d/postgresql-overrides.conf
+        EOF
+        chown -R postgres:postgres /var/lib/postgresql/data /etc/patroni.yml 2>/dev/null || true
+        chmod 700 /var/lib/postgresql/data 2>/dev/null || true
+        exec gosu postgres patroni /etc/patroni.yml
+    volumes:
+      - patroni2_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5433:5432"
+      - "8009:8008"
+    networks:
+      - pg-cluster
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ==========================================================================
+  # Patroni Node 3
+  # ==========================================================================
+  patroni3:
+    image: postgres:16-alpine
+    container_name: pg-patroni-3
+    hostname: patroni3
+    environment:
+      PATRONI_NAME: patroni3
+      PATRONI_SCOPE: pg-cluster
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache python3 py3-pip py3-psycopg2 py3-yaml py3-urllib3 py3-requests
+        pip3 install --break-system-packages patroni[etcd]
+        cat > /etc/patroni.yml <<EOF
+        scope: pg-cluster
+        name: patroni3
+        
+        restapi:
+          listen: 0.0.0.0:8008
+          connect_address: patroni3:8008
+        
+        etcd:
+          hosts: etcd:2379
+        
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            postgresql:
+              use_pg_rewind: true
+              use_slots: true
+              parameters:
+                wal_level: replica
+                hot_standby: "on"
+                max_wal_senders: 10
+                max_replication_slots: 10
+                wal_keep_size: 256MB
+          initdb:
+            - encoding: UTF8
+            - data-checksums
+          pg_hba:
+            - host replication replicator 0.0.0.0/0 scram-sha-256
+            - host all all 0.0.0.0/0 scram-sha-256
+          users:
+            replicator:
+              password: replicator
+              options:
+                - replication
+        
+        postgresql:
+          listen: 0.0.0.0:5432
+          connect_address: patroni3:5432
+          data_dir: /var/lib/postgresql/data
+          authentication:
+            superuser:
+              username: postgres
+              password: postgres
+            replication:
+              username: replicator
+              password: replicator
+          parameters:
+            unix_socket_directories: '/tmp'
+        custom_conf: /etc/postgresql/conf.d/postgresql-overrides.conf
+        EOF
+        chown -R postgres:postgres /var/lib/postgresql/data /etc/patroni.yml 2>/dev/null || true
+        chmod 700 /var/lib/postgresql/data 2>/dev/null || true
+        exec gosu postgres patroni /etc/patroni.yml
+    volumes:
+      - patroni3_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5434:5432"
+      - "8010:8008"
+    networks:
+      - pg-cluster
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  pg-cluster:
+    driver: bridge
+
+volumes:
+  etcd_data:
+  patroni1_data:
+  patroni2_data:
+  patroni3_data:

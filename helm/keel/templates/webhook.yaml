@@ -1,0 +1,85 @@
+{{- if .Values.webhook.enabled }}
+---
+# ValidatingWebhookConfiguration — enforces KeelPool spec rules before objects
+# are persisted. Requires cert-manager (or another TLS provider) to inject the
+# CA bundle. Set webhook.caBundle to a base64-encoded CA cert, or leave empty
+# and use cert-manager's cainjector annotation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "keel.fullname" . }}-validating-webhook
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "keel.fullname" . }}-webhook-cert
+  {{- end }}
+webhooks:
+  - name: vkeelpool.kb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    rules:
+      - apiGroups:   ["keel.virtlabs.io"]
+        apiVersions: ["v1alpha1"]
+        operations:  ["CREATE", "UPDATE"]
+        resources:   ["keelpools"]
+    clientConfig:
+      service:
+        name: {{ include "keel.fullname" . }}-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /validate-keel-virtlabs-io-v1alpha1-keelpool
+        port: 443
+      {{- if .Values.webhook.caBundle }}
+      caBundle: {{ .Values.webhook.caBundle }}
+      {{- end }}
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "keel.fullname" . }}-mutating-webhook
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "keel.fullname" . }}-webhook-cert
+  {{- end }}
+webhooks:
+  - name: mkeelpool.kb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    rules:
+      - apiGroups:   ["keel.virtlabs.io"]
+        apiVersions: ["v1alpha1"]
+        operations:  ["CREATE", "UPDATE"]
+        resources:   ["keelpools"]
+    clientConfig:
+      service:
+        name: {{ include "keel.fullname" . }}-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-keel-virtlabs-io-v1alpha1-keelpool
+        port: 443
+      {{- if .Values.webhook.caBundle }}
+      caBundle: {{ .Values.webhook.caBundle }}
+      {{- end }}
+
+---
+# Webhook Service — exposes port 9443 from the operator pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "keel.fullname" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "keel.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: 9443
+      protocol: TCP
+{{- end }}

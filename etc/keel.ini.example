@@ -1,0 +1,1695 @@
+# =============================================================================
+# keel.ini -- Keel Connection Proxy Configuration Reference
+# =============================================================================
+#
+# This file documents every INI key that Keel actually reads.
+# Copy this file, rename it to keel.ini (or any name you prefer), and adjust
+# values for your environment.  Pass the path with:
+#
+#   keel --config /path/to/keel.ini
+#
+# Syntax rules:
+#   * Section headers:  [section_name]
+#   * Key-value pairs:  key = value      (whitespace around '=' is ignored)
+#   * Comments:         # or ;  (rest of line is ignored)
+#   * Boolean values:   1 / 0   (true/false, yes/no are not recognised)
+#   * String lists:     comma-separated, e.g.  users = app, monitoring
+#
+# =============================================================================
+
+
+# =============================================================================
+# [keel]  -- Global daemon settings
+# =============================================================================
+[keel]
+
+# Minimum severity to write to the startup/fallback log before [logging] takes
+# over.  Values (case-insensitive): trace, debug, info, warn, error, fatal
+# Default: info
+log_level = info
+
+# Maximum time (ms) to wait for active connections to drain during graceful
+# shutdown (SIGTERM / SIGQUIT).  After this timeout, remaining connections are
+# forcibly closed.
+# Default: 30000 (30 seconds)
+# shutdown_timeout_ms = 30000
+
+
+# =============================================================================
+# [logging]  -- Log sink and verbosity
+# =============================================================================
+[logging]
+
+# Logging plugin to load.  Currently supported: "file", "syslog"
+# Default: file
+plugin = file
+
+# Shared-library path for a custom third-party logging plugin.
+# Leave empty (or omit) when using the built-in "file" or "syslog" plugin.
+# plugin_path = /usr/local/lib/keel/my_logging_plugin.so
+
+# Path for the file plugin.  Ignored when plugin = syslog.
+# Default: keel.log  (relative to the working directory)
+log_file = /var/log/keel/keel.log
+
+# Log verbosity after startup.  Overrides [keel] log_level.
+# Values: trace, debug, info, warn, error, fatal
+# Default: info
+log_level = info
+
+# Log output format.
+# Values: text (human-readable), json (NDJSON with trace correlation)
+# Default: text
+# log_format = text
+
+# Query logging mode.  Controls which queries are written to the query log.
+# Values:
+#   none   -- disabled (no per-query log entries)  [default]
+#   all    -- log all queries
+#   read   -- log read-only (SELECT) queries only
+#   write  -- log write / DDL queries only
+# Default: none
+query_log_mode = none
+
+# Maximum number of characters logged per query string.
+# Queries longer than this limit are silently truncated in the log.
+# Default: 1024
+max_query_len = 1024
+
+# Syslog identity string (argv[0]-style tag sent with every message).
+# Only used when plugin = syslog.
+# Default: keel
+syslog_ident = keel
+
+# Syslog facility.  Only used when plugin = syslog.
+# Standard facility names: daemon, local0 ... local7, user, etc.
+# Default: daemon
+syslog_facility = daemon
+
+# Prefix each log line with an ISO-8601 timestamp.
+# 1 = include timestamp,  0 = omit (useful when the log sink adds its own)
+# Default: 1
+log_timestamps = 1
+
+# Include the source file name and line number of the logging call.
+# Useful for debugging; adds noise in production.
+# Default: 0
+log_source = 0
+
+# Log destination bitmask.  Add values together to write to multiple targets.
+#   1  -- stderr
+#   2  -- file  (requires log_file)
+#   4  -- syslog
+# Default: 2
+log_dest = 2
+
+# Log the connecting client username in query log entries.
+# Default: 0
+log_username = 0
+
+# Log the target database name in query log entries.
+# Default: 0
+log_database = 0
+
+# Log the parse tree for every query (very verbose; for development only).
+# Default: 0
+log_query_tree = 0
+
+# Colourize log output with ANSI escape codes.
+# Disable when writing to a file or a log aggregator that does not strip codes.
+# Default: 0
+use_colors = 0
+
+
+# =============================================================================
+# [tracing]  -- Distributed tracing (OTLP/HTTP export)
+# =============================================================================
+[tracing]
+
+# Master switch.  Set to true to enable span collection and export.
+# Default: false
+# enabled = false
+
+# OTLP/HTTP endpoint for span export (JSON encoding).
+# Default: http://localhost:4318/v1/traces
+# endpoint = http://localhost:4318/v1/traces
+
+# OTLP resource service.name attribute.
+# Default: keel
+# service_name = keel
+
+# Head-based sampling rate in parts-per-million (ppm).
+#   1000000 = 100% of sessions    10000 = 1% (default)
+#      1000 = 0.1%                    0 = disabled
+# Default: 10000
+# sample_rate_ppm = 10000
+
+# Maximum spans per export batch.
+# Default: 256
+# batch_size = 256
+
+# Flush interval for the export thread, in milliseconds.
+# Default: 5000
+# flush_interval_ms = 5000
+
+# Per-worker span ring buffer capacity (power of 2).
+# Default: 4096
+# ring_capacity = 4096
+
+# HTTP timeout for OTLP export, in milliseconds.
+# Default: 10000
+# export_timeout_ms = 10000
+
+
+# =============================================================================
+# [stats]  -- Internal statistics collection
+# =============================================================================
+[stats]
+
+# Statistics detail level.
+#   0  -- disabled
+#   1  -- basic counters (connections, queries, errors)
+#   2  -- extended (pool sizes, latency histograms)
+# Default: 1
+level = 1
+
+# How often to emit periodic stats log entries, in milliseconds.
+# Default: 60000  (once per minute)
+log_interval_ms = 60000
+
+# Hot-path instrumentation bitmasks.
+# Enable these only when profiling wait-attribution or deferred-send overhead.
+# Each key accepts 1 (enable) or 0 (disable).  All default to 0.
+#
+#   hotpath_all                       -- enable all hot-path counters at once
+#   hotpath_wait_pool                 -- track time spent waiting for a free pool slot
+#   hotpath_wait_backend              -- track time waiting for the backend to respond
+#   hotpath_wait_backend_query_split  -- wait-backend counter split by read/write
+#   hotpath_deferred_send             -- track deferred send cycles
+#
+# These counters appear in the extended stats dump and Prometheus metrics.
+# Default: 0 (disabled)
+# hotpath_all                       = 0
+# hotpath_wait_pool                 = 0
+# hotpath_wait_backend              = 0
+# hotpath_wait_backend_query_split  = 0
+# hotpath_deferred_send             = 0
+
+
+# =============================================================================
+# [admin]  -- Built-in administration interface
+# =============================================================================
+[admin]
+
+# Enable the admin TCP listener.
+# Default: 0
+enabled = 0
+
+# Address the admin listener binds to.
+# Default: 127.0.0.1
+listen_addr = 127.0.0.1
+
+# Port the admin listener binds to.
+# Default: 6433
+listen_port = 6433
+
+# Comma-separated list of usernames allowed to connect to the admin interface.
+# These users must exist in the userlist.txt password file.
+# users = admin, ops
+
+
+# =============================================================================
+# [prometheus]  -- Prometheus metrics endpoint
+# =============================================================================
+[prometheus]
+
+# Expose a Prometheus /metrics HTTP endpoint.
+# Default: 0
+enabled = 0
+
+# Address the Prometheus listener binds to.
+# Default: 0.0.0.0
+listen_addr = 0.0.0.0
+
+# Port for the Prometheus metrics endpoint.
+# Default: 9101
+port = 9101
+
+# URL path at which metrics are served.
+# Default: /metrics
+path = /metrics
+
+
+# =============================================================================
+# [worker_group.<name>]  -- Listener / pool definition
+#
+# You may define as many [worker_group.*] sections as you need.  Each section
+# creates a fully independent listener, protocol stack, and connection pool.
+# The <name> suffix is used for logging and internal identification only.
+# =============================================================================
+[worker_group.myapp]
+
+# Human-readable label for this group (used in logs and stats output).
+# Default: the section-name suffix, e.g. "myapp"
+name = myapp
+
+# -- Network ------------------------------------------------------------------
+
+# IP address to listen on.  Use 0.0.0.0 to accept on all interfaces.
+# Default: 127.0.0.1
+bind_addr = 127.0.0.1
+
+# TCP port clients connect to.
+# Default: 5432
+bind_port = 5432
+
+# Number of parallel worker threads/reactors for this group.
+# Each worker owns its own event loop and a slice of the connection pool.
+# A value of 0 means "use the number of available CPU cores".
+# Default: 4
+num_workers = 4
+
+# TCP listen backlog (passed to listen(2)).
+# Increase on hosts that see very high burst connection rates.
+# Default: 128
+listen_backlog = 128
+
+# -- Protocol -----------------------------------------------------------------
+
+# Back-end database protocol.  Values: postgresql, mysql
+# Default: postgresql
+protocol = postgresql
+
+# Default database to connect to when the client does not specify one.
+default_database = mydb
+
+# -- Authentication -----------------------------------------------------------
+
+# Username keel uses when opening server-side connections.
+server_user = myuser
+
+# Password for server_user.  Stored in plain text; protect this file with
+# filesystem permissions (chmod 600).
+server_password = secret
+
+# -- Enterprise Authentication ------------------------------------------------
+#
+# Keel supports pluggable authentication backends for environments that require
+# integration with existing identity providers.  The auth_method setting
+# controls how Keel verifies client credentials before establishing a session.
+#
+# Values:
+#   password    — standard hashed-password auth (default; md5/scram)
+#   trust       — no authentication (development only)
+#   pam         — Linux PAM; useful for LDAP/AD integration via pam_ldap
+#   ldap        — direct LDAP bind+search (no PAM dependency)
+#   cert        — mTLS client certificate (CN or SAN used as username)
+#   auth_query  — validate credentials via a SQL function on the backend
+#
+# Default: password
+# auth_method = password
+
+# PAM service name to use when auth_method = pam.
+# The service is looked up in /etc/pam.d/<service>.
+# Default: keel
+# pam_service_name = keel
+
+# -- LDAP Authentication (auth_method = ldap) ---------------------------------
+
+# LDAP server URI.  Use ldap:// or ldaps://.
+# ldap_url = ldap://ldap.corp.example.com:389
+
+# Search base for user look-up.
+# ldap_base_dn = dc=corp,dc=example,dc=com
+
+# DN used to bind for the user-search phase (LDAP search+bind flow).
+# If unset, Keel attempts an anonymous search then a direct bind.
+# ldap_bind_dn = cn=keelbind,ou=service,dc=corp,dc=example,dc=com
+# ldap_bind_password = bindpass
+
+# LDAP attribute that holds the username.  Used to construct the search filter.
+# Default: uid
+# ldap_uid_attr = uid
+
+# Search scope: base | one | sub
+# Default: sub
+# ldap_search_scope = sub
+
+# -- auth_query Authentication (auth_method = auth_query) --------------------
+#
+# Keel calls a SQL function on the backend to validate credentials.
+# The function receives the client-supplied username and password and returns
+# true if authentication should succeed.
+#
+# Example function:
+#   CREATE FUNCTION public.keel_auth(uname text, upass text) RETURNS bool ...
+#
+# auth_query = SELECT public.keel_auth($1, $2)
+
+# Connection (label from [worker_group.NAME.servers]) used for auth queries.
+# If unset, Keel uses any available pool connection.
+# auth_query_connection = primary
+
+# -- Cloud-Native Authentication (AWS / GCP / Azure) -------------------------
+#
+# When cloud_auth_provider is set, Keel automatically fetches a short-lived
+# IAM/OIDC token and uses it as the server_password.  Tokens are cached and
+# rotated before expiry — no manual password rotation is needed.
+#
+# Providers:
+#   aws    — AWS RDS IAM authentication (SigV4 token, valid 15 minutes)
+#   gcp    — GCP Cloud SQL IAM authentication (GCP OAuth2/service account JWT)
+#   azure  — Azure AD / Entra managed-identity auth (IMDS token)
+#
+# Credentials are resolved from the standard provider chain:
+#   AWS  : IAM role attached to EC2/ECS/Lambda/EKS, or AWS_ACCESS_KEY_ID env
+#   GCP  : attached service account, or GOOGLE_APPLICATION_CREDENTIALS env
+#   Azure: managed identity, or AZURE_CLIENT_ID + AZURE_CLIENT_SECRET env
+#
+# cloud_auth_provider = aws
+
+# AWS region for RDS token generation (required for aws provider).
+# cloud_auth_region = us-east-1
+
+# AWS account ID (required for aws provider; used to construct the token URL).
+# cloud_auth_account_id = 123456789012
+
+# GCP project and instance (required for gcp provider).
+# cloud_auth_gcp_project  = my-project
+# cloud_auth_gcp_instance = my-instance:us-central1:my-db
+
+# -- Connection Lifecycle Management ------------------------------------------
+
+# Maximum age (milliseconds) of a server-side backend connection before it
+# is proactively closed and replaced.  This is useful for:
+#   - Rotating cloud IAM tokens (set to token TTL × 0.8)
+#   - Cycling connections after backend software upgrade
+#   - Working around PostgreSQL's backend memory growth
+# 0 = disabled (connections live until idle timeout or error).
+# Default: 0
+# max_connection_age_ms = 840000   # 14 minutes (AWS RDS token TTL × 0.93)
+
+# Maximum number of queries a single backend connection may serve before it
+# is recycled.  0 = no limit.
+# Default: 0
+# max_connection_queries = 0
+
+# -- Connection pool ----------------------------------------------------------
+
+# Minimum number of server connections to keep open (warm pool floor).
+# Default: 2
+min_pool_size = 2
+
+# Maximum total server connections across all workers in this group.
+# Default: 20
+max_pool_size = 20
+
+# Hard cap on server connections a single worker thread may hold.
+# Prevents any one worker from monopolising the pool under skewed load.
+# Default: 0  (no per-worker cap; governed by max_pool_size alone)
+max_conns_per_worker = 0
+
+# Maximum number of client requests that may queue waiting for a connection
+# before new requests are rejected with an error.
+# Default: 100
+pool_max_waiting = 100
+
+# How long (ms) a server connection may stay idle before being closed.
+# Default: 300000  (5 minutes)
+idle_timeout_ms = 300000
+
+# Timeout (ms) for establishing a new server connection.
+# Default: 5000
+connect_timeout_ms = 5000
+
+# -- Pool maintenance ---------------------------------------------------------
+
+# How often (ms) the pool prune sweep runs to close idle connections that
+# exceed idle_timeout_ms.
+# Default: 10000
+pool_prune_interval_ms = 10000
+
+# How often (ms) keel tries to replenish the pool back to min_pool_size after
+# connections were closed (by pruning, errors, or server-side disconnects).
+# Default: 5000
+pool_refill_interval_ms = 5000
+
+# Back-off delay (ms) added between consecutive refill attempts when the
+# server is unavailable.  Prevents hammering a restarting database.
+# Default: 1000
+pool_refill_backoff_ms = 1000
+
+# -- Prepared-statement pooling strategy -------------------------------------
+#
+# Controls how Keel handles named PostgreSQL prepared statements when
+# connections are multiplexed across a pool.  This is one of the most
+# important tunables for applications that use ORMs or drivers with
+# automatic query preparation.
+#
+# The problem: a named prepared statement (created with Parse or PREPARE)
+# exists only on the exact backend connection that received it.  If the pool
+# routes a subsequent Bind/Execute to a different backend, that backend returns
+# "ERROR: prepared statement does not exist".
+#
+# Values:
+#
+#   virtualize  (default)
+#     Keel intercepts named Parse messages before they reach the backend.
+#     The raw Parse bytes are stored in a per-session cache (up to 64 slots).
+#     A synthetic ParseComplete is returned to the client immediately.
+#     When the session uses that statement on a new backend, Keel replays the
+#     cached Parse to the new backend first (one extra round-trip).
+#     Best choice for most ORMs (SQLAlchemy, GORM, Prisma, Hibernate) and
+#     drivers that use extended query protocol (pgx, asyncpg, node-postgres).
+#
+#   pinning
+#     The backend connection is hard-pinned to the session on the first named
+#     Parse.  The connection is NOT returned to the pool until the client
+#     disconnects.  No replay, perfect fidelity.
+#     Cost: one backend per PS-using session — pool efficiency is lost.
+#     Use only for very low concurrency (e.g. <= 10 long-lived sessions).
+#
+#   tracking
+#     Like 'virtualize' but also intercepts PREPARE stmt AS ... sent via the
+#     simple query protocol (a Q message).  Required for older JDBC drivers
+#     or ORMs that mix simple-query PREPARE with extended-query Execute.
+#
+#   anonymous
+#     Keel rewrites every named Parse to an anonymous ('') Parse before
+#     forwarding.  Bind/Execute are rewritten to reference ''.
+#     The backend never accumulates named statement state and connections
+#     are always reusable.  Trade-off: PostgreSQL cannot cache the parse
+#     plan between Executes, so this may increase backend CPU for complex
+#     queries.
+#
+# See docs/PREPARED_STATEMENTS.md for a detailed guide with examples.
+# Default: virtualize
+prepared_statement = virtualize
+
+# -- Runtime mode (feature cost tier) ----------------------------------------
+#
+# Controls which hot-path features are active.  Lower tiers disable expensive
+# features so that users who only need basic pooling pay near-zero overhead
+# for capabilities they never use.
+#
+# Values:
+#
+#   proxy
+#     Minimal pass-through.  The session is hard-pinned to a single backend
+#     for its entire lifetime.  No connection pooling, no R/W routing, no
+#     query analysis.  Comparable to a TCP proxy with protocol awareness.
+#     Use for: debug, pgAdmin, schema migrations, legacy applications.
+#
+#   pool
+#     Connection pooling with prepared-statement replay (PS virtualization).
+#     No R/W routing, no query logging, no hooks, no state sync.
+#     Use for: PgBouncer-replacement, simple pooling workloads.
+#
+#   smart
+#     Pooling + intelligent R/W routing + sticky-primary + state sync +
+#     query logging + full statistics.  No hooks, no transaction tracking,
+#     no LSN capture.
+#     Use for: production read/write splitting, observability, multi-replica.
+#
+#   full  (default)
+#     Everything enabled: hooks, transaction tracking, LSN/GTID capture,
+#     commit-in-doubt recovery.  Maximum safety and programmability.
+#     Use for: applications needing maximum consistency guarantees,
+#     custom hook pipelines, programmable proxy logic.
+#
+# Default: full
+mode = full
+
+# -- Transaction tracking (replication consistency) --------------------------
+#
+# When set to 'on', Keel instruments every COMMIT with a lightweight XID
+# probe (injected SELECT txid_current()) that runs alongside the COMMIT in
+# the same transaction, recording the transaction ID before it completes.
+#
+# This enables two capabilities:
+#
+#   1. Commit-in-doubt recovery
+#      If the backend connection is lost after COMMIT is sent but before
+#      ReadyForQuery('I') is received, Keel re-establishes a fresh connection
+#      and queries txid_status(XID) to determine whether the transaction
+#      committed, aborted, or is still in progress.  Without this, the client
+#      would receive a generic "connection lost" error with no way to know
+#      the outcome.
+#
+#   2. WAL LSN consistency tokens (read-after-write routing)
+#      After every WRITE or DDL query, Keel captures the primary's current
+#      WAL LSN (using SELECT pg_current_wal_lsn() on the same connection).
+#      For subsequent read-only queries in the same session, Keel checks
+#      whether the selected replica has replayed at least that LSN before
+#      routing to it — guaranteeing the client reads its own writes even
+#      when reads are load-balanced across replicas.
+#
+# Values: on | off
+# Default: off
+#
+# Overhead: one additional SELECT per COMMIT (XID), one SELECT per read-write
+# transaction on the primary (LSN capture), and one SELECT per subsequent read
+# on each replica candidate (LSN check).  The overhead is negligible on
+# PostgreSQL >= 12 but should be evaluated for commit-heavy workloads.
+#
+# See docs/TRANSACTION_TRACKING.md for full implementation details.
+transaction_tracking = off
+
+# -- Automatic Load Rebalancing ------------------------------------------------
+#
+# When SO_REUSEPORT distributes connections unevenly across workers, the
+# rebalancing system detects the imbalance and migrates idle sessions from
+# overloaded workers to lightly-loaded ones using SCM_RIGHTS fd passing.
+#
+# The algorithm runs on a periodic timer in each worker:
+#   1. Compute average session count across all workers
+#   2. If this worker has >threshold_pct% of the average, trigger migration
+#   3. Migrate up to max_per_tick eligible idle sessions per interval
+#
+# Sessions are only migrated when idle (READY state, no transaction, no pin,
+# no backend connection borrowed). The client connection is transparently
+# transferred — the client sees no interruption.
+#
+# See docs/MULTIPLEXING.md § Automatic Rebalancing for full algorithm details.
+
+# Enable/disable automatic rebalancing.
+# Values: true | false
+# Default: true
+rebalance = true
+
+# How often each worker checks for imbalance (milliseconds).
+# Lower values react faster but consume more CPU in the check.
+# Default: 5000
+rebalance_interval_ms = 5000
+
+# Imbalance threshold as a percentage. A worker triggers migration when:
+#   my_sessions × 100 > average_sessions × threshold_pct
+# A value of 125 means "25% above average". Higher values tolerate more skew.
+# Default: 125
+rebalance_threshold_pct = 125
+
+# Maximum number of sessions to migrate per check interval.
+# Limits burst migration to prevent thundering-herd effects.
+# Default: 4
+rebalance_max_per_tick = 4
+
+# -- TLS/SSL Configuration (Client Connections) --------------------------------
+#
+# Transport Layer Security (TLS/SSL) protects connections between clients and
+# Keel. Keel supports full TLS termination with automatic Kernel TLS (kTLS)
+# acceleration to maintain zero-copy splice performance when available
+# (Linux 4.17+).
+#
+# TLS Mode (frontend - client to Keel):
+#
+#   disable  -- No TLS, accept plaintext connections only (default)
+#   prefer   -- Offer TLS upgrade via STARTTLS in protocol negotiation
+#   require  -- Reject all non-TLS connections; TLS is mandatory
+#
+# Default: disable
+tls_mode = disable
+
+# Path to server certificate (PEM format).
+# Required when tls_mode is 'prefer' or 'require'.
+# Example: tls_cert_file = /etc/keel/certs/server.pem
+# tls_cert_file = /etc/keel/certs/server.pem
+
+# Path to server private key (PEM format, unencrypted).
+# Required when tls_mode is 'prefer' or 'require'.
+# The key file must have restrictive permissions (chmod 0600).
+# Example: tls_key_file = /etc/keel/certs/server.key
+# tls_key_file = /etc/keel/certs/server.key
+
+# Path to CA certificate bundle (PEM format).
+# Used for verifying client certificates when tls_verify_peer is not 'none'.
+# Multiple CA certificates can be in one PEM file.
+# Example: tls_ca_file = /etc/keel/certs/ca-bundle.pem
+# tls_ca_file = /etc/keel/certs/ca-bundle.pem
+
+# Client certificate verification mode:
+#
+#   none      -- Never verify client certificates (default if tls_ca_file not set)
+#   optional  -- Accept client certificates but do not require them
+#   require   -- Client certificate required and verified against tls_ca_file
+#
+# Default: none
+tls_verify_peer = none
+
+# Enable Kernel TLS (kTLS) acceleration for client connections.
+# kTLS offloads TLS encryption/decryption to the kernel, maintaining zero-copy
+# splice capability and reducing CPU usage (available on Linux 4.17+).
+# Automatically falls back to userspace TLS if kernel_tls unavailable.
+# Values: 0 = disabled, 1 = enabled (default)
+ktls_enabled = 1
+
+# TLS handshake timeout (milliseconds).
+# Maximum time allowed for TLS handshake to complete.
+# Default: 10000 (10 seconds)
+tls_handshake_timeout_ms = 10000
+
+# TLS read timeout (milliseconds).
+# Maximum time to wait for data on a TLS connection.
+# Default: 30000 (30 seconds)
+tls_read_timeout_ms = 30000
+
+# TLS cipher list for TLS 1.2 connections (OpenSSL cipher-string format).
+# Restricts which cipher suites are offered during the TLS 1.2 handshake.
+# Example: tls_ciphers = ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+# Default: (OpenSSL default)
+# tls_ciphers =
+
+# TLS 1.3 cipher suites (colon-separated).
+# Restricts which TLS 1.3 cipher suites are offered.
+# Example: tls_ciphersuites = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+# Default: (OpenSSL default)
+# tls_ciphersuites =
+
+# Minimum TLS protocol version to accept for client connections.
+# Values: 1.0, 1.1, 1.2, 1.3
+# Default: (OpenSSL default, typically 1.2)
+# tls_min_version = 1.2
+
+# -- TLS/SSL Configuration (Backend Connections) --------------------------------
+#
+# Backend TLS: protect connections from Keel to upstream database servers.
+# Configuration mirrors frontend TLS settings but for outbound connections.
+#
+# Backend TLS mode:
+#
+#   disable  -- No TLS to backend (default, plaintext)
+#   prefer   -- Use TLS if backend supports it
+#   require  -- TLS mandatory, reject plaintext backend connections
+#
+# Default: disable
+backend_tls_mode = disable
+
+# Path to client certificate (PEM format).
+# Used to authenticate Keel to the backend when backend requires mTLS.
+# Example: backend_tls_cert_file = /etc/keel/certs/client.pem
+# backend_tls_cert_file = /etc/keel/certs/client.pem
+
+# Path to client private key (PEM format, unencrypted).
+# Must have restrictive permissions (chmod 0600).
+# Example: backend_tls_key_file = /etc/keel/certs/client.key
+# backend_tls_key_file = /etc/keel/certs/client.key
+
+# Path to CA certificate bundle (PEM format).
+# Used to verify backend server certificates.
+# Example: backend_tls_ca_file = /etc/keel/certs/backend-ca-bundle.pem
+# backend_tls_ca_file = /etc/keel/certs/backend-ca-bundle.pem
+
+# Backend server certificate verification mode:
+#
+#   none      -- Do not verify backend server certificate (default, insecure)
+#   optional  -- Verify backend certificate if sent (recommended for safety)
+#   require   -- Backend certificate required and verified (recommended)
+#
+# Default: none
+backend_tls_verify_peer = none
+
+# Enable Kernel TLS for backend connections.
+# Values: 0 = disabled, 1 = enabled (default)
+backend_ktls_enabled = 1
+
+# Backend TLS handshake timeout (milliseconds).
+# Default: 10000 (10 seconds)
+backend_tls_handshake_timeout_ms = 10000
+
+# Backend TLS read timeout (milliseconds).
+# Default: 30000 (30 seconds)
+backend_tls_read_timeout_ms = 30000
+
+# Backend TLS cipher list for TLS 1.2 connections (OpenSSL cipher-string format).
+# Restricts which cipher suites are offered for backend connections.
+# Default: (OpenSSL default)
+# backend_tls_ciphers =
+
+# Backend TLS 1.3 cipher suites (colon-separated).
+# Default: (OpenSSL default)
+# backend_tls_ciphersuites =
+
+# Minimum TLS protocol version for backend connections.
+# Values: 1.0, 1.1, 1.2, 1.3
+# Default: (OpenSSL default, typically 1.2)
+# backend_tls_min_version = 1.2
+
+# -- io_uring buffer rings (Linux 5.19+ / liburing 2.2+) ----------------------
+#
+# Buffer rings pre-register a fixed number of kernel-owned read buffers with
+# io_uring (IORING_REGISTER_PBUF_RING).  The kernel fills a buffer directly
+# from the network and posts a CQE; user-space copies the data once and
+# returns the slot to the ring.  This eliminates the traditional
+# recv() -> malloc -> read cycle.
+#
+# When to enable:
+#   - You are running Linux kernel >= 5.19 and liburing >= 2.2.
+#   - Connections are long-lived and transfer large payloads (bulk queries,
+#     large result sets).
+#   - You want to minimise per-read syscall overhead at high connection counts.
+#
+# Memory cost per worker_group:
+#   num_workers x buf_ring_size x 65536 bytes  (each slot is one 64 KiB page)
+#
+# Example: 4 workers x 256 slots = 67 108 864 bytes (64 MiB) per group.
+#
+# Keel checks at runtime whether the kernel supports buffer rings and silently
+# falls back to normal recv() if not (KEEL_HAS_URING_BUF_RING compile flag).
+
+# 1 = enable buffer rings, 0 = use regular recv().
+# Default: 0
+use_buf_rings = 0
+
+# Number of buffer slots in the ring per worker.
+# Must be a power of two.  Larger rings reduce the chance of stalling when
+# many connections have data ready simultaneously, at the cost of more memory.
+# Default: 128
+buf_ring_size = 128
+
+# -- Health probing -----------------------------------------------------------
+
+# Health-check method for back-end servers.
+# Values:
+#   tcp      -- TCP connect only (lightweight; does not speak the protocol)
+#   query    -- send a trivial SQL query and expect a result
+#   exec     -- run an external command; exit 0 = healthy
+# Default: tcp
+probe = tcp
+
+# How often (ms) to run the health probe against each server.
+# Default: 5000
+probe_interval = 5000
+
+# Timeout (ms) for each probe attempt.
+# Default: 2000
+probe_timeout = 2000
+
+# Probe authentication mode for database probes (postgres/mysql).
+# Values:
+#   auto      -- use whatever the server requests (trust/password/md5/scram)
+#   trust     -- require trust/no-password auth only
+#   password  -- allow password-based auth (cleartext, md5, scram)
+#   md5       -- require PostgreSQL MD5 auth
+#   scram     -- require SCRAM-SHA-256 auth
+# Default: auto
+probe_auth = auto
+
+# Optional dedicated probe credentials.
+# If unset, probe falls back to each server's user/password.
+# probe_user = keel_probe
+# probe_password = change_me
+
+# Number of consecutive failures before a server is marked unavailable.
+# Default: 3
+probe_retries = 3
+
+# Delay (ms) before attempting to route new connections to a server that has
+# just recovered (re-joined the pool after a failure).
+# Default: 2000
+failover_delay = 2000
+
+
+# =============================================================================
+# [worker_group.<name>.servers]  -- Back-end server list
+#
+# Define one or more back-end servers for this group.  Keel distributes
+# connections across healthy servers according to the configured routing policy.
+#
+# Each entry uses a whitespace-separated DSN-style key=value format:
+#
+#   <label> = host=<ip> port=<port> dbname=<db> user=<u> password=<pw>
+#             role=<primary|replica|auto> weight=<N>
+#
+# Fields:
+#   host      IP address or hostname of the backend database server.
+#   port      TCP port.  Defaults: 5432 (PostgreSQL), 3306 (MySQL).
+#   dbname    Database name to connect to on the backend.
+#   user      Username for backend authentication.  Overrides server_user.
+#   password  Password for backend authentication.  Overrides server_password.
+#   probe_user      Optional username used only by health probes.
+#   probe_password  Optional password used only by health probes.
+#   probe_auth      Per-server probe auth mode override (auto|trust|password|md5|scram).
+#   role      Routing role for this server.  Accepted values:
+#
+#             'RW' (or 'primary')  — Read-Write node.  Receives all writes
+#                          and reads when no RO replica is available.
+#             'RO' (or 'replica')  — Read-Only node.  Receives read queries;
+#                          writes are never sent here.
+#             'WO'         — Write-Only node.  Receives write queries only;
+#                          reads are not routed here (useful for Galera
+#                          or multi-primary clusters where one node is
+#                          dedicated to writes).
+#             'auto'       — Keel probes pg_is_in_recovery() (postgres probe)
+#                          or the Patroni REST API (patroni probe) to detect
+#                          the role at runtime.  Role changes during failover
+#                          are automatically detected and applied.
+#   weight    Relative load-balancing weight for replica selection.
+#             Higher values attract proportionally more read traffic.
+#             Default: 100.
+#
+# The label (left of '=') is used in logs, the admin interface, and probe
+# output only — it has no effect on routing.
+# =============================================================================
+[worker_group.myapp.servers]
+
+# role=RW / role=primary  — read-write (all writes + reads when no RO available)
+# role=RO / role=replica  — read-only replica
+# role=WO                 — write-only (writes only; no reads)
+# role=auto               — role detected dynamically by the probe
+primary  = host=127.0.0.1 port=5432 dbname=mydb user=myuser password=secret probe_user=probe probe_password=probe_secret probe_auth=scram role=RW weight=100
+# replica1 = host=192.168.1.11 port=5432 dbname=mydb user=myuser password=secret probe_auth=md5 role=RO weight=100
+# replica2 = host=192.168.1.12 port=5432 dbname=mydb user=myuser password=secret role=RO weight=50
+
+
+# =============================================================================
+# [worker_group.<name>.hooks]  -- Hook plugins (optional)
+#
+# Hooks inject custom logic at four points in the query pipeline:
+#   after_query_read   — raw bytes arrived from the client
+#   after_query_parse  — SQL parsed and classified
+#   before_route       — routing decision about to be made
+#   before_send        — query about to be forwarded to the backend
+#
+# Three plugin types can be mixed freely at any point:
+#
+#   Native .so plugins — fast, zero-overhead when the hook is not triggered.
+#   Lua scripts        — requires -DKEEL_ENABLE_LUA=ON at build time.
+#   Python modules     — requires -DKEEL_ENABLE_PYTHON=ON at build time.
+#
+# See docs/HOOKS.md and examples/hooks/ for working examples.
+# =============================================================================
+[worker_group.myapp.hooks]
+
+# ── Native shared-library plugin ────────────────────────────────────────────
+# Format:  hook.plugin.<name> = <path-to-.so>
+# <name> is an arbitrary label used in log output only.
+# plugin = /usr/local/lib/keel/hooks/my_hooks.so
+# hook.plugin.rate_limiter = /usr/local/lib/keel/hooks/rate_limiter.so
+
+# ── Lua hook scripts ─────────────────────────────────────────────────────────
+# Format:  hook.lua.<point>.<name> = script=<path> func=<function> priority=<N>
+#   <point>   — one of: after_query_read, after_query_parse, before_route, before_send
+#   func      — Lua function to call (default: keel_hook)
+#   priority  — lower numbers run first (default: 100)
+# hook.lua.before_route.force_primary  = script=/etc/keel/hooks/force_primary.lua func=keel_hook priority=100
+# hook.lua.after_query_parse.block_ddl = script=/etc/keel/hooks/block_ddl.lua func=keel_hook priority=50
+
+# ── Python hook modules ───────────────────────────────────────────────────────
+# Format:  hook.python.<point>.<name> = module=<module> func=<function> priority=<N>
+#   module    — Python module name (must be importable; add its directory to PYTHONPATH)
+#   func      — callable inside the module (default: keel_hook)
+# hook.python.before_route.force_primary  = module=force_primary func=keel_hook priority=100
+# hook.python.after_query_parse.block_ddl = module=block_ddl func=keel_hook priority=50
+
+
+# =============================================================================
+# [security]  -- Privilege drop and seccomp hardening
+#
+# These settings harden the process after startup (after privileged setup such
+# as binding to low-numbered ports is complete).  They have no effect on
+# query performance.
+# =============================================================================
+[security]
+
+# Drop root privileges after startup.  Keel will setuid/setgid to run_user
+# and run_group once all privileged operations (bind, RLIMIT) are done.
+# Default: 0
+privilege_drop = 0
+
+# If privilege_drop = 1 and the privilege drop fails (e.g. run_user not found),
+# abort startup rather than continue as root.
+# Default: 1
+require_privilege_drop = 1
+
+# Username to switch to after privilege drop.  Must exist on the system.
+# Default: (none)
+# run_user = keel
+
+# Group to switch to after privilege drop.  Must exist on the system.
+# Default: (none)
+# run_group = keel
+
+# Seccomp system-call filter to apply after startup.
+# Values:
+#   off        -- no seccomp filter applied (default)
+#   baseline   -- allow common syscalls needed for normal operation; block
+#                 dangerous ones (execve, ptrace, reboot, etc.)
+#   strict     -- allow only the minimal set of syscalls required by Keel;
+#                 any unexpected syscall terminates the process with SIGKILL
+# Default: off
+seccomp = off
+
+# Abort startup if the requested seccomp mode cannot be applied.
+# Default: 0
+require_seccomp = 0
+
+# Set PR_SET_NO_NEW_PRIVS on the process so that execve() cannot regain
+# elevated privileges (e.g. via setuid binaries).
+# Recommended when running in containers or setuid environments.
+# Default: 0
+no_new_privs = 0
+
+
+# =============================================================================
+# [cluster]  — Multi-Proxy High Availability Cluster
+# =============================================================================
+# Run 2–3 KEEL instances in a coordinated peer group.
+#
+# Peers exchange heartbeats on a dedicated TCP control-plane port.
+# Each heartbeat carries a config checksum; if checksums differ the mismatch
+# is logged and (optionally) the config is synchronised automatically.
+#
+# State machine per peer: UP → SUSPECT → DOWN → UP
+# Failure is declared after 'failure_threshold' consecutive missed heartbeats.
+#
+# Wire protocol: magic 0x4B454C43 ("KELC"), version 1, packed structs, network
+#                byte order.
+#
+# Admin commands:
+#   SHOW CLUSTER              peer table (node_id, addr, state, latency_ms)
+#   SHOW CLUSTER STATS        aggregated cluster health counters
+#   ADD PEER host:port        register a new peer at runtime
+#   REMOVE PEER host:port     deregister a peer at runtime
+#
+# Environment overrides:
+#   KEEL_CLUSTER_ENABLED=1
+#   KEEL_CLUSTER_NODE_ID=keel-0
+#   KEEL_CLUSTER_LISTEN_PORT=9100
+#   KEEL_CLUSTER_INITIAL_PEERS=10.0.0.2:9100,10.0.0.3:9100
+#
+# [cluster]
+
+# Enable the cluster subsystem.
+# Default: false
+# enabled = false
+
+# Logical name for this node, used in gossip messages and admin output.
+# Defaults to "<hostname>:<listen_port>" if not set.
+# node_id = keel-0
+
+# IP address to bind the cluster control-plane listener.
+# Default: 0.0.0.0
+# listen_addr = 0.0.0.0
+
+# TCP port for the cluster control-plane listener.
+# Each KEEL node must expose this port and allow it in firewall/security groups.
+# Default: 9100
+# listen_port = 9100
+
+# How often to send heartbeats to each peer (milliseconds).
+# Default: 1000
+# heartbeat_interval_ms = 1000
+
+# Maximum time without a heartbeat reply before a peer is considered suspect.
+# Default: 5000
+# heartbeat_timeout_ms = 5000
+
+# Number of consecutive missed heartbeats before declaring a peer DOWN.
+# Default: 3
+# failure_threshold = 3
+
+# If true, detect config checksum mismatches between peers and log a warning.
+# Full auto-sync (config push) is planned for a future release.
+# Default: true
+# auto_sync = true
+
+# Enable leader election using a simplified majority-quorum vote (Raft-style).
+# When enabled, the cluster elects a single leader via randomised election
+# timeouts and majority voting.  The elected leader node responds 200 to GET
+# /leadz; non-leaders respond 503.  Use /leadz as a Kubernetes readinessProbe
+# or Keepalived VRRP script to implement a floating VIP with zero external
+# load-balancer infrastructure.
+#
+# IMPORTANT: requires 3+ nodes for split-brain safety.  A 2-node cluster
+# cannot elect a leader when one node is down — use 3+ nodes for HA.
+#
+# Default: true
+# election_enabled = true
+
+# Path to persist election term and voted_for state across process restarts.
+# Prevents duplicate votes within the same election term after a restart.
+# An empty value auto-derives the path from node_id:
+#   /tmp/keel-cluster-<sanitised-node-id>.state
+# Default: (auto)
+# election_state_path = /var/lib/keel/cluster.state
+
+# ---- Floating VIP (bare-metal / VM deployments, Linux only) ----
+#
+# When vip and vip_interface are set, the elected leader automatically runs:
+#   ip addr add <vip> dev <vip_interface>      (to acquire the VIP)
+#   arping -U -q -I <vip_interface> -c 3 <ip>  (gratuitous ARP)
+# and on step-down:
+#   ip addr del <vip> dev <vip_interface>
+#
+# This gives you a floating IP without Keepalived or any external daemon.
+# Requires CAP_NET_ADMIN (run keel as root or grant the capability).
+# Use CIDR notation so the kernel knows the subnet mask.
+#
+# Default: (disabled)
+# vip           = 192.168.1.200/24
+# vip_interface = eth0
+
+# Comma-separated list of peer endpoints to connect to at startup.
+# Format: host:port[,host:port,...]
+# Each peer is contacted and added to the peer registry; transitive discovery
+# propagates additional peers via gossip.
+# Default: (none — standalone mode)
+# initial_peers = 10.0.0.2:9100,10.0.0.3:9100
+
+
+# =============================================================================
+# [audit]  — Security Audit Logging
+# =============================================================================
+# Emit a structured security audit log for compliance, forensics, and
+# intrusion detection.
+#
+# Each audit event contains: timestamp, event_type, client_addr, username,
+# database, query digest (for query events), outcome (allow/deny), and an
+# optional error message.
+#
+# NDJSON format (one JSON object per line) is suitable for shipping to
+# Elasticsearch, Loki, CloudWatch, Splunk, etc.
+#
+# [audit]
+
+# Enable audit logging.
+# Default: false
+# enabled = false
+
+# File to write audit events to.  Use "-" to write to stdout.
+# If omitted (and enabled = true), writes to stderr.
+# Default: (none)
+# output_file = /var/log/keel/audit.log
+
+# Output format:
+#   json  — NDJSON (one JSON object per line), recommended for log aggregators
+#   text  — Human-readable single-line text format
+# Default: json
+# format = json
+
+# Comma-separated list of event types to log.  Valid values:
+#   auth    — authentication success/failure events
+#   admin   — admin console commands
+#   query   — SQL queries (see log_queries_min_duration for filtering)
+#   pool    — pool state changes (connect, disconnect, eviction)
+#   all     — all of the above
+# Default: auth,admin
+# events = auth,admin
+
+# Only log query events where the query took longer than this many milliseconds.
+# 0 = log all queries (when 'query' is in events).
+# -1 = disable query event logging even if 'query' is in events.
+# Default: 0
+# log_queries_min_duration_ms = 0
+
+# Syslog facility to use when writing to syslog.
+# Valid values: daemon, local0 .. local7
+# Only used if output_file = syslog.
+# Default: daemon
+# syslog_facility = daemon
+
+# Rotate the audit log on SIGHUP (rename + reopen).
+# Default: true
+# rotate_on_sighup = true
+
+
+# =============================================================================
+# [throttle.N]  — Query Throttling Rules  (N = 1, 2, 3, ...)
+# =============================================================================
+# Token-bucket rate limiting applied before a query is routed to a backend.
+# Multiple rules can be defined; they are evaluated in order by rule number.
+# The first matching rule is applied.
+#
+# If a rule matches and the bucket is empty the query is rejected with a
+# configurable error message (no backend connection is consumed).
+#
+# Admin command:
+#   SHOW THROTTLE RULES    List all active throttle rules
+#
+# Example: limit all queries for user 'analytics' to 100 QPS with a burst of 20.
+#
+# [throttle.1]
+
+# User pattern to match.  Glob or exact username.  '*' matches all users.
+# Default: (not set — rule does not filter by user)
+# match_user = analytics
+
+# Database pattern to match.  Glob or exact db name.  '*' matches all.
+# Default: (not set — rule does not filter by database)
+# match_db = *
+
+# POSIX extended regular expression matched against the full SQL text.
+# Default: (not set — rule matches any SQL)
+# match_regex = .*
+
+# Sustained query rate (queries per second) for the token bucket.
+# Default: 1000
+# rate_per_second = 100
+
+# Maximum burst size (tokens in bucket at start and after idle period).
+# A burst of 1.5× the rate is a good default.
+# Default: 100
+# burst_size = 20
+
+# SQL error message sent to the client when the rule triggers.
+# Default: "query rate limit exceeded"
+# reject_message = "Rate limit exceeded. Please reduce query frequency."
+
+# [throttle.2]
+# match_user = *
+# match_db   = reporting
+# rate_per_second = 50
+# burst_size      = 10
+
+
+# =============================================================================
+# [query_rule.NAME]  — Declarative Query Rules
+# =============================================================================
+# INI-driven routing, rewriting, and blocking — no Lua/Python hook code needed.
+# Rules are evaluated after SQL parsing, before routing.
+# The rule with the lowest 'priority' number wins when multiple rules match.
+#
+# Actions:
+#   route    — override the default routing decision (primary / replica / any)
+#   rewrite  — replace the SQL text before sending to the backend
+#   block    — reject the query with a synthetic error (no backend consumed)
+#
+# Admin command:
+#   SHOW QUERY RULES              List all query rules
+#   SELECT * FROM query_rules     Same via SQL virtual table
+#   EXPLAIN QUERY RULE FOR '<sql>' Show which rule would match
+#
+# Reload: SIGHUP reloads all query rules atomically.
+#
+# Example A: route reporting queries to replicas
+# [query_rule.reporting]
+# match_regex = ^SELECT\s+.*\s+FROM\s+(orders|invoices)
+# match_user  = *
+# action      = route
+# route_target = replica
+# priority    = 10
+
+# Example B: block dangerous DDL in the pool (not a migration user)
+# [query_rule.block_ddl]
+# match_regex = ^(DROP|TRUNCATE)\s+TABLE
+# action      = block
+# error_message = DDL not permitted via connection pool. Use a direct connection.
+# priority    = 5
+
+# Example C: rewrite a table name for zero-downtime rename
+# [query_rule.rename_users]
+# match_regex   = \busers_old\b
+# action        = rewrite
+# rewrite_sql   = <original> with s/users_old/users_new/g
+# priority      = 20
+
+# [query_rule.NAME]
+
+# POSIX extended regular expression matched against the full SQL text (case-insensitive).
+# Required.
+# match_regex = ^SELECT
+
+# Username (exact or glob) this rule applies to.  '*' = all users.
+# Default: * (all users)
+# match_user = *
+
+# Database name (exact or glob) this rule applies to.  '*' = all databases.
+# Default: * (all databases)
+# match_db = *
+
+# Action to take when the rule matches.
+# Values: route | rewrite | block
+# Required.
+# action = route
+
+# For action = route: where to send the query.
+# Values: primary | replica | any
+# Default: primary
+# route_target = replica
+
+# For action = rewrite: new SQL text.  Use \1, \2 for capture groups from match_regex.
+# rewrite_sql = SELECT * FROM new_table WHERE id = \1
+
+# For action = block: error message returned to the client.
+# error_message = Query not permitted via connection pool.
+
+# Lower numbers are evaluated first.  Ties broken by declaration order.
+# Default: 100
+# priority = 10
+
+
+# =============================================================================
+# [worker_group.NAME.shard_rule.TABLE]  — Horizontal Sharding (per-group)
+# =============================================================================
+# Transparent client-side sharding: KEEL extracts the shard key from the SQL
+# AST and routes the query to the correct backend without application changes.
+#
+# Shard rules are SCOPED to a worker group: each [worker_group.NAME] section
+# owns its own shard rules under [worker_group.NAME.shard_rule.TABLE].
+# Different worker groups can define completely independent shard topologies
+# in the same config file without any conflict or cross-contamination.
+#
+# Strategies:
+#   modulo  — shard_index = abs(int64(key_value)) % shard_count
+#   hash    — shard_index = xxhash64(key_value_as_string) % shard_count
+#   range   — shard_index from sorted threshold table (see shard_ranges below)
+#
+# Single-key DML (SELECT/INSERT/UPDATE/DELETE) is routed to one shard.
+# Multi-key and key-absent queries trigger scatter to all shards; results are
+# merged and returned to the client as a single result set.
+#
+# Admin commands:
+#   SHOW SHARD RULES                  list all rules
+#   SELECT * FROM shard_rules         same via SQL virtual table
+#   EXPLAIN SHARD PLAN FOR '<sql>'    show routing plan without execution
+#
+# Prometheus metrics: keel_shard_queries_total{rule,shard}, keel_shard_scatter_total
+#
+# Reload: SIGHUP reloads shard rules per worker group without connection loss.
+#
+# [worker_group.myapp.shard_rule.users]
+
+# Logical name for the rule — used in admin output and Prometheus labels.
+# Required (section name, scoped to the worker group).
+
+# Table name to match (case-insensitive).
+# Required.
+# table = users
+
+# Column name to use as the shard key.
+# Required.
+# key_column = user_id
+
+# Sharding strategy.  Values: modulo | hash | range
+# Default: modulo
+# strategy = modulo
+
+# Number of shards (for modulo and hash strategies).
+# Must equal the number of servers in [worker_group.NAME.shard_rule.TABLE.servers].
+# Required for modulo/hash.
+# shards = 4
+
+# For strategy = range: list of INT64 upper bounds, one per shard.
+# The last entry should be the maximum possible value for an open-ended range.
+# Example: 3 shards covering [0,1000), [1000,5000), [5000,∞)
+# shard_ranges = 999,4999,9223372036854775807
+
+# Connection pool per shard.
+# min_shard_pool_size = 2
+# max_shard_pool_size = 20
+# shard_idle_timeout_ms = 60000
+# shard_connect_timeout_ms = 2000
+
+# [worker_group.myapp.shard_rule.users.servers]
+# Each key is a logical shard label; value is the DSN for that shard.
+# The number of entries must match the 'shards' setting (for modulo/hash).
+# Format: host=<h> port=<p> dbname=<db> user=<u> password=<pw>
+#
+# shard0 = host=shard0.db.internal port=5432 dbname=app user=app password=s3cr3t
+# shard1 = host=shard1.db.internal port=5432 dbname=app user=app password=s3cr3t
+# shard2 = host=shard2.db.internal port=5432 dbname=app user=app password=s3cr3t
+# shard3 = host=shard3.db.internal port=5432 dbname=app user=app password=s3cr3t
+
+# ---- Second shard rule example (range strategy, different worker group) ----
+# [worker_group.orders-app.shard_rule.orders]
+# table        = orders
+# key_column   = order_id
+# strategy     = range
+# shard_ranges = 999999,1999999,9223372036854775807
+#
+# [worker_group.orders-app.shard_rule.orders.servers]
+# shard0 = host=orders-0.db port=5432 dbname=orders user=app password=s3cr3t
+# shard1 = host=orders-1.db port=5432 dbname=orders user=app password=s3cr3t
+# shard2 = host=orders-2.db port=5432 dbname=orders user=app password=s3cr3t
+
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Example A: MySQL / MariaDB back-end
+# prepared_statement is not applicable to MySQL (MySQL manages PS per-session).
+# -----------------------------------------------------------------------------
+# [worker_group.mysql_app]
+# name               = mysql_app
+# bind_addr          = 0.0.0.0
+# bind_port          = 3306
+# num_workers        = 4
+# protocol           = mysql
+# default_database   = mydb
+# server_user        = root
+# server_password    = rootpass
+# min_pool_size      = 5
+# max_pool_size      = 50
+# idle_timeout_ms    = 120000
+# connect_timeout_ms = 3000
+# probe              = tcp
+# probe_interval     = 3000
+# probe_retries      = 2
+#
+# [worker_group.mysql_app.servers]
+# primary  = host=127.0.0.1 port=3306 dbname=mydb user=root password=rootpass role=RW weight=100
+# replica1 = host=127.0.0.2 port=3306 dbname=mydb user=root password=rootpass role=RO weight=100
+
+# -----------------------------------------------------------------------------
+# Example B: PostgreSQL + Patroni HA + read/write splitting + ORM support
+#
+# - Patroni HTTP probe: 'probe = patroni:<port>' where <port> is the Patroni
+#   REST API port (default 8008).  Keel probes GET /primary and /replica on
+#   each node to detect the current role automatically.  No patroni_url key
+#   is needed — the host is taken from the server definition.
+# - 'role=auto' defers role detection entirely to the probe.
+# - `virtualize` PS mode for SQLAlchemy / asyncpg / pgx applications
+# - `transaction_tracking` for read-after-write consistency on replicas
+# -----------------------------------------------------------------------------
+# [worker_group.patroni]
+# name                    = patroni
+# bind_addr               = 0.0.0.0
+# bind_port               = 5433
+# num_workers             = 8
+# protocol                = postgresql
+# default_database        = production
+# server_user             = app
+# server_password         = apppass
+# min_pool_size           = 10
+# max_pool_size           = 200
+# pool_max_waiting        = 500
+# idle_timeout_ms         = 60000
+# connect_timeout_ms      = 2000
+# pool_prune_interval_ms  = 5000
+# pool_refill_interval_ms = 2000
+# pool_refill_backoff_ms  = 500
+# probe                   = patroni:8008   # Patroni REST API port
+# probe_interval          = 2000
+# probe_timeout           = 1000
+# probe_retries           = 2
+# failover_delay          = 1000
+# prepared_statement      = virtualize   # ORMs use extended query protocol
+# transaction_tracking    = on           # read-after-write consistency
+#
+# [worker_group.patroni.servers]
+# node1 = host=10.0.0.1 port=5432 dbname=production user=app password=apppass role=auto weight=100
+# node2 = host=10.0.0.2 port=5432 dbname=production user=app password=apppass role=auto weight=100
+# node3 = host=10.0.0.3 port=5432 dbname=production user=app password=apppass role=auto weight=100
+
+# -----------------------------------------------------------------------------
+# Example C: Analytics / data-warehouse workload
+#
+# - io_uring buffer rings for large result sets (Linux 5.19+)
+# - anonymous PS mode: queries are one-shot (no plan cache benefit anyway)
+# - No transaction tracking needed (read-only workload, no replicas)
+# Memory: 8 workers x 256 slots x 65536 B = 128 MiB
+# -----------------------------------------------------------------------------
+# [worker_group.analytics]
+# name                 = analytics
+# bind_addr            = 0.0.0.0
+# bind_port            = 5434
+# num_workers          = 8
+# protocol             = postgresql
+# default_database     = warehouse
+# server_user          = reports
+# server_password      = reportspass
+# min_pool_size        = 4
+# max_pool_size        = 100
+# idle_timeout_ms      = 600000
+# use_buf_rings        = 1
+# buf_ring_size        = 256
+# probe                = tcp
+# prepared_statement   = anonymous   # single-use queries; no plan cache needed
+# transaction_tracking = off         # read-only workload
+#
+# [worker_group.analytics.servers]
+# warehouse = host=10.0.1.10 port=5432 dbname=warehouse user=reports password=reportspass role=RW weight=100
+
+# -----------------------------------------------------------------------------
+# Example D: MySQL Galera cluster with exec probe
+# -----------------------------------------------------------------------------
+# [worker_group.galera]
+# name               = galera
+# bind_addr          = 0.0.0.0
+# bind_port          = 3307
+# num_workers        = 4
+# protocol           = mysql
+# default_database   = shop
+# server_user        = shopuser
+# server_password    = shoppass
+# min_pool_size      = 5
+# max_pool_size      = 80
+# probe              = exec
+# probe_interval     = 5000
+# probe_timeout      = 3000
+# probe_retries      = 3
+# failover_delay     = 3000
+#
+# [worker_group.galera.servers]
+# node1 = host=10.1.0.1 port=3306 dbname=shop user=shopuser password=shoppass role=RW weight=100
+# node2 = host=10.1.0.2 port=3306 dbname=shop user=shopuser password=shoppass role=RO weight=100
+# node3 = host=10.1.0.3 port=3306 dbname=shop user=shopuser password=shoppass role=RO weight=100
+
+# -----------------------------------------------------------------------------
+# Example E: PostgreSQL — legacy Java app with JDBC+simple-query PREPARE
+#
+# Older JDBC drivers send: PREPARE stmt AS SELECT ... (simple query protocol)
+# then use Bind/Execute from the extended query protocol.
+# 'tracking' mode ensures Keel can replay these statements on new backends.
+# -----------------------------------------------------------------------------
+# [worker_group.java_legacy]
+# name                 = java_legacy
+# bind_addr            = 0.0.0.0
+# bind_port            = 5435
+# num_workers          = 4
+# protocol             = postgresql
+# default_database     = app
+# server_user          = appuser
+# server_password      = apppass
+# min_pool_size        = 10
+# max_pool_size        = 100
+# probe                = query
+# probe_interval       = 5000
+# probe_retries        = 3
+# prepared_statement   = tracking   # intercepts both simple and extended PS
+# transaction_tracking = off
+#
+# [worker_group.java_legacy.servers]
+# primary  = host=10.2.0.1 port=5432 dbname=app user=appuser password=apppass role=RW weight=100
+# replica1 = host=10.2.0.2 port=5432 dbname=app user=appuser password=apppass role=RO weight=100
+
+# ============================================================================
+# F. Multi-Proxy HA / Cluster Mode
+# ============================================================================
+# Cluster mode enables multiple KEEL instances to form a peer group for
+# high availability.  Peers exchange heartbeats over a dedicated TCP port,
+# detect failures (UP → SUSPECT → DOWN), and propagate server topology
+# changes automatically.
+#
+# The cluster subsystem uses a dedicated control-plane thread — no impact
+# on the data-plane worker event loops.
+#
+# Admin commands:
+#   SHOW CLUSTER          Peer table with status, latency, heartbeat counts
+#   SHOW CLUSTER STATS    Aggregated cluster statistics
+#   ADD PEER host:port    Register a new peer at runtime
+#   REMOVE PEER host:port Deregister a peer at runtime
+#
+# Wire protocol: magic 0x4B454C43 ("KELC"), version 1, packed structs,
+#                network byte order.
+#
+# Gossip: each heartbeat carries a config checksum.  If checksums differ
+#         between peers, a mismatch is logged (auto-sync is phase 2).
+#
+# [cluster]
+# enabled               = false
+# node_id               =           ; auto-generated from hostname:port if empty
+# listen_addr           = 0.0.0.0
+# listen_port           = 9100
+# heartbeat_interval_ms = 1000      ; how often to send heartbeats (ms)
+# heartbeat_timeout_ms  = 5000      ; peer health timeout (ms)
+# failure_threshold     = 3         ; consecutive failures → DOWN
+# auto_sync             = true      ; detect config mismatches via gossip
+# initial_peers         = 10.0.0.2:9100,10.0.0.3:9100
+
+# ============================================================================
+# Example F: Kubernetes / Helm Deployment (PostgreSQL + Patroni)
+#
+# In Kubernetes, all settings can be overridden via KEEL_* environment variables
+# (useful for Secrets/ConfigMaps without writing a full keel.ini).
+#
+# Environment variable override convention:
+#   KEEL_WORKER_GROUP_0_BIND_PORT=5432
+#   KEEL_WORKER_GROUP_0_SERVER_PASSWORD=<injected from Secret>
+#   KEEL_PROMETHEUS_LISTEN_PORT=9187
+#
+# See docker/docker-entrypoint.sh for the full env→ini translation.
+# ============================================================================
+# [worker_group.k8s_app]
+# name                 = k8s_app
+# bind_addr            = 0.0.0.0
+# bind_port            = 5432
+# num_workers          = 0         # auto = number of vCPUs
+# protocol             = postgresql
+# default_database     = app
+# server_user          = app
+# server_password      = changeme  # use KEEL_WORKER_GROUP_0_SERVER_PASSWORD in K8s
+# min_pool_size        = 5
+# max_pool_size        = 100
+# probe                = patroni:8008
+# probe_interval       = 3000
+# probe_retries        = 2
+# prepared_statement   = virtualize
+# transaction_tracking = on
+#
+# [worker_group.k8s_app.servers]
+# node1 = host=postgres-0.postgres.default.svc.cluster.local port=5432 dbname=app user=app password=changeme role=auto weight=100
+# node2 = host=postgres-1.postgres.default.svc.cluster.local port=5432 dbname=app user=app password=changeme role=auto weight=100
+# node3 = host=postgres-2.postgres.default.svc.cluster.local port=5432 dbname=app user=app password=changeme role=auto weight=100
+
+# ============================================================================
+# Example G: Horizontal Sharding — 4 PostgreSQL shards
+#
+# The application issues queries like:
+#   SELECT * FROM users WHERE user_id = 12345
+# KEEL extracts user_id, computes 12345 % 4 = 1, routes to shard1.
+# INSERT / UPDATE / DELETE are likewise routed.
+# Queries without a WHERE user_id = ? clause are scattered to all shards.
+# ============================================================================
+# [worker_group.sharded_app]
+# name          = sharded_app
+# bind_addr     = 0.0.0.0
+# bind_port     = 5432
+# num_workers   = 4
+# protocol      = postgresql
+# server_user   = app
+# server_password = secret
+# min_pool_size = 2
+# max_pool_size = 40   # 10 per shard
+#
+# [shard_rule.users]
+# table      = users
+# key_column = user_id
+# strategy   = modulo
+# shards     = 4
+#
+# [shard_rule.users.servers]
+# shard0 = host=shard0.db.internal port=5432 dbname=app user=app password=secret
+# shard1 = host=shard1.db.internal port=5432 dbname=app user=app password=secret
+# shard2 = host=shard2.db.internal port=5432 dbname=app user=app password=secret
+# shard3 = host=shard3.db.internal port=5432 dbname=app user=app password=secret
+
+# ============================================================================
+# Example H: Multi-Proxy HA Cluster (3 nodes)
+#
+# Deploy three KEEL instances behind a load balancer (e.g. AWS NLB, HAProxy).
+# Each node forms a peer group: heartbeats keep roles in sync; if one node
+# crashes, the other two continue serving client connections.
+#
+# Node 0 (10.0.0.1):
+# ============================================================================
+# [worker_group.prod]
+# bind_addr   = 0.0.0.0
+# bind_port   = 5432
+# protocol    = postgresql
+# server_user = app
+# server_password = secret
+# min_pool_size = 10
+# max_pool_size = 200
+# probe       = patroni:8008
+#
+# [worker_group.prod.servers]
+# db1 = host=10.0.1.1 port=5432 dbname=prod user=app password=secret role=auto weight=100
+# db2 = host=10.0.1.2 port=5432 dbname=prod user=app password=secret role=auto weight=100
+#
+# [cluster]
+# enabled       = true
+# node_id       = keel-0
+# listen_port   = 9100
+# initial_peers = 10.0.0.2:9100,10.0.0.3:9100
+#
+# ------ Node 1 (10.0.0.2) — same worker_group, different cluster section ----
+# [cluster]
+# enabled       = true
+# node_id       = keel-1
+# listen_port   = 9100
+# initial_peers = 10.0.0.1:9100,10.0.0.3:9100
+
+# ============================================================================
+# Example I: Enterprise Authentication — LDAP + mTLS
+#
+# Clients authenticate via:
+#   1. Client certificate (CN extracted as username)
+#   2. LDAP bind to verify the password
+# No credentials are stored in keel.ini.
+# ============================================================================
+# [worker_group.enterprise]
+# name          = enterprise
+# bind_addr     = 0.0.0.0
+# bind_port     = 5432
+# protocol      = postgresql
+# server_user   = app
+# server_password = (set via KEEL_WORKER_GROUP_0_SERVER_PASSWORD)
+# min_pool_size = 5
+# max_pool_size = 100
+# auth_method   = ldap
+# tls_mode      = require
+# tls_cert_file = /etc/keel/certs/server.pem
+# tls_key_file  = /etc/keel/certs/server.key
+# tls_ca_file   = /etc/keel/certs/client-ca.pem
+# tls_verify_peer = require   # enforce client cert
+# ldap_url        = ldaps://ldap.corp.example.com:636
+# ldap_base_dn    = dc=corp,dc=example,dc=com
+# ldap_bind_dn    = cn=keelbind,ou=service,dc=corp,dc=example,dc=com
+# ldap_bind_password = bindpass
+# ldap_uid_attr   = sAMAccountName
+#
+# [worker_group.enterprise.servers]
+# primary = host=db.corp.example.com port=5432 dbname=app user=app password=secret role=RW weight=100
+
+# ============================================================================
+# Example J: AWS RDS with IAM Authentication
+#
+# Keel generates a short-lived IAM auth token (SigV4, valid 15 minutes) and
+# uses it as the server password.  No static passwords stored anywhere.
+# Rotate max_connection_age_ms to ≤ 14 minutes to avoid token expiry.
+# ============================================================================
+# [worker_group.aws_rds]
+# name                  = aws_rds
+# bind_addr             = 0.0.0.0
+# bind_port             = 5432
+# protocol              = postgresql
+# server_user           = app
+# cloud_auth_provider   = aws
+# cloud_auth_region     = us-east-1
+# cloud_auth_account_id = 123456789012
+# max_connection_age_ms = 840000    # 14 minutes (token TTL × 0.93)
+# min_pool_size         = 5
+# max_pool_size         = 100
+# backend_tls_mode      = require   # RDS requires TLS
+# probe                 = tcp
+#
+# [worker_group.aws_rds.servers]
+# primary = host=mydb.cluster-xxxx.us-east-1.rds.amazonaws.com port=5432 dbname=app user=app role=RW weight=100
+
+# ============================================================================
+# Example K: Audit Logging + Query Throttling (Compliance Deployment)
+#
+# Emit NDJSON audit events for all auth and admin activity.
+# Rate-limit the 'analytics' user to 50 QPS to protect OLTP neighbours.
+# ============================================================================
+# [audit]
+# enabled     = true
+# output_file = /var/log/keel/audit.log
+# format      = json
+# events      = auth,admin,query
+# log_queries_min_duration_ms = 100   # log slow queries
+#
+# [throttle.1]
+# match_user      = analytics
+# rate_per_second = 50
+# burst_size      = 10
+# reject_message  = "Analytics QPS limit reached. Please retry after 1 second."
+#
+# [throttle.2]
+# match_user      = *
+# match_regex     = ^(SELECT|WITH)\s+.*\sFROM\s+audit_log
+# rate_per_second = 5
+# burst_size      = 2
+# reject_message  = "Direct audit_log queries are rate-limited."

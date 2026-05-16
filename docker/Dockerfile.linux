@@ -1,0 +1,298 @@
+# syntax=docker/dockerfile:1
+# ============================================================================
+# KEEL — Linux Docker Build
+# ============================================================================
+# Multi-stage Dockerfile for building and running KEEL on Linux (io_uring).
+# Intended for use from macOS via ./docker/build-linux.sh.
+#
+# Stages:
+#   builder  — full build environment; compiles the keel binary
+#   tester   — runs the unit-test suite (FROM builder)
+#   runner   — minimal runtime image with just the keel binary
+#
+# Usage:
+#   # Build binary only (no tests)
+#   docker build --target builder -t keel-linux-build -f docker/Dockerfile.linux .
+#
+#   # Build + run tests
+#   docker build --target tester -t keel-linux-test -f docker/Dockerfile.linux .
+#
+#   # Produce final minimal runtime image
+#   docker build --target runner -t keel:linux -f docker/Dockerfile.linux .
+#
+# Or use the helper: ./docker/build-linux.sh [build|test|image|run|shell|clean]
+# ============================================================================
+
+# ============================================================================
+# Stage 0 — devenv  (tools only, no source — source is bind-mounted at runtime)
+#
+# Supports the fast inner-loop dev workflow from macOS:
+#   docker/build-linux.sh dev build    → incremental cmake/ninja inside container
+#   docker/build-linux.sh dev test     → run unit tests
+#   docker/build-linux.sh dev sysbench → run sysbench through keel
+#   docker/build-linux.sh dev shell    → interactive shell
+#
+# The project root is mounted at /keel; cmake build dir is /keel/build-linux.
+# A named volume (keel-build-cache) keeps the build cache across runs.
+# ============================================================================
+FROM ubuntu:24.04 AS devenv
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # ── Toolchain ──────────────────────────────────────────────────────────
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    git \
+    gh \
+    clang \
+    lldb \
+    llvm \
+    clang-format \
+    # ── io_uring ───────────────────────────────────────────────────────────
+    liburing-dev \
+    # ── TLS / crypto ───────────────────────────────────────────────────────
+    libssl-dev \
+    ca-certificates \
+    # ── Wire-protocol compression (zlib always present; zstd for WAN) ──────
+    zlib1g-dev \
+    libzstd-dev \
+    # ── Lua 5.4 (hook scripting support) ───────────────────────────────────
+    lua5.4 \
+    liblua5.4-dev \
+    # ── Python 3 (hook scripting support) ──────────────────────────────────
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    # ── Debugger / tracer ──────────────────────────────────────────────────
+    gdb \
+    gdbserver \
+    strace \
+    ltrace \
+    # ── Memory analysis ────────────────────────────────────────────────────
+    valgrind \
+    # AddressSanitizer / UBSan runtime libraries (for -DKEEL_ENABLE_ASAN=ON)
+    libasan8 \
+    libubsan1 \
+    # ── Profiling ──────────────────────────────────────────────────────────
+    linux-tools-generic \
+    linux-tools-common \
+    # ── Binary analysis ────────────────────────────────────────────────────
+    binutils \
+    patchelf \
+    # ── Network troubleshooting ────────────────────────────────────────────
+    iproute2 \
+    iputils-ping \
+    ethtool \
+    mtr-tiny \
+    tcpdump \
+    nmap \
+    netcat-openbsd \
+    socat \
+    dnsutils \
+    net-tools \
+    nftables \
+    iptables \
+    bridge-utils \
+    conntrack \
+    whois \
+    iperf3 \
+    traceroute \
+    # ── Process / system introspection ─────────────────────────────────────
+    lsof \
+    htop \
+    procps \
+    psmisc \
+    # ── Utilities ──────────────────────────────────────────────────────────
+    curl \
+    wget \
+    jq \
+    yq \
+    ripgrep \
+    fd-find \
+    rsync \
+    unzip \
+    zip \
+    tree \
+    tmux \
+    screen \
+    ncdu \
+    file \
+    xxd \
+    gawk \
+    gnupg \
+    openssl \
+    openssh-client \
+    openssh-server \
+    sshpass \
+    telnet \
+    less \
+    nano \
+    vim \
+    postgresql-client \
+    mysql-client \
+    redis-tools \
+    sysbench \
+    man-db \
+    groff-base \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /run/sshd /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && ssh-keygen -A \
+    && printf "\nPermitRootLogin yes\nPasswordAuthentication yes\nUsePAM no\n" >> /etc/ssh/sshd_config
+
+RUN cat > /usr/local/bin/perf << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+kernel_perf="/usr/lib/linux-tools-$(uname -r)/perf"
+if [[ -x "$kernel_perf" ]]; then
+    exec "$kernel_perf" "$@"
+fi
+
+fallback_perf="$(ls -1 /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true)"
+if [[ -n "$fallback_perf" && -x "$fallback_perf" ]]; then
+    echo "[keel-devenv] linuxkit kernel-specific perf binary not found for $(uname -r); using $fallback_perf" >&2
+    exec "$fallback_perf" "$@"
+fi
+
+echo "[keel-devenv] No perf binary found under /usr/lib/linux-tools" >&2
+exit 127
+EOF
+RUN chmod +x /usr/local/bin/perf
+
+# Configure script run at container start: idempotently runs cmake configure
+# if build-linux/CMakeCache.txt doesn't exist yet, then hands off to CMD.
+COPY docker/devenv-init.sh /usr/local/bin/devenv-init.sh
+RUN chmod +x /usr/local/bin/devenv-init.sh
+
+WORKDIR /keel
+
+ENTRYPOINT ["/usr/local/bin/devenv-init.sh"]
+CMD ["bash"]
+
+# ============================================================================
+# Stage 1 — builder
+# ============================================================================
+FROM ubuntu:24.04 AS builder
+
+LABEL org.opencontainers.image.title="keel-linux-build"
+LABEL org.opencontainers.image.description="KEEL build environment (Linux / io_uring)"
+
+# Avoid interactive prompts from apt
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build-time dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # ── Toolchain ──────────────────────────────────────────────────────────
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    git \
+    # ── io_uring support (Linux 5.6+) ──────────────────────────────────────
+    liburing-dev \
+    # ── TLS / authentication ───────────────────────────────────────────────
+    libssl-dev \
+    # ── Wire-protocol compression ──────────────────────────────────────────
+    zlib1g-dev \
+    libzstd-dev \
+    # ── Lua 5.4 ────────────────────────────────────────────────────────────
+    lua5.4 \
+    liblua5.4-dev \
+    # ── Python 3 ───────────────────────────────────────────────────────────
+    python3 \
+    python3-dev \
+    # ── Debugging helpers (available in the builder image) ─────────────────
+    gdb \
+    strace \
+    valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /keel
+
+# Copy the full source tree
+COPY CMakeLists.txt README.md LICENSE ./
+COPY cmake/           cmake/
+COPY include/         include/
+COPY src/             src/
+COPY tests/           tests/
+COPY etc/             etc/
+COPY docker/keel/     docker/keel/
+
+# Configure and build
+RUN cmake -B build-linux -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DKEEL_USE_IOURING=ON \
+        -DKEEL_USE_EPOLL=ON \
+        -DKEEL_ENABLE_TESTS=ON \
+        -DKEEL_ENABLE_LUA=ON \
+        -DKEEL_ENABLE_PYTHON=ON \
+    && cmake --build build-linux
+
+# Quick sanity check
+RUN ls -lh build-linux/src/main/keel
+
+# ============================================================================
+# Stage 2 — tester  (extends builder; runs the full unit-test suite)
+# ============================================================================
+FROM builder AS tester
+
+WORKDIR /keel/build-linux
+
+# Runs every test and prints detailed output on failure
+RUN ctest --output-on-failure -j"$(nproc)"
+
+# ============================================================================
+# Stage 3 — runner  (minimal production image)
+# ============================================================================
+FROM ubuntu:24.04 AS runner
+
+LABEL org.opencontainers.image.title="keel"
+LABEL org.opencontainers.image.description="KEEL high-performance database proxy (Linux)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime dependencies only (no headers, no build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    liburing2 \
+    libssl3 \
+    ca-certificates \
+    # Wire-protocol compression runtimes
+    zlib1g \
+    libzstd1 \
+    netcat-openbsd \
+    # Scripting language runtimes (must match builder versions)
+    liblua5.4-0 \
+    libpython3.12 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dedicated non-root user
+RUN groupadd -r keel && useradd -r -g keel -s /sbin/nologin keel
+
+# Binary from builder stage
+COPY --from=builder /keel/build-linux/src/main/keel /usr/local/bin/keel
+RUN chmod 0755 /usr/local/bin/keel
+
+# Config and runtime directories
+RUN mkdir -p /etc/keel /var/log/keel \
+    && chown keel:keel /etc/keel /var/log/keel
+
+# Default config (override at runtime with -v or environment)
+COPY --from=builder /keel/etc/keel.ini.example /etc/keel/keel.ini.example
+COPY docker/keel/keel-cluster.ini /etc/keel/keel-cluster.ini.example
+
+USER keel
+
+# PostgreSQL proxy, MySQL proxy, admin console, cluster peer, Prometheus metrics
+EXPOSE 7432 7306 6433 9100 9101
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD nc -z 127.0.0.1 6433 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/keel"]
+CMD ["-c", "/etc/keel/keel.ini"]

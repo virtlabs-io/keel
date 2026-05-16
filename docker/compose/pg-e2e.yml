@@ -1,0 +1,255 @@
+# End-to-End Test Docker Compose
+# PostgreSQL Cluster (1 Primary + 2 Replicas) + KEEL Proxy + pgbench
+#
+# Usage:
+#   ./docker/test-pg-e2e-full.sh
+#
+# Components:
+#   - pgsql-01:  PostgreSQL primary (port 5432 internal)
+#   - pgsql-02: PostgreSQL replica (port 5432 internal)
+#   - pgsql-03: PostgreSQL replica (port 5432 internal)
+#   - keel:         KEEL connection pooler (port 6432)
+#   - pgbench:     pgbench stress test client
+
+name: keel-pg-e2e
+
+services:
+  # ==========================================================================
+  # Primary PostgreSQL
+  # ==========================================================================
+  pgsql-01:
+    image: postgres:16-alpine
+    container_name: e2e-pgsql-01
+    hostname: pgsql-01
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - e2e_primary_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-e2e-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb && psql -U postgres -d testdb -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ==========================================================================
+  # Replica 1
+  # ==========================================================================
+  pgsql-02:
+    image: postgres:16-alpine
+    container_name: e2e-pgsql-02
+    hostname: pgsql-02
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "[replica1] Waiting for primary to be ready..."
+        until pg_isready -h pgsql-01 -p 5432 -U postgres; do
+          sleep 2
+        done
+        sleep 5
+        
+        echo "[replica1] Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-01 -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        
+        chmod 700 /var/lib/postgresql/data
+        
+        echo "[replica1] Adding config overrides..."
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" >> /var/lib/postgresql/data/postgresql.conf
+        
+        echo "[replica1] Starting replica..."
+        exec postgres
+    volumes:
+      - e2e_replica1_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    networks:
+      - e2e-network
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ==========================================================================
+  # Replica 2
+  # ==========================================================================
+  pgsql-03:
+    image: postgres:16-alpine
+    container_name: e2e-pgsql-03
+    hostname: pgsql-03
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "[replica2] Waiting for primary to be ready..."
+        until pg_isready -h pgsql-01 -p 5432 -U postgres; do
+          sleep 2
+        done
+        sleep 7
+        
+        echo "[replica2] Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-01 -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        
+        chmod 700 /var/lib/postgresql/data
+        
+        echo "[replica2] Adding config overrides..."
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" >> /var/lib/postgresql/data/postgresql.conf
+        
+        echo "[replica2] Starting replica..."
+        exec postgres
+    volumes:
+      - e2e_replica2_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    networks:
+      - e2e-network
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ==========================================================================
+  # KEEL Connection Pooler
+  # ==========================================================================
+  keel:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+      target: runner
+    container_name: e2e-keel-proxy
+    hostname: keel
+    security_opt:
+      - seccomp:unconfined
+    command: ["-c", "/etc/keel/keel-e2e.ini"]
+    environment:
+      KEEL_LOG_LEVEL: 2
+    volumes:
+      - ../keel/keel-e2e.ini:/etc/keel/keel-e2e.ini:ro
+      - ../keel/userlist.txt:/etc/keel/userlist.txt:ro
+    ports:
+      - "16432:6432"
+    networks:
+      - e2e-network
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+      pgsql-02:
+        condition: service_healthy
+      pgsql-03:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6432 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ==========================================================================
+  # pgbench Stress Test Client
+  # ==========================================================================
+  pgbench:
+    image: postgres:16-alpine
+    container_name: e2e-pgbench
+    hostname: pgbench
+    environment:
+      PGHOST: keel
+      PGPORT: 6432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: testdb
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "=========================================="
+        echo "  KEEL End-to-End Stress Test"
+        echo "=========================================="
+        echo ""
+        
+        echo "[pgbench] Waiting for KEEL proxy to be ready..."
+        until pg_isready -h keel -p 6432 -U postgres -d testdb; do
+          sleep 2
+        done
+        sleep 3
+        
+        echo "[pgbench] Testing basic connectivity..."
+        psql -h keel -p 6432 -U postgres -d testdb -c "SELECT 'Connected via KEEL proxy' AS status;"
+        
+        echo ""
+        # pgbench -i (init) does DROP/CREATE TABLE — must hit the primary
+        # directly.  Routing init through KEEL would race between backends;
+        # a replica receives the DROP TABLE and returns
+        # "cannot execute DROP TABLE in a read-only transaction".
+        echo "[pgbench] Initializing pgbench tables on primary (scale factor 10)..."
+        pgbench -h pgsql-01 -p 5432 -U postgres -d testdb -i -s 10
+        
+        echo ""
+        echo "[pgbench] Verifying table creation..."
+        psql -h pgsql-01 -p 5432 -U postgres -d testdb -c "\dt pgbench_*"
+        
+        echo ""
+        echo "=========================================="
+        echo "  Starting Stress Test"
+        echo "  - Clients: 100"
+        echo "  - Duration: 60 seconds"
+        echo "  - Protocol: simple"
+        echo "=========================================="
+        echo ""
+        
+        pgbench -h keel -p 6432 -U postgres -d testdb \
+          --client=100 \
+          --jobs=4 \
+          --time=60 \
+          --progress=5 \
+          --report-per-command \
+          --no-vacuum
+        
+        echo ""
+        echo "=========================================="
+        echo "  Stress Test Complete!"
+        echo "=========================================="
+        
+        # Keep container running briefly for log collection
+        sleep 5
+    networks:
+      - e2e-network
+    depends_on:
+      keel:
+        condition: service_healthy
+
+networks:
+  e2e-network:
+    driver: bridge
+
+volumes:
+  e2e_primary_data:
+  e2e_replica1_data:
+  e2e_replica2_data:

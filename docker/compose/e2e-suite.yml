@@ -1,0 +1,144 @@
+# =============================================================================
+# KEEL Full E2E Test Suite — Docker Compose Stack
+# =============================================================================
+#
+# Topology:
+#   pg-shard0    PostgreSQL shard 0 (2PC enabled)  → host port 25432
+#   pg-shard1    PostgreSQL shard 1 (2PC enabled)  → host port 25433
+#   keel         KEEL proxy (sharding + 2PC)        → host port 26432
+#                Admin interface                    → host port 26433
+#                Prometheus metrics                 → host port 29101
+#
+# Usage:
+#   # Start stack (builds KEEL from source):
+#   docker compose -f docker/compose/e2e-suite.yml up -d --build --wait
+#
+#   # Use pre-built image:
+#   KEEL_IMAGE=keel:latest docker compose -f docker/compose/e2e-suite.yml up -d --wait
+#
+#   # Run the Python test suite:
+#   cd tests/e2e && ./run_e2e.sh
+#
+#   # Tear down:
+#   docker compose -f docker/compose/e2e-suite.yml down -v
+# =============================================================================
+
+name: keel-e2e-suite
+
+networks:
+  e2e-net:
+    driver: bridge
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Shard 0 — even IDs (hash(id) % 2 == 0)
+  # ---------------------------------------------------------------------------
+  pg-shard0:
+    image: postgres:16-alpine
+    container_name: e2e-pg-shard0
+    hostname: pg-shard0
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    # Minimal overrides: enable 2PC and quiet logging
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=50
+      - -c
+      - max_connections=300
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_statement=none
+    ports:
+      - "25432:5432"
+    networks:
+      - e2e-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+    user: ${CURRENT_UID}
+
+  # ---------------------------------------------------------------------------
+  # Shard 1 — odd IDs (hash(id) % 2 == 1)
+  # ---------------------------------------------------------------------------
+  pg-shard1:
+    image: postgres:16-alpine
+    container_name: e2e-pg-shard1
+    hostname: pg-shard1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=50
+      - -c
+      - max_connections=300
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_statement=none
+    ports:
+      - "25433:5432"
+    networks:
+      - e2e-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    user: ${CURRENT_UID}
+  # ---------------------------------------------------------------------------
+  # KEEL proxy
+  # ---------------------------------------------------------------------------
+  keel:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+    image: ${KEEL_IMAGE:-keel:e2e-suite}
+    container_name: e2e-keel
+    hostname: keel
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      pg-shard0:
+        condition: service_healthy
+      pg-shard1:
+        condition: service_healthy
+    volumes:
+      - ../keel/keel-e2e-suite.ini:/etc/keel/keel.ini:ro
+    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    ports:
+      - "26432:6432"   # PostgreSQL proxy (virtualize default + sharding)
+      - "26433:6433"   # Admin SQL interface
+      - "26440:6440"   # PS virtualize
+      - "26441:6441"   # PS pinning
+      - "26442:6442"   # PS tracking
+      - "26443:6443"   # PS anonymous
+      - "26444:6444"   # PS off
+      - "29101:9101"   # Prometheus metrics
+      - "26440:6440"   # PS test: virtualize
+      - "26441:6441"   # PS test: pinning
+      - "26442:6442"   # PS test: tracking
+      - "26443:6443"   # PS test: anonymous
+      - "26444:6444"   # PS test: off
+    networks:
+      - e2e-net
+    healthcheck:
+      # Check that the Prometheus port is open (KEEL is fully started)
+      test: ["CMD-SHELL", "nc -z -w 2 localhost 9101 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+    user: ${CURRENT_UID}

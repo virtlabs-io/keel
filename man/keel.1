@@ -1,0 +1,223 @@
+.\" keel(1) — KEEL high-performance database proxy
+.\" ============================================================================
+.TH KEEL 1 "2026-04-17" "KEEL 0.1.0" "User Commands"
+.\" ============================================================================
+.SH NAME
+keel \- high-performance database connection proxy for PostgreSQL and MySQL
+.\" ============================================================================
+.SH SYNOPSIS
+.B keel
+.RB [ \-c
+.IR file ]
+.RB [ \-l
+.IR addr ]
+.RB [ \-p
+.IR port ]
+.RB [ \-H
+.IR host ]
+.RB [ \-P
+.IR port ]
+.RB [ \-w
+.IR n ]
+.RB [ \-v ]
+.RB [ \-d ]
+.br
+.B keel \-\-help
+.br
+.B keel \-\-version
+.\" ============================================================================
+.SH DESCRIPTION
+.B keel
+is a zero-copy, thread-per-core database connection proxy supporting both
+PostgreSQL (wire protocol v3) and MySQL (client/server protocol) from a single
+binary.
+It provides transaction-level connection pooling, automatic read/write
+splitting, TLS termination with kernel TLS (kTLS) acceleration, prepared
+statement virtualization, and session state preservation across backend
+reassignments.
+.PP
+In normal operation,
+.B keel
+reads its configuration from an INI file (see
+.BR keel.ini (5))
+and binds one or more worker groups to the specified network ports.
+Each worker group runs on a dedicated thread with its own
+.BR io_uring (7)
+ring, connection pool, and SQL routing engine.
+.\" ============================================================================
+.SH OPTIONS
+.TP
+.BI \-c " file" "\fR,\fP \-\-config " file
+Read configuration from
+.IR file .
+If not specified, keel looks for
+.I /etc/keel/keel.ini
+by default.
+.TP
+.BI \-l " addr" "\fR,\fP \-\-listen " addr
+Bind to
+.IR addr
+(default:
+.BR 0.0.0.0 ).
+.TP
+.BI \-p " port" "\fR,\fP \-\-port " port
+Listen on
+.IR port
+(default:
+.BR 6432 ).
+.TP
+.BI \-H " host" "\fR,\fP \-\-host " host
+Backend database host (default:
+.BR 127.0.0.1 ).
+.TP
+.BI \-P " port" "\fR,\fP \-\-backend\-port " port
+Backend database port (default:
+.BR 5432 ).
+.TP
+.BI \-w " n" "\fR,\fP \-\-workers " n
+Number of worker threads.
+Default is the number of online CPU cores.
+.TP
+.BR \-v ", " \-\-verbose
+Increase log verbosity.
+Can be specified multiple times (e.g.\&
+.BR \-vvv ).
+.TP
+.BR \-d ", " \-\-daemon
+Fork into the background and detach from the controlling terminal.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version, build, and backend information, then exit.
+.\" ============================================================================
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload configuration: pool sizes, timeouts, server weights, probe timing,
+rebalancing parameters, TLS certificates, and log level.
+Equivalent to the
+.B RELOAD
+admin command.
+.TP
+.B SIGINT\fR, \fBSIGTERM
+Initiate graceful shutdown.
+In-flight transactions are allowed to complete up to
+.I shutdown_timeout_ms
+(default: 30 000 ms), after which remaining connections are force-closed.
+.TP
+.B SIGUSR1
+Dump runtime statistics to the log at INFO level.
+.\" ============================================================================
+.SH FILES
+.TP
+.I /etc/keel/keel.ini
+Default configuration file.
+See
+.BR keel.ini (5).
+.TP
+.I /etc/keel/userlist.txt
+Client authentication credential file (username/password pairs).
+.TP
+.I /etc/keel/certs/
+Default directory for TLS certificate material.
+Use
+.B scripts/generate\-test\-certs.sh
+to generate development certificates, or provide production certificates
+signed by a trusted CA.
+.TP
+.I /var/log/keel/
+Default log directory when file logging is enabled.
+.TP
+.I /var/run/keel/keel.pid
+PID file when running as a daemon.
+.\" ============================================================================
+.SH PORTS
+.TP
+.B 7432
+Default PostgreSQL proxy port (configurable via worker group).
+.TP
+.B 7306
+Default MySQL proxy port (configurable via worker group).
+.TP
+.B 6433
+Admin console port (PgBouncer-compatible wire protocol).
+.TP
+.B 9101
+Prometheus metrics HTTP endpoint (/metrics, /healthz, /readyz, /livez).
+.\" ============================================================================
+.SH ADMIN CONSOLE
+Connect to the admin port with any PostgreSQL client:
+.PP
+.RS
+.nf
+psql -h 127.0.0.1 -p 6433 -U admin -d keel
+.fi
+.RE
+.PP
+Available commands include
+.BR "SHOW POOLS" ,
+.BR "SHOW CLIENTS" ,
+.BR "SHOW SERVERS" ,
+.BR "SHOW STATS" ,
+.BR "SHOW CONFIG" ,
+.BR "PAUSE" ,
+.BR "RESUME" ,
+.BR "RELOAD" ,
+.BR "DRAIN" ,
+.BR "KILL CLIENT" ,
+.BR "DISABLE SERVER" ,
+.BR "ENABLE SERVER" ,
+.BR "ADD SERVER" ,
+.BR "REMOVE SERVER" ,
+and
+.BR "SET" .
+Append
+.B FORMAT JSON
+to any command for JSON output.
+.\" ============================================================================
+.SH EXAMPLES
+Start with a configuration file:
+.PP
+.RS
+.nf
+keel -c /etc/keel/keel.ini
+.fi
+.RE
+.PP
+Quick test with command-line overrides:
+.PP
+.RS
+.nf
+keel -p 6432 -H localhost -P 5432 -w 4
+.fi
+.RE
+.PP
+Run as a daemon:
+.PP
+.RS
+.nf
+keel -d -c /etc/keel/keel.ini
+.fi
+.RE
+.\" ============================================================================
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B 1
+Startup failure (configuration error, bind failure, etc.).
+.\" ============================================================================
+.SH SEE ALSO
+.BR keel.ini (5),
+.BR keel\-cli (1),
+.BR pgbouncer (1),
+.BR io_uring (7)
+.\" ============================================================================
+.SH AUTHORS
+The KEEL project: https://github.com/virtlabs-io/dbcp-keel
+.\" ============================================================================
+.SH BUGS
+Report bugs at https://github.com/virtlabs-io/dbcp-keel/issues

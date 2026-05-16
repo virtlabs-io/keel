@@ -1,0 +1,16 @@
+#!/bin/sh
+# ============================================================================
+# keel — pre-remove script (DEB: prerm, RPM: %preun)
+# ============================================================================
+# Runs before package files are removed.  Stops and disables the service.
+# ============================================================================
+set -e
+
+# ---------------------------------------------------------------------------
+# Stop and disable the systemd service
+# ---------------------------------------------------------------------------
+if [ -d /run/systemd/system ]; then
+    systemctl stop keel.service 2>/dev/null || true
+    systemctl disable keel.service 2>/dev/null || true
+    systemctl daemon-reload || true
+fi

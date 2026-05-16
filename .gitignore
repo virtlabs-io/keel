@@ -1,0 +1,123 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+
+# Executables and output files
+*.exe
+*.out
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.copilot/
+.settings/
+*.sublime-*
+
+# Debug files
+*.dSYM/
+*.pdb
+*.ilk
+
+# Coverage files
+*.gcov
+*.gcda
+*.gcno
+coverage/
+lcov.info
+
+# Profiling
+*.prof
+gmon.out
+perf.data
+perf.data.old
+
+# Temporary files and logs
+logs/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Package manager directories
+third_party/
+vendor/
+
+# Documentation build
+docs/_build/
+docs/html/
+docs/latex/
+
+# Sanitizer logs
+*.asan
+*.tsan
+*.msan
+*.ubsan
+
+# Core dumps (but not src/core directory)
+/core
+/core.*
+vgcore.*
+
+tests/__pycache__/
+tests/integration/__pycache__/
+tests/e2e/__pycache__/
+tests/suites/__pycache__/
+tests/e2e/.venv/
+*.pyc
+history/*
+
+# Generated test certificates (regenerate via scripts/generate-test-certs.sh)
+etc/certs/*.crt
+etc/certs/*.key
+etc/certs/*.csr
+etc/certs/*.pem
+etc/certs/*.srl
+etc/certs/*.ext
+
+artifacts/
+
+reports/
+
+competitor/*
+docs/COMPETITIVE_ANALYSIS.md
+
+research/*
+docs/full.md
+docs/all.md
+bench/bench_cloud_auth

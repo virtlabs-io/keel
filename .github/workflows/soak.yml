@@ -1,0 +1,314 @@
+name: Nightly Soak Test
+
+on:
+  schedule:
+    # 03:00 UTC every night — offset from chaos (02:00) to avoid resource contention
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Soak duration in seconds (default: 1800 = 30 min)'
+        required: false
+        default: '1800'
+      clients:
+        description: 'pgbench client count (default: 32)'
+        required: false
+        default: '32'
+
+# Never run two soak tests in parallel — each needs the full runner.
+concurrency:
+  group: soak-test
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: 30-minute soak test
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soakdb
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + bench dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc libssl-dev liburing-dev \
+            postgresql-client python3 bc
+
+      - name: Build keel (Release)
+        run: |
+          cmake -S . -B build-soak \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKEEL_ENABLE_TESTS=OFF \
+            -DKEEL_ENABLE_LUA=OFF \
+            -DKEEL_ENABLE_PYTHON=OFF
+          cmake --build build-soak --target keel -- -j$(nproc)
+
+      - name: Load benchmark schema
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d soakdb -f bench/schema.sql
+          echo "Schema loaded."
+
+      - name: Write keel config
+        run: |
+          cat > /tmp/keel-soak.ini << 'EOF'
+          [keel]
+          log_level = 1
+          shutdown_timeout_ms = 30000
+
+          [worker_group.soak]
+          protocol = postgres
+          bind_addr = 127.0.0.1
+          bind_port = 7432
+          num_workers = 4
+          min_pool_size = 16
+          max_pool_size = 64
+          pool_max_waiting = 200
+          idle_timeout_ms = 300000
+          connect_timeout_ms = 5000
+          server_user = postgres
+          server_password = postgres
+          probe = postgres
+          probe_interval = 5s
+
+          [worker_group.soak.servers]
+          primary = host=127.0.0.1 port=5432 dbname=soakdb role=RW weight=100
+
+          [admin]
+          enabled = true
+          listen_addr = 127.0.0.1
+          listen_port = 7433
+
+          [prometheus]
+          enabled = true
+          port = 9101
+          EOF
+
+      - name: Start keel proxy
+        run: |
+          ./build-soak/src/main/keel /tmp/keel-soak.ini &
+          echo "KEEL_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 7432 -U postgres >/dev/null 2>&1; then
+              echo "keel ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 7432 -U postgres || { echo "keel failed to start"; exit 1; }
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 60-second warm-up run to establish the baseline latency and RSS
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Warm-up (60s)
+        id: warmup
+        env:
+          PGPASSWORD: postgres
+        run: |
+          WARMUP_LOG=$(mktemp)
+          pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
+            -n -r -T 60 -c 16 -j 4 \
+            --random-seed=1 \
+            --file=bench/scripts/read_point.sql@45 \
+            --file=bench/scripts/read_range.sql@15 \
+            --file=bench/scripts/read_aggregate.sql@10 \
+            --file=bench/scripts/write_update.sql@20 \
+            --file=bench/scripts/write_insert.sql@8 \
+            --file=bench/scripts/write_delete.sql@2 \
+            > "$WARMUP_LOG" 2>&1
+
+          # Capture baseline RSS of keel process (kB → MB)
+          RSS_KB=$(cat /proc/${KEEL_PID}/status | grep VmRSS | awk '{print $2}')
+          BASELINE_RSS_MB=$(( RSS_KB / 1024 ))
+
+          # Capture initial FD count
+          BASELINE_FD=$(ls /proc/${KEEL_PID}/fd 2>/dev/null | wc -l)
+
+          # Capture warm-up TPS and latency
+          WARMUP_TPS=$(grep -E "^tps = " "$WARMUP_LOG" | tail -1 | awk '{print $3}')
+          WARMUP_LAT=$(grep "latency average" "$WARMUP_LOG" | awk '{print $4}')
+
+          echo "BASELINE_RSS_MB=${BASELINE_RSS_MB}" >> "$GITHUB_ENV"
+          echo "BASELINE_FD=${BASELINE_FD}"         >> "$GITHUB_ENV"
+          echo "WARMUP_TPS=${WARMUP_TPS}"           >> "$GITHUB_ENV"
+          echo "WARMUP_LAT=${WARMUP_LAT}"           >> "$GITHUB_ENV"
+
+          echo "Warm-up complete:"
+          echo "  TPS:           ${WARMUP_TPS}"
+          echo "  Avg latency:   ${WARMUP_LAT} ms"
+          echo "  Baseline RSS:  ${BASELINE_RSS_MB} MB"
+          echo "  Baseline FDs:  ${BASELINE_FD}"
+          rm -f "$WARMUP_LOG"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Main soak run — pgbench in background, monitor loop in foreground
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Run soak workload (${{ github.event.inputs.duration || '1800' }}s)
+        id: soak
+        env:
+          PGPASSWORD: postgres
+          SOAK_DURATION: ${{ github.event.inputs.duration || '1800' }}
+          SOAK_CLIENTS:  ${{ github.event.inputs.clients  || '32'   }}
+        run: |
+          SOAK_LOG=$(mktemp)
+          METRICS_LOG=$(mktemp)
+
+          # Start pgbench workload in background
+          pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
+            -n -r \
+            -T "$SOAK_DURATION" \
+            -c "$SOAK_CLIENTS" -j 8 \
+            --random-seed=1 \
+            --file=bench/scripts/read_point.sql@45 \
+            --file=bench/scripts/read_range.sql@15 \
+            --file=bench/scripts/read_aggregate.sql@10 \
+            --file=bench/scripts/write_update.sql@20 \
+            --file=bench/scripts/write_insert.sql@8 \
+            --file=bench/scripts/write_delete.sql@2 \
+            > "$SOAK_LOG" 2>&1 &
+          PGBENCH_PID=$!
+
+          # Monitor loop: every 30s record RSS, FD count, and /metrics latency
+          echo "# ts_s rss_mb fd_count" > "$METRICS_LOG"
+          START_TIME=$(date +%s)
+          END_TIME=$(( START_TIME + SOAK_DURATION ))
+
+          while [[ $(date +%s) -lt $END_TIME ]] && kill -0 "$PGBENCH_PID" 2>/dev/null; do
+            RSS_KB=$(cat /proc/${KEEL_PID}/status 2>/dev/null | grep VmRSS | awk '{print $2}')
+            RSS_MB=$(( ${RSS_KB:-0} / 1024 ))
+            FD_COUNT=$(ls /proc/${KEEL_PID}/fd 2>/dev/null | wc -l)
+            TS=$(( $(date +%s) - START_TIME ))
+            echo "${TS} ${RSS_MB} ${FD_COUNT}" >> "$METRICS_LOG"
+            echo "  [t+${TS}s] RSS=${RSS_MB}MB FDs=${FD_COUNT}"
+            sleep 30
+          done
+
+          wait "$PGBENCH_PID" || true
+
+          # Save to env for assertions step
+          echo "SOAK_LOG=${SOAK_LOG}"       >> "$GITHUB_ENV"
+          echo "METRICS_LOG=${METRICS_LOG}" >> "$GITHUB_ENV"
+
+      - name: Assert soak results
+        run: |
+          echo "=== Soak Test Assertions ==="
+
+          SOAK_TPS=$(grep -E "^tps = " "$SOAK_LOG" | tail -1 | awk '{print $3}' || echo "0")
+          SOAK_LAT=$(grep "latency average" "$SOAK_LOG" | awk '{print $4}' || echo "0")
+
+          echo "  Warm-up TPS:   ${WARMUP_TPS}"
+          echo "  Soak TPS:      ${SOAK_TPS}"
+          echo "  Warm-up lat:   ${WARMUP_LAT} ms"
+          echo "  Soak lat:      ${SOAK_LAT} ms"
+
+          # Check keel process is still running
+          if ! kill -0 "${KEEL_PID}" 2>/dev/null; then
+            echo "FAIL: keel process crashed during soak test!"
+            exit 1
+          fi
+          echo "  PASS: keel process alive"
+
+          python3 - << 'PYEOF'
+          import os, sys
+
+          baseline_rss = int(os.environ["BASELINE_RSS_MB"])
+          baseline_fd  = int(os.environ["BASELINE_FD"])
+          warmup_lat   = float(os.environ["WARMUP_LAT"])
+
+          # Read metrics log
+          metrics = []
+          with open(os.environ["METRICS_LOG"]) as f:
+              for line in f:
+                  if line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) == 3:
+                      metrics.append({
+                          "ts":    int(parts[0]),
+                          "rss":   int(parts[1]),
+                          "fds":   int(parts[2]),
+                      })
+
+          if not metrics:
+              print("  WARN: No metrics collected — skipping RSS/FD checks")
+              sys.exit(0)
+
+          max_rss = max(m["rss"] for m in metrics)
+          max_fds = max(m["fds"] for m in metrics)
+          final_rss = metrics[-1]["rss"]
+          final_fds = metrics[-1]["fds"]
+          rss_growth = final_rss - baseline_rss
+          fd_growth  = final_fds - baseline_fd
+
+          print(f"  Baseline RSS:    {baseline_rss} MB")
+          print(f"  Peak RSS:        {max_rss} MB")
+          print(f"  Final RSS:       {final_rss} MB  (growth: {rss_growth:+d} MB)")
+          print(f"  Baseline FDs:    {baseline_fd}")
+          print(f"  Peak FDs:        {max_fds}")
+          print(f"  Final FDs:       {final_fds}  (growth: {fd_growth:+d})")
+
+          failed = False
+
+          # RSS growth ≤ 50 MB over soak period
+          RSS_GROWTH_LIMIT_MB = 50
+          if rss_growth > RSS_GROWTH_LIMIT_MB:
+              print(f"  FAIL: RSS grew by {rss_growth} MB (limit: {RSS_GROWTH_LIMIT_MB} MB) — possible memory leak")
+              failed = True
+          else:
+              print(f"  PASS: RSS growth within limit ({rss_growth:+d} MB)")
+
+          # FD growth ≤ 100 over soak period
+          FD_GROWTH_LIMIT = 100
+          if fd_growth > FD_GROWTH_LIMIT:
+              print(f"  FAIL: FD count grew by {fd_growth} (limit: {FD_GROWTH_LIMIT}) — possible FD leak")
+              failed = True
+          else:
+              print(f"  PASS: FD count stable ({fd_growth:+d})")
+
+          # P99 proxy (avg latency) ≤ 2× warm-up baseline
+          try:
+              soak_lat = float(os.environ.get("SOAK_LAT", "0") or "0")
+              lat_limit = warmup_lat * 2.0
+              if soak_lat > lat_limit:
+                  print(f"  FAIL: Soak avg latency {soak_lat:.3f} ms > 2× warm-up {warmup_lat:.3f} ms ({lat_limit:.3f} ms)")
+                  failed = True
+              elif soak_lat > 0:
+                  print(f"  PASS: Soak latency within 2× warm-up ({soak_lat:.3f} ms ≤ {lat_limit:.3f} ms)")
+          except (ValueError, ZeroDivisionError):
+              print(f"  WARN: Could not parse latency values for comparison")
+
+          if failed:
+              sys.exit(1)
+          PYEOF
+
+      - name: Upload soak metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-metrics-${{ github.run_id }}
+          path: |
+            /tmp/keel-soak-*.log
+            /tmp/keel-metrics-*.log
+          retention-days: 14
+
+      - name: Stop keel proxy
+        if: always()
+        run: kill "${KEEL_PID}" 2>/dev/null || true

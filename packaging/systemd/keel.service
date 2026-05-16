@@ -1,0 +1,19 @@
+[Unit]
+Description=Keel database connection pooler
+Documentation=https://github.com/virtlabs-io/dbcp-keel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keel
+Group=keel
+EnvironmentFile=-/etc/default/keel
+ExecStart=/usr/bin/keel -c /etc/keel/keel.ini
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

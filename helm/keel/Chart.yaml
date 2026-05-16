@@ -1,0 +1,20 @@
+apiVersion: v2
+name: keel
+description: High-performance database connection pooler for PostgreSQL and MySQL
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/virtlabs-io/dbcp-keel
+sources:
+  - https://github.com/virtlabs-io/dbcp-keel
+maintainers:
+  - name: virtlabs-io
+    url: https://github.com/virtlabs-io
+keywords:
+  - database
+  - connection-pooler
+  - postgresql
+  - mysql
+  - proxy
+  - io-uring
+icon: https://raw.githubusercontent.com/virtlabs-io/dbcp-keel/main/docs/logo.png

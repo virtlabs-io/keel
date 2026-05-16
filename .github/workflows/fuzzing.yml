@@ -1,0 +1,113 @@
+name: Fuzzing
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/test_*fuzz*.c'
+      - 'tests/fuzz_seeds/**'
+      - 'CMakeLists.txt'
+      - 'tests/CMakeLists.txt'
+      - '.github/workflows/fuzzing.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/test_*fuzz*.c'
+  schedule:
+    # Extended nightly fuzz run (10 minutes per target)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_duration:
+        description: 'Seconds to run each fuzzer (default: 60)'
+        required: false
+        default: '60'
+
+jobs:
+  fuzz-ci:
+    name: libFuzzer — ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - test_fuzz_harness     # PostgreSQL + MySQL protocol parser
+          - test_admin_sql_fuzz   # Admin SQL parser
+          - test_sm_fuzz          # Session state machine
+          - test_cluster_fuzz     # Cluster wire protocol
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang lld cmake ninja-build \
+            libssl-dev liburing-dev
+
+      - name: Configure (libFuzzer + ASan + UBSan)
+        run: |
+          cmake -S . -B build-fuzz \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DKEEL_ENABLE_FUZZ=ON \
+            -DKEEL_ENABLE_ASAN=ON \
+            -DKEEL_ENABLE_UBSAN=ON \
+            -DKEEL_USE_IOURING=OFF \
+            -DKEEL_ENABLE_HARDENING=OFF \
+            -DKEEL_ENABLE_LUA=OFF \
+            -DKEEL_ENABLE_PYTHON=OFF
+
+      - name: Build fuzz target
+        run: cmake --build build-fuzz --target ${{ matrix.target }} -- -j$(nproc)
+
+      - name: Prepare seed corpus
+        run: |
+          mkdir -p /tmp/fuzz-corpus
+          # Copy any seed inputs for this target (best-effort)
+          cp tests/fuzz_seeds/*.bin /tmp/fuzz-corpus/ 2>/dev/null || true
+
+      - name: Run fuzzer (60 s)
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:allocator_may_return_null=1"
+          UBSAN_OPTIONS: "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+        run: |
+          DURATION="${{ github.event.inputs.fuzz_duration || '60' }}"
+          # Schedule gets a longer run
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            DURATION=600
+          fi
+
+          echo "Running ${{ matrix.target }} for ${DURATION}s"
+          ./build-fuzz/tests/${{ matrix.target }} \
+            -max_total_time="${DURATION}" \
+            -max_len=65536 \
+            -rss_limit_mb=2048 \
+            -print_final_stats=1 \
+            -artifact_prefix=/tmp/fuzz-artifact- \
+            /tmp/fuzz-corpus
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: /tmp/fuzz-artifact-*
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload corpus
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          path: /tmp/fuzz-corpus/
+          if-no-files-found: ignore
+          retention-days: 7

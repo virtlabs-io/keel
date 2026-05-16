@@ -1,0 +1,184 @@
+name: docker-publish
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/keel
+
+on:
+  # Publish on version tags
+  push:
+    tags:
+      - "v*.*.*"
+  # Allow manual trigger with optional tag override
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (default: latest)"
+        required: false
+        default: "latest"
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Build, test, and publish multi-arch Docker image
+  # ===========================================================================
+  docker-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # for OIDC signing (cosign)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # QEMU + buildx for multi-arch (arm64 via emulation)
+      # ------------------------------------------------------------------
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      # ------------------------------------------------------------------
+      # Login to GitHub Container Registry
+      # ------------------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # Compute image tags and labels from git metadata
+      # ------------------------------------------------------------------
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # semver tag  v1.2.3  →  1.2.3, 1.2, 1, latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # latest on default branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # manual dispatch override
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            # sha for traceability
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=keel
+            org.opencontainers.image.description=KEEL high-performance database connection pooler
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/tree/main/docs
+            org.opencontainers.image.licenses=AGPL-3.0
+
+      # ------------------------------------------------------------------
+      # Build the tester stage first to verify tests pass on amd64
+      # (arm64 tests are skipped for speed — they run the same code path)
+      # ------------------------------------------------------------------
+      - name: Verify tests pass (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          target: tester
+          push: false
+          cache-from: type=gha,scope=tester
+          cache-to: type=gha,mode=max,scope=tester
+
+      # ------------------------------------------------------------------
+      # Build + push multi-arch runner image
+      # ------------------------------------------------------------------
+      - name: Build and push runner image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          target: runner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=runner
+          cache-to: type=gha,mode=max,scope=runner
+          provenance: true
+          sbom: true
+
+      # ------------------------------------------------------------------
+      # Summary
+      # ------------------------------------------------------------------
+      - name: Image digest
+        run: |
+          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.push.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Smoke test: pull the published image and verify it starts
+  # ===========================================================================
+  smoke-test:
+    needs: docker-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Pulling ${IMAGE}"
+          docker pull "${IMAGE}"
+
+      - name: Smoke test — binary version flag
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker run --rm "${IMAGE}" keel --version
+
+      - name: Smoke test — entrypoint env override
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          # Start keel with env overrides; expect it to fail to connect to PG
+          # (no PG running) but the env-override INI write must succeed.
+          # We just verify the process starts and the entrypoint script works.
+          docker run --rm \
+            -e KEEL_LOG_LEVEL=debug \
+            -e KEEL_CLUSTER_NODE_ID=smoke-node \
+            -e KEEL_CLUSTER_ENABLED=false \
+            --entrypoint /usr/local/bin/docker-entrypoint.sh \
+            "${IMAGE}" keel --help 2>&1 | head -5

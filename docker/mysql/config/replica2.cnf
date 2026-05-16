@@ -1,0 +1,18 @@
+# =============================================================================
+# MySQL Replica 2 Configuration — Simple Replication
+# =============================================================================
+[mysqld]
+server-id                = 3
+relay-log                = relay-bin
+log-bin                  = mysql-bin
+gtid-mode                = ON
+enforce-gtid-consistency = ON
+log-replica-updates      = ON
+read-only                = ON
+
+# Connections
+max-connections          = 1000
+bind-address             = 0.0.0.0
+
+# Performance
+innodb-buffer-pool-size  = 256M

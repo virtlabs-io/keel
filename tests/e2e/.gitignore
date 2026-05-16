@@ -1,0 +1,6 @@
+# Generated test reports and runtime artifacts
+reports/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

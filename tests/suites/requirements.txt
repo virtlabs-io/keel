@@ -1,0 +1,15 @@
+# tests/suites/requirements.txt
+# Python dependencies for the standalone test suites in tests/suites/.
+#
+# Install into the project venv:
+#   pip install -r tests/suites/requirements.txt
+#
+# Or into the e2e venv:
+#   pip install -r tests/suites/requirements.txt -r tests/e2e/requirements.txt
+
+# PostgreSQL adapter — required by the throughput, regression, chaos, and soak suites
+psycopg2-binary>=2.9.9
+
+# Optional: property-based / fuzz testing helpers used by suite_protocol.py
+# Uncomment if you want Hypothesis-based fuzzing:
+# hypothesis>=6.100.0

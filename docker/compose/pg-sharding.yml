@@ -1,0 +1,91 @@
+# =============================================================================
+# KEEL Sharding Integration Test Docker Compose
+# =============================================================================
+# Topology:
+#   pg-shard0   — PostgreSQL for shard 0 (even IDs)
+#   pg-shard1   — PostgreSQL for shard 1 (odd IDs)
+#   keel        — KEEL proxy with shard routing on port 6432
+#                 Prometheus metrics on port 9101
+#   test-client — psql-based test script
+#
+# Usage:
+#   tests/integration/test-sharding.sh
+# =============================================================================
+
+name: keel-sharding
+
+services:
+  # --------------------------------------------------------------------------
+  # Shard 0 — serves even IDs
+  # --------------------------------------------------------------------------
+  pg-shard0:
+    image: postgres:16-alpine
+    container_name: shard-pg0
+    hostname: pg-shard0
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - shard-net
+
+  # --------------------------------------------------------------------------
+  # Shard 1 — serves odd IDs
+  # --------------------------------------------------------------------------
+  pg-shard1:
+    image: postgres:16-alpine
+    container_name: shard-pg1
+    hostname: pg-shard1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - shard-net
+
+  # --------------------------------------------------------------------------
+  # KEEL proxy
+  # --------------------------------------------------------------------------
+  keel:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+    container_name: shard-keel
+    hostname: keel
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      pg-shard0:
+        condition: service_healthy
+      pg-shard1:
+        condition: service_healthy
+    volumes:
+      - ../keel/keel-sharding.ini:/etc/keel/keel.ini:ro
+    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    ports:
+      - "16432:6432"   # proxy port — host access for test client
+      - "19101:9101"   # prometheus port
+    networks:
+      - shard-net
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 1 localhost 9101 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+networks:
+  shard-net:
+    driver: bridge

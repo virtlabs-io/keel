@@ -1,0 +1,112 @@
+# Percona XtraDB Cluster 8.4 — Multi-Master (Galera)
+# 3 nodes, all read-write
+#
+# Ports:
+#   node1: 3306
+#   node2: 3307
+#   node3: 3308
+#
+# PXC uses Galera SST/IST on ports 4567-4568
+# Requires fixed IPs for Galera communication
+
+name: keel-mysql-pxc
+
+services:
+  # ==========================================================================
+  # Node 1 — Bootstrap node
+  # ==========================================================================
+  pxc-node1:
+    image: percona/percona-xtradb-cluster:8.4
+    container_name: pxc-node1
+    hostname: pxc-node1
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      CLUSTER_NAME: pxc-cluster
+      XTRABACKUP_PASSWORD: backup
+    volumes:
+      - pxc_node1_data:/var/lib/mysql
+      - ../mysql/config/pxc-node1.cnf:/etc/percona-xtradb-cluster.conf.d/custom.cnf:ro
+      - ../mysql/scripts/pxc-init-node1.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3306:3306"
+    networks:
+      pxc-net:
+        ipv4_address: 172.29.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uroot -proot -e \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" 2>/dev/null | grep -q Synced"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  # ==========================================================================
+  # Node 2
+  # ==========================================================================
+  pxc-node2:
+    image: percona/percona-xtradb-cluster:8.4
+    container_name: pxc-node2
+    hostname: pxc-node2
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      CLUSTER_NAME: pxc-cluster
+      XTRABACKUP_PASSWORD: backup
+      CLUSTER_JOIN: pxc-node1
+    volumes:
+      - pxc_node2_data:/var/lib/mysql
+      - ../mysql/config/pxc-node2.cnf:/etc/percona-xtradb-cluster.conf.d/custom.cnf:ro
+    ports:
+      - "3307:3306"
+    networks:
+      pxc-net:
+        ipv4_address: 172.29.0.12
+    depends_on:
+      pxc-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uroot -proot -e \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" 2>/dev/null | grep -q Synced"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  # ==========================================================================
+  # Node 3
+  # ==========================================================================
+  pxc-node3:
+    image: percona/percona-xtradb-cluster:8.4
+    container_name: pxc-node3
+    hostname: pxc-node3
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      CLUSTER_NAME: pxc-cluster
+      XTRABACKUP_PASSWORD: backup
+      CLUSTER_JOIN: pxc-node1
+    volumes:
+      - pxc_node3_data:/var/lib/mysql
+      - ../mysql/config/pxc-node3.cnf:/etc/percona-xtradb-cluster.conf.d/custom.cnf:ro
+    ports:
+      - "3308:3306"
+    networks:
+      pxc-net:
+        ipv4_address: 172.29.0.13
+    depends_on:
+      pxc-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uroot -proot -e \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" 2>/dev/null | grep -q Synced"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+networks:
+  pxc-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  pxc_node1_data:
+  pxc_node2_data:
+  pxc_node3_data:

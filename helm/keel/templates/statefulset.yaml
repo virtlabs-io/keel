@@ -1,0 +1,156 @@
+{{/*
+StatefulSet is used when cluster.enabled = true to provide stable DNS names
+(keel-N.keel-cluster.ns.svc.cluster.local) needed for gossip peer discovery.
+*/}}
+{{- if .Values.cluster.enabled }}
+{{- $replicaCount := int .Values.cluster.replicaCount | default 3 }}
+{{- $clusterPort  := int .Values.cluster.port }}
+{{- $fullname     := include "keel.fullname" . }}
+{{- $ns           := .Release.Namespace }}
+{{/*
+Build the initial_peers list: all pod DNS names except "self".
+Because every pod gets the full list, self-connection is intentionally
+included — the cluster layer drops its own node_id on arrival.
+*/}}
+{{- $peers := list }}
+{{- range $i := until $replicaCount }}
+{{- $peer := printf "%s-%d.%s-cluster.%s.svc.cluster.local:%d" $fullname $i $fullname $ns $clusterPort }}
+{{- $peers = append $peers $peer }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-cluster
+  replicas: {{ $replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "keel.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "keel.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "keel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "keel"
+            - "-c"
+            - "/etc/keel/keel.ini"
+          env:
+            # Downward API: use the pod name as the cluster node ID
+            - name: KEEL_CLUSTER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Full peer list; the cluster layer discards self-connections
+            - name: KEEL_CLUSTER_INITIAL_PEERS
+              value: {{ join "," $peers | quote }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: pg
+              containerPort: {{ .Values.service.pgPort }}
+              protocol: TCP
+            {{- if .Values.service.myPort }}
+            - name: mysql
+              containerPort: {{ .Values.service.myPort }}
+              protocol: TCP
+            {{- end }}
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.service.port }}
+              protocol: TCP
+            {{- end }}
+            - name: cluster
+              containerPort: {{ .Values.cluster.port }}
+              protocol: TCP
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/keel
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run/keel
+            {{- range .Values.extraSecretMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              readOnly: {{ .readOnly | default true }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: run
+          emptyDir:
+            sizeLimit: 1Mi
+        {{- range .Values.extraSecretMounts }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secretName }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

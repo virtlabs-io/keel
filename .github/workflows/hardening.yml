@@ -1,0 +1,179 @@
+name: Hardening
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly full hardening: Sunday 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Binary Hardening Verification (checksec)
+  # ===========================================================================
+  checksec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            checksec
+
+      - name: Build (Release + hardening)
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_HARDENING=ON
+          cmake --build build -j$(nproc)
+
+      - name: Verify binary hardening
+        run: |
+          set -e
+          checksec --file=build/src/main/keel --output=json | tee checksec.json
+          # Verify critical protections
+          python3 -c "
+          import json, sys
+          with open('checksec.json') as f:
+              data = json.load(f)
+          # checksec JSON structure varies; extract first file entry
+          entry = list(data.values())[0] if isinstance(data, dict) else data[0]
+          checks = {
+              'pie': entry.get('pie', 'no'),
+              'relro': entry.get('relro', 'no'),
+              'canary': entry.get('canary', 'no'),
+              'nx': entry.get('nx', 'no'),
+          }
+          failed = []
+          for name, val in checks.items():
+              val_lower = str(val).lower()
+              if val_lower in ('no', 'false', 'disabled'):
+                  failed.append(f'{name}={val}')
+          if failed:
+              print(f'FAIL: Missing hardening: {failed}', file=sys.stderr)
+              sys.exit(1)
+          print('PASS: All binary hardening flags verified')
+          "
+
+  # ===========================================================================
+  # Static Analysis (clang scan-build)
+  # ===========================================================================
+  static-analysis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            clang \
+            clang-tools \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-scan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=OFF
+
+      - name: Run scan-build
+        run: |
+          scan-build \
+            --status-bugs \
+            -o scan-results \
+            cmake --build build-scan -j$(nproc)
+
+      - name: Upload scan results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build-results
+          path: scan-results/
+
+  # ===========================================================================
+  # Full Hardening CI Gate
+  # ===========================================================================
+  hardening-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            checksec \
+            strace
+
+      - name: Run hardening CI gate
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build-hardening
+          RUN_HARDENING_TESTS: 1
+          RUN_SECURITY_CHECKSEC: 1
+          RUN_SANITIZERS: 0
+          RUN_PROXY_SSV_E2E: 0
+          # Static analysis (clang scan-build): always-on (skips gracefully if scan-build absent)
+          RUN_SECURITY_SAST: ${{ github.event_name == 'pull_request' && '1' || '1' }}
+          # TLS audit: nightly only — requires a running KEEL instance with TLS
+          RUN_SECURITY_TLS: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          # sqlmap resilience: nightly/weekly only (slow, ~5 min)
+          RUN_SECURITY_SQLMAP: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          # Chaos/reliability: nightly/weekly only
+          RUN_CHAOS_SYSCALLS: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          RUN_CHAOS_NETEM: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          RUN_CHAOS_ZOMBIE: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          RUN_SHADOW_DIFF: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          RUN_SLOW_CLIENT: ${{ github.event_name == 'schedule' && '1' || '0' }}
+        run: bash tests/hardening/run_all.sh

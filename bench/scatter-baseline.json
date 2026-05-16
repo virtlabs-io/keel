@@ -1,0 +1,12 @@
+{
+  "direct_tps": 0,
+  "direct_avg_latency_ms": 0,
+  "keel_tps": 0,
+  "keel_avg_latency_ms": 0,
+  "scatter_conn_overhead_pct": 0,
+  "scatter_overhead_ms": 0,
+  "tps_ratio_keel_vs_direct": 0,
+  "clients": 8,
+  "duration_s": 60,
+  "note": "Placeholder baseline — run: SCATTER_UPDATE_BASELINE=1 ./bench/run_scatter_pgbench.sh to populate after a live keel+shard cluster is available. scatter_conn_overhead_pct tracks the per-query TCP connect+auth cost per shard (keel opens a new connection per scatter, bypassing the pool). This is the primary scatter performance bottleneck at high QPS."
+}

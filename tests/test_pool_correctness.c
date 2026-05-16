@@ -1,0 +1,754 @@
+/**
+ * @file test_pool_correctness.c
+ * @brief White-box regression tests for backend-pool lifecycle invariants.
+ *
+ * This suite targets the parts of pool management that are easy to regress when
+ * optimizing for throughput: deciding whether a returned connection is clean,
+ * accounting for pinned versus reusable slots, and ensuring cleanup generations
+ * advance monotonically so stale observations cannot be mistaken for current
+ * state.
+ *
+ * The tests are deliberately narrow and structural. They do not talk to a real
+ * PostgreSQL server and they do not attempt to validate the full wire cleanup
+ * conversation. Instead they manufacture backend_conn_t objects around local
+ * socketpairs and assert that the pool's linked lists, state enums, and quota
+ * counters evolve in a way the worker runtime can trust.
+ */
+
+#include "test_utils.h"
+#include "keel/protocol/protocol_flow.h"  /* KEEL_FPIN_QUARANTINE, KEEL_QE_POTENTIALLY_STATEFUL */
+#include "keel/engine/engine_flow.h"    /* keel_session_flow_t */
+#include "keel/mem/mem.h"
+
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/*
+ * This file is intentionally white-box. The public engine API does not expose
+ * enough internal pool bookkeeping to assert list membership, cleanup state, or
+ * pin counters directly, so the tests include the internal header and inspect
+ * the structures the runtime itself relies on.
+ */
+#include "keel/engine/backend_pool.h"
+
+/* ============================================================================
+ * Helpers
+ * ============================================================================ */
+
+/**
+ * @brief Assemble a synthetic pool populated with `n` immediately borrowable
+ *        connections.
+ * @param n Number of slots to create.
+ * @param backend_fds [out] Receives the peer fd for each socketpair-backed
+ *                          connection.
+ * @return Heap-allocated pool fixture.
+ *
+ * The fixture bypasses real backend connect/auth because the tests care about
+ * pool bookkeeping, not wire protocol. `socketpair()` is sufficient to provide
+ * valid descriptors so send/recv-based cleanup logic behaves as if a transport
+ * exists, while still keeping the tests deterministic and fast.
+ */
+static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
+{
+    backend_pool_config_t cfg = {
+        .host = "127.0.0.1",
+        .port = 5432,
+        .user = "test",
+        .password = "test",
+        .database = "test",
+        .min_connections = n,
+        .max_connections = n,
+        .max_waiting = 4,
+    };
+
+    /* Allocate pool manually (bypass actual TCP connect) */
+    backend_pool_t* pool = keel_calloc(1, sizeof(backend_pool_t));
+    pool->config = cfg;
+    pool->connections = keel_calloc(n, sizeof(backend_conn_t));
+    pool->total_count = n;
+
+    for (size_t i = 0; i < n; i++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+            /* If socketpair fails, use fd = -1 (test will note it) */
+            pool->connections[i].fd = -1;
+            backend_fds[i] = -1;
+            continue;
+        }
+        pool->connections[i].fd = sv[0];
+        backend_fds[i] = sv[1];
+        atomic_store(&pool->connections[i].state, BACKEND_CONN_IDLE);
+        pool->connections[i].pool = pool;
+        pool->connections[i].next = (i > 0) ? NULL : NULL;
+    }
+
+    /* Put all connections on clean_list */
+    pool->clean_list = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (pool->connections[i].fd >= 0) {
+            pool->connections[i].next = pool->clean_list;
+            pool->clean_list = &pool->connections[i];
+            pool->clean_count++;
+        }
+    }
+
+    return pool;
+}
+
+/**
+ * @brief Tear down a synthetic pool created by make_test_pool().
+ * @param pool Pool fixture to destroy.
+ * @param backend_fds Peer descriptors paired with each backend slot.
+ * @param n Number of connection slots in the fixture.
+ * @return
+ */
+static void destroy_test_pool(backend_pool_t* pool, int backend_fds[], size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (pool->connections[i].fd >= 0) close(pool->connections[i].fd);
+        if (backend_fds[i] >= 0) close(backend_fds[i]);
+    }
+    keel_free(pool->connections);
+    keel_free(pool);
+}
+
+/* ============================================================================
+ * Test: CLEANING State Transition
+ * ============================================================================ */
+
+static void test_cleaning_state_transition(void)
+{
+    TEST_BEGIN("CLEANING state transition on return of dirty connection");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    /* Borrow a connection */
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_ACTIVE);
+
+    /* Simulate the connection having state (dirty) */
+    conn->current_state_hash = 0xBEEF;
+
+    /* Return it — should enter CLEANING since it has state */
+    backend_pool_return(pool, conn, false);
+
+    /* The connection should either be CLEANING (DISCARD ALL sent, awaiting response)
+     * or IDLE (if the fake socketpair responded somehow) or CLOSED (send error).
+     * With a socketpair and no ReadyForQuery response, expect CLEANING */
+    backend_conn_state_t st = atomic_load(&conn->state);
+    /* With socketpair: send succeeds, recv returns EAGAIN → CLEANING.
+     * OR send succeeds, recv returns data (unlikely from empty socketpair) → ??? */
+    TEST_ASSERT(st == BACKEND_CONN_CLEANING || st == BACKEND_CONN_IDLE || st == BACKEND_CONN_CLOSED);
+
+    if (st == BACKEND_CONN_CLEANING) {
+        /* Verify it's not on any list (borrowers can't see it) */
+        bool found_on_clean = false;
+        for (backend_conn_t* c = pool->clean_list; c; c = c->next) {
+            if (c == conn) found_on_clean = true;
+        }
+        TEST_ASSERT(!found_on_clean);
+        TEST_ASSERT(pool->cleaning_count > 0);
+    }
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: Clean Connection Returns Directly to IDLE
+ * ============================================================================ */
+
+static void test_clean_return_bypasses_discard(void)
+{
+    TEST_BEGIN("Clean connection returns directly to IDLE (no DISCARD ALL)");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    /* Connection has no state → should return directly to clean_list */
+    conn->current_state_hash = 0;
+    conn->profile = NULL;  /* No profile → clean */
+
+    size_t clean_before = pool->clean_count;
+    backend_pool_return(pool, conn, false);
+
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
+    TEST_ASSERT(pool->clean_count > clean_before);
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: clean_gen Bumps on Return
+ * ============================================================================ */
+
+static void test_clean_gen_increments(void)
+{
+    TEST_BEGIN("clean_gen increments on every return");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    uint64_t gen0 = conn->clean_gen;
+
+    backend_pool_return(pool, conn, false);
+    uint64_t gen1 = conn->clean_gen;
+    TEST_ASSERT(gen1 > gen0);
+
+    /* Borrow and return again */
+    conn = backend_pool_borrow(pool, 0);
+    if (conn) {
+        backend_pool_return(pool, conn, false);
+        TEST_ASSERT(conn->clean_gen > gen1);
+    }
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: Admission Control (max_pinned)
+ * ============================================================================ */
+
+static void test_admission_control_max_pinned(void)
+{
+    TEST_BEGIN("admission control: max_pinned limits pinned borrows");
+
+    int be_fds[4];
+    backend_pool_t* pool = make_test_pool(4, be_fds);
+    pool->max_pinned = 2;  /* Allow only 2 pinned connections */
+
+    /* Fake sessions */
+    int session1 = 1, session2 = 2, session3 = 3;
+
+    /* Pin 1 */
+    backend_conn_t* c1 = backend_pool_borrow_pinned(pool, &session1);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_EQ(pool->pinned_count, 1);
+
+    /* Pin 2 */
+    backend_conn_t* c2 = backend_pool_borrow_pinned(pool, &session2);
+    TEST_ASSERT_NOT_NULL(c2);
+    TEST_ASSERT_EQ(pool->pinned_count, 2);
+
+    /* Pin 3 — should fail (at max) */
+    backend_conn_t* c3 = backend_pool_borrow_pinned(pool, &session3);
+    TEST_ASSERT_NULL(c3);
+    TEST_ASSERT_EQ(pool->pinned_count, 2);
+
+    /* Return one — should allow new pin */
+    backend_pool_return(pool, c1, false);
+    TEST_ASSERT_EQ(pool->pinned_count, 1);
+
+    c3 = backend_pool_borrow_pinned(pool, &session3);
+    TEST_ASSERT_NOT_NULL(c3);
+    TEST_ASSERT_EQ(pool->pinned_count, 2);
+
+    /* Cleanup */
+    backend_pool_return(pool, c2, false);
+    backend_pool_return(pool, c3, false);
+
+    destroy_test_pool(pool, be_fds, 4);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: Quarantine Pin Flag Definitions
+ * ============================================================================ */
+
+static void test_quarantine_pin_flags(void)
+{
+    TEST_BEGIN("quarantine pin flag definitions and bit operations");
+
+    /* Verify QUARANTINE is a distinct bit */
+    TEST_ASSERT(KEEL_FPIN_QUARANTINE != 0);
+    TEST_ASSERT((KEEL_FPIN_QUARANTINE & KEEL_FPIN_TRANSACTION) == 0);
+    TEST_ASSERT((KEEL_FPIN_QUARANTINE & KEEL_FPIN_COPY) == 0);
+
+    /* Verify POTENTIALLY_STATEFUL query effect */
+    TEST_ASSERT(KEEL_QE_POTENTIALLY_STATEFUL != 0);
+
+    /* Test quarantine set/clear logic */
+    keel_flow_pin_reason_t pins = KEEL_FPIN_NONE;
+    pins |= KEEL_FPIN_QUARANTINE;
+    TEST_ASSERT(pins != KEEL_FPIN_NONE);
+    TEST_ASSERT(pins & KEEL_FPIN_QUARANTINE);
+
+    /* Clearing only quarantine should make pins == NONE */
+    pins &= ~(uint32_t)KEEL_FPIN_QUARANTINE;
+    TEST_ASSERT_EQ(pins, KEEL_FPIN_NONE);
+
+    /* Multiple pins: quarantine + transaction */
+    pins = KEEL_FPIN_TRANSACTION | KEEL_FPIN_QUARANTINE;
+    /* Clearing quarantine leaves TRANSACTION */
+    pins &= ~(uint32_t)KEEL_FPIN_QUARANTINE;
+    TEST_ASSERT(pins & KEEL_FPIN_TRANSACTION);
+    TEST_ASSERT(!(pins & KEEL_FPIN_QUARANTINE));
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: Session Flow Sticky-Primary Fields
+ * ============================================================================ */
+
+static void test_sticky_primary_fields(void)
+{
+    TEST_BEGIN("session flow sticky-primary fields initialization");
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+
+    TEST_ASSERT_EQ(sf.last_write_ns, 0ULL);
+    TEST_ASSERT_EQ(sf.sticky_primary_ttl_ms, 0U);
+    TEST_ASSERT_EQ(sf.quarantine_pending, 0U);
+
+    /* Simulate write timestamp */
+    sf.last_write_ns = 1234567890ULL;
+    TEST_ASSERT(sf.last_write_ns > 0);
+
+    /* Simulate TTL */
+    sf.sticky_primary_ttl_ms = 100;
+    TEST_ASSERT_EQ(sf.sticky_primary_ttl_ms, 100U);
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: CLEANING State Rejected by Borrow CAS
+ * ============================================================================ */
+
+static void test_borrow_rejects_cleaning(void)
+{
+    TEST_BEGIN("borrow CAS rejects CLEANING connections");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    /* Borrow both connections */
+    backend_conn_t* c1 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c2 = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_NOT_NULL(c2);
+
+    /* Manually put c1 into CLEANING state and back on clean_list */
+    atomic_store(&c1->state, BACKEND_CONN_CLEANING);
+    pool->active_count--;
+    c1->next = pool->clean_list;
+    pool->clean_list = c1;
+    pool->clean_count++;
+
+    /* Return c2 as clean */
+    c2->current_state_hash = 0;
+    backend_pool_return(pool, c2, false);
+
+    /* Now borrow — should get c2 (IDLE), NOT c1 (CLEANING) */
+    backend_conn_t* borrowed = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(borrowed);
+    TEST_ASSERT(borrowed != c1);  /* Must not get the CLEANING connection */
+    TEST_ASSERT_EQ(atomic_load(&borrowed->state), BACKEND_CONN_ACTIVE);
+
+    /* Cleanup */
+    backend_pool_return(pool, borrowed, false);
+    /* Close the CLEANING one manually */
+    atomic_store(&c1->state, BACKEND_CONN_CLOSED);
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: Drain Cleaning with Simulated Response
+ * ============================================================================ */
+
+static void test_drain_cleaning_reclaims(void)
+{
+    TEST_BEGIN("drain_cleaning reclaims connections with ReadyForQuery response");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    /* Borrow a connection and make it dirty */
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0xDEAD;
+
+    /* Find which backend fd corresponds to this connection */
+    int be_fd = -1;
+    for (size_t i = 0; i < pool->total_count; i++) {
+        if (&pool->connections[i] == conn) {
+            be_fd = be_fds[i];
+            break;
+        }
+    }
+    TEST_ASSERT(be_fd >= 0);
+
+    /* Return it — will send DISCARD ALL, then enter CLEANING */
+    backend_pool_return(pool, conn, false);
+
+    /* Read the DISCARD ALL command from the backend side of the socketpair */
+    uint8_t discard_buf[64];
+    ssize_t nr = recv(be_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    /* We should have received the DISCARD ALL command */
+    TEST_ASSERT(nr > 0);
+
+    /* Simulate backend response: CommandComplete + ReadyForQuery('I') */
+    /* CommandComplete: 'C' + length(4) + "DISCARD ALL\0" = 'C' + 16 bytes */
+    uint8_t response[] = {
+        'C', 0, 0, 0, 16,
+        'D','I','S','C','A','R','D',' ','A','L','L', 0,
+        'Z', 0, 0, 0, 5, 'I'
+    };
+    ssize_t sw = send(be_fd, response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    /* Now drain_cleaning should reclaim it */
+    if (atomic_load(&conn->state) == BACKEND_CONN_CLEANING) {
+        size_t reclaimed = backend_pool_drain_cleaning(pool);
+        TEST_ASSERT(reclaimed >= 1);
+        TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
+        TEST_ASSERT_EQ(conn->current_state_hash, 0ULL);
+        TEST_ASSERT(pool->cleaning_count == 0);
+    }
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: conn_is_alive — dead connection is discarded by borrow
+ * ============================================================================ */
+
+/*
+ * When the peer end of a socketpair is closed before borrow is called the
+ * liveness peek (MSG_PEEK | MSG_DONTWAIT) returns 0 (EOF), which must cause
+ * the borrow to discard that slot and return NULL (no other connection
+ * available).
+ */
+static void test_borrow_skips_dead_connection(void)
+{
+    TEST_BEGIN("borrow skips connection whose peer fd was closed (conn_is_alive=false)");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    /* Close the peer end — the connection is now dead */
+    close(be_fds[0]);
+    be_fds[0] = -1;
+
+    /* The single connection slot is on clean_list.  borrow should detect EOF
+     * via conn_is_alive, discard the slot, and return NULL. */
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT(conn == NULL);
+
+    /* The slot should have been marked CLOSED */
+    bool all_closed = true;
+    for (size_t i = 0; i < pool->total_count; i++) {
+        if (atomic_load(&pool->connections[i].state) != BACKEND_CONN_CLOSED)
+            all_closed = false;
+    }
+    TEST_ASSERT(all_closed);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/*
+ * When two connections are in the pool and one is dead, borrow must skip
+ * the dead one and return the alive one.
+ */
+static void test_borrow_returns_alive_when_one_dead(void)
+{
+    TEST_BEGIN("borrow returns the alive connection when one of two slots is dead");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    /* Close the peer for the first connection only */
+    close(be_fds[0]);
+    be_fds[0] = -1;
+
+    /* borrow should skip the dead slot and return the alive one */
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    /* The returned connection must have a valid fd */
+    TEST_ASSERT(conn->fd >= 0);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_ACTIVE);
+
+    backend_pool_return(pool, conn, true);
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: backend_pool_drain_idle closes all idle lists
+ * ============================================================================ */
+
+/*
+ * backend_pool_drain_idle is called on DOWN→UP probe transitions to flush
+ * stale connections.  It must close every fd on clean_list, idle_list, and
+ * dirty_list, reset those lists to NULL, and return the count of closed slots.
+ */
+static void test_drain_idle_closes_all_lists(void)
+{
+    TEST_BEGIN("drain_idle closes all idle connections and resets list pointers");
+
+    int be_fds[3];
+    backend_pool_t* pool = make_test_pool(3, be_fds);
+
+    /* All 3 connections start on clean_list */
+    TEST_ASSERT(pool->clean_list != NULL);
+    TEST_ASSERT_EQ(pool->clean_count, 3U);
+
+    size_t drained = backend_pool_drain_idle(pool);
+    TEST_ASSERT(drained >= 3U);
+    TEST_ASSERT(pool->clean_list == NULL);
+    TEST_ASSERT(pool->idle_list  == NULL);
+    TEST_ASSERT(pool->dirty_list == NULL);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    /* All slots must be CLOSED; their fd fields have been closed by drain */
+    for (size_t i = 0; i < pool->total_count; i++) {
+        TEST_ASSERT_EQ(atomic_load(&pool->connections[i].state), BACKEND_CONN_CLOSED);
+        pool->connections[i].fd = -1; /* already closed by drain, prevent double-close */
+    }
+    /* Peer fds are still open — close them here */
+    for (size_t i = 0; i < 3; i++) {
+        if (be_fds[i] >= 0) { close(be_fds[i]); be_fds[i] = -1; }
+    }
+
+    destroy_test_pool(pool, be_fds, 3);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: backend_pool_discard
+ * ============================================================================ */
+
+/*
+ * backend_pool_discard() must atomically transition a borrowed connection from
+ * ACTIVE to CLOSED and decrement pool->active_count.  Calling it a second time
+ * (double-discard) must be a safe no-op.
+ */
+static void test_discard_decrements_active_count(void)
+{
+    TEST_BEGIN("discard transitions ACTIVE→CLOSED and decrements active_count");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    TEST_ASSERT_EQ(pool->active_count, 1U);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_ACTIVE);
+
+    /* Simulate an error: close the fd and discard */
+    close(conn->fd);
+    conn->fd = -1;
+    backend_pool_discard(pool, conn);
+
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->active_count, 0U);
+
+    /* Second discard must be a safe no-op (state is already CLOSED) */
+    backend_pool_discard(pool, conn);
+    TEST_ASSERT_EQ(pool->active_count, 0U);
+
+    /* Peer fd still open; fd in slot was already closed above */
+    be_fds[0] = be_fds[0]; /* suppress unused warning */
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: backend_pool_get_stats
+ * ============================================================================ */
+
+static void test_get_stats_counts_connections(void)
+{
+    TEST_BEGIN("get_stats returns accurate idle/active/total counts");
+
+    int be_fds[3];
+    backend_pool_t* pool = make_test_pool(3, be_fds);
+
+    backend_pool_stats_t stats = {0};
+    backend_pool_get_stats(pool, &stats);
+
+    TEST_ASSERT_EQ(stats.total_connections,  3U);
+    TEST_ASSERT_EQ(stats.idle_connections,   3U);
+    TEST_ASSERT_EQ(stats.active_connections, 0U);
+    TEST_ASSERT_EQ(stats.waiting_sessions,   0U);
+
+    /* Borrow one — active_connections should increment */
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    memset(&stats, 0, sizeof stats);
+    backend_pool_get_stats(pool, &stats);
+    TEST_ASSERT_EQ(stats.active_connections, 1U);
+    TEST_ASSERT_EQ(stats.idle_connections,   2U);
+
+    backend_pool_return(pool, conn, false);
+    destroy_test_pool(pool, be_fds, 3);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: backend_pool_has_available
+ * ============================================================================ */
+
+static void test_has_available_reflects_clean_list(void)
+{
+    TEST_BEGIN("has_available returns true when idle connections exist");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    TEST_ASSERT(backend_pool_has_available(pool));
+    TEST_ASSERT(!backend_pool_has_available(NULL));
+
+    /* Borrow both; pool should still report available = false */
+    backend_conn_t* c1 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c2 = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_NOT_NULL(c2);
+    TEST_ASSERT(!backend_pool_has_available(pool));
+
+    backend_pool_return(pool, c1, false);
+    backend_pool_return(pool, c2, false);
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: backend_pool_mark_transaction / backend_pool_update_state_hash
+ * ============================================================================ */
+
+static void test_mark_transaction_transitions_state(void)
+{
+    TEST_BEGIN("mark_transaction sets/clears TXN_PINNED state correctly");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    /* begin=true: must flip to TXN_PINNED */
+    backend_pool_mark_transaction(pool, conn, true);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_TXN_PINNED);
+    TEST_ASSERT(conn->in_transaction);
+
+    /* begin=false with no pinned_session: must flip back to ACTIVE */
+    backend_pool_mark_transaction(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_ACTIVE);
+    TEST_ASSERT(!conn->in_transaction);
+
+    backend_pool_return(pool, conn, false);
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_update_state_hash_pins_connection(void)
+{
+    TEST_BEGIN("update_state_hash transitions to STATE_PINNED on non-zero hash");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    backend_pool_update_state_hash(pool, conn, 0xdeadbeefULL);
+    TEST_ASSERT_EQ(conn->current_state_hash, 0xdeadbeefULL);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_STATE_PINNED);
+
+    /* Reset to zero — state stays STATE_PINNED (caller must return/discard) */
+    backend_pool_update_state_hash(pool, conn, 0);
+    TEST_ASSERT_EQ(conn->current_state_hash, 0U);
+
+    /* Discard instead of return because state is no longer ACTIVE */
+    close(conn->fd);
+    conn->fd = -1;
+    backend_pool_discard(pool, conn);
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Test: per-user connection accounting
+ * ============================================================================ */
+
+static void test_user_conn_accounting(void)
+{
+    TEST_BEGIN("user_can_acquire / acquire / release track per-user active count");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+
+    /* With max_user_connections == 0 (default), can_acquire always returns true */
+    TEST_ASSERT(backend_pool_user_can_acquire(pool, "alice"));
+    TEST_ASSERT(backend_pool_user_can_acquire(NULL, "alice"));
+
+    /* Set a per-user limit of 1 */
+    pool->config.max_user_connections = 1;
+
+    TEST_ASSERT(backend_pool_user_can_acquire(pool, "alice"));
+    backend_pool_user_conn_acquire(pool, "alice");
+    /* Now at limit: must return false */
+    TEST_ASSERT(!backend_pool_user_can_acquire(pool, "alice"));
+    /* Different user must still be allowed */
+    TEST_ASSERT(backend_pool_user_can_acquire(pool, "bob"));
+
+    backend_pool_user_conn_release(pool, "alice");
+    /* After release: alice can acquire again */
+    TEST_ASSERT(backend_pool_user_can_acquire(pool, "alice"));
+
+    /* Extra release must not underflow (should be a safe no-op) */
+    backend_pool_user_conn_release(pool, "alice");
+    TEST_ASSERT(backend_pool_user_can_acquire(pool, "alice"));
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+/* ============================================================================
+ * Main
+ * ============================================================================ */
+
+int main(void)
+{
+    printf("=== Pool Correctness Tests ===\n\n");
+
+    test_cleaning_state_transition();
+    test_clean_return_bypasses_discard();
+    test_clean_gen_increments();
+    test_admission_control_max_pinned();
+    test_quarantine_pin_flags();
+    test_sticky_primary_fields();
+    test_borrow_rejects_cleaning();
+    test_drain_cleaning_reclaims();
+    test_borrow_skips_dead_connection();
+    test_borrow_returns_alive_when_one_dead();
+    test_drain_idle_closes_all_lists();
+    test_discard_decrements_active_count();
+    test_get_stats_counts_connections();
+    test_has_available_reflects_clean_list();
+    test_mark_transaction_transitions_state();
+    test_update_state_hash_pins_connection();
+    test_user_conn_accounting();
+
+    printf("\n");
+    return test_summary();
+}

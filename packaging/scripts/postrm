@@ -1,0 +1,35 @@
+#!/bin/sh
+# ============================================================================
+# keel — post-remove script (DEB: postrm, RPM: %postun)
+# ============================================================================
+# Runs after package files are removed.  On purge / full remove, cleans up
+# runtime state.  User and group are left intact to preserve log ownership.
+# ============================================================================
+set -e
+
+case "${1:-remove}" in
+    purge)
+        # Remove logs and runtime dirs
+        rm -rf /var/log/keel
+        rm -rf /var/run/keel
+
+        # Remove generated certs (keep /etc/keel dir if admin has custom files)
+        rm -rf /etc/keel/certs
+
+        # Remove keel system user and group
+        if getent passwd keel >/dev/null 2>&1; then
+            userdel keel 2>/dev/null || true
+        fi
+        if getent group keel >/dev/null 2>&1; then
+            groupdel keel 2>/dev/null || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # Nothing to do — leave user, group, logs, certs in place
+        ;;
+esac
+
+# Re-sync systemd if available
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi

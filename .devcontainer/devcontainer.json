@@ -1,0 +1,63 @@
+{
+  // VS Code opens *inside* the Linux devenv container.
+  // IntelliSense, CMake Tools, GDB
+  // docker compose -f docker/compose/keel.yml up -d --build devenv --remove-orphans
+  "name": "keel (Linux Dev Environment)",
+
+  // Reuse the existing dev compose stack (postgres + devenv).
+  "dockerComposeFile": "../docker/compose/keel.yml",
+  "service": "devenv",
+
+  // Source is bind-mounted at /keel by the compose file.
+  "workspaceFolder": "/keel",
+
+  // Expose keel proxy port to the host so you can test from macOS terminal.
+  "forwardPorts": [7432, 7433, 7434, 6432, 6433, 6434, 6306, 6307, 6308],
+  "portsAttributes": {
+    "7432": { "label": "Keel proxy", "onAutoForward": "silent" },
+    "7433": { "label": "HAProxy (PG)", "onAutoForward": "silent" },
+    "7434": { "label": "PgBouncer", "onAutoForward": "silent" },
+    "6432": { "label": "PostgreSQL Primary", "onAutoForward": "silent" },
+    "6433": { "label": "PostgreSQL Replica 1", "onAutoForward": "silent" },
+    "6434": { "label": "PostgreSQL Replica 2", "onAutoForward": "silent" },
+    "6306": { "label": "MySQL Primary", "onAutoForward": "silent" },
+    "6307": { "label": "MySQL Replica 1", "onAutoForward": "silent" },
+    "6308": { "label": "MySQL Replica 2", "onAutoForward": "silent" }
+  },
+
+  // Run cmake configure once after the container is first created.
+  // Subsequent `cmake --build` calls inside the terminal are incremental.
+  "postCreateCommand": "cmake -B /keel/build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DKEEL_USE_IOURING=ON -DKEEL_USE_EPOLL=ON -DKEEL_ENABLE_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON /keel && echo '✓ CMake configured'",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // C/C++ IntelliSense + language support
+        "ms-vscode.cpptools-extension-pack",
+        // CMake configure / build / test UI
+        "ms-vscode.cmake-tools",
+        // Native debug adapter (GDB/LLDB)
+        "ms-vscode.cpptools",
+        // Extra: hex editor for inspecting protocol buffers
+        "ms-vscode.hexeditor"
+      ],
+      "settings": {
+        // Point CMake Tools at our existing build dir
+        "cmake.buildDirectory": "/keel/build-linux",
+        // Don't auto-configure on open (we've already done it in postCreateCommand)
+        "cmake.configureOnOpen": false,
+        // Feed the compile_commands.json to IntelliSense
+        "C_Cpp.default.compileCommands": "/keel/build-linux/compile_commands.json",
+        "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+        "C_Cpp.default.cStandard": "c17",
+        // Show all warnings inline
+        "C_Cpp.errorSquiggles": "enabled",
+        // Use the integrated terminal inside the container
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  // Run as root so strace / gdb / io_uring tools work without sudo.
+  "remoteUser": "root"
+}

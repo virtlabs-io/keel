@@ -1,0 +1,121 @@
+name: Chaos Tests
+
+on:
+  schedule:
+    # 02:00 UTC every night
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Specific scenario to run (leave empty to run all)'
+        required: false
+        default: ''
+
+jobs:
+  chaos:
+    name: Chaos / Resilience (${{ github.event.inputs.scenario || 'all scenarios' }})
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc libssl-dev liburing-dev \
+            postgresql-client netcat-openbsd python3
+
+      - name: Build keel (Release)
+        run: |
+          cmake -S . -B build-chaos \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKEEL_ENABLE_TESTS=OFF \
+            -DKEEL_ENABLE_LUA=OFF \
+            -DKEEL_ENABLE_PYTHON=OFF
+          cmake --build build-chaos --target keel -- -j$(nproc)
+
+      - name: Build chaos Docker image for keel
+        run: |
+          docker build \
+            -f docker/Dockerfile.linux \
+            --target runner \
+            -t keel:chaos \
+            .
+
+      - name: Patch chaos compose to use pre-built image
+        run: |
+          # Replace the build: block with a plain image: reference to avoid
+          # rebuilding inside compose (we already have the image from above).
+          sed -i \
+            '/build:/,/target: runner/c\    image: keel:chaos' \
+            docker/compose/pg-chaos.yml
+
+      - name: Pull netshoot image (fault injector)
+        run: docker pull nicolaka/netshoot:latest
+
+      - name: Start chaos stack
+        run: |
+          docker compose -f docker/compose/pg-chaos.yml up -d
+          # Wait up to 120s for all services to be healthy
+          timeout 120 bash -c '
+            until docker compose -f docker/compose/pg-chaos.yml ps --format json \
+              | python3 -c "
+          import sys, json
+          data = sys.stdin.read()
+          # compose ps can return a stream of JSON objects or a JSON array
+          import re
+          objs = re.findall(r\"\{[^}]+\}\", data, re.DOTALL)
+          services = [json.loads(o) for o in objs if o.strip()]
+          unhealthy = [s for s in services if s.get(\"Health\") not in (\"\", \"healthy\", None)]
+          notrunning = [s for s in services if s.get(\"State\") != \"running\"]
+          if unhealthy or notrunning:
+              sys.exit(1)
+              " 2>/dev/null; do
+              sleep 3
+              echo "Waiting for stack..."
+            done
+          ' || {
+            echo "Stack did not become healthy in time:"
+            docker compose -f docker/compose/pg-chaos.yml ps
+            docker compose -f docker/compose/pg-chaos.yml logs
+            exit 1
+          }
+
+      - name: Show running containers
+        run: docker compose -f docker/compose/pg-chaos.yml ps
+
+      - name: Run chaos scenarios
+        id: chaos
+        env:
+          KEEL_HOST: "127.0.0.1"
+          KEEL_PORT: "17432"
+          KEEL_ADMIN_PORT: "17433"
+          CHAOS_DB: "chaosdb"
+          CHAOS_USER: "postgres"
+          CHAOS_PASS: "postgres"
+          CHAOS_TIMEOUT: "120"
+        run: |
+          chmod +x tests/chaos/run-chaos.sh tests/chaos/scenarios/*.sh
+          if [[ -n "${{ github.event.inputs.scenario }}" ]]; then
+            bash tests/chaos/run-chaos.sh "${{ github.event.inputs.scenario }}"
+          else
+            bash tests/chaos/run-chaos.sh
+          fi
+
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          echo "=== keel logs ==="
+          docker logs chaos-keel --tail 100 || true
+          echo "=== pgsql-primary logs ==="
+          docker logs chaos-pgsql-primary --tail 50 || true
+          echo "=== pgsql-replica1 logs ==="
+          docker logs chaos-pgsql-replica1 --tail 50 || true
+          echo "=== pgsql-replica2 logs ==="
+          docker logs chaos-pgsql-replica2 --tail 50 || true
+
+      - name: Tear down chaos stack
+        if: always()
+        run: docker compose -f docker/compose/pg-chaos.yml down -v --remove-orphans

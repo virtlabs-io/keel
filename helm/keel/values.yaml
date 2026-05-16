@@ -1,0 +1,282 @@
+# -- Number of keel replicas
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/virtlabs-io/keel
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default: chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+# -- Override the release name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount
+  create: true
+  # -- Annotations for the ServiceAccount (e.g. IAM roles)
+  annotations: {}
+  # -- Override ServiceAccount name
+  name: ""
+
+# -- Pod-level annotations
+podAnnotations: {}
+
+# -- Pod-level security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container-level security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# ==============================================================================
+# Keel Configuration
+# ==============================================================================
+
+# -- Raw keel.ini content. Mounted as /etc/keel/keel.ini.
+# Passwords should use env: or file: references — not inline secrets.
+config: |
+  [keel]
+  log_level = 2
+
+  [worker_group.default]
+  name = default
+  protocol = postgres
+  bind_addr = 0.0.0.0
+  bind_port = 7432
+  num_workers = 0
+  max_conns_per_worker = 5000
+  min_pool_size = 10
+  max_pool_size = 50
+  client_idle_timeout = 5m
+  client_connect_timeout = 10s
+  probe = postgres
+  probe_interval = 5s
+  probe_timeout = 3s
+  probe_retries = 3
+  failover_delay = 10s
+
+  [worker_group.default.servers]
+  primary = host=postgres port=5432 dbname=app role=RW weight=100
+
+  [logging]
+  plugin = stdout
+  log_level = info
+  query_log_mode = none
+  use_colors = false
+
+  [stats]
+  level = basic
+  log_interval_ms = 0
+
+  [admin]
+  enabled = true
+  listen_addr = 0.0.0.0
+  listen_port = 6433
+
+  [prometheus]
+  enabled = true
+  listen_addr = 0.0.0.0
+  port = 9101
+
+  # -- Distributed tracing (OTLP/HTTP).
+  # Uncomment and configure to export spans to Jaeger / Tempo / OTel Collector.
+  # [tracing]
+  # enabled = true
+  # endpoint = http://tempo:4318/v1/traces
+  # service_name = keel
+  # sample_rate_ppm = 10000
+  # batch_size = 256
+  # flush_interval_ms = 5000
+
+# -- Optional plaintext credentials stored in a managed Secret.
+# Keys map to Secret data entries; reference them in config with `env:VAR`.
+# Example: credentials: {DB_PASSWORD: "s3cr3t"}
+credentials: {}
+
+# -- Additional environment variables (for env:VAR password references)
+env: []
+  # - name: DB_PASSWORD
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: db-credentials
+  #       key: password
+
+# -- Mount extra secrets as files (for file:/path password references)
+extraSecretMounts: []
+  # - name: db-password
+  #   secretName: db-credentials
+  #   mountPath: /etc/keel/secrets
+  #   readOnly: true
+
+# -- Mount extra volumes (e.g. TLS certs from cert-manager)
+extraVolumeMounts: []
+  # - name: tls-certs
+  #   mountPath: /etc/keel/tls
+  #   readOnly: true
+
+# -- Extra volumes to attach to the pod
+extraVolumes: []
+  # - name: tls-certs
+  #   secret:
+  #     secretName: keel-tls
+
+# ==============================================================================
+# Cluster Mode (HA multi-proxy)
+# ==============================================================================
+
+cluster:
+  # -- Enable cluster mode (renders a StatefulSet with peer auto-discovery)
+  enabled: false
+  # -- Number of replicas in cluster mode (StatefulSet replicas)
+  replicaCount: 3
+  # -- Cluster communication port
+  port: 9100
+  # -- Heartbeat interval in milliseconds
+  heartbeatIntervalMs: 1000
+  # -- Heartbeat timeout in milliseconds
+  heartbeatTimeoutMs: 5000
+  # -- Consecutive failures before marking peer DOWN
+  failureThreshold: 3
+
+# ==============================================================================
+# Services
+# ==============================================================================
+
+service:
+  # -- Service type (ClusterIP, NodePort, LoadBalancer)
+  type: ClusterIP
+  # -- PostgreSQL proxy port
+  pgPort: 7432
+  # -- MySQL proxy port (set to null to disable)
+  myPort: null
+  # -- Admin console port
+  adminPort: 6433
+  # -- Additional service annotations (e.g. cloud LB config)
+  annotations: {}
+
+metrics:
+  # -- Expose a separate metrics service for Prometheus scraping
+  enabled: true
+  service:
+    # -- Metrics service port
+    port: 9101
+    # -- Additional annotations on the metrics service
+    annotations: {}
+  # -- Create a Prometheus ServiceMonitor resource
+  serviceMonitor:
+    # -- Deploy the ServiceMonitor
+    enabled: false
+    # -- Namespace for the ServiceMonitor (defaults to release namespace)
+    namespace: ""
+    # -- Scrape interval
+    interval: 15s
+    # -- Scrape timeout
+    scrapeTimeout: 10s
+    # -- Additional labels for ServiceMonitor selection
+    labels: {}
+
+# ==============================================================================
+# Health Probes
+# ==============================================================================
+
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: metrics
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 2
+
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: metrics
+  initialDelaySeconds: 2
+  periodSeconds: 3
+  timeoutSeconds: 3
+  failureThreshold: 10
+
+# ==============================================================================
+# Resources & Scheduling
+# ==============================================================================
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 512Mi
+
+# -- Node selector constraints
+nodeSelector: {}
+
+# -- Tolerations for pod scheduling
+tolerations: []
+
+# -- Affinity rules
+affinity: {}
+
+# -- Topology spread constraints
+topologySpreadConstraints: []
+
+# -- Pod disruption budget
+podDisruptionBudget:
+  # -- Create a PDB
+  enabled: false
+  # -- Minimum available replicas
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# -- Autoscaling via HorizontalPodAutoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+
+# ==============================================================================
+# Admission Webhooks
+# ==============================================================================
+webhook:
+  # -- Deploy ValidatingWebhookConfiguration and MutatingWebhookConfiguration.
+  # Requires the operator to be running and TLS configured (see certManager).
+  enabled: false
+
+  # -- Base64-encoded CA bundle for webhook TLS verification.
+  # Leave empty when using cert-manager cainjector.
+  caBundle: ""
+
+  certManager:
+    # -- Use cert-manager to provision and inject the webhook TLS certificate.
+    enabled: false
+    # -- Issuer name. Defaults to the cluster self-signed issuer.
+    issuerRef:
+      name: selfsigned-issuer
+      kind: ClusterIssuer

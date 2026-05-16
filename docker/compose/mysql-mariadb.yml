@@ -1,0 +1,108 @@
+# MariaDB Galera Cluster — Multi-Master
+# 3 nodes, all read-write (synchronous Galera replication)
+#
+# Ports:
+#   node1: 3306
+#   node2: 3307
+#   node3: 3308
+#
+# Galera internal: 4567 (replication), 4568 (IST), 4444 (SST)
+
+name: keel-mysql-mariadb
+
+services:
+  # ==========================================================================
+  # Node 1 — Bootstrap node
+  # ==========================================================================
+  mdb-node1:
+    image: mariadb:latest
+    container_name: mdb-node1
+    hostname: mdb-node1
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: test
+      MARIADB_USER: keel
+      MARIADB_PASSWORD: keel
+    volumes:
+      - mdb_node1_data:/var/lib/mysql
+      - ../mysql/config/mdb-node1.cnf:/etc/mysql/mariadb.conf.d/99-galera.cnf:ro
+      - ../mysql/scripts/mdb-init-node1.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    command:
+      - --wsrep-new-cluster
+    ports:
+      - "3306:3306"
+    networks:
+      mdb-galera:
+        ipv4_address: 172.30.0.11
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # Node 2
+  # ==========================================================================
+  mdb-node2:
+    image: mariadb:latest
+    container_name: mdb-node2
+    hostname: mdb-node2
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - mdb_node2_data:/var/lib/mysql
+      - ../mysql/config/mdb-node2.cnf:/etc/mysql/mariadb.conf.d/99-galera.cnf:ro
+    ports:
+      - "3307:3306"
+    networks:
+      mdb-galera:
+        ipv4_address: 172.30.0.12
+    depends_on:
+      mdb-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # Node 3
+  # ==========================================================================
+  mdb-node3:
+    image: mariadb:latest
+    container_name: mdb-node3
+    hostname: mdb-node3
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - mdb_node3_data:/var/lib/mysql
+      - ../mysql/config/mdb-node3.cnf:/etc/mysql/mariadb.conf.d/99-galera.cnf:ro
+    ports:
+      - "3308:3306"
+    networks:
+      mdb-galera:
+        ipv4_address: 172.30.0.13
+    depends_on:
+      mdb-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+networks:
+  mdb-galera:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  mdb_node1_data:
+  mdb_node2_data:
+  mdb_node3_data:

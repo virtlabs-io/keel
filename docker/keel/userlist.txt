@@ -1,0 +1,14 @@
+# User authentication file for KEEL E2E tests
+# Format: "username" "password"
+# Passwords are MD5 hashed as: md5(password + username)
+# Or plaintext if auth mode supports it
+
+# Main test user (password: postgres)
+# MD5 hash of "postgrespostgres" = md5175bce38...
+"postgres" "postgres"
+
+# Replication user (password: replicator)
+"replicator" "replicator"
+
+# pgbench user (password: pgbench)  
+"pgbench" "pgbench"

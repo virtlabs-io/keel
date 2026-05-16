@@ -1,0 +1,110 @@
+#!/bin/sh
+# ============================================================================
+# keel — post-install script (DEB: postinst, RPM: %post)
+# ============================================================================
+# Runs after the package files have been unpacked.  Creates the system user
+# and group, ensures required directories exist with correct ownership, and
+# optionally generates self-signed test certificates if none are present.
+# ============================================================================
+set -e
+
+KEEL_USER="keel"
+KEEL_GROUP="keel"
+
+# ---------------------------------------------------------------------------
+# 1. Create system user and group
+# ---------------------------------------------------------------------------
+if ! getent group "$KEEL_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$KEEL_GROUP"
+fi
+
+if ! getent passwd "$KEEL_USER" >/dev/null 2>&1; then
+    useradd --system \
+        --gid "$KEEL_GROUP" \
+        --home-dir /nonexistent \
+        --shell /usr/sbin/nologin \
+        --no-create-home \
+        --comment "KEEL database proxy" \
+        "$KEEL_USER"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Create runtime directories
+# ---------------------------------------------------------------------------
+install -d -m 0750 -o "$KEEL_USER" -g "$KEEL_GROUP" /var/log/keel
+install -d -m 0750 -o "$KEEL_USER" -g "$KEEL_GROUP" /var/run/keel
+install -d -m 0750 -o "$KEEL_USER" -g "$KEEL_GROUP" /etc/keel/certs
+
+# ---------------------------------------------------------------------------
+# 3. Set ownership on config directory
+# ---------------------------------------------------------------------------
+chown root:"$KEEL_GROUP" /etc/keel
+chmod 0750 /etc/keel
+
+# Protect private key material
+if [ -d /etc/keel/certs ]; then
+    chmod 0750 /etc/keel/certs
+    chown "$KEEL_USER":"$KEEL_GROUP" /etc/keel/certs
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Install default config if none exists
+# ---------------------------------------------------------------------------
+if [ ! -f /etc/keel/keel.ini ]; then
+    if [ -f /etc/keel/keel.ini.example ]; then
+        cp /etc/keel/keel.ini.example /etc/keel/keel.ini
+        chown root:"$KEEL_GROUP" /etc/keel/keel.ini
+        chmod 0640 /etc/keel/keel.ini
+        echo "keel: installed default config /etc/keel/keel.ini"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Generate self-signed test certs if none exist
+# ---------------------------------------------------------------------------
+if [ ! -f /etc/keel/certs/server.pem ] && command -v openssl >/dev/null 2>&1; then
+    echo "keel: generating self-signed TLS certificates..."
+    # CA
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout /etc/keel/certs/ca.key \
+        -out /etc/keel/certs/ca.crt \
+        -days 3650 \
+        -subj "/CN=KEEL Local CA/O=KEEL/C=US" 2>/dev/null
+    cp /etc/keel/certs/ca.crt /etc/keel/certs/ca-bundle.pem
+
+    # Server cert
+    openssl req -newkey rsa:2048 -nodes \
+        -keyout /etc/keel/certs/server.key \
+        -out /etc/keel/certs/server.csr \
+        -subj "/CN=$(hostname -f 2>/dev/null || echo localhost)/O=KEEL/C=US" 2>/dev/null
+
+    printf "subjectAltName=DNS:localhost,DNS:%s,IP:127.0.0.1\n" \
+        "$(hostname -f 2>/dev/null || echo localhost)" > /etc/keel/certs/server.ext
+    printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n" \
+        >> /etc/keel/certs/server.ext
+
+    openssl x509 -req \
+        -in /etc/keel/certs/server.csr \
+        -CA /etc/keel/certs/ca.crt -CAkey /etc/keel/certs/ca.key -CAcreateserial \
+        -out /etc/keel/certs/server.pem \
+        -days 3650 \
+        -extfile /etc/keel/certs/server.ext 2>/dev/null
+
+    rm -f /etc/keel/certs/server.csr /etc/keel/certs/server.ext /etc/keel/certs/ca.srl
+
+    # Set ownership
+    chown "$KEEL_USER":"$KEEL_GROUP" /etc/keel/certs/*
+    chmod 0640 /etc/keel/certs/*.key
+    chmod 0644 /etc/keel/certs/*.crt /etc/keel/certs/*.pem
+
+    echo "keel: self-signed certificates installed in /etc/keel/certs/"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Reload systemd and enable service
+# ---------------------------------------------------------------------------
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable keel.service || true
+    echo "keel: systemd service enabled (start with: systemctl start keel)"
+fi

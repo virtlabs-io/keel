@@ -1,0 +1,259 @@
+name: Operator & Helm
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "operator/**"
+      - "helm/**"
+      - ".github/workflows/operator.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "operator/**"
+      - "helm/**"
+      - ".github/workflows/operator.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: operator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Operator unit tests (webhook defaulter + validator)
+  # ===========================================================================
+  operator-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+
+      - name: Tidy dependencies
+        working-directory: operator
+        run: go mod tidy
+
+      - name: Run operator unit tests
+        working-directory: operator
+        run: go test ./api/... -v -count=1
+
+      - name: vet
+        working-directory: operator
+        run: go vet ./...
+
+  # ===========================================================================
+  # Helm chart lint & template render
+  # ===========================================================================
+  helm-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart (default values)
+        run: helm lint helm/keel/
+
+      - name: Lint chart (webhook enabled)
+        run: |
+          helm lint helm/keel/ \
+            --set webhook.enabled=true \
+            --set webhook.certManager.enabled=true
+
+      - name: Template render (default)
+        run: |
+          helm template keel-test helm/keel/ \
+            --set image.tag=alpha-0.3.0 \
+            --debug > /dev/null
+
+      - name: Template render (cluster mode)
+        run: |
+          helm template keel-test helm/keel/ \
+            --set cluster.enabled=true \
+            --set replicaCount=3 \
+            --debug > /dev/null
+
+  # ===========================================================================
+  # End-to-end Helm + operator test against kind cluster
+  # ===========================================================================
+  helm-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+
+      - name: Tidy dependencies
+        working-directory: operator
+        run: go mod tidy
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -Lo ./kubectl \
+            "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Create kind cluster
+        run: kind create cluster --name keel-ci --wait 60s
+
+      - name: Build operator image
+        working-directory: operator
+        run: |
+          docker build -t keel-operator:ci .
+          kind load docker-image keel-operator:ci --name keel-ci
+
+      - name: Build keel image
+        run: |
+          docker build \
+            --target runner \
+            -t keel:ci \
+            .
+          kind load docker-image keel:ci --name keel-ci
+
+      - name: Install CRDs
+        run: |
+          kubectl apply -f helm/keel/crds/keelpool-crd.yaml
+          kubectl wait --for=condition=Established \
+            crd/keelpools.keel.virtlabs.io --timeout=30s
+
+      - name: Deploy operator (webhooks disabled for CI simplicity)
+        working-directory: operator
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+        run: |
+          kubectl create namespace keel-system || true
+          # Run operator with webhooks disabled (no cert-manager in CI)
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: keel-operator
+            namespace: keel-system
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: {app: keel-operator}
+            template:
+              metadata:
+                labels: {app: keel-operator}
+              spec:
+                serviceAccountName: default
+                containers:
+                  - name: operator
+                    image: keel-operator:ci
+                    imagePullPolicy: Never
+                    env:
+                      - name: ENABLE_WEBHOOKS
+                        value: "false"
+                    args:
+                      - --leader-elect=false
+          EOF
+          kubectl wait deployment/keel-operator \
+            -n keel-system \
+            --for=condition=Available \
+            --timeout=60s
+
+      - name: Apply RBAC for operator
+        run: |
+          kubectl create clusterrolebinding keel-operator-admin \
+            --clusterrole=cluster-admin \
+            --serviceaccount=keel-system:default || true
+
+      - name: Deploy KeelPool via Helm
+        run: |
+          # Use a dedicated CI ini that enables prometheus on 0.0.0.0:9101
+          # (--set-file properly handles the multi-line INI value; plain
+          # --set with a shell-substituted multi-line string is unreliable)
+          helm install keel-test helm/keel/ \
+            --namespace keel-ci \
+            --create-namespace \
+            --set image.repository=keel \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set webhook.enabled=false \
+            --set-file config=tests/keel_helm_ci.ini \
+            --timeout 90s \
+            --wait
+
+      - name: Verify Helm release is deployed
+        run: |
+          helm status keel-test -n keel-ci
+          kubectl get all -n keel-ci
+
+      - name: Apply a KeelPool CR and verify operator reconciles
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: keel.virtlabs.io/v1alpha1
+          kind: KeelPool
+          metadata:
+            name: test-pool
+            namespace: keel-ci
+          spec:
+            protocol: postgres
+            replicas: 1
+            listenPort: 7432
+            minPoolSize: 2
+            maxPoolSize: 20
+            backends:
+              - host: postgres.default.svc.cluster.local
+                port: 5432
+                database: postgres
+                username: postgres
+          EOF
+
+          # Wait for operator to reconcile (up to 30s)
+          for i in {1..15}; do
+            phase=$(kubectl get keelpool test-pool -n keel-ci \
+              -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            echo "Phase: $phase (attempt $i)"
+            if [[ "$phase" == "Running" || "$phase" == "Reconciling" || "$phase" == "Ready" ]]; then
+              echo "Operator reconciled the KeelPool."
+              break
+            fi
+            sleep 2
+          done
+
+          kubectl get keelpool test-pool -n keel-ci -o yaml | tail -20
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get events -n keel-system --sort-by=.metadata.creationTimestamp | tail -20
+          kubectl get events -n keel-ci --sort-by=.metadata.creationTimestamp | tail -20
+          kubectl logs -l app.kubernetes.io/name=keel -n keel-ci --tail=50 || true
+          kubectl logs deployment/keel-operator -n keel-system || true
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name keel-ci

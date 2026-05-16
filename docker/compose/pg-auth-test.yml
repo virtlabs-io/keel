@@ -1,0 +1,153 @@
+# Auth Provider End-to-End Test Stack
+# ====================================
+#
+# Components:
+#   postgres     — backend database (trust auth from keel, reachable directly for setup)
+#   openldap     — OpenLDAP server for LDAP auth tests
+#   keel-trust   — KEEL in trust mode   (port 25501)
+#   keel-scram   — KEEL in SCRAM mode   (port 25502)
+#   keel-ldap    — KEEL in LDAP mode    (port 25503)
+#   keel-md5     — KEEL in MD5 mode     (port 25504)
+#
+# Usage (from repo root):
+#   docker compose -f docker/compose/pg-auth-test.yml up -d
+#   cd tests/e2e && pytest test_enterprise_auth.py -v
+#   docker compose -f docker/compose/pg-auth-test.yml down -v
+
+name: keel-auth-test
+
+x-keel-base: &keel-base
+  image: keel:linux
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - auth-net
+  restart: "no"
+
+services:
+  # ==========================================================================
+  # Backend PostgreSQL (no password from localhost — keel connects as postgres)
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: auth-test-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespass
+      POSTGRES_DB: testdb
+      # Allow keel to connect without password from within the docker network
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "25500:5432"
+    networks:
+      - auth-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # ==========================================================================
+  # OpenLDAP for LDAP auth tests
+  # ==========================================================================
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: auth-test-openldap
+    hostname: openldap
+    environment:
+      LDAP_ORGANISATION: "Keel Test"
+      LDAP_DOMAIN: "keel.test"
+      LDAP_ADMIN_PASSWORD: "adminpass"
+      LDAP_CONFIG_PASSWORD: "configpass"
+      LDAP_TLS: "false"
+      LDAP_REMOVE_CONFIG_AFTER_SETUP: "true"
+      # Point the image to load the LDIF from its internal pre-seeding path.
+      # The bootstrap.ldif is baked in via the LDAP_SEED_INTERNAL_LDIF_PATH
+      # mechanism: osixia *copies* (not mounts) from that path before startup.
+      LDAP_SEED_INTERNAL_LDIF_PATH: /bootstrap.ldif
+    volumes:
+      - ../../tests/e2e/auth/ldap/bootstrap.ldif:/bootstrap.ldif:ro
+    ports:
+      - "25389:389"
+    networks:
+      - auth-net
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost -b dc=keel,dc=test -D cn=admin,dc=keel,dc=test -w adminpass '(objectclass=*)' dn 2>&1 | grep -q 'numEntries'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ==========================================================================
+  # KEEL — trust mode (baseline: no auth, all connections accepted)
+  # ==========================================================================
+  keel-trust:
+    <<: *keel-base
+    container_name: auth-test-keel-trust
+    hostname: keel-trust
+    environment:
+      KEEL_CONFIG: /etc/keel/keel-trust.ini
+    command: ["keel"]
+    volumes:
+      - ../../tests/e2e/auth/configs/keel-trust.ini:/etc/keel/keel-trust.ini:ro
+    ports:
+      - "25501:5432"
+
+  # ==========================================================================
+  # KEEL — SCRAM-SHA-256 mode
+  # ==========================================================================
+  keel-scram:
+    <<: *keel-base
+    container_name: auth-test-keel-scram
+    hostname: keel-scram
+    environment:
+      KEEL_CONFIG: /etc/keel/keel-scram.ini
+    command: ["keel"]
+    volumes:
+      - ../../tests/e2e/auth/configs/keel-scram.ini:/etc/keel/keel-scram.ini:ro
+      - ../../tests/e2e/auth/configs/userlist.txt:/etc/keel/userlist.txt:ro
+    ports:
+      - "25502:5432"
+
+  # ==========================================================================
+  # KEEL — LDAP mode
+  # ==========================================================================
+  keel-ldap:
+    <<: *keel-base
+    container_name: auth-test-keel-ldap
+    hostname: keel-ldap
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openldap:
+        condition: service_healthy
+    environment:
+      KEEL_CONFIG: /etc/keel/keel-ldap.ini
+    command: ["keel"]
+    volumes:
+      - ../../tests/e2e/auth/configs/keel-ldap.ini:/etc/keel/keel-ldap.ini:ro
+    ports:
+      - "25503:5432"
+
+  # ==========================================================================
+  # KEEL — MD5 mode
+  # ==========================================================================
+  keel-md5:
+    <<: *keel-base
+    container_name: auth-test-keel-md5
+    hostname: keel-md5
+    environment:
+      KEEL_CONFIG: /etc/keel/keel-md5.ini
+    command: ["keel"]
+    volumes:
+      - ../../tests/e2e/auth/configs/keel-md5.ini:/etc/keel/keel-md5.ini:ro
+      - ../../tests/e2e/auth/configs/userlist.txt:/etc/keel/userlist.txt:ro
+    ports:
+      - "25504:5432"
+
+networks:
+  auth-net:
+    driver: bridge

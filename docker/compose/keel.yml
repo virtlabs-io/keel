@@ -1,0 +1,429 @@
+# ============================================================================
+# keel dev environment — PostgreSQL 17 cluster + MySQL 8.4 cluster + keel
+#
+# Clusters:
+#   PostgreSQL 17  — physical streaming replication, 1 primary + 2 replicas
+#     pgsql-01   : 127.0.0.1:5499  (intentionally not 5432)
+#     pgsql-02  : 127.0.0.1:5500
+#     pgsql-03  : 127.0.0.1:5501
+#
+#   MySQL 8.4      — GTID-based async replication, 1 primary + 2 replicas
+#     mysql-01  : 127.0.0.1:3306
+#     mysql-02 : 127.0.0.1:3307
+#     mysql-03 : 127.0.0.1:3308
+#
+# Usage (from project root):
+#   docker/build-linux.sh dev up       # start clusters in background
+#   docker/build-linux.sh dev build    # (re)build keel inside devenv
+#   docker/build-linux.sh dev run      # run keel inside devenv
+#   docker/build-linux.sh dev sysbench # run sysbench tests end-to-end
+#   docker/build-linux.sh dev shell    # interactive shell with all tools
+#   docker/build-linux.sh dev down     # stop everything
+# ============================================================================
+
+name: keel-dev
+
+services:
+
+  # ==========================================================================
+  # PostgreSQL 17 — Primary
+  # ==========================================================================
+  pgsql-01:
+    image: postgres:17-alpine
+    container_name: keel-dev-pgsql-01
+    hostname: pgsql-01
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgsql_01_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "6432:5432"
+    networks:
+      - keel-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 2gb
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+
+  # ==========================================================================
+  # PostgreSQL 17 — Replica 1 (physical streaming replication)
+  # ==========================================================================
+  pgsql-02:
+    image: postgres:17-alpine
+    container_name: keel-dev-pgsql-02
+    hostname: pgsql-02
+    user: postgres
+    shm_size: 2gb
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "[pgsql-02] Waiting for primary..."
+        until pg_isready -h pgsql-01 -p 5432 -U postgres; do
+          sleep 2
+        done
+        sleep 5
+        echo "[pgsql-02] Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        PGPASSWORD=replicator pg_basebackup \
+          -h pgsql-01 -p 5432 -U replicator \
+          -D /var/lib/postgresql/data \
+          -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" \
+          >> /var/lib/postgresql/data/postgresql.conf
+        echo "[pgsql-02] Starting replica..."
+        exec postgres
+    volumes:
+      - pgsql_02_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "6433:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # PostgreSQL 17 — Replica 2 (physical streaming replication)
+  # ==========================================================================
+  pgsql-03:
+    image: postgres:17-alpine
+    container_name: keel-dev-pgsql-03
+    hostname: pgsql-03
+    user: postgres
+    shm_size: 2gb
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "[pgsql-03] Waiting for primary..."
+        until pg_isready -h pgsql-01 -p 5432 -U postgres; do
+          sleep 2
+        done
+        sleep 7
+        echo "[pgsql-03] Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        PGPASSWORD=replicator pg_basebackup \
+          -h pgsql-01 -p 5432 -U replicator \
+          -D /var/lib/postgresql/data \
+          -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" \
+          >> /var/lib/postgresql/data/postgresql.conf
+        echo "[pgsql-03] Starting replica..."
+        exec postgres
+    volumes:
+      - pgsql_03_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "6434:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # MySQL 8.4 — Primary
+  # ==========================================================================
+  mysql-01:
+    image: mysql:8.4
+    container_name: keel-dev-mysql-01
+    hostname: mysql-01
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: keel
+      MYSQL_PASSWORD: keel
+    volumes:
+      - mysql_01_data:/var/lib/mysql
+      - ../mysql/config/primary.cnf:/etc/mysql/conf.d/primary.cnf:ro
+      - ../mysql/scripts/init-primary.sh:/docker-entrypoint-initdb.d/01-init-primary.sh:ro
+      - ../mysql/scripts/init-primary.sql:/docker-entrypoint-initdb.d/02-init-primary.sql:ro
+    ports:
+      - "6306:3306"
+    networks:
+      - keel-dev
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+
+  # ==========================================================================
+  # MySQL 8.4 — Replica 1 (GTID-based async replication)
+  # ==========================================================================
+  mysql-02:
+    image: mysql:8.4
+    container_name: keel-dev-mysql-02
+    hostname: mysql-02
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql_02_data:/var/lib/mysql
+      - ../mysql/config/replica1.cnf:/etc/mysql/conf.d/replica.cnf:ro
+      - ../mysql/scripts/init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    ports:
+      - "6307:3306"
+    networks:
+      - keel-dev
+    depends_on:
+      mysql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+
+  # ==========================================================================
+  # MySQL 8.4 — Replica 2 (GTID-based async replication)
+  # ==========================================================================
+  mysql-03:
+    image: mysql:8.4
+    container_name: keel-dev-mysql-03
+    hostname: mysql-03
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql_03_data:/var/lib/mysql
+      - ../mysql/config/replica2.cnf:/etc/mysql/conf.d/replica.cnf:ro
+      - ../mysql/scripts/init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    ports:
+      - "6308:3306"
+    networks:
+      - keel-dev
+    depends_on:
+      mysql-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+
+  # --------------------------------------------------------------------------
+  # keel devenv — build + run container with source bind-mounted
+  #
+  # Source edits on the host are immediately visible inside the container.
+  # The cmake build dir lives in the named volume keel-build-cache so that
+  # incremental builds are fast across container restarts.
+  # --------------------------------------------------------------------------
+  devenv:
+    image: keel-devenv          # built by: docker/build-linux.sh dev build-image
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+      target: devenv
+    container_name: keel-devenv
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - keel_build_cache:/keel/build-linux  # persistent cmake/ninja cache
+    ports:
+      - "7432:7432"
+      - "2222:22"
+    networks:
+      - keel-dev
+    environment:
+      # PostgreSQL primary connection vars (used by psql, sysbench, keel configs)
+      PGHOST: pgsql-01
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      # MySQL primary connection vars
+      MYSQL_HOST: mysql-01
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: test
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+      pgsql-02:
+        condition: service_healthy
+      pgsql-03:
+        condition: service_healthy
+      mysql-01:
+        condition: service_healthy
+      mysql-02:
+        condition: service_healthy
+      mysql-03:
+        condition: service_healthy
+    # SYS_PTRACE + seccomp:unconfined are required for gdb / strace inside
+    # the container (used both by the Dev Container and by docker exec sessions).
+    cap_add:
+      - SYS_PTRACE
+      - PERFMON
+      - SYSLOG
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    # keep the container alive so `docker exec` / Dev Container attachment works
+    stdin_open: true
+    tty: true
+    command: ["bash", "-lc", "mkdir -p /run/sshd && /usr/sbin/sshd && echo '[devenv] ready (ssh on :22)'; sleep infinity"]
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65536
+      net.ipv4.tcp_keepalive_time: 600
+      net.ipv4.tcp_keepalive_intvl: 60
+      net.ipv4.tcp_keepalive_probes: 5
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 5
+
+  # ==========================================================================
+  # HAProxy — L4 TCP proxy for PostgreSQL benchmarking comparison
+  # Listens on port 7433 (mapped from internal 5432)
+  # ==========================================================================
+  haproxy:
+    image: haproxy:3.1-alpine
+    container_name: keel-dev-haproxy
+    hostname: haproxy
+    volumes:
+      - ../haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "7433:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.ip_local_port_range: "1024 65535"
+    healthcheck:
+      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==========================================================================
+  # PgBouncer — connection pooler for PostgreSQL benchmarking comparison
+  # Listens on port 7434 (mapped from internal 5432)
+  # ==========================================================================
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: keel-dev-pgbouncer
+    hostname: pgbouncer
+    volumes:
+      - ../pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ../pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "7434:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      pgsql-01:
+        condition: service_healthy
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.ip_local_port_range: "1024 65535"
+
+networks:
+  keel-dev:
+    driver: bridge
+
+volumes:
+  pgsql_01_data:
+  pgsql_02_data:
+  pgsql_03_data:
+  mysql_01_data:
+  mysql_02_data:
+  mysql_03_data:
+  keel_build_cache:

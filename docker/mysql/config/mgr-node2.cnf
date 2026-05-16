@@ -1,0 +1,31 @@
+# =============================================================================
+# MySQL Group Replication — Node 2 (Joiner)
+# =============================================================================
+[mysqld]
+server-id                      = 2
+bind-address                   = 0.0.0.0
+report-host                    = mgr-node2
+
+# Binary logging
+log-bin                        = mysql-bin
+gtid-mode                      = ON
+enforce-gtid-consistency       = ON
+log-replica-updates            = ON
+
+# Group Replication
+loose-plugin-load-add                = group_replication.so
+loose-group-replication-group-name   = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+loose-group-replication-local-address = mgr-node2:33061
+loose-group-replication-group-seeds  = mgr-node1:33061,mgr-node2:33061,mgr-node3:33061
+loose-group-replication-start-on-boot = OFF
+loose-group-replication-bootstrap-group = OFF
+
+# Multi-Primary mode
+loose-group-replication-single-primary-mode = OFF
+loose-group-replication-enforce-update-everywhere-checks = ON
+
+# Connections
+max-connections                = 200
+
+# Performance
+innodb-buffer-pool-size        = 256M

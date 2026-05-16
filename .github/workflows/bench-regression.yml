@@ -1,0 +1,149 @@
+name: Benchmark Regression
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'bench/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/bench-regression.yml'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'pgbench duration in seconds (default: 60)'
+        required: false
+        default: '60'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only one benchmark run at a time — concurrent runs would contend on the same
+# PostgreSQL instance and produce noisy results.
+concurrency:
+  group: bench-regression
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: pgbench regression (32 clients, 60s)
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keelbench
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc libssl-dev liburing-dev \
+            postgresql-client python3
+
+      - name: Build keel (Release)
+        run: |
+          cmake -S . -B build-bench \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKEEL_ENABLE_TESTS=OFF \
+            -DKEEL_ENABLE_LUA=OFF \
+            -DKEEL_ENABLE_PYTHON=OFF
+          cmake --build build-bench --target keel -- -j$(nproc)
+
+      - name: Load benchmark schema
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d keelbench -f bench/schema.sql
+          echo "Schema loaded."
+
+      - name: Write keel config
+        run: |
+          cat > /tmp/keel-bench.ini << 'EOF'
+          [keel]
+          log_level = 1
+
+          [worker_group.bench]
+          protocol = postgres
+          bind_addr = 127.0.0.1
+          bind_port = 7432
+          num_workers = 4
+          min_pool_size = 10
+          max_pool_size = 50
+          server_user = postgres
+          server_password = postgres
+          probe = postgres
+          probe_interval = 5s
+
+          [worker_group.bench.servers]
+          primary = host=127.0.0.1 port=5432 dbname=keelbench role=RW weight=100
+
+          [admin]
+          enabled = false
+
+          [prometheus]
+          enabled = false
+          EOF
+
+      - name: Start keel proxy
+        run: |
+          ./build-bench/src/main/keel /tmp/keel-bench.ini &
+          KEEL_PID=$!
+          echo "KEEL_PID=${KEEL_PID}" >> "$GITHUB_ENV"
+          # Wait for keel to be ready
+          for i in $(seq 1 20); do
+            if pg_isready -h 127.0.0.1 -p 7432 -U postgres >/dev/null 2>&1; then
+              echo "keel ready after ${i} attempts"
+              break
+            fi
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p 7432 -U postgres || { echo "keel failed to start"; exit 1; }
+
+      - name: Run benchmark regression check
+        env:
+          KEEL_BENCH_CONNSTR: "host=127.0.0.1 port=7432 dbname=keelbench user=postgres password=postgres"
+          DIRECT_BENCH_CONNSTR: "host=127.0.0.1 port=5432 dbname=keelbench user=postgres password=postgres"
+          PGPASSWORD: postgres
+          KEEL_BENCH_DURATION: ${{ github.event.inputs.duration || '60' }}
+          KEEL_BENCH_CLIENTS: "32"
+          KEEL_BENCH_THREADS: "8"
+          TPS_RATIO_MIN: "0.60"
+          LAT_RATIO_MAX: "2.50"
+        run: |
+          chmod +x bench/bench-regression.sh
+          bash bench/bench-regression.sh | tee /tmp/bench-result.txt
+
+      - name: Stop keel proxy
+        if: always()
+        run: kill "${KEEL_PID}" 2>/dev/null || true
+
+      - name: Post result summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const result = fs.readFileSync('/tmp/bench-result.txt', 'utf8');
+            const body = `## Benchmark Regression Results\n\n\`\`\`\n${result}\n\`\`\`\n\n> Thresholds: throughput -5% · avg latency +10%`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

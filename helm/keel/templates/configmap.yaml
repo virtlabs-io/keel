@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keel.fullname" . }}
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+data:
+  keel.ini: |
+    {{- .Values.config | nindent 4 }}
+    {{- if .Values.cluster.enabled }}
+
+    [cluster]
+    enabled = true
+    listen_addr = 0.0.0.0
+    listen_port = {{ .Values.cluster.port }}
+    heartbeat_interval_ms = {{ .Values.cluster.heartbeatIntervalMs }}
+    heartbeat_timeout_ms = {{ .Values.cluster.heartbeatTimeoutMs }}
+    failure_threshold = {{ .Values.cluster.failureThreshold }}
+    {{- end }}

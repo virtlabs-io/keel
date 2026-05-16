@@ -1,0 +1,229 @@
+# =============================================================================
+# KEEL Multi-Proxy HA Cluster — Production Compose Template (MySQL)
+# =============================================================================
+# Uses the published keel image from ghcr.io instead of a local build.
+# Backs 3 KEEL proxy nodes onto a MySQL 9 primary + 2 async GTID replicas.
+#
+# Architecture:
+#   Client ──► keel-1 (7306) ──┐
+#   Client ──► keel-2 (7307) ──┤──► mysql-primary  (RW 3306)
+#   Client ──► keel-3 (7308) ──┘──► mysql-replica1 (RO 3306)
+#                                └──► mysql-replica2 (RO 3306)
+#
+# Each KEEL node:
+#   MySQL proxy  → host:7306 / 7307 / 7308
+#   Admin        → host:6433 / 6434 / 6435   (psql -h 127.0.0.1 -p 6433 -U admin keel)
+#   Prometheus   → host:9101 / 9102 / 9103
+#   Cluster peer → 9100 (internal only)
+#
+# Usage:
+#   docker pull ghcr.io/virtlabs/keel:latest
+#   docker compose -f docker/compose/mysql-ha-official.yml up -d
+#
+#   # Connect via any keel node (MySQL protocol)
+#   mysql -h 127.0.0.1 -P 7306 -u root -proot test
+#   mysql -h 127.0.0.1 -P 7307 -u root -proot test
+#
+#   # Check cluster status (admin uses PostgreSQL wire protocol)
+#   psql -h 127.0.0.1 -p 6433 -U admin keel -c "SHOW CLUSTER;"
+# =============================================================================
+
+name: keel-mysql-ha
+
+x-keel-base: &keel-base
+  image: ${KEEL_IMAGE:-ghcr.io/virtlabs/keel:latest}
+  restart: unless-stopped
+  networks:
+    - cluster
+  healthcheck:
+    test: ["CMD", "nc", "-z", "127.0.0.1", "6433"]
+    interval: 10s
+    timeout: 3s
+    start_period: 15s
+    retries: 3
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 512M
+
+x-keel-env-common: &keel-env-common
+  KEEL_LOG_LEVEL: info
+  KEEL_ADMIN_ENABLED: "true"
+  KEEL_ADMIN_PORT: "6433"
+  KEEL_PROM_ENABLED: "true"
+  KEEL_PROM_PORT: "9101"
+  KEEL_CLUSTER_ENABLED: "true"
+  KEEL_CLUSTER_LISTEN_PORT: "9100"
+  KEEL_CLUSTER_HB_INTERVAL: "1000"
+  KEEL_CLUSTER_HB_TIMEOUT: "5000"
+  KEEL_CLUSTER_FAIL_THRESHOLD: "3"
+  KEEL_CLUSTER_AUTO_SYNC: "true"
+
+services:
+
+  # ==========================================================================
+  # MySQL — Primary (RW)
+  # ==========================================================================
+  mysql-primary:
+    image: mysql:9
+    container_name: keel-mysql-ha-primary
+    hostname: mysql-primary
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: keel
+      MYSQL_PASSWORD: keel
+    volumes:
+      - mysql_primary_data:/var/lib/mysql
+      - ../mysql/config/primary.cnf:/etc/mysql/conf.d/primary.cnf:ro
+      - ../mysql/scripts/init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+      - ../mysql/scripts/init-primary.sql:/docker-entrypoint-initdb.d/init-primary.sql:ro
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ==========================================================================
+  # MySQL — Replica 1 (RO)
+  # ==========================================================================
+  mysql-replica1:
+    image: mysql:9
+    container_name: keel-mysql-ha-replica1
+    hostname: mysql-replica1
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql_replica1_data:/var/lib/mysql
+      - ../mysql/config/replica1.cnf:/etc/mysql/conf.d/replica.cnf:ro
+      - ../mysql/scripts/init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # MySQL — Replica 2 (RO)
+  # ==========================================================================
+  mysql-replica2:
+    image: mysql:9
+    container_name: keel-mysql-ha-replica2
+    hostname: mysql-replica2
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql_replica2_data:/var/lib/mysql
+      - ../mysql/config/replica2.cnf:/etc/mysql/conf.d/replica.cnf:ro
+      - ../mysql/scripts/init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    networks:
+      - cluster
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ==========================================================================
+  # KEEL Node 1
+  # ==========================================================================
+  keel-1:
+    <<: *keel-base
+    container_name: keel-mysql-ha-node-1
+    hostname: keel-1
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      <<: *keel-env-common
+      KEEL_CLUSTER_NODE_ID: keel-1
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-2:9100,keel-3:9100"
+    ports:
+      - "${KEEL1_SQL_PORT:-7306}:7306"
+      - "${KEEL1_ADMIN_PORT:-6433}:6433"
+      - "${KEEL1_PROM_PORT:-9101}:9101"
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+      mysql-replica1:
+        condition: service_healthy
+      mysql-replica2:
+        condition: service_healthy
+
+  # ==========================================================================
+  # KEEL Node 2
+  # ==========================================================================
+  keel-2:
+    <<: *keel-base
+    container_name: keel-mysql-ha-node-2
+    hostname: keel-2
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      <<: *keel-env-common
+      KEEL_CLUSTER_NODE_ID: keel-2
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-1:9100,keel-3:9100"
+    ports:
+      - "${KEEL2_SQL_PORT:-7307}:7306"
+      - "${KEEL2_ADMIN_PORT:-6434}:6433"
+      - "${KEEL2_PROM_PORT:-9102}:9101"
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+      mysql-replica1:
+        condition: service_healthy
+      mysql-replica2:
+        condition: service_healthy
+
+  # ==========================================================================
+  # KEEL Node 3
+  # ==========================================================================
+  keel-3:
+    <<: *keel-base
+    container_name: keel-mysql-ha-node-3
+    hostname: keel-3
+    volumes:
+      - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
+    environment:
+      <<: *keel-env-common
+      KEEL_CLUSTER_NODE_ID: keel-3
+      KEEL_CLUSTER_INITIAL_PEERS: "keel-1:9100,keel-2:9100"
+    ports:
+      - "${KEEL3_SQL_PORT:-7308}:7306"
+      - "${KEEL3_ADMIN_PORT:-6435}:6433"
+      - "${KEEL3_PROM_PORT:-9103}:9101"
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+      mysql-replica1:
+        condition: service_healthy
+      mysql-replica2:
+        condition: service_healthy
+
+networks:
+  cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.0.0/24
+
+volumes:
+  mysql_primary_data:
+  mysql_replica1_data:
+  mysql_replica2_data:

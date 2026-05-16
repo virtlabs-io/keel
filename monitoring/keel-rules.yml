@@ -1,0 +1,245 @@
+groups:
+  # ---------------------------------------------------------------------------
+  # Pool saturation — fires when the connection pool is under pressure
+  # ---------------------------------------------------------------------------
+  - name: keel.pool
+    interval: 15s
+    rules:
+      - alert: KeelPoolNearSaturation
+        expr: |
+          keel_pool_utilization_ratio > 0.85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL pool near saturation ({{ $value | humanizePercentage }})"
+          description: >
+            Pool utilization has been above 85% for 2 minutes.
+            Consider increasing max_pool_size or adding backend replicas.
+            Instance: {{ $labels.instance }}
+
+      - alert: KeelPoolSaturated
+        expr: |
+          keel_pool_utilization_ratio > 0.98
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KEEL pool saturated ({{ $value | humanizePercentage }})"
+          description: >
+            Pool utilization is above 98%. New client connections will queue
+            or be rejected. Immediate action required.
+            Instance: {{ $labels.instance }}
+
+      - alert: KeelWaitingSessionsHigh
+        expr: |
+          keel_pool_waiting_sessions > 50
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL has {{ $value }} sessions waiting for a backend connection"
+          description: >
+            More than 50 sessions are queued waiting for a backend connection.
+            Check max_pool_size, backend health, and query latency.
+
+  # ---------------------------------------------------------------------------
+  # Query latency SLO
+  # ---------------------------------------------------------------------------
+  - name: keel.latency
+    interval: 30s
+    rules:
+      - alert: KeelQueryLatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            rate(keel_query_latency_ns_bucket[5m])
+          ) / 1e6 > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL P99 query latency is {{ $value | humanize }}ms"
+          description: >
+            The 99th-percentile query latency has been above 500ms for 5 minutes.
+            Check backend health, pool starvation, and query patterns.
+
+      - alert: KeelBackendLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            rate(keel_backend_latency_ns_bucket[5m])
+          ) / 1e6 > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL P95 backend latency is {{ $value | humanize }}ms"
+          description: >
+            The 95th-percentile backend-side latency has been above 200ms.
+            This may indicate slow queries, replication lag, or backend overload.
+
+      - alert: KeelConnectLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(keel_connect_latency_ns_bucket[5m])
+          ) / 1e6 > 100
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL P95 backend connect latency is {{ $value | humanize }}ms"
+          description: >
+            New backend connections are taking more than 100ms at P95.
+            Check network latency, backend accept queue, and pool warmup settings.
+
+  # ---------------------------------------------------------------------------
+  # Availability
+  # ---------------------------------------------------------------------------
+  - name: keel.availability
+    interval: 30s
+    rules:
+      - alert: KeelDown
+        expr: |
+          absent(keel_uptime_seconds)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KEEL instance is down"
+          description: >
+            No metrics from keel for 1 minute. The process may have crashed.
+            Check systemd/K8s pod status and recent logs.
+
+      - alert: KeelHighFDUsage
+        expr: |
+          keel_fd_open / keel_fd_limit > 0.80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL FD usage at {{ $value | humanizePercentage }}"
+          description: >
+            File descriptor usage has been above 80% of the limit for 5 minutes.
+            At 100% KEEL will refuse new connections. Consider raising ulimit or
+            reducing max_conns_per_worker.
+
+  # ---------------------------------------------------------------------------
+  # TLS / Security
+  # ---------------------------------------------------------------------------
+  - name: keel.tls
+    interval: 60s
+    rules:
+      - alert: KeelTLSDowngradeAttempts
+        expr: |
+          increase(keel_tls_downgrade_rejected[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL rejected {{ $value }} TLS downgrade attempt(s)"
+          description: >
+            One or more clients attempted a TLS downgrade in the last 10 minutes.
+            Investigate client TLS configuration and potential MITM activity.
+
+      - alert: KeelTLSCertReloadFailure
+        expr: |
+          increase(keel_tls_cert_reload_failures[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "KEEL TLS certificate reload failed"
+          description: >
+            A SIGHUP-triggered TLS certificate reload failed. The proxy is still
+            serving with the old certificate. Check the new certificate files for
+            validity and permissions.
+
+  # ---------------------------------------------------------------------------
+  # Cluster / HA
+  # ---------------------------------------------------------------------------
+  - name: keel.cluster
+    interval: 30s
+    rules:
+      - alert: KeelClusterPeerDown
+        expr: |
+          keel_cluster_peers_down > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} KEEL cluster peer(s) are unreachable"
+          description: >
+            One or more keel cluster peers have been unreachable for 2 minutes.
+            This reduces HA redundancy. Check peer network connectivity.
+
+      - alert: KeelClusterNoLeader
+        expr: |
+          sum(keel_cluster_is_leader) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "KEEL cluster has no leader"
+          description: >
+            No keel instance reports itself as leader. Config gossip and
+            quorum-gated operations are suspended until a new leader is elected.
+
+  # ---------------------------------------------------------------------------
+  # Routing
+  # ---------------------------------------------------------------------------
+  - name: keel.routing
+    interval: 30s
+    rules:
+      - alert: KeelRoutingFailoverHigh
+        expr: |
+          rate(keel_router_failover_routes[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEEL is routing {{ $value | humanize }} failover routes/s"
+          description: >
+            High failover routing rate suggests repeated backend health probe
+            failures. Check primary/replica availability and probe config.
+
+  # ---------------------------------------------------------------------------
+  # Recording rules (pre-aggregate expensive queries for dashboards)
+  # ---------------------------------------------------------------------------
+  - name: keel.recording
+    interval: 30s
+    rules:
+      - record: keel:query_latency_p50
+        expr: |
+          histogram_quantile(0.50,
+            rate(keel_query_latency_ns_bucket[5m])
+          ) / 1e6
+
+      - record: keel:query_latency_p95
+        expr: |
+          histogram_quantile(0.95,
+            rate(keel_query_latency_ns_bucket[5m])
+          ) / 1e6
+
+      - record: keel:query_latency_p99
+        expr: |
+          histogram_quantile(0.99,
+            rate(keel_query_latency_ns_bucket[5m])
+          ) / 1e6
+
+      - record: keel:backend_latency_p95
+        expr: |
+          histogram_quantile(0.95,
+            rate(keel_backend_latency_ns_bucket[5m])
+          ) / 1e6
+
+      - record: keel:pool_utilization
+        expr: keel_pool_utilization_ratio
+
+      - record: keel:queries_per_second
+        expr: rate(keel_router_total_routes[1m])
+
+      - record: keel:read_offload_ratio
+        expr: |
+          rate(keel_router_read_routes[5m])
+          /
+          clamp_min(rate(keel_router_total_routes[5m]), 1)
+
+      - record: keel:fd_usage_ratio
+        expr: keel_fd_open / keel_fd_limit

@@ -1,0 +1,22 @@
+# KEEL User List
+# Format: "username" "password_hash"
+#
+# Password hash formats:
+#   SCRAM-SHA-256$iterations:salt:stored_key:server_key  (recommended)
+#   md5<32-char-md5-hash>  (legacy)
+#   plain_text  (will be converted to SCRAM on load)
+#
+# Generate SCRAM hashes with:
+#   ./build/keel-hash-password <password>
+#
+# Example entries:
+# "admin" "SCRAM-SHA-256$4096:abc123:base64storedkey:base64serverkey"
+# "readonly" "md5abc123def456..."
+# "testuser" "plaintext_password"
+
+# Test users with plain text passwords (will be hashed on load)
+"postgres" "postgres"
+"testuser" "testpass"
+"pgbench" "pgbench"
+"admin" "admin"
+"tpcc" "tpcc"

@@ -1,0 +1,27 @@
+# =============================================================================
+# MariaDB Galera Cluster — Node 2 (Joiner)
+# =============================================================================
+[mysqld]
+server-id                     = 2
+binlog-format                 = ROW
+default-storage-engine        = InnoDB
+innodb-autoinc-lock-mode      = 2
+bind-address                  = 0.0.0.0
+
+# Galera
+wsrep_on                      = ON
+wsrep_provider                = /usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name            = mdb-galera
+wsrep_cluster_address         = gcomm://mdb-node1,mdb-node2,mdb-node3
+wsrep_node_name               = mdb-node2
+wsrep_node_address            = mdb-node2
+wsrep_sst_method              = rsync
+
+# Performance
+innodb-buffer-pool-size       = 256M
+
+# Connections
+max-connections               = 200
+
+# Logging
+log-error                     = /var/lib/mysql/error.log

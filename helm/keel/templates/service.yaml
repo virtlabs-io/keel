@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "keel.fullname" . }}
+  labels:
+    {{- include "keel.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.pgPort }}
+      targetPort: pg
+      protocol: TCP
+      name: pg
+    {{- if .Values.service.myPort }}
+    - port: {{ .Values.service.myPort }}
+      targetPort: mysql
+      protocol: TCP
+      name: mysql
+    {{- end }}
+    - port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+      name: admin
+  selector:
+    {{- include "keel.selectorLabels" . | nindent 4 }}

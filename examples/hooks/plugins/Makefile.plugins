@@ -1,0 +1,26 @@
+# Hook Plugin Examples — Build & Usage
+#
+# Build the example plugins:
+#   make -f Makefile.plugins
+#
+# Then reference the .so files in your keel configuration (per worker group):
+#   [worker_group.<group>.hooks]
+#   hook.plugin.query_logger = examples/hooks/plugins/query_logger_plugin.so
+#   hook.plugin.rate_limiter = examples/hooks/plugins/rate_limiter_plugin.so
+
+CC      ?= gcc
+CFLAGS  := -shared -fPIC -Wall -Wextra -O2
+INCDIR  := ../../../include
+
+.PHONY: all clean
+
+all: query_logger_plugin.so rate_limiter_plugin.so
+
+query_logger_plugin.so: query_logger_plugin.c
+	$(CC) $(CFLAGS) -I$(INCDIR) -o $@ $<
+
+rate_limiter_plugin.so: rate_limiter_plugin.c
+	$(CC) $(CFLAGS) -I$(INCDIR) -o $@ $<
+
+clean:
+	rm -f *.so

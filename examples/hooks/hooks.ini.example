@@ -1,0 +1,190 @@
+# =============================================================================
+# Keel Hook System — Configuration Examples
+# =============================================================================
+#
+# This file shows how to configure hooks at each of the 4 pipeline points
+# using all 3 supported hook types: Lua, Python, and native .so plugins.
+#
+# Add these entries to your main keel configuration file (e.g., keel-pg.ini).
+#
+# Hook Points (in execution order):
+#   1. after_query_read   — raw query bytes received from client
+#   2. after_query_parse  — SQL parsed / classified (query type, effects)
+#   3. before_route       — about to pick primary vs replica
+#   4. before_send        — about to forward payload to backend
+#
+# Hook Types:
+#   lua     — Lua 5.4 / LuaJIT script (requires KEEL_ENABLE_LUA=ON build)
+#   python  — CPython 3.x module     (requires KEEL_ENABLE_PYTHON=ON build)
+#   plugin  — Native .so shared library (always available)
+#
+# Key Format:
+#   hook.plugin.<name>              — native .so plugin
+#   hook.lua.<point>.<name>         — Lua hook
+#   hook.python.<point>.<name>      — Python hook
+#
+# The key itself encodes the hook type, trigger point, and descriptive name.
+# No numbers, no ambiguity.
+#
+# Hooks are scoped per worker group.  Each group has its own [hooks] section:
+#   [worker_group.<group_name>.hooks]
+#
+# This means different groups (e.g., PostgreSQL vs MySQL) can have
+# completely independent hook configurations.
+#
+# Priority:
+#   Lower numbers execute first.  Same priority = registration order.
+#   Recommended ranges:
+#     1-49    : security / rate limiting (abort early)
+#     50-99   : validation / policy enforcement
+#     100-199 : routing overrides
+#     200-499 : logging / auditing
+#     500+    : telemetry / sampling
+#
+# =============================================================================
+
+# ============================================================================
+# PostgreSQL worker group — hooks
+# ============================================================================
+[worker_group.my_pgsql.hooks]
+
+# --------------------------------------------------------------------------
+# Native .so Plugins (always available, no special build flags needed)
+# --------------------------------------------------------------------------
+# Plugins are loaded via dlopen().  The .so must export:
+#   const keel_hook_plugin_info_t* keel_hook_plugin_init(void);
+#
+# The plugin self-registers its hooks (points, priorities, callbacks) via
+# the returned keel_hook_plugin_info_t struct.  See the C examples in
+# examples/hooks/plugins/ for the full pattern.
+#
+# Syntax:  hook.plugin.<name> = <path-to-shared-library>
+
+hook.plugin.query_logger = examples/hooks/plugins/query_logger_plugin.so
+hook.plugin.rate_limiter = examples/hooks/plugins/rate_limiter_plugin.so
+
+# --------------------------------------------------------------------------
+# Lua Hooks (requires building with -DKEEL_ENABLE_LUA=ON)
+# --------------------------------------------------------------------------
+# Key format:  hook.lua.<point>.<name>
+#
+# The hook point and name are part of the key — no need to repeat them
+# in the value.  Only specify script, func, and priority.
+#
+# Value fields:
+#   script    — Path to the .lua file
+#   func      — Name of the Lua function to call
+#   priority  — Execution priority (lower = earlier)
+#
+# The Lua function signature:
+#   function my_hook(ctx)
+#       -- ctx is a table with session/query fields
+#       -- return true, ctx   to continue
+#       -- return false, ctx  to abort (set ctx.error_msg first)
+#   end
+
+# Example: Log every query after parsing
+hook.lua.after_query_parse.query_logger = \
+    script=examples/hooks/lua/query_logger.lua \
+    func=log_query priority=200
+
+# Example: Block dangerous queries (DROP, TRUNCATE, DELETE without WHERE)
+hook.lua.after_query_parse.block_dangerous = \
+    script=examples/hooks/lua/block_dangerous.lua \
+    func=check_query priority=50
+
+# Example: Force certain users/databases to primary
+hook.lua.before_route.force_primary = \
+    script=examples/hooks/lua/force_primary.lua \
+    func=route_check priority=100
+
+# Example: Log outbound payload info
+hook.lua.before_send.latency_sampler = \
+    script=examples/hooks/lua/latency_sampler.lua \
+    func=before_send priority=500
+
+# --------------------------------------------------------------------------
+# Python Hooks (requires building with -DKEEL_ENABLE_PYTHON=ON)
+# --------------------------------------------------------------------------
+# Key format:  hook.python.<point>.<name>
+#
+# Value fields:
+#   module    — Python module path (dot-separated, e.g., "my_hooks.logger")
+#   func      — Function name in the module
+#   priority  — Execution priority
+#
+# The Python function signature:
+#   def my_hook(ctx: dict) -> tuple[bool, dict]:
+#       # ctx is a dict with session/query fields
+#       # Return (True, ctx) to continue, (False, ctx) to abort
+#       return True, ctx
+
+# Example: Log every query after parsing (Python version)
+hook.python.after_query_parse.query_logger = \
+    module=examples.hooks.python.query_logger \
+    func=log_query priority=200
+
+# Example: Block dangerous queries (Python version)
+hook.python.after_query_parse.block_dangerous = \
+    module=examples.hooks.python.block_dangerous \
+    func=check_query priority=50
+
+# Example: Force certain users/databases to primary (Python version)
+hook.python.before_route.force_primary = \
+    module=examples.hooks.python.force_primary \
+    func=route_check priority=100
+
+# Example: Log outbound payload info (Python version)
+hook.python.before_send.latency_sampler = \
+    module=examples.hooks.python.latency_sampler \
+    func=before_send priority=500
+
+# --------------------------------------------------------------------------
+# Mixing Hook Types
+# --------------------------------------------------------------------------
+# You can freely mix Lua, Python, and native plugin hooks at the same hook
+# points.  They execute in priority order regardless of type.
+#
+# Example: Security plugin (native, prio 10) → Lua policy (prio 50) →
+#          Python logger (prio 200)
+#
+# This works because all hooks share the same keel_hook_ctx_t context
+# and the same priority-sorted dispatch chain.
+#
+# --------------------------------------------------------------------------
+# Per-Hook-Point Examples (all types at each point)
+# --------------------------------------------------------------------------
+#
+# AFTER_QUERY_READ — raw bytes, before any parsing
+#   hook.plugin.raw_inspector   = /usr/lib/keel/raw_inspector.so
+#   hook.lua.after_query_read.raw_logger    = script=hooks/raw_log.lua \
+#                                             func=log_raw priority=200
+#   hook.python.after_query_read.raw_logger = module=hooks.raw_log \
+#                                             func=log_raw priority=201
+#
+# AFTER_QUERY_PARSE — SQL classified, query_type/flags/effects available
+#   hook.lua.after_query_parse.sql_audit    = script=hooks/audit.lua \
+#                                             func=audit priority=100
+#   hook.python.after_query_parse.sql_audit = module=hooks.audit \
+#                                             func=audit priority=101
+#
+# BEFORE_ROUTE — about to pick primary vs replica
+#   hook.lua.before_route.custom_router    = script=hooks/router.lua \
+#                                            func=route priority=50
+#   hook.python.before_route.custom_router = module=hooks.router \
+#                                            func=route priority=51
+#
+# BEFORE_SEND — payload about to go to backend
+#   hook.lua.before_send.send_audit    = script=hooks/send_audit.lua \
+#                                        func=audit priority=200
+#   hook.python.before_send.send_audit = module=hooks.send_audit \
+#                                        func=audit priority=201
+
+# ============================================================================
+# MySQL worker group — different hooks for a different protocol
+# ============================================================================
+# [worker_group.my_mysql.hooks]
+# hook.plugin.rate_limiter = examples/hooks/plugins/rate_limiter_plugin.so
+# hook.lua.after_query_parse.block_dangerous = \
+#     script=examples/hooks/lua/block_dangerous.lua \
+#     func=check_query priority=50

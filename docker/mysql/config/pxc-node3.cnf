@@ -1,0 +1,18 @@
+# =============================================================================
+# Percona XtraDB Cluster — Node 3 (Joiner)
+# =============================================================================
+[mysqld]
+server-id                     = 3
+bind-address                  = 0.0.0.0
+
+# InnoDB
+default-storage-engine        = InnoDB
+innodb-autoinc-lock-mode      = 2
+innodb-buffer-pool-size       = 256M
+
+# Connections
+max-connections               = 200
+
+
+# Disable SSL for Galera cluster traffic (test only)
+loose-pxc_encrypt_cluster_traffic = OFF

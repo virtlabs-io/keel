@@ -1,0 +1,92 @@
+# ============================================================================
+# keel dev environment — PostgreSQL + keel (source build)
+#
+# Usage (from project root):
+#   docker/build-linux.sh dev up       # start postgres in background
+#   docker/build-linux.sh dev build    # (re)build keel inside devenv
+#   docker/build-linux.sh dev run      # run keel inside devenv
+#   docker/build-linux.sh dev sysbench # run sysbench tests end-to-end
+#   docker/build-linux.sh dev shell    # interactive shell with all tools
+#   docker/build-linux.sh dev down     # stop everything
+#
+# PG is accessible from the host at 127.0.0.1:5499 (intentionally not 5432
+# to avoid clashing with a local PG install).
+# Inside the devenv container it is reachable as postgres:5432.
+# ============================================================================
+
+name: keel-dev
+
+services:
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL — target backend for keel
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: keel-dev-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pg_dev_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-dev.sh:/docker-entrypoint-initdb.d/init-dev.sh:ro
+    ports:
+      - "5499:5432"
+    networks:
+      - keel-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # --------------------------------------------------------------------------
+  # keel devenv — build + run container with source bind-mounted
+  #
+  # Source edits on the host are immediately visible inside the container.
+  # The cmake build dir lives in the named volume keel-build-cache so that
+  # incremental builds are fast across container restarts.
+  # --------------------------------------------------------------------------
+  devenv:
+    image: keel-devenv          # built by: docker/build-linux.sh dev build-image
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+      target: devenv
+    container_name: keel-devenv
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - keel_build_cache:/keel/build-linux  # persistent cmake/ninja cache
+    networks:
+      - keel-dev
+    environment:
+      # postgres connection vars used by psql, sysbench, and keel test configs
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # SYS_PTRACE + seccomp:unconfined are required for gdb / strace inside
+    # the container (used both by the Dev Container and by docker exec sessions).
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    # keep the container alive so `docker exec` / Dev Container attachment works
+    stdin_open: true
+    tty: true
+    command: ["bash", "-c", "echo '[devenv] ready'; sleep infinity"]
+
+networks:
+  keel-dev:
+    driver: bridge
+
+volumes:
+  pg_dev_data:
+  keel_build_cache:

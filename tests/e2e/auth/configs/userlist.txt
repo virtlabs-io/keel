@@ -1,0 +1,7 @@
+# KEEL auth-test userlist
+# Format: "username" "password"
+# Plain text passwords are hashed at load time.
+# Used by keel-scram and keel-md5 test instances.
+"testuser" "testpass123"
+"testuser2" "testpass456"
+"postgres" "postgrespass"

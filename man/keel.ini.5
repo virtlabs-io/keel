@@ -1,0 +1,488 @@
+.\" keel.ini(5) — KEEL configuration file format
+.\" ============================================================================
+.TH KEEL.INI 5 "2026-04-17" "KEEL 0.1.0" "File Formats"
+.\" ============================================================================
+.SH NAME
+keel.ini \- configuration file for the keel database proxy
+.\" ============================================================================
+.SH SYNOPSIS
+.I /etc/keel/keel.ini
+.\" ============================================================================
+.SH DESCRIPTION
+.B keel.ini
+is the main configuration file for
+.BR keel (1).
+It uses INI format with sections delimited by
+.BI [ section ]
+headers.
+Lines starting with
+.B #
+or
+.B ;
+are comments.
+.PP
+The file is divided into global sections and per-worker-group sections.
+Worker groups define independent connection pools, each with its own
+port, protocol, backend servers, and TLS configuration.
+.\" ============================================================================
+.SH GLOBAL SECTIONS
+.\" ---------------------------------------------------------------------------
+.SS [keel]
+Top-level daemon settings.
+.TP
+.BI log_level " = 2"
+Logging verbosity: 0=ERROR, 1=WARN, 2=INFO (default), 3=DEBUG, 4=TRACE.
+.TP
+.BI shutdown_timeout_ms " = 30000"
+Maximum time (ms) to wait for in-flight transactions during graceful shutdown.
+.\" ---------------------------------------------------------------------------
+.SS [logging]
+Log output configuration.
+.TP
+.BI plugin " = file"
+Log backend:
+.BR stdout ,
+.BR file ,
+or
+.BR syslog .
+.TP
+.BI log_file " = /var/log/keel/keel.log"
+Log file path (when
+.I plugin=file
+).
+.TP
+.BI query_log_mode " = none"
+Per-query logging:
+.BR all ,
+.BR read ,
+.BR write ,
+.BR none .
+.TP
+.BI max_query_len " = 1024"
+Maximum query text length to log (bytes).
+.TP
+.BI syslog_ident " = keel"
+syslog identifier.
+.TP
+.BI syslog_facility " = daemon"
+syslog facility.
+.TP
+.BI log_timestamps " = 1"
+Include ISO-8601 timestamps in log output.
+.TP
+.BI use_colors " = 0"
+Enable ANSI colour codes in log output (for terminal use).
+.\" ---------------------------------------------------------------------------
+.SS [stats]
+Runtime statistics collection.
+.TP
+.BI level " = 1"
+Statistics depth: 0=off, 1=basic counters, 2=extended per-query stats.
+.TP
+.BI log_interval_ms " = 10000"
+How often (ms) to emit statistics to the log.
+.\" ---------------------------------------------------------------------------
+.SS [admin]
+Admin console (PgBouncer wire-protocol compatible).
+.TP
+.BI enabled " = true"
+Enable or disable the admin console.
+.TP
+.BI listen_addr " = 127.0.0.1"
+Bind address for the admin port.
+.TP
+.BI listen_port " = 6433"
+Admin port number.
+.TP
+.BI users " = admin"
+Comma-separated list of users allowed to connect.
+.\" ---------------------------------------------------------------------------
+.SS [prometheus]
+Prometheus metrics HTTP endpoint.
+.TP
+.BI enabled " = true"
+Enable or disable the /metrics endpoint.
+.TP
+.BI listen_addr " = 0.0.0.0"
+Bind address.
+.TP
+.BI port " = 9101"
+HTTP port for /metrics, /healthz, /readyz, /livez.
+.TP
+.BI path " = /metrics"
+HTTP path for metrics scraping.
+.\" ============================================================================
+.SH SHARD RULE SECTIONS
+Shard routing rules are declared in sections named
+.BI [shard_rule. table ]
+where
+.I table
+is the table name to match.
+Rules are loaded at startup and can be hot-reloaded by sending
+.B SIGHUP
+to the proxy process.
+.\" ---------------------------------------------------------------------------
+.SS Keys
+.TP
+.BI column " = id"
+Column used to derive the shard key.
+.TP
+.BI shard_count " = 4"
+Number of logical shards.
+Must be \(>= 1.
+.TP
+.BI strategy " = hash"
+Sharding strategy.
+.B hash
+(default) uses
+.I xxhash64 % shard_count
+(string) or
+.I int64 % shard_count
+(integer).
+.B range
+divides the INT64 domain into
+.I shard_count
+uniform segments.
+.\" ============================================================================
+.SH QUERY RULE SECTIONS
+Declarative query routing, blocking, and rewriting rules are declared in
+sections named
+.BI [query_rule. N ]
+where
+.I N
+is a zero-based integer index.
+Rules are evaluated in index order; the first matching rule wins.
+All specified match keys must match (AND semantics).
+Rules are hot-reloadable via
+.BR SIGHUP .
+.\" ---------------------------------------------------------------------------
+.SS Match Keys
+.TP
+.BI match_regex " = <POSIX ERE>"
+POSIX extended regular expression matched against the full SQL text (case-sensitive).
+When omitted, the rule matches any SQL.
+.TP
+.BI match_user " = <username>"
+Exact client username (case-sensitive).
+When omitted, the rule matches any user.
+.TP
+.BI match_db " = <dbname>"
+Exact database name (case-sensitive).
+When omitted, the rule matches any database.
+.\" ---------------------------------------------------------------------------
+.SS Action Keys
+.TP
+.BI action " = route | block | rewrite"
+Required.
+Specifies what to do when the rule matches.
+.B route
+overrides the routing decision.
+.B block
+rejects the query with an error.
+.B rewrite
+rewrites the SQL before forwarding.
+.TP
+.BI route_to " = primary | replica | any"
+Required when
+.B action = route .
+The target backend tier.
+.TP
+.BI error_msg " = <message>"
+Optional rejection message sent to the client when
+.B action = block .
+Defaults to
+.IR "query blocked by proxy rule" .
+.TP
+.BI rewrite_to " = <replacement SQL>"
+Required when
+.B action = rewrite .
+The replacement SQL string.
+Capture groups from
+.B match_regex
+can be referenced as
+.BR \e1 ", " \e2 ,
+etc.
+.PP
+Example:
+.RS
+.nf
+[query_rule.0]
+match_regex = ^SELECT .* FROM audit_log
+action      = route
+route_to    = replica
+
+[query_rule.1]
+match_regex = ^DROP
+action      = block
+error_msg   = DDL not allowed through the proxy
+.fi
+.RE
+.\" ============================================================================
+.SH WORKER GROUP SECTIONS
+Worker groups are defined by sections named
+.BI [worker_group. name ]
+where
+.I name
+is an arbitrary identifier.
+Each group operates as an independent connection pool.
+.\" ---------------------------------------------------------------------------
+.SS Network
+.TP
+.BI bind_addr " = 0.0.0.0"
+Address to bind.
+.TP
+.BI bind_port " = 6432"
+Port to listen on.
+.TP
+.BI num_workers " = 0"
+Worker threads for this group.
+0 means one thread per CPU core.
+.TP
+.BI listen_backlog " = 128"
+TCP listen backlog.
+.\" ---------------------------------------------------------------------------
+.SS Protocol
+.TP
+.BI protocol " = postgresql"
+Wire protocol:
+.BR postgresql
+or
+.BR mysql .
+.TP
+.BI default_database " = postgres"
+Default database when the client does not specify one.
+.\" ---------------------------------------------------------------------------
+.SS Authentication
+.TP
+.BI server_user " = postgres"
+Username for backend connections.
+.TP
+.BI server_password " = \fR..."
+Password for backend connections.
+.\" ---------------------------------------------------------------------------
+.SS Connection Pool
+.TP
+.BI min_pool_size " = 5"
+Minimum backend connections to maintain per server.
+.TP
+.BI max_pool_size " = 20"
+Maximum backend connections per server.
+.TP
+.BI max_conns_per_worker " = 250"
+Maximum client connections per worker thread.
+.TP
+.BI pool_max_waiting " = 100"
+Maximum clients waiting in the admission queue.
+.TP
+.BI idle_timeout_ms " = 300000"
+Close backend connections idle longer than this (ms).
+.TP
+.BI connect_timeout_ms " = 10000"
+Backend connection establishment timeout (ms).
+.\" ---------------------------------------------------------------------------
+.SS Prepared Statements
+.TP
+.BI prepared_statement " = virtualize"
+Strategy:
+.BR virtualize
+(replay on new backend),
+.BR pinning
+(session affinity),
+.BR tracking
+(simple+extended),
+.BR anonymous
+(JIT rewrite).
+.\" ---------------------------------------------------------------------------
+.SS Runtime Mode
+.TP
+.BI mode " = pool"
+Feature tier:
+.BR proxy
+(passthrough),
+.BR pool
+(connection pooling),
+.BR smart
+(pooling + routing),
+.BR full
+(all features).
+.\" ---------------------------------------------------------------------------
+.SS Transaction Tracking
+.TP
+.BI transaction_tracking " = off"
+XID probe and WAL LSN integration:
+.BR on
+or
+.BR off .
+.\" ---------------------------------------------------------------------------
+.SS Rebalancing
+.TP
+.BI rebalance " = true"
+Enable timer-based connection migration between workers.
+.TP
+.BI rebalance_interval_ms " = 5000"
+How often to check for load imbalance.
+.TP
+.BI rebalance_threshold_pct " = 20"
+Percentage imbalance required to trigger migration.
+.TP
+.BI rebalance_max_per_tick " = 5"
+Maximum sessions to migrate per rebalancing tick.
+.\" ---------------------------------------------------------------------------
+.SS Frontend TLS
+.TP
+.BI tls_mode " = disable"
+TLS mode for client connections:
+.BR disable ,
+.BR allow ,
+.BR prefer ,
+.BR require .
+.TP
+.BI tls_cert_file " = /etc/keel/certs/server.pem"
+Server certificate file (PEM).
+.TP
+.BI tls_key_file " = /etc/keel/certs/server.key"
+Server private key file (PEM).
+.TP
+.BI tls_ca_file " = /etc/keel/certs/ca-bundle.pem"
+CA certificate for client verification (mTLS).
+.TP
+.BI tls_verify_peer " = none"
+Client certificate verification:
+.BR none ,
+.BR optional ,
+.BR require .
+.TP
+.BI ktls_enabled " = 0"
+Enable kernel TLS (kTLS) acceleration.
+Requires Linux 4.13+ and a supported cipher.
+.TP
+.BI tls_ciphers " = \fR..."
+OpenSSL cipher string for TLS 1.2.
+.TP
+.BI tls_ciphersuites " = \fR..."
+OpenSSL ciphersuite string for TLS 1.3.
+.TP
+.BI tls_min_version " = TLSv1.2"
+Minimum accepted TLS version.
+.\" ---------------------------------------------------------------------------
+.SS Backend TLS
+Mirrors the frontend TLS parameters with a
+.B backend_tls_
+prefix:
+.BR backend_tls_mode ,
+.BR backend_tls_cert_file ,
+.BR backend_tls_key_file ,
+.BR backend_tls_ca_file ,
+.BR backend_tls_verify_peer ,
+.BR backend_ktls_enabled .
+.\" ---------------------------------------------------------------------------
+.SS io_uring Buffer Rings
+.TP
+.BI use_buf_rings " = 1"
+Use io_uring provided buffer rings for zero-copy receives.
+.TP
+.BI buf_ring_size " = 256"
+Number of buffers in each io_uring buffer ring.
+.\" ---------------------------------------------------------------------------
+.SS Backend Servers
+Servers are defined in a sub-section named
+.BI [worker_group. name .servers]\fR.
+Each line has the form:
+.PP
+.RS
+.I label
+=
+.BI host= addr
+.BI port= n
+.BI dbname= db
+.BI role= RW|RO
+.BI weight= n
+.RE
+.PP
+Example:
+.PP
+.RS
+.nf
+[worker_group.pg.servers]
+primary  = host=10.0.0.1 port=5432 dbname=app role=RW weight=100
+replica1 = host=10.0.0.2 port=5432 dbname=app role=RO weight=100
+replica2 = host=10.0.0.3 port=5432 dbname=app role=RO weight=50
+.fi
+.RE
+.\" ============================================================================
+.SH EXAMPLE
+.PP
+.RS
+.nf
+[keel]
+log_level = 2
+
+[admin]
+enabled   = true
+listen_port = 6433
+
+[prometheus]
+enabled = true
+port    = 9101
+
+[worker_group.pg]
+protocol        = postgresql
+bind_port       = 6432
+num_workers     = 4
+max_pool_size   = 50
+mode            = smart
+
+tls_mode        = require
+tls_cert_file   = /etc/keel/certs/server.pem
+tls_key_file    = /etc/keel/certs/server.key
+
+[worker_group.pg.servers]
+primary  = host=10.0.0.1 port=5432 dbname=app role=RW weight=100
+replica1 = host=10.0.0.2 port=5432 dbname=app role=RO weight=100
+
+[shard_rule.users]
+column      = id
+shard_count = 4
+strategy    = hash
+
+[shard_rule.orders]
+column      = order_id
+shard_count = 4
+strategy    = range
+
+[query_rule.0]
+match_regex = ^SELECT .* FROM audit_log
+action      = route
+route_to    = replica
+
+[query_rule.1]
+match_regex = ^DROP
+action      = block
+error_msg   = DDL not allowed through the proxy
+
+[audit]
+enabled = true
+path    = /var/log/keel/audit.log
+format  = ndjson
+events  = auth,connect,ddl,admin,rules
+
+[throttle.0]
+; Global ceiling — 1 000 queries/s across all clients
+rate_rps = 1000
+burst    = 500
+
+[throttle.1]
+; Per-user cap for the reporting user
+match_user = reporting
+rate_rps   = 50
+burst      = 20
+error_msg  = reporting user rate limit exceeded
+.fi
+.RE
+.\" ============================================================================
+.SH SEE ALSO
+.BR keel (1),
+.BR keel\-cli (1)
+.\" ============================================================================
+.SH AUTHORS
+The KEEL project: https://github.com/virtlabs-io/dbcp-keel

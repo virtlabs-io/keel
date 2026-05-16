@@ -1,0 +1,26 @@
+1. Keel has been deployed as {{ include "keel.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+2. Connect to the PostgreSQL proxy:
+{{- if contains "NodePort" .Values.service.type }}
+   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "keel.fullname" . }})
+   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+   psql -h $NODE_IP -p $NODE_PORT -U <user> -d <database>
+{{- else if contains "LoadBalancer" .Values.service.type }}
+   NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+   export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "keel.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+   psql -h $SERVICE_IP -p {{ .Values.service.pgPort }} -U <user> -d <database>
+{{- else }}
+   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "keel.fullname" . }} {{ .Values.service.pgPort }}:{{ .Values.service.pgPort }}
+   psql -h 127.0.0.1 -p {{ .Values.service.pgPort }} -U <user> -d <database>
+{{- end }}
+
+3. Access the admin console:
+   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "keel.fullname" . }} {{ .Values.service.adminPort }}:{{ .Values.service.adminPort }}
+   psql -h 127.0.0.1 -p {{ .Values.service.adminPort }} -c "SHOW VERSION"
+
+{{- if .Values.metrics.enabled }}
+
+4. View Prometheus metrics:
+   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "keel.fullname" . }}-metrics {{ .Values.metrics.service.port }}:{{ .Values.metrics.service.port }}
+   curl http://127.0.0.1:{{ .Values.metrics.service.port }}/metrics
+{{- end }}

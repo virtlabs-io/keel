@@ -1,0 +1,166 @@
+name: package-linux
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'alpha-*'
+      - 'v*'
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_PRIVATE_KEY != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            rpm \
+            dpkg-dev \
+            gnupg \
+            libssl-dev \
+            liburing-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            groff-base
+
+      # ── Pre-release test gate ────────────────────────────────────────────
+      # Run the full CTest suite + Python protocol/resilience suites before
+      # building any distributable package.  A failing test means no package.
+      - name: Configure (test gate build)
+        run: |
+          cmake -S . -B build-gate \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_HARDENING=ON
+
+      - name: Build (test gate)
+        run: cmake --build build-gate -j$(nproc)
+
+      - name: Run CTest (test gate)
+        run: ctest --test-dir build-gate --output-on-failure -j$(nproc)
+
+      - name: Install Python test dependencies
+        run: pip3 install --user psycopg2-binary
+
+      - name: Run Python suites (test gate)
+        run: |
+          python3 tests/run_tests.py \
+            --suite protocol \
+            --suite resilience \
+            --build-dir build-gate \
+            --ci
+
+      # ── Build distributable packages ─────────────────────────────────────
+      - name: Build Linux packages
+        run: bash scripts/package-linux.sh
+
+      - name: Generate CycloneDX SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: artifacts/packages/keel-${{ github.ref_name }}-sbom.cdx.json
+
+      - name: Import GPG key for package signing
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
+        env:
+          PACKAGE_SIGNING_PRIVATE_KEY: ${{ secrets.PACKAGE_SIGNING_PRIVATE_KEY }}
+          PACKAGE_SIGNING_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
+        run: |
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          printf '%s' "$PACKAGE_SIGNING_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign release artifacts
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
+        env:
+          PACKAGE_SIGNING_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(artifacts/packages/*.deb artifacts/packages/*.rpm artifacts/packages/*.tar.gz artifacts/packages/*.cdx.json)
+          if [[ ${#artifacts[@]} -eq 0 ]]; then
+            echo "No artifacts found to sign" >&2
+            exit 1
+          fi
+          sha256sum "${artifacts[@]}" > artifacts/packages/SHA256SUMS
+          passphrase_args=()
+          if [[ -n "${PACKAGE_SIGNING_PASSPHRASE:-}" ]]; then
+            passphrase_args=(--pinentry-mode loopback --passphrase "$PACKAGE_SIGNING_PASSPHRASE")
+          fi
+          for f in "${artifacts[@]}" artifacts/packages/SHA256SUMS; do
+            gpg --batch --yes "${passphrase_args[@]}" --armor --detach-sign "$f"
+          done
+
+      - name: Warn when signing is not configured
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true'
+        run: echo "PACKAGE_SIGNING_PRIVATE_KEY secret not configured; publishing unsigned artifacts."
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keel-linux-packages
+          path: artifacts/packages/*
+
+      - name: Ensure GitHub Release exists
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Automated Linux package assets for $GITHUB_REF_NAME"
+          fi
+
+      - name: Upload DEB/RPM/TGZ to Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(
+            artifacts/packages/keel_*.deb
+            artifacts/packages/keel-*.rpm
+            artifacts/packages/keel-*-Linux-*.tar.gz
+            artifacts/packages/keel-*.cdx.json
+          )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No package artifacts found to upload" >&2
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+
+      - name: Upload signatures to Release assets
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            artifacts/packages/*.asc \
+            artifacts/packages/SHA256SUMS \
+            --clobber

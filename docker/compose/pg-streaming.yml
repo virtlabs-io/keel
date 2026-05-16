@@ -1,0 +1,153 @@
+# PostgreSQL Streaming Replication Cluster
+# 1 Primary + 2 Replicas (no coordination/auto-failover)
+#
+# Ports (uses 15xxx to avoid conflict with local PostgreSQL):
+#   primary:  5432
+#   replica1: 5433
+#   replica2: 5434
+
+name: keel-pg-streaming
+
+services:
+  # ==========================================================================
+  # Primary PostgreSQL
+  # ==========================================================================
+  primary:
+    image: postgres:16-alpine
+    container_name: pg-stream-primary
+    hostname: pg-stream-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - primary_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - keel-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 512m
+
+  # ==========================================================================
+  # Replica 1
+  # ==========================================================================
+  replica1:
+    image: postgres:16-alpine
+    container_name: pg-stream-replica1
+    hostname: pg-stream-replica1
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "Waiting for primary to be ready..."
+        until pg_isready -h pg-stream-primary -p 5432 -U postgres; do
+          sleep 2
+        done
+        echo "Primary is ready, waiting for replication user..."
+        sleep 5
+        
+        echo "Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        PGPASSWORD=replicator pg_basebackup -h pg-stream-primary -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        
+        chmod 700 /var/lib/postgresql/data
+        
+        echo "Adding config overrides..."
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" >> /var/lib/postgresql/data/postgresql.conf
+        
+        echo "Starting replica..."
+        exec postgres
+    volumes:
+      - replica1_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5433:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      primary:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    shm_size: 512m
+
+  # ==========================================================================
+  # Replica 2
+  # ==========================================================================
+  replica2:
+    image: postgres:16-alpine
+    container_name: pg-stream-replica2
+    hostname: pg-stream-replica2
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "Waiting for primary to be ready..."
+        until pg_isready -h pg-stream-primary -p 5432 -U postgres; do
+          sleep 2
+        done
+        echo "Primary is ready, waiting for replication user..."
+        sleep 7
+        
+        echo "Taking base backup..."
+        rm -rf /var/lib/postgresql/data/*
+        PGPASSWORD=replicator pg_basebackup -h pg-stream-primary -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        
+        chmod 700 /var/lib/postgresql/data
+        
+        echo "Adding config overrides..."
+        echo "include_if_exists = '/etc/postgresql/conf.d/postgresql-overrides.conf'" >> /var/lib/postgresql/data/postgresql.conf
+        
+        echo "Starting replica..."
+        exec postgres
+    volumes:
+      - replica2_data:/var/lib/postgresql/data
+      - ../postgres/config/postgresql-overrides.conf:/etc/postgresql/conf.d/postgresql-overrides.conf:ro
+    ports:
+      - "5434:5432"
+    networks:
+      - keel-dev
+    depends_on:
+      primary:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    shm_size: 512m
+
+networks:
+  keel-dev:
+    driver: bridge
+
+volumes:
+  primary_data:
+  replica1_data:
+  replica2_data:

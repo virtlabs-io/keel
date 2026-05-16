@@ -1,0 +1,249 @@
+---
+# KeelPool CRD — managed by the keel-operator.
+# Install standalone: kubectl apply -f keelpool-crd.yaml
+# The Helm chart bundles this under helm/keel/crds/ so it is created before
+# any release resources (Helm CRD install lifecycle).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: keelpools.keel.virtlabs.io
+  labels:
+    app.kubernetes.io/name: keel
+    app.kubernetes.io/managed-by: keel-operator
+spec:
+  group: keel.virtlabs.io
+  names:
+    kind: KeelPool
+    listKind: KeelPoolList
+    plural: keelpools
+    singular: keelpool
+    shortNames:
+      - kp
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Protocol
+          type: string
+          jsonPath: .spec.protocol
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: >
+            KeelPool is the CRD for a managed KEEL connection-pooler deployment.
+            The operator reconciles the desired state into a StatefulSet (cluster
+            mode) or Deployment (standalone), a ConfigMap containing the INI
+            config, and the associated Services.
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - protocol
+                - backends
+              properties:
+                # ── Image ────────────────────────────────────────────────────
+                image:
+                  type: string
+                  default: "ghcr.io/virtlabs/keel:latest"
+                  description: "KEEL container image."
+                # ── Sizing ───────────────────────────────────────────────────
+                replicas:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: >
+                    Number of KEEL proxy replicas. Set >1 with clusterMode=true
+                    for a gossip-coordinated HA cluster.
+                clusterMode:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true the operator renders a StatefulSet with cluster
+                    gossip enabled and auto-generated INITIAL_PEERS.
+                # ── Protocol ─────────────────────────────────────────────────
+                protocol:
+                  type: string
+                  enum: [postgres, mysql]
+                  description: "Frontend wire protocol."
+                listenPort:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 7432
+                  description: "Port keel listens on for client connections."
+                # ── Pool sizing ───────────────────────────────────────────────
+                minPoolSize:
+                  type: integer
+                  minimum: 0
+                  default: 5
+                  description: "Minimum backend connections per worker."
+                maxPoolSize:
+                  type: integer
+                  minimum: 1
+                  default: 50
+                  description: "Maximum backend connections per worker."
+                maxConnectionAgeSeconds:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                  description: >
+                    Forcibly close backend connections older than this many
+                    seconds. 0 disables connection aging.
+                # ── Authentication ────────────────────────────────────────────
+                authMethod:
+                  type: string
+                  enum:
+                    - scram-sha-256
+                    - md5
+                    - trust
+                    - ldap
+                    - pam
+                    - cert
+                    - reject
+                  default: scram-sha-256
+                  description: "Client authentication method."
+                authConfig:
+                  type: object
+                  description: "Method-specific authentication parameters."
+                  x-kubernetes-preserve-unknown-fields: true
+                # ── Backends ─────────────────────────────────────────────────
+                backends:
+                  type: array
+                  minItems: 1
+                  description: "List of backend servers."
+                  items:
+                    type: object
+                    required:
+                      - host
+                    properties:
+                      host:
+                        type: string
+                        description: "Backend hostname or IP."
+                      port:
+                        type: integer
+                        minimum: 1
+                        maximum: 65535
+                        default: 5432
+                      database:
+                        type: string
+                        default: postgres
+                      username:
+                        type: string
+                        default: postgres
+                      passwordSecret:
+                        type: object
+                        description: "K8s Secret reference for backend password."
+                        required:
+                          - name
+                          - key
+                        properties:
+                          name:
+                            type: string
+                          key:
+                            type: string
+                      role:
+                        type: string
+                        enum: [RW, RO, ANY]
+                        default: RW
+                        description: "Role hint used for read/write routing."
+                      weight:
+                        type: integer
+                        minimum: 1
+                        default: 100
+                # ── TLS ──────────────────────────────────────────────────────
+                tls:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    autoGenerate:
+                      type: boolean
+                      default: false
+                      description: >
+                        When true, KEEL generates a self-signed CA and leaf
+                        certs on first startup (requires tls_auto support).
+                    secretName:
+                      type: string
+                      description: "K8s TLS Secret containing tls.crt + tls.key."
+                    caCertSecret:
+                      type: string
+                      description: "Secret containing the CA certificate bundle."
+                # ── Observability ─────────────────────────────────────────────
+                tracing:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    endpoint:
+                      type: string
+                      description: "OTLP/HTTP endpoint (e.g. http://tempo:4318/v1/traces)."
+                    sampleRatePpm:
+                      type: integer
+                      minimum: 0
+                      maximum: 1000000
+                      default: 10000
+                      description: "Traces to sample per million (1000000 = 100%)."
+                # ── Resources ─────────────────────────────────────────────────
+                resources:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: "Reconciliation phase: Pending, Running, Degraded, Error."
+                readyReplicas:
+                  type: integer
+                  description: "Number of ready KEEL proxy replicas."
+                observedGeneration:
+                  type: integer
+                  format: int64
+                message:
+                  type: string
+                  description: "Human-readable status message."
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

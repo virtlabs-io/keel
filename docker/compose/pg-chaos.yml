@@ -1,0 +1,191 @@
+# Chaos / Resilience Test Stack
+# PostgreSQL Cluster (1 Primary + 2 Replicas) + KEEL Proxy + fault-injection sidecar
+#
+# Usage:
+#   cd /path/to/keel
+#   docker compose -f docker/compose/pg-chaos.yml up -d
+#   tests/chaos/run-chaos.sh
+#   docker compose -f docker/compose/pg-chaos.yml down -v
+#
+# The "fault-injector" service has iproute2 + iptables pre-installed and runs
+# with NET_ADMIN capability so individual chaos scenarios can exec into it and
+# use `tc netem` or `iptables` to introduce network faults.
+
+name: keel-pg-chaos
+
+networks:
+  chaos-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  chaos_primary_data:
+  chaos_replica1_data:
+  chaos_replica2_data:
+
+services:
+  # ============================================================================
+  # Primary PostgreSQL
+  # ============================================================================
+  pgsql-primary:
+    image: postgres:16-alpine
+    container_name: chaos-pgsql-primary
+    hostname: pgsql-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chaosdb
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - chaos_primary_data:/var/lib/postgresql/data
+      - ../postgres/scripts/init-e2e-primary.sh:/docker-entrypoint-initdb.d/init-primary.sh:ro
+    networks:
+      chaos-net:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chaosdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ============================================================================
+  # Replica 1
+  # ============================================================================
+  pgsql-replica1:
+    image: postgres:16-alpine
+    container_name: chaos-pgsql-replica1
+    hostname: pgsql-replica1
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        until pg_isready -h pgsql-primary -p 5432 -U postgres; do sleep 2; done
+        sleep 3
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-primary -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+        exec postgres
+    volumes:
+      - chaos_replica1_data:/var/lib/postgresql/data
+    networks:
+      chaos-net:
+        ipv4_address: 172.30.0.11
+    depends_on:
+      pgsql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ============================================================================
+  # Replica 2
+  # ============================================================================
+  pgsql-replica2:
+    image: postgres:16-alpine
+    container_name: chaos-pgsql-replica2
+    hostname: pgsql-replica2
+    user: postgres
+    environment:
+      PGUSER: postgres
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        until pg_isready -h pgsql-primary -p 5432 -U postgres; do sleep 2; done
+        sleep 5
+        rm -rf /var/lib/postgresql/data/*
+        pg_basebackup -h pgsql-primary -D /var/lib/postgresql/data -U replicator -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+        exec postgres
+    volumes:
+      - chaos_replica2_data:/var/lib/postgresql/data
+    networks:
+      chaos-net:
+        ipv4_address: 172.30.0.12
+    depends_on:
+      pgsql-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ============================================================================
+  # KEEL Proxy
+  # ============================================================================
+  keel:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+      target: runner
+    container_name: chaos-keel
+    hostname: keel
+    security_opt:
+      - seccomp:unconfined
+    command: ["-c", "/etc/keel/keel-chaos.ini"]
+    environment:
+      KEEL_LOG_LEVEL: 2
+    volumes:
+      - ../keel/keel-chaos.ini:/etc/keel/keel-chaos.ini:ro
+    ports:
+      - "17432:6432"
+      - "17433:6433"   # admin console
+      - "19101:9101"   # prometheus
+    networks:
+      chaos-net:
+        ipv4_address: 172.30.0.20
+    depends_on:
+      pgsql-primary:
+        condition: service_healthy
+      pgsql-replica1:
+        condition: service_healthy
+      pgsql-replica2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6432 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ============================================================================
+  # Fault Injector Sidecar
+  # ============================================================================
+  # Runs as privileged to allow tc/iptables manipulation.
+  # Chaos scripts exec commands into this container via:
+  #   docker exec chaos-fault-injector tc qdisc add dev eth0 root netem loss 100%
+  fault-injector:
+    image: nicolaka/netshoot:latest
+    container_name: chaos-fault-injector
+    cap_add:
+      - NET_ADMIN
+    network_mode: "service:pgsql-replica1"   # shares replica1's network namespace
+    command: ["sleep", "infinity"]
+    depends_on:
+      - pgsql-replica1
+
+  # Second fault-injector sharing replica2's namespace (for partition tests)
+  fault-injector2:
+    image: nicolaka/netshoot:latest
+    container_name: chaos-fault-injector2
+    cap_add:
+      - NET_ADMIN
+    network_mode: "service:pgsql-replica2"
+    command: ["sleep", "infinity"]
+    depends_on:
+      - pgsql-replica2

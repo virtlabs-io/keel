@@ -1,0 +1,16 @@
+/var/log/keel/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 0640 keel keel
+    sharedscripts
+    postrotate
+        # Send SIGUSR1 to re-open log files
+        if [ -f /var/run/keel/keel.pid ]; then
+            kill -USR1 $(cat /var/run/keel/keel.pid) 2>/dev/null || true
+        fi
+    endscript
+}

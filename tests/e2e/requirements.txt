@@ -1,0 +1,27 @@
+# KEEL E2E Test Suite — Python dependencies
+#
+# Install into an isolated virtual environment:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+
+# PostgreSQL adapter
+psycopg2-binary>=2.9.9
+
+# HTTP client (Prometheus metrics endpoint)
+requests>=2.31.0
+
+# Test framework
+pytest>=8.0.0
+
+# HTML report (--html=report.html)
+pytest-html>=4.1.1
+
+# JSON report (--json-report --json-report-file=report.json)
+pytest-json-report>=1.5.0
+
+# Parallel test execution (optional — pytest -n auto)
+pytest-xdist>=3.5.0
+
+# Test timeout guard (avoids hangs in CI)
+pytest-timeout>=2.2.0

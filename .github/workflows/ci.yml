@@ -1,0 +1,651 @@
+name: CI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Memory policy lint — no direct system allocator calls outside mem/ arch/
+  # Runs first, cheapest gate: no build required.
+  # ===========================================================================
+  lint-memory-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check forbidden system allocator calls
+        run: bash scripts/check_forbidden_syscalls.sh
+
+  # ===========================================================================
+  # Build + Unit Tests (Release with debug info)
+  # ===========================================================================
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: lint-memory-policy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_HARDENING=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
+
+  # ===========================================================================
+  # AddressSanitizer + UndefinedBehaviorSanitizer
+  # ===========================================================================
+  sanitizer-asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: lint-memory-policy
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev
+
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -S . -B build-asan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_ASAN=ON \
+            -DKEEL_ENABLE_UBSAN=ON
+
+      - name: Build
+        run: cmake --build build-asan -j$(nproc)
+
+      - name: Test (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure -j$(nproc)
+
+      - name: Python memory suite (ASAN build)
+        run: |
+          python3 tests/run_tests.py \
+            --suite memory \
+            --build-dir build-asan \
+            --py-verbose \
+            --ci 2>&1 | tail -40
+
+  # ===========================================================================
+  # ThreadSanitizer
+  # ===========================================================================
+  sanitizer-tsan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: lint-memory-policy
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S . -B build-tsan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build-tsan -j$(nproc)
+
+      - name: Test (TSan)
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          TSAN_SUPPRESSIONS: cmake/tsan_suppressions.txt
+        run: ctest --test-dir build-tsan --output-on-failure -j$(nproc)
+
+      - name: Python concurrency suite (TSAN build)
+        run: |
+          python3 tests/run_tests.py \
+            --suite concurrency \
+            --build-dir build-tsan \
+            --concurrency-repeat 1 \
+            --py-verbose \
+            --ci 2>&1 | tail -40
+
+  # ===========================================================================
+  # MemorySanitizer
+  # Note: MSan requires a fully-instrumented build; tests linking system OpenSSL
+  # are skipped via -LE openssl to avoid false positives from uninstrumented libs.
+  # ===========================================================================
+  sanitizer-msan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: lint-memory-policy
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev
+
+      - name: Configure (MSan)
+        run: |
+          cmake -S . -B build-msan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_MSAN=ON \
+            -DKEEL_USE_IOURING=OFF
+
+      - name: Build
+        run: cmake --build build-msan -j$(nproc)
+
+      - name: Test (MSan — skip OpenSSL-linked tests)
+        env:
+          MSAN_OPTIONS: halt_on_error=1:print_stats=1
+        run: |
+          ctest --test-dir build-msan \
+            --output-on-failure \
+            -LE openssl \
+            -j$(nproc)
+
+  # ===========================================================================
+  # Python Protocol & Resilience Suites
+  # Wire-level protocol compliance, raw-TCP fuzzing, and C-level fault injection.
+  # These suites run against host-compiled binaries — no Docker required.
+  # ===========================================================================
+  python-suites:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: build-and-test
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            python3-pip
+
+      - name: Install Python test dependencies
+        run: pip3 install --user psycopg2-binary
+
+      - name: Configure (host build)
+        run: |
+          cmake -S . -B build-host \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_HARDENING=ON
+
+      - name: Build
+        run: cmake --build build-host -j$(nproc)
+
+      - name: Protocol suite (raw TCP, no proxy required)
+        run: |
+          python3 tests/run_tests.py \
+            --suite protocol \
+            --build-dir build-host \
+            --py-verbose \
+            --ci
+
+      - name: Resilience suite (C binary fault injection)
+        run: |
+          python3 tests/run_tests.py \
+            --suite resilience \
+            --build-dir build-host \
+            --py-verbose \
+            --ci
+
+      - name: Upload Python suite report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-suite-report
+          path: tests/reports/report_latest.json
+          retention-days: 14
+
+  # ===========================================================================
+  # Code Coverage — line + branch (Gcov / Lcov / Gcovr)
+  #
+  # Thresholds:
+  #   Line   coverage ≥ 70%
+  #   Branch coverage ≥ 40%
+  #
+  # Artifacts:
+  #   • HTML report with branch-level annotations
+  #   • Cobertura XML for Codecov badge
+  #   • "Dark corners" table in the GitHub Step Summary
+  # ===========================================================================
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            lcov \
+            gcovr
+
+      - name: Configure (gcov instrumentation)
+        run: |
+          cmake -S . -B build-coverage \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_COVERAGE=ON \
+            -DKEEL_ENABLE_HARDENING=OFF
+
+      - name: Build
+        run: cmake --build build-coverage -j$(nproc)
+
+      - name: Reset counters
+        run: lcov --directory build-coverage --zerocounters --quiet
+
+      - name: Run Tests
+        run: ctest --test-dir build-coverage --output-on-failure -j$(nproc)
+
+      - name: Collect Coverage (line + branch)
+        run: |
+          LCOV_MAJOR=$(lcov --version 2>&1 | grep -oP '\d+' | head -1)
+          if [[ "${LCOV_MAJOR}" -ge 2 ]]; then
+            IGNORE_FLAGS="--ignore-errors source,negative,unused"
+          else
+            IGNORE_FLAGS="--ignore-errors source --ignore-errors negative"
+          fi
+
+          lcov \
+            --capture \
+            --directory build-coverage \
+            --output-file coverage.info \
+            --rc lcov_branch_coverage=1 \
+            ${IGNORE_FLAGS}
+
+          lcov \
+            --remove coverage.info \
+              '/usr/*' '*/tests/*' '*/build-coverage/*' '*/oss-fuzz/*' \
+            --output-file coverage-filtered.info \
+            --rc lcov_branch_coverage=1 \
+            ${IGNORE_FLAGS}
+
+      - name: Enforce thresholds (line ≥ 70%, branch ≥ 40%)
+        run: |
+          python3 - <<'EOF'
+          import subprocess, re, sys, os
+
+          out = subprocess.check_output(
+              ["lcov", "--summary", "coverage-filtered.info",
+               "--rc", "lcov_branch_coverage=1"],
+              stderr=subprocess.STDOUT,
+          ).decode()
+
+          def extract(pattern, text):
+              m = re.search(pattern, text)
+              return float(m.group(1)) if m else 0.0
+
+          line_pct   = extract(r'lines\.*:\s*([\d.]+)%',    out)
+          branch_pct = extract(r'branches\.*:\s*([\d.]+)%', out)
+
+          LINE_MIN, BRANCH_MIN = 70.0, 40.0
+          fail = False
+
+          print(out)
+          if line_pct < LINE_MIN:
+              print(f"✗ Line {line_pct:.1f}% < {LINE_MIN:.0f}%", file=sys.stderr)
+              fail = True
+          else:
+              print(f"✓ Line {line_pct:.1f}% ≥ {LINE_MIN:.0f}%")
+
+          if branch_pct < BRANCH_MIN:
+              print(f"✗ Branch {branch_pct:.1f}% < {BRANCH_MIN:.0f}%", file=sys.stderr)
+              fail = True
+          else:
+              print(f"✓ Branch {branch_pct:.1f}% ≥ {BRANCH_MIN:.0f}%")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_file:
+              with open(summary_file, "a") as f:
+                  f.write("## Coverage Thresholds\n\n")
+                  f.write("| Metric | Value | Threshold | Pass? |\n")
+                  f.write("|--------|-------|-----------|-------|\n")
+                  f.write(f"| Line   | {line_pct:.1f}%   | {LINE_MIN:.0f}% | "
+                          f"{'✅' if line_pct >= LINE_MIN else '❌'} |\n")
+                  f.write(f"| Branch | {branch_pct:.1f}% | {BRANCH_MIN:.0f}% | "
+                          f"{'✅' if branch_pct >= BRANCH_MIN else '❌'} |\n\n")
+
+          sys.exit(1 if fail else 0)
+          EOF
+
+      - name: Generate HTML report (with branch annotations)
+        run: |
+          genhtml \
+            coverage-filtered.info \
+            --output-directory coverage-html \
+            --branch-coverage \
+            --function-coverage \
+            --legend \
+            --title "KEEL Coverage — ${{ github.sha }}"
+
+      - name: Generate Cobertura XML (gcovr)
+        run: |
+          gcovr \
+            --root . \
+            --object-directory build-coverage \
+            --exclude '^tests/' \
+            --exclude '^build-coverage/' \
+            --branches \
+            --xml-pretty \
+            --output coverage.xml \
+            build-coverage 2>/dev/null \
+            || echo "gcovr Cobertura generation failed (non-fatal)"
+
+      - name: Dark Corners — lowest branch coverage
+        run: |
+          echo "## Dark Corners — Lowest Branch Coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source files ranked by uncovered branches. Target these with new tests." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          gcovr \
+            --root . \
+            --object-directory build-coverage \
+            --exclude '^tests/' \
+            --exclude '^build-coverage/' \
+            --branches \
+            --json-pretty \
+            --output coverage-gcovr.json \
+            build-coverage 2>/dev/null || true
+
+          python3 - <<'EOF'
+          import json, os, sys
+
+          try:
+              with open("coverage-gcovr.json") as f:
+                  data = json.load(f)
+          except Exception as e:
+              print(f"gcovr JSON unavailable: {e}", file=sys.stderr); sys.exit(0)
+
+          rows = []
+          for fdata in data.get("files", []):
+              rel      = os.path.relpath(fdata.get("filename", "?"), ".")
+              if any(rel.startswith(p) for p in ("tests/","build-","oss-fuzz/")):
+                  continue
+              branches = fdata.get("branches", [])
+              total    = len(branches)
+              covered  = sum(1 for b in branches if b.get("count", 0) > 0)
+              if total == 0:
+                  continue
+              pct = 100.0 * covered / total
+              rows.append((pct, covered, total, rel))
+
+          rows.sort()
+
+          lines = ["| Branch% | Covered/Total | File |",
+                   "|---------|---------------|------|"]
+          for pct, cov, tot, name in rows[:25]:
+              lines.append(f"| {pct:5.1f}% | {cov}/{tot} | `{name}` |")
+
+          zero = [r for r in rows if r[0] == 0.0]
+          if zero:
+              lines.append("")
+              lines.append(f"**⚠ {len(zero)} file(s) with 0% branch coverage**")
+
+          print("\n".join(lines))
+          sf = os.environ.get("GITHUB_STEP_SUMMARY","")
+          if sf:
+              with open(sf,"a") as f:
+                  f.write("\n".join(lines) + "\n")
+          EOF
+
+      - name: gcovr text summary
+        run: |
+          gcovr \
+            --root . \
+            --object-directory build-coverage \
+            --exclude '^tests/' \
+            --exclude '^build-coverage/' \
+            --print-summary \
+            build-coverage 2>/dev/null || true
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage-html/
+          retention-days: 14
+
+      - name: Upload Cobertura XML
+        if: hashFiles('coverage.xml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-cobertura
+          path: coverage.xml
+          retention-days: 14
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage-filtered.info
+          flags: unittests
+          fail_ci_if_error: false
+
+  # ===========================================================================
+  # Real Database Integration Tests (PostgreSQL 16 + MySQL 8)
+  # ===========================================================================
+  integration-db:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: keeltest
+          MYSQL_USER: keel
+          MYSQL_PASSWORD: keel
+        ports:
+          - 13306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pmysql --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            liburing-dev \
+            libssl-dev \
+            lua5.4 \
+            liblua5.4-dev \
+            python3 \
+            python3-dev \
+            postgresql-client \
+            default-mysql-client
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-integ \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_STANDARD=23 \
+            -DKEEL_ENABLE_TESTS=ON \
+            -DKEEL_ENABLE_HARDENING=ON
+
+      - name: Build
+        run: cmake --build build-integ -j$(nproc)
+
+      - name: Verify PostgreSQL is reachable
+        run: |
+          psql "host=127.0.0.1 port=15432 user=postgres password=postgres dbname=postgres" \
+            -c "SELECT version();"
+
+      - name: Verify MySQL is reachable
+        run: |
+          mysql -h 127.0.0.1 -P 13306 -u root -pmysql -e "SELECT VERSION();"
+
+      - name: Run proxy E2E tests (PostgreSQL)
+        env:
+          KEEL_TEST_PG_HOST: 127.0.0.1
+          KEEL_TEST_PG_PORT: "15432"
+          KEEL_TEST_PG_USER: postgres
+          KEEL_TEST_PG_PASSWORD: postgres
+          KEEL_TEST_PG_DB: postgres
+        run: |
+          ctest --test-dir build-integ \
+            --output-on-failure \
+            --label-regex "integration" \
+            -j$(nproc) || true
+          # Run the E2E binary directly (also built above via ctest registration)
+          build-integ/tests/test_proxy_ssv_e2e 2>&1 | tail -40
+
+      - name: Run MySQL protocol E2E tests
+        env:
+          KEEL_TEST_MYSQL_HOST: 127.0.0.1
+          KEEL_TEST_MYSQL_PORT: "13306"
+          KEEL_TEST_MYSQL_USER: root
+          KEEL_TEST_MYSQL_PASSWORD: mysql
+          KEEL_TEST_MYSQL_DB: keeltest
+        run: |
+          ctest --test-dir build-integ \
+            --output-on-failure \
+            --label-regex "protocol" \
+            -j$(nproc)

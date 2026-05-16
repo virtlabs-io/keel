@@ -1,0 +1,41 @@
+# =============================================================================
+# MemorySanitizer ignorelist for KEEL
+# =============================================================================
+#
+# MSan reports false positives when KEEL calls into system shared libraries
+# that were not built with -fsanitize=memory instrumentation.  This file
+# suppresses those false positives by source file and function name patterns.
+#
+# How it works:
+#   The ignorelist is passed to the compiler via:
+#     -fsanitize-ignorelist=cmake/msan_ignorelist.txt
+#   This tells MSan to treat any data returned by the ignored functions as
+#   fully initialised, preventing cascading false-positive reports downstream.
+#
+# Currently suppressed:
+#   - OpenSSL 3.x (libcrypto, libssl) — random number generation, BIO,
+#     EVP cipher/digest, SHA-256, HMAC, PBKDF2 functions.  These are safe
+#     but uninstrumented, so MSan flags their output buffers.
+#
+# Maintenance:
+#   Add new entries when upgrading system dependencies introduces new
+#   false positives.  Remove entries if/when instrumented builds of those
+#   libraries become available (e.g. via a custom MSan-instrumented sysroot).
+#
+# Reference:
+#   https://clang.llvm.org/docs/SanitizerSpecialCaseList.html
+# =============================================================================
+
+# OpenSSL 3.x (system package, not MSAN-instrumented)
+src:*/libcrypto.so*
+src:*/libssl.so*
+fun:RAND_bytes*
+fun:RAND_priv_bytes*
+fun:BIO_new_file
+fun:BIO_new_mem_buf
+fun:OPENSSL_init_ssl
+fun:OPENSSL_init_crypto
+fun:EVP_*
+fun:SHA256*
+fun:HMAC*
+fun:PKCS5_PBKDF2_HMAC
