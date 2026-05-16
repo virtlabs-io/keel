@@ -62,80 +62,6 @@
 #include <sys/eventfd.h>
 #endif
 
-/* ============================================================================
- * Backend Connection Helpers
- * ============================================================================ */
-
-/**
- * @brief Create a non-blocking TCP connection to a backend server
- */
-static int connect_to_backend(const char* host, uint16_t port)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "Failed to create backend socket: %s", strerror(errno));
-        return -1;
-    }
-    
-    /* Set non-blocking */
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-    
-    /* Set TCP_NODELAY */
-    int opt = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    
-    /* Connect */
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "Invalid backend address: %s", host);
-        close(fd);
-        return -1;
-    }
-    
-    int rc = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
-    if (rc < 0 && errno != EINPROGRESS) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "Failed to connect to backend %s:%u: %s",
-                    host, port, strerror(errno));
-        close(fd);
-        return -1;
-    }
-    
-    /* For non-blocking, wait for connection to complete */
-    if (errno == EINPROGRESS) {
-        fd_set writefds;
-        FD_ZERO(&writefds);
-        FD_SET(fd, &writefds);
-        
-        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-        rc = select(fd + 1, NULL, &writefds, NULL, &tv);
-        
-        if (rc <= 0) {
-            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "Backend connection timeout: %s:%u", host, port);
-            close(fd);
-            return -1;
-        }
-        
-        /* Check for connection error */
-        int err = 0;
-        socklen_t len = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-        if (err != 0) {
-            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "Backend connection failed: %s", strerror(err));
-            close(fd);
-            return -1;
-        }
-    }
-    
-    return fd;
-}
-
 /**
  * @brief Select backend server based on query type (read/write splitting)
  * 
@@ -2067,13 +1993,14 @@ static void session_idle_timeout_cb(void* userdata)
                     recv_ctx->flow.ctx, KEEL_CLEANUP_TIMEOUT,
                     cleanup_buf, sizeof(cleanup_buf));
             if (cn > 0)
-                (void)send(be_conn->fd, cleanup_buf, (size_t)cn, MSG_NOSIGNAL);
+                (void)send(be_conn->fd, cleanup_buf, (size_t)cn,
+                           MSG_NOSIGNAL | MSG_DONTWAIT);
         } else {
             /* Fallback: hardcoded PG ROLLBACK for legacy/no-vtable path */
             if (be_conn->fd >= 0) {
                 const char rollback_q[] = "Q\0\0\0\x0eROLLBACK;\0";
                 (void)send(be_conn->fd, rollback_q, sizeof(rollback_q) - 1,
-                           MSG_NOSIGNAL);
+                           MSG_NOSIGNAL | MSG_DONTWAIT);
             }
         }
         /* Drain response (ReadyForQuery / OK) — non-blocking */
@@ -2840,29 +2767,16 @@ static void on_client_recv_complete(void* userdata, int result)
                     close_session(worker, session, recv_ctx);
                     return;
                 }
-                /* Handle partial send: retry the unsent remainder.
-                 * TLS handshake data must be delivered in full before the
-                 * handshake can advance; drop the session if we cannot flush. */
+                /* Handle partial send without blocking the reactor.  The
+                 * helper already drained until EAGAIN; queueing handshake
+                 * fragments is not implemented here, so fail closed instead
+                 * of spinning on a client socket. */
                 if ((size_t)s < (size_t)n) {
-                    size_t off = (size_t)s;
-                    size_t remaining = (size_t)n - off;
-                    while (remaining > 0) {
-                        ssize_t r = send(session->client_fd,
-                                         recv_ctx->tls_hs_buf + off,
-                                         remaining, MSG_NOSIGNAL);
-                        if (r > 0) {
-                            off       += (size_t)r;
-                            remaining -= (size_t)r;
-                        } else if (r < 0 && errno == EINTR) {
-                            continue;
-                        } else {
-                            KEEL_LOG_ERROR(KEEL_LOG_CAT_TLS,
-                                "Worker %u: TLS handshake partial send failed: %s",
-                                worker->id, strerror(errno));
-                            close_session(worker, session, recv_ctx);
-                            return;
-                        }
-                    }
+                    KEEL_LOG_ERROR(KEEL_LOG_CAT_TLS,
+                        "Worker %u: TLS handshake partial send (%zd of %zd); closing",
+                        worker->id, s, n);
+                    close_session(worker, session, recv_ctx);
+                    return;
                 }
             }
             /* Continue waiting for more handshake data from client */

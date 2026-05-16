@@ -8,6 +8,7 @@
 #include "keel/engine/engine_flow.h"
 #include "keel/engine/backend_pool.h"
 #include "keel/session/session.h"
+#include "keel/session/state_profile.h"
 #include "keel/protocol/protocol_flow.h"
 
 #include <errno.h>
@@ -29,14 +30,18 @@ static void wr32(uint8_t* p, uint32_t v)
     p[3] = (uint8_t)(v);
 }
 
-static size_t build_command_complete_begin(uint8_t* buf)
+static size_t build_command_complete_tag(uint8_t* buf, const char* tag)
 {
-    const char* tag = "BEGIN";
     size_t tlen = strlen(tag) + 1; /* include NUL */
     buf[0] = 'C';
     wr32(buf + 1, (uint32_t)(4 + tlen));
     memcpy(buf + 5, tag, tlen);
     return 1 + 4 + tlen;
+}
+
+static size_t build_command_complete_begin(uint8_t* buf)
+{
+    return build_command_complete_tag(buf, "BEGIN");
 }
 
 static size_t build_ready_for_query(uint8_t* buf, char status)
@@ -86,6 +91,7 @@ static void test_flag_lifecycle_and_forward_on_rfq(void)
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
     sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
     sf.pending_pre_query_absorbed = 0;
 
     const uint8_t follow[] = { 'Q', 0, 0, 0, 5, 0 };
@@ -127,6 +133,7 @@ static void test_absorb_without_rfq(void)
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
     sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
 
     uint8_t bebuf[32];
     size_t n = build_command_complete_begin(bebuf);
@@ -159,6 +166,7 @@ static void test_partial_then_completion(void)
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
     sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
 
     const uint8_t follow[] = { 'Q', 0, 0, 0, 8, 'x', ';', 0 };
     memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
@@ -203,6 +211,7 @@ static void test_disconnect_during_absorb(void)
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
     sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
     sf.pending_pre_query_len = 4;
 
     keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, NULL, 0);
@@ -276,6 +285,7 @@ static void test_runaway_absorption_guard(void)
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
     sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
 
     size_t big_len = 64u * 1024u + 1u;
     uint8_t* blob = (uint8_t*)malloc(big_len);
@@ -290,6 +300,139 @@ static void test_runaway_absorption_guard(void)
     TEST_END();
 }
 
+static void test_state_sync_absorbs_setup_stream(void)
+{
+    TEST_BEGIN("pre_query: state sync absorbs setup stream");
+
+    int be_sv[2] = { -1, -1 };
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 4;
+
+    state_profile_t be_profile;
+    state_profile_t session_profile;
+    state_profile_init(&be_profile);
+    state_profile_init(&session_profile);
+    TEST_ASSERT(state_profile_set(&be_profile, "search_path", "public") == 0);
+    TEST_ASSERT(state_profile_set(&session_profile, "search_path", "tenant_a") == 0);
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+    be.profile = &be_profile;
+    be.current_state_hash = be_profile.hash;
+    be.needs_sync = true;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = fe_sv[0];
+    session.backend_conn = &be;
+    session.state_profile = &session_profile;
+    session.state_hash = session_profile.hash;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query = KEEL_PRE_QUERY_STATE_SYNC;
+    sf.pending_state_sync_hash = session.state_hash;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+
+    const uint8_t follow[] = { 'Q', 0, 0, 0, 13, 'S','E','L','E','C','T',' ','1', 0 };
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    uint8_t bebuf[64];
+    size_t n = 0;
+    n += build_command_complete_tag(bebuf + n, "SET");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+    TEST_ASSERT_EQ(be.current_state_hash, session.state_hash);
+    TEST_ASSERT_EQ(be.needs_sync, false);
+    TEST_ASSERT(state_profile_equal(&be_profile, &session_profile));
+
+    uint8_t got[32];
+    ssize_t rr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT_EQ(rr, (ssize_t)sizeof(follow));
+    TEST_ASSERT(memcmp(got, follow, sizeof(follow)) == 0);
+
+    uint8_t leaked[32];
+    ssize_t cr = recv(fe_sv[1], leaked, sizeof(leaked), 0);
+    TEST_ASSERT(cr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    close_pair(be_sv);
+    close_pair(fe_sv);
+    TEST_END();
+}
+
+static void test_state_sync_waits_until_rfq(void)
+{
+    TEST_BEGIN("pre_query: state sync waits until RFQ");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 5;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+    be.current_state_hash = 0x11;
+    be.needs_sync = true;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.backend_conn = &be;
+    session.state_hash = 0x22;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query = KEEL_PRE_QUERY_STATE_SYNC;
+    sf.pending_state_sync_hash = session.state_hash;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+
+    const uint8_t follow[] = { 'Q', 0, 0, 0, 5, 0 };
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    uint8_t cmsg[16];
+    size_t csz = build_command_complete_tag(cmsg, "SET");
+    keel_flow_result_t r1 = keel_engine_flow_on_be_data(&sf, &session, cmsg, csz);
+    TEST_ASSERT_EQ(r1, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_STATE_SYNC);
+    TEST_ASSERT_EQ(be.current_state_hash, 0x11ULL);
+
+    uint8_t got[16];
+    ssize_t rr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT(rr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    uint8_t zmsg[8];
+    size_t zsz = build_ready_for_query(zmsg, 'I');
+    keel_flow_result_t r2 = keel_engine_flow_on_be_data(&sf, &session, zmsg, zsz);
+    TEST_ASSERT_EQ(r2, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+    TEST_ASSERT_EQ(be.current_state_hash, 0x22ULL);
+
+    rr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT_EQ(rr, (ssize_t)sizeof(follow));
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
 int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
@@ -300,6 +443,8 @@ int main(void)
     test_disconnect_during_absorb();
     test_stash_overflow_on_resume();
     test_runaway_absorption_guard();
+    test_state_sync_absorbs_setup_stream();
+    test_state_sync_waits_until_rfq();
 
     return test_summary();
 }

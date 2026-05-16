@@ -11,6 +11,7 @@
  */
 
 #include "keel/engine/invariant.h"
+#include "keel/session/state_profile.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -189,6 +190,9 @@ enum {
     KEEL_PINV_CLEANING_OVERFLOW      = (1 << 1),
     KEEL_PINV_ACTIVE_OVERFLOW        = (1 << 2),
     KEEL_PINV_IDLE_ON_WRONG_LIST     = (1 << 3),
+    KEEL_PINV_BORROWABLE_HAS_OWNER   = (1 << 4),
+    KEEL_PINV_CLEAN_LIST_DIRTY       = (1 << 5),
+    KEEL_PINV_DIRTY_LIST_CLEAN       = (1 << 6),
 };
 
 /**
@@ -216,15 +220,56 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
     if (pool->active_count > pool->total_count)
         v |= KEEL_PINV_ACTIVE_OVERFLOW;
 
-    /* Walk clean_list: all entries must be in IDLE state */
+    /* Walk clean_list: entries must be borrowable and fully clean. */
     {
         const backend_conn_t *c = pool->clean_list;
         while (c) {
             backend_conn_state_t s = atomic_load(&((backend_conn_t *)c)->state);
-            if (s != BACKEND_CONN_IDLE) {
+            if (s != BACKEND_CONN_IDLE)
                 v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
-                break;
-            }
+            if (c->pinned_session || c->hard_pinned)
+                v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
+            if (c->current_state_hash != 0 || c->stmt_set_hash != 0 ||
+                c->needs_discard_all || (c->profile && c->profile->count != 0))
+                v |= KEEL_PINV_CLEAN_LIST_DIRTY;
+            if (v) break;
+            c = c->next;
+        }
+    }
+
+    /* idle_list may carry state/profile/stmt hashes, but it must not contain
+     * ACTIVE, CLEANING, CLOSED, or pinned/owned connections. */
+    {
+        const backend_conn_t *c = pool->idle_list;
+        while (c) {
+            backend_conn_state_t s = atomic_load(&((backend_conn_t *)c)->state);
+            if (s != BACKEND_CONN_IDLE)
+                v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
+            if (c->pinned_session || c->hard_pinned)
+                v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
+            if (c->needs_discard_all)
+                v |= KEEL_PINV_CLEAN_LIST_DIRTY;
+            if (v) break;
+            c = c->next;
+        }
+    }
+
+    /* dirty_list entries are borrowable only through cleanup. They must be
+     * IDLE/unowned and must actually need cleanup. */
+    {
+        const backend_conn_t *c = pool->dirty_list;
+        while (c) {
+            backend_conn_state_t s = atomic_load(&((backend_conn_t *)c)->state);
+            bool dirty = c->needs_discard_all ||
+                         c->current_state_hash != 0 ||
+                         (c->profile && c->profile->count != 0);
+            if (s != BACKEND_CONN_IDLE)
+                v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
+            if (c->pinned_session || c->hard_pinned)
+                v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
+            if (!dirty)
+                v |= KEEL_PINV_DIRTY_LIST_CLEAN;
+            if (v) break;
             c = c->next;
         }
     }

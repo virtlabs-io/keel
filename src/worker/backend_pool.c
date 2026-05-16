@@ -33,7 +33,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -137,104 +136,6 @@ static int check_pg_reusable_gate(const uint8_t* data, size_t len)
         pos += 1 + msg_len;
     }
     return 0; /* No ReadyForQuery yet */
-}
-
-/**
- * @brief Send cleanup command and wait for reusable gate with timeout
- *
- * Implements the cleanup state machine:
- *   1. Send cleanup command (ROLLBACK if in tx, then DISCARD ALL)
- *   2. Wait for ReadyForQuery with tx_status='I'
- *   3. Timeout after BACKEND_CLEANUP_TIMEOUT_MS
- *
- * Returns 0 on success (backend is now clean and reusable), -1 on failure.
- */
-/**
- * @brief Issue cleanup commands and wait for the backend reuse gate.
- *
- * The pool sends `ROLLBACK;DISCARD ALL;` and then waits for a reusable
- * `ReadyForQuery` response. The cleanup timeout is intentionally short because
- * this code runs on the worker's control path; a slow cleanup is cheaper to
- * treat as a dead connection than to let it stall multiplexing.
- *
- * @param fd Backend socket.
- * @param in_transaction Historical hint about transaction state. The current
- *        implementation always sends `ROLLBACK` first for safety.
- * @return `0` on successful cleanup, `-1` on failure or timeout.
- */
-static int backend_cleanup_with_gate(int fd, bool in_transaction)
-{
-    uint8_t cmd_buf[64];
-    size_t cmd_len = 0;
-
-    (void)in_transaction; /* Always ROLLBACK+DISCARD ALL — ROLLBACK is a no-op
-                            * when not in a transaction but safely exits any
-                            * active transaction first. */
-    {
-        /* ROLLBACK first to exit any transaction, then DISCARD ALL */
-        static const uint8_t rollback_discard[] = {
-            'Q', 0, 0, 0, 26,
-            'R', 'O', 'L', 'L', 'B', 'A', 'C', 'K', ';',
-            'D', 'I', 'S', 'C', 'A', 'R', 'D', ' ', 'A', 'L', 'L', ';', 0
-        };
-        memcpy(cmd_buf, rollback_discard, sizeof(rollback_discard));
-        cmd_len = sizeof(rollback_discard);
-    }
-
-    /* Send cleanup command */
-    if (send(fd, cmd_buf, cmd_len, MSG_NOSIGNAL) != (ssize_t)cmd_len) {
-        return -1;
-    }
-
-    /* Wait for response with timeout using epoll */
-    uint8_t recv_buf[512];
-    int64_t deadline_ms = BACKEND_CLEANUP_TIMEOUT_MS;
-    struct timeval start, now;
-    gettimeofday(&start, NULL);
-
-    while (deadline_ms > 0) {
-        int rc = keel_fd_wait(fd, KEEL_FD_WAIT_READ, (int)deadline_ms);
-
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-
-        if (rc == 0) {
-            /* Timeout — cleanup failed */
-            return -1;
-        }
-
-        ssize_t n = recv(fd, recv_buf, sizeof(recv_buf), MSG_DONTWAIT);
-        if (n <= 0) {
-            return -1;
-        }
-
-        int gate = check_pg_reusable_gate(recv_buf, (size_t)n);
-        if (gate == 1) {
-            return 0;  /* Success — backend is clean */
-        }
-        if (gate == -1) {
-            return -1; /* Error — backend is not reusable */
-        }
-
-        /* gate == 0: need more data, continue loop */
-        gettimeofday(&now, NULL);
-        int64_t elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
-                             (now.tv_usec - start.tv_usec) / 1000;
-        deadline_ms = BACKEND_CLEANUP_TIMEOUT_MS - elapsed_ms;
-    }
-
-    /* Timeout reached */
-    return -1;
-}
-
-/**
- * @brief Legacy simple DISCARD ALL (fallback for non-PostgreSQL)
- */
-static int backend_discard_all(int fd)
-{
-    return backend_cleanup_with_gate(fd, false);
 }
 
 /* ============================================================================
@@ -571,7 +472,8 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
                     'Q', 0, 0, 0, 17,
                     'D','I','S','C','A','R','D',' ','A','L','L',';', 0
                 };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd), MSG_NOSIGNAL);
+                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (ws == (ssize_t)sizeof(discard_cmd)) {
                     /* Try non-blocking read for ReadyForQuery */
                     uint8_t rbuf[512];
@@ -800,7 +702,8 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                     'Q', 0, 0, 0, 17,
                     'D','I','S','C','A','R','D',' ','A','L','L',';', 0
                 };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd), MSG_NOSIGNAL);
+                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (ws == (ssize_t)sizeof(discard_cmd)) {
                     uint8_t rbuf[512];
                     ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
@@ -1076,7 +979,8 @@ backend_conn_t* backend_pool_borrow_profiled(backend_pool_t* pool,
                     'Q', 0, 0, 0, 17,
                     'D','I','S','C','A','R','D',' ','A','L','L',';', 0
                 };
-                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd), MSG_NOSIGNAL);
+                ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (ws == (ssize_t)sizeof(discard_cmd)) {
                     uint8_t rbuf[512];
                     ssize_t rr = recv(conn->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
@@ -1251,7 +1155,8 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
         'Q', 0, 0, 0, 17,
         'D','I','S','C','A','R','D',' ','A','L','L',';', 0
     };
-    ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd), MSG_NOSIGNAL);
+    ssize_t ws = send(conn->fd, discard_cmd, sizeof(discard_cmd),
+                      MSG_NOSIGNAL | MSG_DONTWAIT);
     if (ws != (ssize_t)sizeof(discard_cmd)) {
         /* Send failed — close the connection */
         POOL_CLEANING_DEC(pool);

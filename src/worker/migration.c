@@ -73,7 +73,7 @@ static int migration_send_fd(int dst_sock, int fd)
         .msg_controllen = sizeof(ctrl.buf),
     };
 
-    ssize_t rc = sendmsg(dst_sock, &msg, MSG_NOSIGNAL);
+    ssize_t rc = sendmsg(dst_sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (rc < 0) {
         KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
             "migration: sendmsg FD failed: %s", strerror(errno));
