@@ -853,11 +853,9 @@ done:
         /* Response not fully consumed — connection is in an unknown protocol
          * state.  Close the fd and mark the pool slot CLOSED so the pool's
          * background refill timer can reconnect it. */
-        close(be->fd);
-        be->fd = -1;
-        atomic_store(&be->state, BACKEND_CONN_CLOSED);
+        backend_pool_close_connection(pool, be, BACKEND_CLOSE_REASON_IO_ERROR);
+        return rc;
     }
-    /* backend_pool_return is a no-op when state == BACKEND_CONN_CLOSED */
     backend_pool_return(pool, be, false);
     return rc;
 }

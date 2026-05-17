@@ -364,6 +364,11 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->pool_borrow_state_replay,      &src->pool_borrow_state_replay);
         counter_add_to(&dst->pool_borrow_stmt_replay,       &src->pool_borrow_stmt_replay);
         counter_add_to(&dst->pool_borrow_cleanup_required,  &src->pool_borrow_cleanup_required);
+        counter_add_to(&dst->backend_borrow_success,          &src->backend_borrow_success);
+        counter_add_to(&dst->backend_borrow_failed_incompatible,
+                       &src->backend_borrow_failed_incompatible);
+        counter_add_to(&dst->backend_borrow_failed_quarantined,
+                       &src->backend_borrow_failed_quarantined);
 
         /* Sessions */
         counter_add_to(&dst->sessions_created, &src->sessions_created);

@@ -40,6 +40,37 @@ For the full maturity inventory, failure-mode matrix, and failover semantics,
 see [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md). New production
 claims should be added there before feature docs or UI copy are expanded.
 
+### Production Profiles (v0.2-alpha)
+
+`pool` is now the default runtime tier and only production-safe defaults are enabled by default.
+
+```ini
+[keel]
+experimental_features = false
+
+[worker_group.main]
+mode = pool
+prepared_statement = virtualize
+result_cache = off
+```
+
+Experimental features require explicit opt-in:
+
+```ini
+[keel]
+experimental_features = true
+
+[worker_group.main]
+mode = smart
+result_cache = on
+scatter_merge = on
+wal_lsn_capture = on
+```
+
+Startup logs now emit:
+
+`Runtime tier: <tier>. Enabled features: [...]`
+
 ### Core
 - **Native Reactor I/O** — io_uring on Linux 5.6+ (primary), kqueue on macOS, epoll as Linux fallback
 - **PostgreSQL + MySQL** — full wire protocol support for both databases from a single binary
@@ -812,6 +843,7 @@ replica2 = host=127.0.0.1 port=5434 dbname=mydb role=RO weight=100
 |--------|---------|-------------|
 | `bind_addr` | `0.0.0.0` | Listen address |
 | `bind_port` | `6432` | Listen port |
+| `mode` | `pool` | Runtime tier: `proxy`, `pool`, `smart`, `full` |
 | `num_workers` | `0` (auto) | Worker threads (0 = one per CPU core) |
 | `min_pool_size` | `10` | Minimum backend connections per worker |
 | `max_pool_size` | `50` | Maximum backend connections per worker |
@@ -829,6 +861,10 @@ replica2 = host=127.0.0.1 port=5434 dbname=mydb role=RO weight=100
 | `use_buf_rings` | `0` | io_uring buffer rings (Linux 5.19+) |
 | `prepared_statement` | `virtualize` | PS pooling strategy: virtualize, pinning, tracking, anonymous |
 | `transaction_tracking` | `off` | XID probe + read-after-write consistency tokens |
+| `experimental_features` | `off` | Required to enable experimental feature keys |
+| `scatter_merge` | `off` | Enable scatter-merge routing features (experimental) |
+| `wal_lsn_capture` | `off` | Enable WAL LSN capture (experimental) |
+| `gtid_capture` | `off` | Enable GTID capture (experimental) |
 
 ### TLS Configuration (Frontend + Backend)
 

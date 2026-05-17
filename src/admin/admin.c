@@ -962,6 +962,9 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
     ROW_COUNTER("pool_borrow_state_replay",      pool_borrow_state_replay);
     ROW_COUNTER("pool_borrow_stmt_replay",       pool_borrow_stmt_replay);
     ROW_COUNTER("pool_borrow_cleanup_required",  pool_borrow_cleanup_required);
+    ROW_COUNTER("backend_borrow_success",        backend_borrow_success);
+    ROW_COUNTER("backend_borrow_failed_incompatible", backend_borrow_failed_incompatible);
+    ROW_COUNTER("backend_borrow_failed_quarantined",  backend_borrow_failed_quarantined);
     ROW_COUNTER("queries_total",     queries_total);
     ROW_COUNTER("queries_read",      queries_read);
     ROW_COUNTER("queries_write",     queries_write);
@@ -4646,6 +4649,9 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         PROM_COUNTER("pool_borrow_state_replay", "Borrows requiring state replay", pool_borrow_state_replay);
         PROM_COUNTER("pool_borrow_stmt_replay", "Borrows requiring prepared-statement replay", pool_borrow_stmt_replay);
         PROM_COUNTER("pool_borrow_cleanup_required", "Borrows requiring setup cleanup before use", pool_borrow_cleanup_required);
+        PROM_COUNTER("backend_borrow_total_success", "Borrow attempts that passed lifecycle predicate", backend_borrow_success);
+        PROM_COUNTER("backend_borrow_total_failed_incompatible", "Borrow attempts rejected by lifecycle incompatibility", backend_borrow_failed_incompatible);
+        PROM_COUNTER("backend_borrow_total_failed_quarantined", "Borrow attempts rejected because backend was quarantined", backend_borrow_failed_quarantined);
         PROM_COUNTER("pool_wait_queue_enqueued", "Sessions enqueued waiting for backend", pool_wait_queue_enqueued);
         PROM_COUNTER("pool_wait_queue_full_rejects", "Pool wait enqueue attempts rejected because queue was full", pool_wait_queue_full_rejects);
         PROM_COUNTER("pool_wait_resume_success", "Pool wait callbacks that resumed with a backend", pool_wait_resume_success);

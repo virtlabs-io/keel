@@ -1446,6 +1446,7 @@ static int worker_setup_session(keel_worker_t* worker, int client_fd)
     session->last_activity = session->created_at;
     session->id = ++worker->stats.sessions_created;
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->in_transaction = false;
 
     /* Start trace span (if tracing is enabled and this session is sampled) */
@@ -1725,17 +1726,21 @@ static void backend_cleanup_and_return(keel_worker_t*        worker,
     (void)flow;
     (void)reason;
 
+    if (!backend_pool_validate_generation(be_conn, session->backend_generation)) {
+        session->backend_conn = NULL;
+        session->backend_generation = 0;
+        session->server_fd = -1;
+        return;
+    }
+
     /* Close backend — don't try to reuse a connection that was mid-transaction
      * when the FE disconnected.  Non-blocking cleanup is race-prone. */
-    if (be_conn->fd >= 0) { close(be_conn->fd); be_conn->fd = -1; }
-    atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-    be_conn->pinned_session     = NULL;
-    be_conn->in_transaction     = false;
-    be_conn->current_state_hash = 0;
-    be_conn->stmt_set_hash      = 0;
-    be_conn->hard_pinned        = false;
-    if (be_conn->pool) be_conn->pool->active_count--;
+    if (be_conn->pool) {
+        backend_pool_close_connection(be_conn->pool, be_conn,
+                                      BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    }
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->server_fd    = -1;
 
     if (worker->stats_ctx)
@@ -1791,22 +1796,14 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
          * by pinned_session, which is NOT set for non-pinned connections. */
         if (session->backend_conn) {
             backend_conn_t* be_conn = session->backend_conn;
-            /* Note: server_fd == be_conn->fd, close via be_conn */
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-                if (worker->stats_ctx)
-                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
-            }
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->current_state_hash = 0;
-            be_conn->hard_pinned = false;
-            if (be_conn->pool) {
-                be_conn->pool->active_count--;
+            if (backend_pool_validate_generation(be_conn, session->backend_generation)) {
+                if (be_conn->pool) {
+                    backend_pool_close_connection(be_conn->pool, be_conn,
+                                                  BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+                }
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         } else if (session->server_fd >= 0) {
             close(session->server_fd);
@@ -1848,6 +1845,12 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
      *   - hard-pinned (prepared statements / SET) */
     if (session->backend_conn) {
         backend_conn_t* be_conn = session->backend_conn;
+        if (!backend_pool_validate_generation(be_conn, session->backend_generation)) {
+            session->backend_conn = NULL;
+            session->backend_generation = 0;
+            session->server_fd = -1;
+            goto backend_release_done;
+        }
         
         bool can_return = (be_conn->fd >= 0) &&
                           !be_conn->in_transaction &&
@@ -1857,6 +1860,7 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
         if (can_return && be_conn->pool) {
             /* Safe to return — backend is idle after last query completed */
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
             backend_pool_return(be_conn->pool, be_conn, false);
             if (worker->stats_ctx)
@@ -1879,27 +1883,19 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
                                        be_conn, KEEL_CLEANUP_FE_DISCONNECT);
         } else {
             /* Unsafe — close the backend fd and mark slot as CLOSED */
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-                if (worker->stats_ctx)
-                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
-            }
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->current_state_hash = 0;
-            be_conn->hard_pinned = false;
             if (be_conn->pool) {
-                be_conn->pool->active_count--;
+                backend_pool_close_connection(be_conn->pool, be_conn,
+                                              BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         }
     } else if (session->server_fd >= 0) {
         close(session->server_fd);
         session->server_fd = -1;
     }
+backend_release_done:
     
     /* plugin_state borrow is cleared; the flow vtable owns the context and
      * frees it in keel_session_flow_destroy() called above or below. */
@@ -3688,18 +3684,14 @@ static void on_backend_recv_complete(void* userdata, int result)
         /* Mark pooled connection as broken so it gets discarded */
         if (session->backend_conn) {
             backend_conn_t* be_conn = session->backend_conn;
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-            }
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->hard_pinned = false;
-            if (be_conn->pool) {
-                be_conn->pool->active_count--;
+            if (backend_pool_validate_generation(be_conn, session->backend_generation)) {
+                if (be_conn->pool) {
+                    backend_pool_close_connection(be_conn->pool, be_conn,
+                                                  BACKEND_CLOSE_REASON_IO_ERROR);
+                }
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         } else if (session->server_fd >= 0) {
             close(session->server_fd);

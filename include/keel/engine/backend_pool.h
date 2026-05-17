@@ -63,6 +63,33 @@ typedef enum backend_cleanup_state {
     BACKEND_CLEANUP_DRAIN,          /**< Draining cleanup responses via plugin */
 } backend_cleanup_state_t;
 
+/**
+ * @brief Why a backend is quarantined from reuse.
+ */
+typedef enum backend_quarantine_reason {
+    BACKEND_QUARANTINE_NONE = 0,      /**< Not quarantined */
+    BACKEND_QUARANTINE_DIRTY,         /**< Carries state requiring cleanup/replay */
+    BACKEND_QUARANTINE_SYNCING,       /**< Sync operation in progress */
+    BACKEND_QUARANTINE_REPLAYING,     /**< Replay operation in progress */
+    BACKEND_QUARANTINE_PROTOCOL_DESYNC,/**< Protocol state mismatch detected */
+    BACKEND_QUARANTINE_CLEANUP_FAILED,/**< Cleanup failed; slot is not reusable */
+} backend_quarantine_reason_t;
+
+/**
+ * @brief Why a backend slot transitioned to CLOSED.
+ */
+typedef enum backend_close_reason {
+    BACKEND_CLOSE_REASON_NONE = 0,
+    BACKEND_CLOSE_REASON_DEAD_IDLE,
+    BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+    BACKEND_CLOSE_REASON_CLEANUP_TIMEOUT,
+    BACKEND_CLOSE_REASON_CLIENT_DISCONNECT,
+    BACKEND_CLOSE_REASON_IO_ERROR,
+    BACKEND_CLOSE_REASON_PRUNE_IDLE,
+    BACKEND_CLOSE_REASON_PRUNE_AGED,
+    BACKEND_CLOSE_REASON_DRAIN_IDLE,
+} backend_close_reason_t;
+
 #define KEEL_BACKEND_CLEANUP_RECV_BUFSZ 1024
 #define KEEL_BACKEND_CLEANUP_CMD_BUFSZ 2048
 
@@ -80,6 +107,9 @@ typedef struct backend_conn {
                                                  *   Cleared when full cleanup is sent. */
     bool                    in_transaction;     /**< Inside BEGIN...COMMIT */
     bool                    needs_sync;         /**< Needs state sync before use */
+    bool                    syncing;            /**< Backend sync in progress */
+    bool                    replay_active;      /**< Backend replay in progress */
+    bool                    protocol_desync;    /**< Protocol desync observed */
     bool                    hard_pinned;        /**< Exclusively owned by session (spec §16) */
     bool                    needs_full_cleanup;  /**< Borrowed with a different stmt hash — engine must
                                                  *   run full cleanup before replaying prepared stmts.
@@ -89,7 +119,11 @@ typedef struct backend_conn {
     uint32_t                my_connection_id;   /**< Protocol connection id for command cancellation */
     uint64_t                last_used;          /**< Timestamp of last use */
     uint64_t                created_at;         /**< Timestamp when connection was established (ms) */
+    uint64_t                generation;         /**< Monotonic lifecycle generation for stale-ref detection */
     uint64_t                clean_gen;          /**< Monotonic generation counter (bumped on return) */
+    backend_quarantine_reason_t quarantine;     /**< Reuse quarantine reason */
+    backend_close_reason_t  close_reason;       /**< Last close reason for this generation */
+    void*                   active_owner;       /**< Non-NULL while backend is actively owned */
     void*                   pinned_session;     /**< Session pinned to (or NULL) */
     struct state_profile*   profile;            /**< Connection state profile (spec §5) */
     struct backend_pool*    pool;               /**< Pool this connection belongs to */
@@ -277,6 +311,21 @@ void backend_pool_destroy(backend_pool_t* pool);
 backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_state_hash);
 
 /**
+ * @brief Canonical backend reuse predicate.
+ *
+ * All borrow decisions must call this predicate instead of ad-hoc checks.
+ */
+bool backend_pool_can_borrow(const backend_conn_t* conn);
+
+/**
+ * @brief Validate a session-held backend reference generation.
+ *
+ * Returns true only when the backend still matches the session snapshot.
+ */
+bool backend_pool_validate_generation(const backend_conn_t* conn,
+                                      uint64_t expected_generation);
+
+/**
  * @brief Borrow a connection, preferring one with matching prepared-statement set.
  *
  * Used when a session has named prepared statements.  Search order:
@@ -361,6 +410,21 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
  * @param conn Connection to discard
  */
 void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn);
+
+/**
+ * @brief Close a backend slot and emit exactly one close reason for this close.
+ *
+ * The function is idempotent while a slot is already CLOSED.
+ */
+void backend_pool_close_connection(backend_pool_t* pool,
+                                   backend_conn_t* conn,
+                                   backend_close_reason_t reason);
+
+/**
+ * @brief Set or clear backend quarantine reason.
+ */
+void backend_pool_set_quarantine(backend_conn_t* conn,
+                                 backend_quarantine_reason_t reason);
 
 /**
  * @brief Supervise connections in CLEANING state

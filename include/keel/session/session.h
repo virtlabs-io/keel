@@ -308,6 +308,7 @@ typedef struct keel_session {
     
     /* Backend pool connection (for multiplexing) */
     struct backend_conn* backend_conn;  /* Borrowed connection from pool */
+    uint64_t            backend_generation; /* Snapshot of backend_conn->generation at bind time */
     bool                in_transaction; /* Inside BEGIN...COMMIT */
     bool                commit_in_doubt; /* CID recovery in progress — do not force-close */
     uint64_t            state_hash;     /* Hash of SET variables */

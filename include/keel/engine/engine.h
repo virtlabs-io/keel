@@ -309,7 +309,7 @@ typedef struct keel_engine_config {
 
     /** Runtime mode tier — controls which hot-path features are active.
      *  proxy=minimal pass-through, pool=pooling+PS, smart=+routing+logging,
-     *  full=+hooks+txn_tracking+LSN.  Default: full (all features). */
+     *  full=+hooks+txn_tracking+LSN.  Default: pool. */
     keel_tier_t          runtime_mode;
 
     /** Replication uncertainty tracking (transaction_tracking = on).
@@ -451,7 +451,7 @@ typedef struct keel_engine_config {
     .instr_mask = 0, \
     .hook_registry = NULL, \
     .ps_mode = KEEL_PS_MODE_VIRTUALIZE, \
-    .runtime_mode = KEEL_TIER_FULL, \
+    .runtime_mode = KEEL_TIER_POOL, \
     .txn_tracking = false, \
     .fast_network_path = true, \
     .result_cache = false, \

@@ -35,6 +35,33 @@ features that are aspirational or roadmap-only.
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |
 
+## Production-Supported Profiles (v0.2-alpha)
+
+Default profile (enabled without opt-in):
+
+```ini
+[keel]
+experimental_features = false
+
+[worker_group.main]
+mode = pool
+prepared_statement = virtualize
+result_cache = off
+```
+
+Experimental profile (explicitly opt-in):
+
+```ini
+[keel]
+experimental_features = true
+
+[worker_group.main]
+mode = smart
+scatter_merge = on
+wal_lsn_capture = on
+gtid_capture = on
+```
+
 ## Required Failure-Mode Matrix
 
 | Failure mode | Required behavior | Required observability | Current gate |

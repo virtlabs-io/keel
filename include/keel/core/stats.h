@@ -242,6 +242,9 @@ typedef struct keel_stats_basic {
     keel_counter_t   pool_borrow_state_replay;        /**< Borrow selected backend requiring state replay */
     keel_counter_t   pool_borrow_stmt_replay;         /**< Borrow selected backend requiring statement replay */
     keel_counter_t   pool_borrow_cleanup_required;    /**< Borrow selected backend requiring cleanup before use */
+    keel_counter_t   backend_borrow_success;          /**< Central borrow predicate accepted and borrow succeeded */
+    keel_counter_t   backend_borrow_failed_incompatible; /**< Borrow rejected by lifecycle incompatibility */
+    keel_counter_t   backend_borrow_failed_quarantined;  /**< Borrow rejected because backend is quarantined */
 
     /* -- Session metrics -- */
     keel_counter_t   sessions_created;   /**< Frontend connections accepted */

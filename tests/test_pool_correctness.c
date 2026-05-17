@@ -275,6 +275,99 @@ static void test_clean_gen_increments(void)
     TEST_END();
 }
 
+static void test_backend_can_borrow_predicate_matrix(void)
+{
+    TEST_BEGIN("backend_can_borrow rejects illegal lifecycle states");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = &pool->connections[0];
+
+    atomic_store(&conn->state, BACKEND_CONN_IDLE);
+    conn->pinned_session = NULL;
+    conn->quarantine = BACKEND_QUARANTINE_NONE;
+    conn->in_transaction = false;
+    conn->syncing = false;
+    conn->replay_active = false;
+    conn->protocol_desync = false;
+    conn->needs_full_cleanup = false;
+    TEST_ASSERT(backend_pool_can_borrow(conn));
+
+    atomic_store(&conn->state, BACKEND_CONN_CLEANING);
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    atomic_store(&conn->state, BACKEND_CONN_IDLE);
+
+    conn->pinned_session = (void*)0x1;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->pinned_session = NULL;
+
+    conn->quarantine = BACKEND_QUARANTINE_DIRTY;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->quarantine = BACKEND_QUARANTINE_NONE;
+
+    conn->in_transaction = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->in_transaction = false;
+
+    conn->syncing = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->syncing = false;
+
+    conn->replay_active = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->replay_active = false;
+
+    conn->protocol_desync = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->protocol_desync = false;
+
+    conn->needs_full_cleanup = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_backend_generation_validation(void)
+{
+    TEST_BEGIN("backend generation validation rejects stale references");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    uint64_t g = conn->generation;
+    TEST_ASSERT(backend_pool_validate_generation(conn, g));
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
+    TEST_ASSERT(!backend_pool_validate_generation(conn, g));
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_close_reason_once(void)
+{
+    TEST_BEGIN("backend close reason is emitted once per close transition");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    uint64_t gen_after_first = conn->generation;
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    TEST_ASSERT_EQ(conn->generation, gen_after_first);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
 /* ============================================================================
  * Test: Admission Control (max_pinned)
  * ============================================================================ */
@@ -407,6 +500,8 @@ static void test_borrow_rejects_cleaning(void)
      * should trap on it. */
     atomic_store(&c1->state, BACKEND_CONN_CLEANING);
     atomic_store(&c2->state, BACKEND_CONN_IDLE);
+    c1->active_owner = NULL;
+    c2->active_owner = NULL;
     pool->active_count = 0;
     c1->next = c2;
     c2->next = NULL;
@@ -976,6 +1071,9 @@ int main(void)
     test_cleaning_state_transition();
     test_clean_return_bypasses_discard();
     test_clean_gen_increments();
+    test_backend_can_borrow_predicate_matrix();
+    test_backend_generation_validation();
+    test_close_reason_once();
     test_admission_control_max_pinned();
     test_quarantine_pin_flags();
     test_sticky_primary_fields();

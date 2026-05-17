@@ -230,7 +230,8 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
             backend_conn_state_t s = atomic_load(&((backend_conn_t *)c)->state);
             if (s != BACKEND_CONN_IDLE)
                 v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
-            if (c->pinned_session || c->hard_pinned)
+            if (c->pinned_session || c->active_owner || c->hard_pinned ||
+                c->quarantine != BACKEND_QUARANTINE_NONE)
                 v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
             if (c->current_state_hash != 0 || c->stmt_set_hash != 0 ||
                 c->needs_full_cleanup || (c->profile && c->profile->count != 0))
@@ -248,7 +249,8 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
             backend_conn_state_t s = atomic_load(&((backend_conn_t *)c)->state);
             if (s != BACKEND_CONN_IDLE)
                 v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
-            if (c->pinned_session || c->hard_pinned)
+            if (c->pinned_session || c->active_owner || c->hard_pinned ||
+                c->quarantine != BACKEND_QUARANTINE_NONE)
                 v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
             if (c->needs_full_cleanup)
                 v |= KEEL_PINV_CLEAN_LIST_DIRTY;
@@ -268,7 +270,7 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
                          (c->profile && c->profile->count != 0);
             if (s != BACKEND_CONN_IDLE)
                 v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
-            if (c->pinned_session || c->hard_pinned)
+            if (c->pinned_session || c->active_owner || c->hard_pinned)
                 v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
             if (!dirty)
                 v |= KEEL_PINV_DIRTY_LIST_CLEAN;
