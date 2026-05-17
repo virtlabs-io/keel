@@ -103,6 +103,8 @@ static inline void pool_record_borrow_result(backend_pool_t* pool,
     }
 }
 
+static uint64_t get_time_ms(void);
+
 static void pool_record_backend_close(backend_pool_t* pool,
                                       backend_close_reason_t reason)
 {
@@ -132,6 +134,54 @@ static void pool_record_backend_close(backend_pool_t* pool,
     case BACKEND_CLOSE_REASON_DRAIN_IDLE:
         break;
     }
+}
+
+static uint64_t pool_cleanup_elapsed_ns(const backend_conn_t* conn)
+{
+    if (!conn || conn->cleanup_started_ms == 0)
+        return 0;
+    uint64_t now_ms = get_time_ms();
+    if (now_ms <= conn->cleanup_started_ms)
+        return 0;
+    return (now_ms - conn->cleanup_started_ms) * 1000000ULL;
+}
+
+static void pool_record_cleanup_result(backend_pool_t* pool,
+                                       backend_conn_t* conn,
+                                       backend_cleanup_result_t result)
+{
+    if (!conn)
+        return;
+
+    conn->cleanup_last_result = result;
+    conn->cleanup_last_duration_ns = pool_cleanup_elapsed_ns(conn);
+
+    if (!pool || !pool->stats_ctx)
+        return;
+
+    switch (result) {
+    case BACKEND_CLEANUP_RESULT_SUCCESS:
+        KEEL_STAT_INC(pool->stats_ctx, cleanup_result_success);
+        break;
+    case BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR:
+        KEEL_STAT_INC(pool->stats_ctx, cleanup_result_protocol_error);
+        break;
+    case BACKEND_CLEANUP_RESULT_TIMEOUT:
+        KEEL_STAT_INC(pool->stats_ctx, cleanup_result_timeout);
+        break;
+    case BACKEND_CLEANUP_RESULT_BACKEND_EOF:
+        KEEL_STAT_INC(pool->stats_ctx, cleanup_result_backend_eof);
+        break;
+    case BACKEND_CLEANUP_RESULT_SEND_FAILURE:
+        KEEL_STAT_INC(pool->stats_ctx, cleanup_result_send_failure);
+        break;
+    case BACKEND_CLEANUP_RESULT_NONE:
+        break;
+    }
+
+    if (conn->cleanup_last_duration_ns > 0)
+        KEEL_STAT_LATENCY(pool->stats_ctx, cleanup_duration_ns,
+                          conn->cleanup_last_duration_ns);
 }
 
 /* ============================================================================
@@ -172,6 +222,8 @@ static inline void backend_pool_mark_borrowed(backend_conn_t* conn)
     if (!conn) return;
     conn->generation++;
     conn->close_reason = BACKEND_CLOSE_REASON_NONE;
+    conn->cleanup_last_result = BACKEND_CLEANUP_RESULT_NONE;
+    conn->cleanup_last_duration_ns = 0;
     conn->quarantine = BACKEND_QUARANTINE_NONE;
     conn->syncing = false;
     conn->replay_active = false;
@@ -306,8 +358,10 @@ static void backend_pool_wake_one_locked(backend_pool_t* pool)
 
 static void backend_pool_close_cleaning_locked(backend_pool_t* pool,
                                                backend_conn_t* conn,
-                                               backend_close_reason_t reason)
+                                               backend_close_reason_t reason,
+                                               backend_cleanup_result_t result)
 {
+    pool_record_cleanup_result(pool, conn, result);
     POOL_CLEANING_DEC(pool);
     POOL_REUSE_FAIL_INC(pool);
     backend_pool_close_slot_locked(pool, conn, reason, false);
@@ -318,6 +372,7 @@ static void backend_pool_close_cleaning_locked(backend_pool_t* pool,
 static void backend_pool_reclaim_clean_locked(backend_pool_t* pool,
                                               backend_conn_t* conn)
 {
+    pool_record_cleanup_result(pool, conn, BACKEND_CLEANUP_RESULT_SUCCESS);
     POOL_CLEANING_DEC(pool);
     backend_pool_cleanup_reset(conn);
     conn->current_state_hash = 0;
@@ -386,7 +441,9 @@ static bool backend_pool_arm_cleanup_send_locked(backend_pool_t* pool,
                                                  backend_conn_t* conn)
 {
     if (!pool->reactor || conn->fd < 0) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         return false;
     }
 
@@ -402,7 +459,9 @@ static bool backend_pool_arm_cleanup_send_locked(backend_pool_t* pool,
                                conn, backend_pool_cleanup_send_cb);
     if (rc < 0) {
         conn->cleanup_io_armed = false;
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         return false;
     }
     return true;
@@ -412,7 +471,9 @@ static bool backend_pool_arm_cleanup_recv_locked(backend_pool_t* pool,
                                                  backend_conn_t* conn)
 {
     if (!pool->reactor || conn->fd < 0) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         return false;
     }
 
@@ -424,7 +485,9 @@ static bool backend_pool_arm_cleanup_recv_locked(backend_pool_t* pool,
                                0, conn, backend_pool_cleanup_recv_cb);
     if (rc < 0) {
         conn->cleanup_io_armed = false;
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         return false;
     }
     return true;
@@ -439,7 +502,9 @@ static void backend_pool_enter_cleanup_locked(backend_pool_t* pool,
     conn->cleanup_started_ms = get_time_ms();
     conn->last_used = conn->cleanup_started_ms;
     if (!backend_pool_prepare_cleanup_locked(pool, conn)) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         KEEL_CHECK_POOL_INVARIANTS(pool);
         return;
     }
@@ -493,14 +558,18 @@ static void backend_pool_cleanup_send_cb(void* userdata, int result)
 
     conn->cleanup_io_armed = false;
     if (result <= 0) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_SEND_FAILURE);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
 
     size_t remaining = conn->cleanup_send_len - conn->cleanup_send_off;
     if ((size_t)result > remaining) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
@@ -530,13 +599,17 @@ static void backend_pool_cleanup_recv_cb(void* userdata, int result)
 
     conn->cleanup_io_armed = false;
     if (result <= 0) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_BACKEND_EOF);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
 
     if (!pool->flow_vt || !pool->flow_vt->drain_cleanup_response) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR);
         pthread_mutex_unlock(&pool->lock);
         return;
     }
@@ -549,7 +622,9 @@ static void backend_pool_cleanup_recv_cb(void* userdata, int result)
         backend_pool_reclaim_clean_locked(pool, conn);
     } else if (gate == KEEL_PROTO_DRAIN_ERROR ||
                (gate == KEEL_PROTO_DRAIN_COMPLETE && consumed != (size_t)result)) {
-        backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+        backend_pool_close_cleaning_locked(pool, conn,
+                                           BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                           BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR);
     } else {
         backend_pool_arm_cleanup_recv_locked(pool, conn);
     }
@@ -1601,7 +1676,9 @@ size_t backend_pool_drain_cleaning(backend_pool_t* pool)
         /* Timeout check: if stuck in CLEANING too long, close it */
         if (conn->cleanup_started_ms > 0 &&
             (now - conn->cleanup_started_ms) > BACKEND_CLEANUP_TIMEOUT_MS) {
-            backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_TIMEOUT);
+            backend_pool_close_cleaning_locked(pool, conn,
+                                               BACKEND_CLOSE_REASON_CLEANUP_TIMEOUT,
+                                               BACKEND_CLEANUP_RESULT_TIMEOUT);
             KEEL_DEBUG_LOG("Connection CLEANING timeout — closed (gen=%lu)\n",
                           (unsigned long)conn->clean_gen);
             closed++;
@@ -1614,7 +1691,9 @@ size_t backend_pool_drain_cleaning(backend_pool_t* pool)
             } else if (conn->cleanup_state == BACKEND_CLEANUP_DRAIN) {
                 backend_pool_arm_cleanup_recv_locked(pool, conn);
             } else {
-                backend_pool_close_cleaning_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+                backend_pool_close_cleaning_locked(pool, conn,
+                                                   BACKEND_CLOSE_REASON_CLEANUP_ERROR,
+                                                   BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR);
                 closed++;
             }
         }

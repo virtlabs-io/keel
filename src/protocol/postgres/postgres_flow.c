@@ -2079,6 +2079,16 @@ static void pgf_destroy(void* v) {
  */
 static ssize_t pgf_frame_len(void* vctx, const uint8_t* data, size_t len, int dir) {
     pg_flow_ctx_t* ctx = vctx;
+    if (!ctx) {
+        if (dir == 0 && len < 4)
+            return 0;
+        if (len < 5)
+            return 0;
+        uint32_t bl = rd32(data + 1);
+        if (bl < 4 || bl > 1073741824)
+            return -1;
+        return (ssize_t)(1 + bl);
+    }
     if (!ctx->startup_complete && dir == 0) {
         /* During auth challenge phase (auth_pending=true), the client sends
          * 'p' PasswordMessage / SASLInitialResponse / SASLResponse, which use
@@ -3391,6 +3401,86 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
     act->type = KEEL_BE_ACT_FORWARD_FE;
     act->fe_payload = data; act->fe_payload_len = len;
     uint8_t t = data[0];
+    if (!ctx) {
+        switch (t) {
+        case '1':
+            act->stmt_replay_accepted = true;
+            return 0;
+        case 'E':
+            act->type = KEEL_BE_ACT_ERROR;
+            return 0;
+        case 'Z':
+            if (len >= 6) {
+                char s = (char)data[5];
+                act->tx_state_changed = true;
+                act->query_complete = true;
+                if (s == 'I') {
+                    act->tx_status = KEEL_TX_IDLE;
+                    act->backend_reusable = true;
+                    act->pin_clear |= KEEL_FPIN_TRANSACTION|KEEL_FPIN_FAILED_TX;
+                } else if (s == 'T') {
+                    act->tx_status = KEEL_TX_ACTIVE;
+                    act->pin_update |= KEEL_FPIN_TRANSACTION;
+                } else {
+                    act->tx_status = KEEL_TX_FAILED;
+                    act->pin_update |= KEEL_FPIN_TRANSACTION|KEEL_FPIN_FAILED_TX;
+                }
+            }
+            return 0;
+        default:
+            return 0;
+        }
+    }
+
+    if (ctx->commit_doubt_check_active) {
+        /* Commit-in-doubt outcome stream is protocol-owned and absorbed here.
+         * Expected sequence: RowDescription/DataRow/CommandComplete/RFQ. */
+        act->type = KEEL_BE_ACT_ABSORB;
+        act->fe_payload = NULL;
+        act->fe_payload_len = 0;
+        if (t == 'D' && len >= 11) {
+            uint16_t ncols = (uint16_t)(((uint16_t)data[5] << 8) | data[6]);
+            if (ncols >= 1) {
+                int32_t vcl = (int32_t)(((uint32_t)data[7]  << 24)
+                                      | ((uint32_t)data[8]  << 16)
+                                      | ((uint32_t)data[9]  <<  8)
+                                      |  (uint32_t)data[10]);
+                if (vcl > 0 && len >= (size_t)(11 + vcl)) {
+                    const char* val = (const char*)(data + 11);
+                    if (strncmp(val, "committed", 9) == 0) {
+                        ctx->commit_doubt_outcome = 1;
+                        act->commit_doubt_outcome_changed = true;
+                        act->commit_doubt_outcome = 1;
+                    } else if (strncmp(val, "aborted", 7) == 0) {
+                        ctx->commit_doubt_outcome = 2;
+                        act->commit_doubt_outcome_changed = true;
+                        act->commit_doubt_outcome = 2;
+                    }
+                }
+            }
+            return 0;
+        }
+        if (t == 'E') {
+            /* Keep unknown outcome and wait for RFQ boundary. */
+            return 0;
+        }
+        if (t == 'Z' && len >= 6) {
+            char s = (char)data[5];
+            act->tx_state_changed = true;
+            act->query_complete = true;
+            if (s == 'I') {
+                act->tx_status = KEEL_TX_IDLE;
+                act->backend_reusable = true;
+            } else if (s == 'T') {
+                act->tx_status = KEEL_TX_ACTIVE;
+            } else {
+                act->tx_status = KEEL_TX_FAILED;
+            }
+            ctx->commit_doubt_check_active = false;
+            return 0;
+        }
+        return 0;
+    }
 
     /* Replication tracking: absorb the RowDescription / DataRow / SELECT
      * CommandComplete that come from the "SELECT txid_current()" prepended
@@ -3508,6 +3598,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             act->type = KEEL_BE_ACT_AUTH_PROGRESS;
         return 0;
     case '1': /* ParseComplete — confirm the in-flight prepared statement */
+        act->stmt_replay_accepted = true;
         if (ctx->pending_parse_valid && ctx->pending_parse_hash != 0) {
             /* Mark the cache entry as confirmed and rebuild the session
              * hash from scratch so context_sig is always included. */
@@ -4698,6 +4789,108 @@ static ssize_t pgf_gen_ready_for_query(void* ctx, uint8_t* buf, size_t buf_len) 
     return 6;
 }
 
+static ssize_t pgf_build_commit_doubt_check(void* vctx,
+                                            uint64_t xid,
+                                            uint8_t* out_buf,
+                                            size_t out_cap)
+{
+    pg_flow_ctx_t* ctx = (pg_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < 32 || xid == 0)
+        return -1;
+
+    char sql[80];
+    int sql_len = snprintf(sql, sizeof(sql), "SELECT txid_status(%llu)",
+                           (unsigned long long)xid);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql))
+        return -1;
+
+    uint32_t qlen = (uint32_t)(4 + (size_t)sql_len + 1);
+    size_t msg_len = 1 + 4 + (size_t)sql_len + 1;
+    if (msg_len > out_cap)
+        return -1;
+
+    out_buf[0] = 'Q';
+    out_buf[1] = (uint8_t)(qlen >> 24);
+    out_buf[2] = (uint8_t)(qlen >> 16);
+    out_buf[3] = (uint8_t)(qlen >> 8);
+    out_buf[4] = (uint8_t)(qlen);
+    memcpy(out_buf + 5, sql, (size_t)sql_len);
+    out_buf[5 + (size_t)sql_len] = '\0';
+
+    if (ctx) {
+        ctx->commit_doubt_check_active = true;
+        ctx->commit_doubt_outcome = 0;
+    }
+    return (ssize_t)msg_len;
+}
+
+static ssize_t pgf_generate_commit_doubt_response(void* vctx,
+                                                  keel_commit_doubt_reason_t reason,
+                                                  uint64_t xid,
+                                                  uint8_t* out_buf,
+                                                  size_t out_cap)
+{
+    pg_flow_ctx_t* ctx = (pg_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < 16)
+        return -1;
+
+    if (reason == KEEL_CIDR_RESOLVED_COMMITTED) {
+        static const uint8_t kCommitOk[] = {
+            'C', 0x00, 0x00, 0x00, 0x0b, 'C','O','M','M','I','T','\0',
+            'Z', 0x00, 0x00, 0x00, 0x05, 'I'
+        };
+        if (sizeof(kCommitOk) > out_cap)
+            return -1;
+        memcpy(out_buf, kCommitOk, sizeof(kCommitOk));
+        return (ssize_t)sizeof(kCommitOk);
+    }
+
+    const char* code = "08006";
+    char msg[256];
+    switch (reason) {
+    case KEEL_CIDR_NO_XID:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction outcome unknown (no XID captured)");
+        break;
+    case KEEL_CIDR_NO_RW_POOL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: no RW pool — check txid_status(%llu) to resolve",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_NO_CHECK_CONN:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: pool unavailable — check txid_status(%llu) to resolve",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_CHECK_BUILD_FAIL:
+    case KEEL_CIDR_CHECK_SEND_FAIL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: XID-check failed — verify txid_status(%llu) manually",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_RESOLVED_ABORTED:
+        code = "40000";
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction was rolled back");
+        break;
+    case KEEL_CIDR_RESOLVED_UNKNOWN:
+    default:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: outcome uncertain for XID %llu — check txid_status() manually",
+                 (unsigned long long)xid);
+        break;
+    }
+
+    ssize_t el = pgf_gen_error(ctx, code, msg, out_buf, out_cap);
+    if (el <= 0)
+        return -1;
+
+    ssize_t zl = pgf_gen_ready_for_query(ctx, out_buf + (size_t)el, out_cap - (size_t)el);
+    if (zl < 0)
+        return -1;
+    return el + zl;
+}
+
 /* ---- Anonymous mode vtable hook: rewrite_execute_anonymous ----
  *
  * Called by the engine when ps_mode == KEEL_PS_MODE_ANONYMOUS and a named
@@ -5221,6 +5414,8 @@ const keel_proto_flow_vtable_t keel_proto_flow_postgres = {
     .get_backend_metadata  = pgf_get_backend_metadata,
     .get_metrics           = pgf_get_metrics,
     .notify_write_lsn      = pgf_notify_write_lsn,
+    .build_commit_doubt_check = pgf_build_commit_doubt_check,
+    .generate_commit_doubt_response = pgf_generate_commit_doubt_response,
     .get_stmt_replay           = pgf_get_stmt_replay,
     .rewrite_execute_anonymous = pgf_rewrite_execute_anonymous,
     .captured_fe_pin_effects   = pgf_captured_fe_pin_effects,

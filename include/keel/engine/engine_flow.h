@@ -69,6 +69,19 @@ typedef enum keel_pre_query_state {
     KEEL_PQSTATE_FAILED,
 } keel_pre_query_state_t;
 
+/**
+ * @brief Outcome taxonomy for setup replay paths (state sync / stmt replay).
+ */
+typedef enum keel_replay_result {
+    KEEL_REPLAY_RESULT_NONE = 0,
+    KEEL_REPLAY_RESULT_SUCCESS,
+    KEEL_REPLAY_RESULT_PARSE_ERROR,
+    KEEL_REPLAY_RESULT_DRAIN_ERROR,
+    KEEL_REPLAY_RESULT_TIMEOUT,
+    KEEL_REPLAY_RESULT_OOM,
+    KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE,
+} keel_replay_result_t;
+
 typedef struct keel_pre_query_op {
     keel_pre_query_op_type_t type;
     keel_pre_query_state_t   state;
@@ -305,6 +318,9 @@ typedef struct keel_session_flow {
     size_t  pending_pre_query_absorbed;      /**< BE bytes absorbed; runaway-cap */
     uint64_t pending_state_sync_hash;        /**< backend state hash to stamp after sync RFQ */
     keel_flow_result_t pending_pre_query_resume; /**< Result after stashed payload is forwarded */
+    uint64_t pending_pre_query_started_ns;     /**< Active pre-query op start timestamp */
+    keel_replay_result_t replay_last_result;   /**< Last replay/setup outcome */
+    uint64_t replay_last_duration_ns;          /**< Last replay/setup duration in ns */
     /* Generic pre-query operation queue (sequential, never parallel).
      * Used to compose deferred BEGIN, state sync, prepared replay, and
      * cleanup checks while holding client bytes atomically. */

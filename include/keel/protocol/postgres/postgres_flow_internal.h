@@ -212,6 +212,8 @@ typedef struct pg_flow_ctx {
     bool     txn_tracking;       /**< transaction_tracking config enabled */
     bool     xid_probe_active;   /**< Rewritten COMMIT in flight; absorb SELECT results */
     uint64_t xid_probe_result;   /**< txid_current() captured from DataRow */
+    bool     commit_doubt_check_active; /**< txid_status() check stream in progress */
+    uint8_t  commit_doubt_outcome;      /**< 0=unknown, 1=committed, 2=aborted */
 
     /* Anonymous mode: stmt_name → full SQL text mapping.
      * Parse messages are intercepted and stored here rather than sent to the

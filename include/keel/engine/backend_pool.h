@@ -90,6 +90,18 @@ typedef enum backend_close_reason {
     BACKEND_CLOSE_REASON_DRAIN_IDLE,
 } backend_close_reason_t;
 
+/**
+ * @brief Outcome taxonomy for reactor-owned backend cleanup attempts.
+ */
+typedef enum backend_cleanup_result {
+    BACKEND_CLEANUP_RESULT_NONE = 0,
+    BACKEND_CLEANUP_RESULT_SUCCESS,
+    BACKEND_CLEANUP_RESULT_PROTOCOL_ERROR,
+    BACKEND_CLEANUP_RESULT_TIMEOUT,
+    BACKEND_CLEANUP_RESULT_BACKEND_EOF,
+    BACKEND_CLEANUP_RESULT_SEND_FAILURE,
+} backend_cleanup_result_t;
+
 #define KEEL_BACKEND_CLEANUP_RECV_BUFSZ 1024
 #define KEEL_BACKEND_CLEANUP_CMD_BUFSZ 2048
 
@@ -123,6 +135,8 @@ typedef struct backend_conn {
     uint64_t                clean_gen;          /**< Monotonic generation counter (bumped on return) */
     backend_quarantine_reason_t quarantine;     /**< Reuse quarantine reason */
     backend_close_reason_t  close_reason;       /**< Last close reason for this generation */
+    backend_cleanup_result_t cleanup_last_result; /**< Last cleanup outcome for this generation */
+    uint64_t                cleanup_last_duration_ns; /**< Last cleanup duration in ns */
     void*                   active_owner;       /**< Non-NULL while backend is actively owned */
     void*                   pinned_session;     /**< Session pinned to (or NULL) */
     struct state_profile*   profile;            /**< Connection state profile (spec §5) */
@@ -193,6 +207,9 @@ typedef struct backend_pool {
     backend_conn_t*         clean_list;         /**< Clean connections (no state) */
     backend_conn_t*         idle_list;          /**< Stateful idle connections */
     backend_conn_t*         dirty_list;         /**< Connections needing reset */
+    backend_conn_t*         cleaning_list;      /**< Connections in cleanup state machine */
+    backend_conn_t*         quarantined_list;   /**< Non-borrowable quarantined connections */
+    backend_conn_t*         closed_list;        /**< Closed slots awaiting refill */
 
     size_t                  active_count;       /**< Number of active connections */
     size_t                  total_count;        /**< Total connections in pool */

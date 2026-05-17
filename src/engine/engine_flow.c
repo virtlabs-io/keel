@@ -483,6 +483,11 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
     size_t sent = 0;
     while (sent < len) {
         ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (s < 0 && errno == EPERM) {
+            /* Some sandbox/seccomp environments deny send* while allowing
+             * write() on connected sockets. Preserve non-blocking semantics. */
+            s = write(fd, p + sent, len - sent);
+        }
         if (s > 0) {
             sent += (size_t)s;
             continue;
@@ -604,6 +609,56 @@ static void pre_query_fail_clear(keel_session_flow_t* sf)
     pre_query_clear_queue(sf);
 }
 
+static void pre_query_record_result(keel_session_flow_t* sf,
+                                    keel_worker_t* worker,
+                                    keel_replay_result_t result)
+{
+    if (!sf)
+        return;
+
+    uint64_t dur_ns = 0;
+    if (sf->pending_pre_query_started_ns > 0) {
+        int64_t now_ns = keel_stats_now_ns();
+        if (now_ns > 0 &&
+            (uint64_t)now_ns > sf->pending_pre_query_started_ns) {
+            dur_ns = (uint64_t)now_ns - sf->pending_pre_query_started_ns;
+        }
+    }
+
+    sf->replay_last_result = result;
+    sf->replay_last_duration_ns = dur_ns;
+    sf->pending_pre_query_started_ns = 0;
+
+    if (!worker || !worker->stats_ctx)
+        return;
+
+    switch (result) {
+    case KEEL_REPLAY_RESULT_SUCCESS:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_success);
+        break;
+    case KEEL_REPLAY_RESULT_PARSE_ERROR:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_parse_error);
+        break;
+    case KEEL_REPLAY_RESULT_DRAIN_ERROR:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_drain_error);
+        break;
+    case KEEL_REPLAY_RESULT_TIMEOUT:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_timeout);
+        break;
+    case KEEL_REPLAY_RESULT_OOM:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_oom);
+        break;
+    case KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_partial_send_failure);
+        break;
+    case KEEL_REPLAY_RESULT_NONE:
+        break;
+    }
+
+    if (dur_ns > 0)
+        KEEL_STAT_LATENCY(worker->stats_ctx, replay_duration_ns, dur_ns);
+}
+
 static bool pre_query_has_active_op(const keel_session_flow_t* sf)
 {
     if (!sf)
@@ -655,6 +710,9 @@ static keel_flow_result_t pre_query_start_op(keel_session_flow_t* sf,
     if (!sf || !session || !op || !op->payload || op->payload_len == 0)
         return KEEL_FLOW_ERROR;
 
+    if (sf->pending_pre_query_started_ns == 0)
+        sf->pending_pre_query_started_ns = (uint64_t)keel_stats_now_ns();
+
     sf->pending_pre_query_absorbed = 0;
     sf->pending_pre_query_resume = op->resume;
     sf->pending_state_sync_hash = op->state_sync_hash;
@@ -684,6 +742,8 @@ static keel_flow_result_t pre_query_start_op(keel_session_flow_t* sf,
             KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
             KEEL_STAT_INC(worker->stats_ctx, errors_backend);
         }
+        pre_query_record_result(sf, worker,
+                                KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
         pre_query_reset_active(sf);
         return KEEL_FLOW_ERROR;
     }
@@ -694,13 +754,18 @@ static keel_flow_result_t pre_query_start_op(keel_session_flow_t* sf,
         KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
 
     if ((size_t)s < op->payload_len) {
-        return defer_send(sf, session->server_fd,
-                          op->payload + s,
-                          op->payload_len - (size_t)s,
-                          (op->type == KEEL_PQOP_PS_REPLAY ||
-                           op->type == KEEL_PQOP_CLEAN_CHECK)
-                              ? KEEL_FLOW_WAIT_STMT_REPLAY
-                              : KEEL_FLOW_WAIT_BACKEND);
+        keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                           op->payload + s,
+                                           op->payload_len - (size_t)s,
+                                           (op->type == KEEL_PQOP_PS_REPLAY ||
+                                            op->type == KEEL_PQOP_CLEAN_CHECK)
+                                               ? KEEL_FLOW_WAIT_STMT_REPLAY
+                                               : KEEL_FLOW_WAIT_BACKEND);
+        if (dr == KEEL_FLOW_ERROR) {
+            pre_query_record_result(sf, worker,
+                                    KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+        }
+        return dr;
     }
 
     if (op->type == KEEL_PQOP_PS_REPLAY || op->type == KEEL_PQOP_CLEAN_CHECK)
@@ -751,6 +816,7 @@ static keel_flow_result_t pre_query_enqueue(keel_session_flow_t* sf,
             sizeof(sf->pending_pre_query_buf));
         if (worker && worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pre_query_overflow);
+        pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_OOM);
         return KEEL_FLOW_ERROR;
     }
 
@@ -766,6 +832,7 @@ static keel_flow_result_t pre_query_enqueue(keel_session_flow_t* sf,
                 worker ? worker->id : 0u);
             if (worker && worker->stats_ctx)
                 KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
             return KEEL_FLOW_ERROR;
         }
     }
@@ -790,6 +857,10 @@ static keel_flow_result_t pre_query_enqueue(keel_session_flow_t* sf,
             worker ? worker->id : 0u, (unsigned)sf->pre_query_count);
         if (worker && worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pre_query_overflow);
+        pre_query_record_result(sf, worker,
+            sf->pre_query_count >= ENGINE_PRE_QUERY_OP_CAP
+                ? KEEL_REPLAY_RESULT_DRAIN_ERROR
+                : KEEL_REPLAY_RESULT_OOM);
         return KEEL_FLOW_ERROR;
     }
 
@@ -823,6 +894,8 @@ static keel_flow_result_t pre_query_enqueue_cleanup(keel_session_flow_t* sf,
             "W%u: setup cleanup build failed (%s)",
             session && session->worker ? session->worker->id : 0u,
             where ? where : "unknown");
+        pre_query_record_result(sf, session ? session->worker : NULL,
+                                KEEL_REPLAY_RESULT_DRAIN_ERROR);
         return KEEL_FLOW_ERROR;
     }
     return pre_query_enqueue(sf, session, KEEL_PQOP_CLEAN_CHECK,
@@ -841,7 +914,11 @@ static keel_flow_result_t pre_query_enqueue_stmt_replay(keel_session_flow_t* sf,
                                                          size_t follow_len)
 {
     if (!replay_buf || replay_len == 0 || replay_count == 0)
+    {
+        pre_query_record_result(sf, session ? session->worker : NULL,
+                                KEEL_REPLAY_RESULT_PARSE_ERROR);
         return KEEL_FLOW_ERROR;
+    }
     return pre_query_enqueue(sf, session, KEEL_PQOP_PS_REPLAY,
                              replay_buf, replay_len,
                              follow_buf, follow_len,
@@ -1017,7 +1094,7 @@ int keel_session_flow_init(keel_session_flow_t* sf,
  *  3. Frees the prepared-statement replay buffer.
  *  4. Returns the commit-in-doubt check connection to the pool if it
  *     was borrowed — prevents silent pool leaks when a session is
- *     destroyed while a txid_status() check is still in flight.
+ *     destroyed while an outcome-check query is still in flight.
  *
  * THREAD SAFETY: Must only be called from the session's owning worker
  * thread.  The pool return is lock-free (CAS on the connection state).
@@ -2264,7 +2341,7 @@ copy_scan_done:
                                         reason, errbuf, sizeof(errbuf));
                                     if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                 }
-                                if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                if (flow->generate_ready_for_query) {
                                     uint8_t z[16];
                                     ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                     if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2314,7 +2391,7 @@ copy_scan_done:
                                                 "shard unavailable", errbuf, sizeof(errbuf));
                                             if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                         }
-                                        if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                        if (flow->generate_ready_for_query) {
                                             uint8_t z[16];
                                             ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                             if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2376,7 +2453,7 @@ copy_scan_done:
                                             reason, errbuf, sizeof(errbuf));
                                         if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                     }
-                                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                    if (flow->generate_ready_for_query) {
                                         uint8_t z[16];
                                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                         if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2577,7 +2654,7 @@ copy_scan_done:
                             "no backend pool configured", errbuf, sizeof(errbuf));
                         if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                     }
-                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                    if (flow->generate_ready_for_query) {
                         uint8_t z[16];
                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                         if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2719,7 +2796,7 @@ copy_scan_done:
                             "connection pool exhausted, retry later", errbuf, sizeof(errbuf));
                         if (el > 0) { memcpy(sendbuf2, errbuf, (size_t)el); sendlen2 += (size_t)el; }
                     }
-                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                    if (flow->generate_ready_for_query) {
                         uint8_t z[16];
                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                         if (zlen > 0) { memcpy(sendbuf2 + sendlen2, z, (size_t)zlen); sendlen2 += (size_t)zlen; }
@@ -3548,62 +3625,41 @@ be_forward_done:
  * Replication Tracking: Commit-in-Doubt Resolution (spec §TXN-TRACK)
  * ============================================================================ */
 
-/* Synthetic PostgreSQL wire messages for commit_in_doubt responses. */
-static const uint8_t kPgCommitOK[] = {
-    /* CommandComplete("COMMIT") */
-    'C', 0x00, 0x00, 0x00, 0x0b, 'C','O','M','M','I','T','\0',   /* 12 bytes */
-    /* ReadyForQuery('I') */
-    'Z', 0x00, 0x00, 0x00, 0x05, 'I'                              /*  6 bytes */
-};  /* total 18 bytes */
-
-static const uint8_t kPgRFQIdle[] = {
-    'Z', 0x00, 0x00, 0x00, 0x05, 'I'
-};
-
-/** Build a minimal PostgreSQL ErrorResponse + ReadyForQuery('I') into buf.
- *  @return total bytes written, or -1 if buf too small */
-/**
- * @brief Build a PostgreSQL wire-protocol ErrorResponse + ReadyForQuery('I').
- *
- * Serialises a minimal ErrorResponse message with fields:
- *   'S' SEVERITY     = "ERROR"
- *   'V' SEVERITY_NP  = "ERROR"
- *   'C' SQLSTATE     = sqlstate (must be exactly 5 characters)
- *   'M' MESSAGE      = msg
- * followed immediately by a `ReadyForQuery('I')` (idle status).
- *
- * The combined buffer is used both for commit-in-doubt error synthesis
- * and for abort responses where the engine must reset the session to idle
- * state without a round-trip to the backend.
- *
- * @param buf       Output buffer.
- * @param cap       Capacity of output buffer.
- * @param sqlstate  5-character PostgreSQL SQLSTATE code (e.g. "08006").
- * @param msg       Human-readable error message.
- * @return Total bytes written, or -1 if the buffer is too small.
- */
-static ssize_t pg_build_error_resp(uint8_t* buf, size_t cap,
-                                   const char* sqlstate, const char* msg)
+static void send_commit_doubt_response(const keel_proto_flow_vtable_t* flow,
+                                       void* flow_ctx,
+                                       int client_fd,
+                                       keel_commit_doubt_reason_t reason,
+                                       uint64_t xid)
 {
-    /* ErrorResponse body: 'S' "ERROR\0" + 'V' "ERROR\0" + 'C' sqlstate + '\0' +
-     *                     'M' msg + '\0' + '\0' (terminator) */
-    size_t ml      = strlen(msg);
-    size_t bodylen = 1+6 + 1+6 + 1+5+1 + 1+ml+1 + 1;
-    size_t totlen  = 1 + 4 + bodylen + sizeof(kPgRFQIdle);
-    if (totlen > cap) return -1;
+    if (!flow || client_fd < 0)
+        return;
 
-    uint8_t* p = buf;
-    *p++ = 'E';
-    uint32_t ll = (uint32_t)(4 + bodylen);
-    *p++ = (ll >> 24) & 0xff; *p++ = (ll >> 16) & 0xff;
-    *p++ = (ll >>  8) & 0xff; *p++ = (ll      ) & 0xff;
-    *p++ = 'S'; memcpy(p, "ERROR",  5); p += 5; *p++ = '\0';
-    *p++ = 'V'; memcpy(p, "ERROR",  5); p += 5; *p++ = '\0';
-    *p++ = 'C'; memcpy(p, sqlstate, 5); p += 5; *p++ = '\0';
-    *p++ = 'M'; memcpy(p, msg, ml);     p += ml; *p++ = '\0';
-    *p++ = '\0';
-    memcpy(p, kPgRFQIdle, sizeof(kPgRFQIdle));
-    return (ssize_t)totlen;
+    uint8_t out[512];
+    ssize_t n = -1;
+    if (flow->generate_commit_doubt_response) {
+        n = flow->generate_commit_doubt_response(flow_ctx, reason, xid,
+                                                 out, sizeof(out));
+    } else if (flow->generate_error) {
+        const char* code = (reason == KEEL_CIDR_RESOLVED_ABORTED) ? "40000" : "08006";
+        const char* msg = (reason == KEEL_CIDR_RESOLVED_ABORTED)
+            ? "connection lost before COMMIT confirmation: transaction failed"
+            : "connection lost before COMMIT confirmation";
+        ssize_t el = flow->generate_error(flow_ctx, code, msg, out, sizeof(out));
+        if (el > 0) {
+            size_t total = (size_t)el;
+            if (flow->generate_ready_for_query) {
+                ssize_t zl = flow->generate_ready_for_query(flow_ctx,
+                                                            out + total,
+                                                            sizeof(out) - total);
+                if (zl > 0)
+                    total += (size_t)zl;
+            }
+            n = (ssize_t)total;
+        }
+    }
+
+    if (n > 0)
+        (void)keel_try_send_nb(client_fd, out, (size_t)n);
 }
 
 /**
@@ -3619,18 +3675,16 @@ static ssize_t pg_build_error_resp(uint8_t* buf, size_t cap,
  *    Outcome is completely unknown.  Synthesise ErrorResponse(08006),
  *    send it to the client, return KEEL_FLOW_CLOSED.
  *
- *  Case 2 — XID captured but no RW pool:
- *    Synthesise ErrorResponse(08006) with the XID in the message so the
- *    operator can manually verify via `txid_status(XID)`.
+ *  Case 2 — token captured but no RW pool:
+ *    Ask the protocol plugin to synthesize an operator-facing uncertain result.
  *
- *  Case 3 — XID captured, RW pool available:
+ *  Case 3 — token captured, RW pool available:
  *    Borrow a new connection from the first RW server pool.
- *    Send `SELECT txid_status(XID)` to the borrowed connection.
+ *    Build and send a protocol-owned outcome-check query to that connection.
  *    Store the connection in `sf->xid_check_conn`.
  *    Return KEEL_FLOW_WAIT_COMMIT_CHECK — the worker arms recv on the
  *    check connection and routes responses back through on_be_data where
- *    the commit_in_doubt handler parses `T/D/C/Z` and synthesises the
- *    appropriate committed/aborted/uncertain response.
+ *    plugin callbacks determine committed/aborted/uncertain outcomes.
  *
  * IMPORTANT: This function sets `session->server_fd = check_conn->fd`
  * and clears `session->backend_conn` so the worker's recv arming targets
@@ -3646,6 +3700,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     keel_session_t* session,
     keel_worker_t* worker)
 {
+    const keel_proto_flow_vtable_t* flow = sf ? sf->flow : NULL;
     sf->commit_in_doubt      = true;
     sf->indoubt_xid          = sf->pending_commit_xid;
     sf->commit_in_flight     = false;
@@ -3659,14 +3714,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     }
 
     if (sf->indoubt_xid == 0) {
-        /* No XID captured — outcome truly unknown */
-        uint8_t errbuf[384];
-        ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-            "08006",
-            "connection lost before COMMIT confirmation: "
-            "transaction outcome unknown (no XID captured)");
-        if (elen > 0)
-            keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_XID, 0);
         sf->commit_in_doubt = false;
         session->commit_in_doubt = false;
         if (worker->stats_ctx) {
@@ -3685,13 +3734,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         }
     }
     if (!pool) {
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "no RW pool — check txid_status(%llu) to resolve",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_RW_POOL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
         session->commit_in_doubt = false;
         if (worker->stats_ctx) {
@@ -3703,13 +3747,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
 
     backend_conn_t* check_conn = backend_pool_borrow(pool, 0);
     if (!check_conn) {
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "pool unavailable — check txid_status(%llu) to resolve",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_CHECK_CONN, sf->indoubt_xid);
         sf->commit_in_doubt = false;
         session->commit_in_doubt = false;
         if (worker->stats_ctx) {
@@ -3719,41 +3758,30 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         return KEEL_FLOW_CLOSED;
     }
 
-    /* Build and send: SELECT txid_status(XID) */
-    char sql[80];
-    int  sql_len = snprintf(sql, sizeof(sql),
-                            "SELECT txid_status(%llu)",
-                            (unsigned long long)sf->indoubt_xid);
-    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
+    uint8_t qbuf[256];
+    ssize_t qmsglen = 0;
+    if (flow && flow->build_commit_doubt_check) {
+        qmsglen = flow->build_commit_doubt_check(sf->ctx, sf->indoubt_xid,
+                                                 qbuf, sizeof(qbuf));
+    }
+    if (qmsglen <= 0) {
         backend_pool_return(pool, check_conn, false);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_CHECK_BUILD_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
         session->commit_in_doubt = false;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
         }
-        return KEEL_FLOW_ERROR;
+        return KEEL_FLOW_CLOSED;
     }
 
-    uint8_t  qbuf[128];
-    uint32_t qlen = (uint32_t)(4 + (size_t)sql_len + 1);
-    qbuf[0] = 'Q';
-    qbuf[1] = (qlen >> 24) & 0xff; qbuf[2] = (qlen >> 16) & 0xff;
-    qbuf[3] = (qlen >>  8) & 0xff; qbuf[4] = (qlen      ) & 0xff;
-    memcpy(qbuf + 5, sql, (size_t)sql_len);
-    qbuf[5 + (size_t)sql_len] = '\0';
-    size_t qmsglen = 5 + (size_t)sql_len + 1;
-
-    ssize_t s = keel_try_send_nb(check_conn->fd, qbuf, qmsglen);
-    if (s < 0 || (size_t)s < qmsglen) {
+    ssize_t s = keel_try_send_nb(check_conn->fd, qbuf, (size_t)qmsglen);
+    if (s < 0 || (size_t)s < (size_t)qmsglen) {
         backend_pool_return(pool, check_conn, false);
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "XID-check send failed — verify txid_status(%llu) manually",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_CHECK_SEND_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
         session->commit_in_doubt = false;
         if (worker->stats_ctx) {
@@ -3764,7 +3792,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     }
 
     KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-        "W%u: session %lu: commit-in-doubt — checking txid_status(%llu) on fd=%d",
+        "W%u: session %lu: commit-in-doubt — checking outcome for token=%llu on fd=%d",
         worker->id, (unsigned long)session->id,
         (unsigned long long)sf->indoubt_xid, check_conn->fd);
 
@@ -3786,10 +3814,9 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
  * Handles several distinct states:
  *
  *  **commit_in_doubt** — If `sf->commit_in_doubt` is set, the session is
- *    waiting for the result of a `SELECT txid_status()` check on the
- *    borrowed check connection.  Messages are absorbed (T/D/C) or used
- *    to synthesise a success/failure response (C+Z).  On completion the
- *    check connection is returned to the pool.
+ *    waiting for protocol-owned outcome-check messages on a borrowed
+ *    check connection. On completion the check connection is returned
+ *    to the pool.
  *
  *  **WAIT_STMT_REPLAY** — When performing prepared-statement replay after
  *    pool-wait resume, responses to Parse messages are counted.  Each
@@ -3896,46 +3923,32 @@ keel_flow_result_t keel_engine_flow_on_be_data(
     /* ------------------------------------------------------------------ *
      * Replication tracking: commit_in_doubt response handler.            *
      * After keel_engine_flow_handle_commit_doubt() borrows a check conn  *
-     * and sends SELECT txid_status(), the response comes through here.   *
-     * Absorb T/D/C, synthesize the appropriate response on Z.           *
+     * and sends a protocol-owned outcome-check query, responses flow      *
+     * through here and are interpreted by plugin callbacks.              *
      * ------------------------------------------------------------------ */
     if (sf->commit_in_doubt) {
+        if (!flow->frame_len || !flow->on_be_msg)
+            return KEEL_FLOW_ERROR;
         size_t cid_pos = 0;
         while (cid_pos < len) {
-            if (len - cid_pos < 5) break;  /* incomplete header */
-            uint8_t  ct  = data[cid_pos];
-            uint32_t cl  = ((uint32_t)data[cid_pos+1] << 24)
-                         | ((uint32_t)data[cid_pos+2] << 16)
-                         | ((uint32_t)data[cid_pos+3] <<  8)
-                         |  (uint32_t)data[cid_pos+4];
-            if (cl < 4) break;
-            size_t cm = 1u + (size_t)cl;
-            if (cid_pos + cm > len) break;  /* partial message — wait for more */
+            ssize_t fl = flow->frame_len(sf->ctx, data + cid_pos, len - cid_pos, 1);
+            if (fl < 0)
+                return KEEL_FLOW_ERROR;
+            if (fl == 0 || (size_t)fl > (len - cid_pos))
+                break;
 
-            if (ct == 'D' && cm >= 11) {
-                /* DataRow: extract text value of txid_status() */
-                uint16_t ncols = (uint16_t)(((uint16_t)data[cid_pos+5] << 8)
-                                           | data[cid_pos+6]);
-                if (ncols >= 1) {
-                    int32_t vcl = (int32_t)(((uint32_t)data[cid_pos+7]  << 24)
-                                          | ((uint32_t)data[cid_pos+8]  << 16)
-                                          | ((uint32_t)data[cid_pos+9]  <<  8)
-                                          |  (uint32_t)data[cid_pos+10]);
-                    if (vcl > 0 && cm >= (size_t)(11 + vcl)) {
-                        const char* val = (const char*)(data + cid_pos + 11);
-                        if (strncmp(val, "committed",  9) == 0)
-                            sf->indoubt_check_result = 1;
-                        else if (strncmp(val, "aborted", 7) == 0)
-                            sf->indoubt_check_result = 2;
-                        /* in progress or NULL → result stays 0 (uncertain) */
-                    }
-                    /* NULL column (vcl < 0) → txid too old → result stays 0 */
-                }
-            } else if (ct == 'Z') {
-                /* ReadyForQuery — return check conn and synthesize client response */
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + cid_pos, (size_t)fl, &act) < 0)
+                return KEEL_FLOW_ERROR;
+
+            if (act.commit_doubt_outcome_changed) {
+                sf->indoubt_check_result = act.commit_doubt_outcome;
+            }
+
+            if (act.query_complete) {
                 if (sf->xid_check_conn) {
                     backend_pool_return(sf->xid_check_conn->pool,
-                                       sf->xid_check_conn, false);
+                                        sf->xid_check_conn, false);
                     sf->xid_check_conn = NULL;
                     session->server_fd = -1;
                 }
@@ -3950,35 +3963,21 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 }
 
                 if (sf->indoubt_check_result == 1) {
-                    /* Transaction committed — send synthetic success */
-                    keel_try_send_nb(session->client_fd,
-                                     kPgCommitOK, sizeof(kPgCommitOK));
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_COMMITTED,
+                                               sf->indoubt_xid);
                 } else if (sf->indoubt_check_result == 2) {
-                    /* Transaction aborted — send error */
-                    uint8_t errbuf[384];
-                    ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-                        "40000",
-                        "connection lost before COMMIT confirmation: "
-                        "transaction was rolled back");
-                    if (elen > 0)
-                        keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_ABORTED,
+                                               sf->indoubt_xid);
                 } else {
-                    /* Unknown / in-progress / NULL */
-                    char umsg[256];
-                    snprintf(umsg, sizeof(umsg),
-                        "connection lost before COMMIT confirmation: "
-                        "outcome uncertain for XID %llu — check txid_status() manually",
-                        (unsigned long long)sf->indoubt_xid);
-                    uint8_t errbuf[384];
-                    ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-                                                       "08006", umsg);
-                    if (elen > 0)
-                        keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_UNKNOWN,
+                                               sf->indoubt_xid);
                 }
                 return KEEL_FLOW_CLOSED;
             }
-            /* T (RowDescription) and C (CommandComplete SELECT) → absorbed silently */
-            cid_pos += cm;
+            cid_pos += (size_t)fl;
         }
         return KEEL_FLOW_WAIT_BACKEND;  /* wait for the rest of the response */
     }
@@ -3993,6 +3992,8 @@ keel_flow_result_t keel_engine_flow_on_be_data(
     if (sf->pending_pre_query == KEEL_PRE_QUERY_BEGIN_REPLAY ||
         sf->pending_pre_query == KEEL_PRE_QUERY_STATE_SYNC) {
         bool is_state_sync = (sf->pending_pre_query == KEEL_PRE_QUERY_STATE_SYNC);
+        keel_tx_status_t expected_tx =
+            is_state_sync ? KEEL_TX_IDLE : KEEL_TX_ACTIVE;
         if (len == 0) {
             /* recv()==0 on backend → connection lost mid-replay. */
             KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
@@ -4000,6 +4001,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 worker->id, is_state_sync ? "state sync" : "deferred BEGIN replay");
             if (worker->stats_ctx)
                 KEEL_STAT_INC(worker->stats_ctx, pre_query_be_disconnect);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
             pre_query_fail_clear(sf);
             return KEEL_FLOW_ERROR;
         }
@@ -4017,38 +4019,64 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 sf->pending_pre_query_absorbed);
             if (worker->stats_ctx)
                 KEEL_STAT_INC(worker->stats_ctx, pre_query_runaway);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_TIMEOUT);
             pre_query_fail_clear(sf);
             return KEEL_FLOW_ERROR;
         }
 
-        /* Scan for ReadyForQuery in this batch. */
-        size_t pp      = 0;
-        bool   saw_rfq = false;
-        char   rfq_status = '?';
-        while (pp + 5 <= len) {
-            uint8_t  mt = data[pp];
-            uint32_t ml = ((uint32_t)data[pp+1] << 24)
-                        | ((uint32_t)data[pp+2] << 16)
-                        | ((uint32_t)data[pp+3] <<  8)
-                        |  (uint32_t)data[pp+4];
-            if (ml < 4) {
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                    "W%u: protocol violation during deferred BEGIN replay: "
-                    "msg type '%c' len %u < 4",
-                    worker->id, (mt >= 32 && mt < 127) ? mt : '?', ml);
+        if (!flow->frame_len || !flow->on_be_msg) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: protocol handler missing frame_len/on_be_msg during %s",
+                worker->id, is_state_sync ? "state sync" : "deferred begin");
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
+        }
+
+        size_t pp = 0;
+        bool saw_complete = false;
+        bool saw_tx_state = false;
+        keel_tx_status_t observed_tx = KEEL_TX_IDLE;
+        while (pp < len) {
+            ssize_t fl = flow->frame_len(sf->ctx, data + pp, len - pp, 1);
+            if (fl < 0) {
                 if (worker->stats_ctx)
                     KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
                 pre_query_fail_clear(sf);
                 return KEEL_FLOW_ERROR;
             }
-            if (pp + 1u + ml > len) break;  /* partial frame — wait for more */
-            if (mt == 'Z' && ml >= 5)
-                rfq_status = (char)data[pp + 5];
-            pp += 1u + ml;
-            if (mt == 'Z') { saw_rfq = true; break; }
+            if (fl == 0 || (size_t)fl > (len - pp))
+                break;
+
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + pp, (size_t)fl, &act) < 0) {
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                pre_query_fail_clear(sf);
+                return KEEL_FLOW_ERROR;
+            }
+
+            if (act.tx_state_changed) {
+                saw_tx_state = true;
+                observed_tx = act.tx_status;
+                sf->tx = act.tx_status;
+                session->in_transaction = (act.tx_status != KEEL_TX_IDLE);
+                if (session->backend_conn)
+                    session->backend_conn->in_transaction = session->in_transaction;
+            }
+
+            if (act.query_complete) {
+                saw_complete = true;
+                pp += (size_t)fl;
+                break;
+            }
+
+            pp += (size_t)fl;
         }
 
-        if (!saw_rfq) {
+        if (!saw_complete) {
             if (pp < len)
                 keel_residual_append(&session->server_residual,
                                      data + pp, len - pp);
@@ -4056,14 +4084,18 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             return KEEL_FLOW_WAIT_BACKEND;
         }
 
+        if (!saw_tx_state || observed_tx != expected_tx) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: %s completed with unexpected tx state (seen=%d expected=%d)",
+                worker->id,
+                is_state_sync ? "state sync" : "deferred begin",
+                (int)observed_tx, (int)expected_tx);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
+        }
+
         if (is_state_sync) {
-            if (rfq_status != 'I') {
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                    "W%u: state sync completed with tx_status='%c'; closing backend",
-                    worker->id, rfq_status);
-                pre_query_fail_clear(sf);
-                return KEEL_FLOW_ERROR;
-            }
             if (session->backend_conn) {
                 session->backend_conn->current_state_hash =
                     sf->pending_state_sync_hash;
@@ -4106,6 +4138,8 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
                     KEEL_STAT_INC(worker->stats_ctx, errors_backend);
                 }
+                pre_query_record_result(sf, worker,
+                                        KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
                 sf->pending_pre_query_len = 0;
                 return KEEL_FLOW_ERROR;
             }
@@ -4116,13 +4150,19 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 /* Partial send — io_uring path will complete the rest, then
                  * resume into KEEL_FLOW_WAIT_BACKEND so we can pick up the
                  * real query response. */
-                return defer_send(sf, session->server_fd,
-                                  sf->pending_pre_query_buf + fs,
-                                  forward_len - (size_t)fs,
-                                  forward_resume);
+                keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                   sf->pending_pre_query_buf + fs,
+                                                   forward_len - (size_t)fs,
+                                                   forward_resume);
+                if (dr == KEEL_FLOW_ERROR) {
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                }
+                return dr;
             }
         }
         sf->pending_pre_query_len = 0;
+        pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
 
         /* Any trailing bytes after 'Z' are part of the real query stream;
          * re-enter this function on that slice rather than duplicating the
@@ -4153,6 +4193,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
                 "W%u: setup cleanup drain failed fd=%d consumed=%zu len=%zu",
                 worker->id, session->server_fd, consumed, len);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
             return KEEL_FLOW_ERROR;
         }
         if (gate == KEEL_PROTO_DRAIN_MORE)
@@ -4179,13 +4220,23 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                           forward_len);
             sf->pending_pre_query_len = 0;
             if (rs < 0)
+            {
+                pre_query_record_result(sf, worker,
+                                        KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
                 return KEEL_FLOW_ERROR;
-            if ((size_t)rs < forward_len) {
-                return defer_send(sf, session->server_fd,
-                                  sf->pending_pre_query_buf + rs,
-                                  forward_len - (size_t)rs,
-                                  forward_resume);
             }
+            if ((size_t)rs < forward_len) {
+                keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                   sf->pending_pre_query_buf + rs,
+                                                   forward_len - (size_t)rs,
+                                                   forward_resume);
+                if (dr == KEEL_FLOW_ERROR) {
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                }
+                return dr;
+            }
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
             if (len > 0)
                 return keel_engine_flow_on_be_data(sf, session, data, len);
             return forward_resume;
@@ -4196,97 +4247,39 @@ keel_flow_result_t keel_engine_flow_on_be_data(
     }
 
     /* ------------------------------------------------------------------ *
-     * Prepared-statement replay (spec §17):                               *
-     * When the engine sent Parse wire messages to restore the session's   *
-     * named prepared statements on a freshly borrowed backend,            *
-     * stmt_replay_count holds the number of ParseComplete ('1') responses *
-     * still expected.  Count them here; when all are received, forward   *
-     * the original client message to the backend.                        *
+     * Prepared-statement replay (spec §17):
+     * Core drains replay responses using protocol frame parsing and
+     * semantic backend actions only (no protocol tag checks in core).
      * ------------------------------------------------------------------ */
     if (sf->stmt_replay_count > 0 || sf->stmt_replay_rfq_pending) {
-        size_t scan_pos = 0;
-        while (scan_pos < len && sf->stmt_replay_count > 0) {
-            /* Each Parse reply frame: '1' + int32(4) = 5 bytes */
-            if (len - scan_pos < 5) break;
-            uint8_t msg_type = data[scan_pos];
-            uint32_t msg_len = ((uint32_t)data[scan_pos+1] << 24)
-                             | ((uint32_t)data[scan_pos+2] << 16)
-                             | ((uint32_t)data[scan_pos+3] <<  8)
-                             |  (uint32_t)data[scan_pos+4];
-            if (msg_len < 4 || 1 + msg_len > len - scan_pos) break;
+        if (len == 0) {
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            return KEEL_FLOW_ERROR;
+        }
+        if (!flow->frame_len || !flow->on_be_msg) {
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+            return KEEL_FLOW_ERROR;
+        }
 
-            if (msg_type == '1') {
-                /* ParseComplete — one stmt has been accepted */
-                sf->stmt_replay_count--;
-                scan_pos += 1 + msg_len;
-                if (sf->stmt_replay_count == 0) {
-                    /* All ParseCompletes in; now wait for the ReadyForQuery
-                     * generated by the Sync we appended to the replay buffer.
-                     * We MUST drain it before sending orig_msg so it doesn't
-                     * contaminate the WAIT_BACKEND response stream. */
-                    sf->stmt_replay_rfq_pending = true;
-                    /* Fall through to the rfq_pending scan below. */
-                    break;
-                }
-                continue;
-            } else if (msg_type == 'E') {
-                /* ErrorResponse during replay — a Parse message was rejected.
-                 *
-                 * CRITICAL: the replay buffer contains only Parse messages
-                 * (no Sync).  The backend accepted each ParseComplete and
-                 * sent it immediately — but on a Parse failure it enters
-                 * "error recovery" mode and discards ALL subsequent messages
-                 * until a Sync is received.  Without an explicit Sync the
-                 * backend stays frozen in error recovery, never sends RFQ,
-                 * and keel waits for WAIT_BACKEND indefinitely → deadlock.
-                 *
-                 * Fix: send a Sync immediately so the backend exits error
-                 * recovery and sends RFQ(E).  We then fall through to the
-                 * normal WAIT_BACKEND path which forwards the RFQ to the
-                 * client and releases the backend.
-                 *
-                 * Root cause: replay landed on a backend that already had
-                 * stmts with the same names from a previous session.  This
-                 * is now prevented by borrow_with_stmts only falling back
-                 * to stmt-clean backends (stmt_set_hash==0), but we keep
-                 * this Sync as a safety net. */
-                {
-                    /* Log the error message for debugging */
-                    const uint8_t* emsg = data + scan_pos + 5;  /* skip type+len */
-                    size_t ebody = (size_t)msg_len - 4;
-                    char errbuf[256] = {0};
-                    size_t ei = 0, oi = 0;
-                    while (ei < ebody && oi < sizeof(errbuf)-1) {
-                        uint8_t field = emsg[ei++];
-                        if (!field) break;
-                        const char* fval = (const char*)(emsg + ei);
-                        size_t flen = strnlen(fval, ebody - ei);
-                        if (field == 'M') {  /* Message field */
-                            size_t copy = flen < sizeof(errbuf)-oi-1 ? flen : sizeof(errbuf)-oi-1;
-                            memcpy(errbuf + oi, fval, copy);
-                            oi += copy;
-                            break;
-                        }
-                        ei += flen + 1;
-                    }
-                    KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                        "W%u: REPLAY ErrorResponse: fd=%d replay_count_left=%u msg='%s'"
-                        " stmt_hash=0x%016llx be_stmt_hash=0x%016llx",
-                        worker->id, session->server_fd,
-                        sf->stmt_replay_count, errbuf,
-                        (unsigned long long)sf->stmt_replay_hash,
-                        session->backend_conn
-                            ? (unsigned long long)session->backend_conn->stmt_set_hash : 0ULL);
-                }
-                static const uint8_t pg_sync[] = { 'S', 0, 0, 0, 4 };
-                keel_try_send_nb(session->server_fd,
-                                 pg_sync, sizeof(pg_sync));
-                /* Forward the error to the client so its protocol state
-                 * machine gets the ErrorResponse it expects. */
-                if (session->client_fd >= 0) {
-                    keel_try_send_nb(session->client_fd,
-                                    data + scan_pos, 1 + msg_len);
-                }
+        size_t scan_pos = 0;
+        while (scan_pos < len) {
+            ssize_t fl = flow->frame_len(sf->ctx, data + scan_pos, len - scan_pos, 1);
+            if (fl < 0) {
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
+            }
+            if (fl == 0 || (size_t)fl > (len - scan_pos))
+                break;
+
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + scan_pos, (size_t)fl, &act) < 0) {
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
+            }
+
+            if (act.type == KEEL_BE_ACT_ERROR) {
+                if (act.fe_payload && act.fe_payload_len > 0 && session->client_fd >= 0)
+                    keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)
                     session->backend_conn->stmt_set_hash = 0;
                 sf->stmt_replay_count       = 0;
@@ -4295,42 +4288,27 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 sf->stmt_replay_orig_len    = 0;
                 sf->stmt_replay_hash        = 0;
                 sf->pending_pre_query_len   = 0;
-                /* RFQ(E) will arrive shortly (response to the Sync we just
-                 * sent); handle it via the normal WAIT_BACKEND path. */
-                return KEEL_FLOW_WAIT_BACKEND;
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
             }
-            scan_pos += 1 + msg_len;
-        }
 
-        /* ---------------------------------------------------------------
-         * If all ParseCompletes have been counted, drain the ReadyForQuery
-         * (type 'Z') that the Sync appended to the replay buffer generates.
-         * We MUST consume it here; if we let it linger in the socket buffer
-         * it will be the first byte the WAIT_BACKEND handler sees, which
-         * would misinterpret it as an end-of-transaction signal, returning
-         * the backend to the pool prematurely before the actual response to
-         * orig_msg ever arrives.
-         * --------------------------------------------------------------- */
-        if (sf->stmt_replay_rfq_pending) {
-            /* Scan forward from scan_pos for the 'Z' message */
-            while (scan_pos < len) {
-                if (len - scan_pos < 5) break;  /* partial message header */
-                uint8_t  mtype = data[scan_pos];
-                uint32_t mlen  = ((uint32_t)data[scan_pos+1] << 24)
-                               | ((uint32_t)data[scan_pos+2] << 16)
-                               | ((uint32_t)data[scan_pos+3] <<  8)
-                               |  (uint32_t)data[scan_pos+4];
-                if (mlen < 4 || 1 + mlen > len - scan_pos) break;  /* partial body */
-                scan_pos += 1 + mlen;
-                if (mtype == 'Z') {
-                    /* Found the replay Sync's ReadyForQuery — drain it */
-                    sf->stmt_replay_rfq_pending = false;
-                    break;
-                }
-                /* Any other messages (NoticeResponse, ParameterStatus, etc.)
-                 * before the RFQ are silently discarded — they're artifacts
-                 * of the replay Sync and should not reach the client. */
+            if (act.tx_state_changed) {
+                sf->tx = act.tx_status;
+                session->in_transaction = (act.tx_status != KEEL_TX_IDLE);
+                if (session->backend_conn)
+                    session->backend_conn->in_transaction = session->in_transaction;
             }
+
+            if (sf->stmt_replay_count > 0 && act.stmt_replay_accepted) {
+                sf->stmt_replay_count--;
+                if (sf->stmt_replay_count == 0)
+                    sf->stmt_replay_rfq_pending = true;
+            }
+
+            if (sf->stmt_replay_rfq_pending && act.query_complete)
+                sf->stmt_replay_rfq_pending = false;
+
+            scan_pos += (size_t)fl;
         }
 
         if (sf->stmt_replay_count == 0 && !sf->stmt_replay_rfq_pending) {
@@ -4388,20 +4366,31 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
                         "W%u: orig msg send after replay failed: %s",
                         worker->id, strerror(errno));
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
                     return KEEL_FLOW_ERROR;
                 }
                 if ((size_t)s < orig_len) {
-                    return defer_send(sf, session->server_fd,
-                                      orig + s, orig_len - (size_t)s,
-                                      forward_resume);
+                    keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                       orig + s, orig_len - (size_t)s,
+                                                       forward_resume);
+                    if (dr == KEEL_FLOW_ERROR) {
+                        pre_query_record_result(sf, worker,
+                                                KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                    }
+                    return dr;
                 }
             }
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
             if (scan_pos < len)
                 return keel_engine_flow_on_be_data(sf, session,
                                                    data + scan_pos, len - scan_pos);
             return KEEL_FLOW_WAIT_BACKEND;
         }
         /* Still waiting for more ParseComplete responses or the replay RFQ */
+        if (scan_pos < len)
+            keel_residual_append(&session->server_residual,
+                                 data + scan_pos, len - scan_pos);
         return KEEL_FLOW_WAIT_STMT_REPLAY;
     }
 
@@ -4549,83 +4538,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             continue;
         }
 
-        /* ---- NotificationResponse relay (LISTEN/NOTIFY transparent proxy) --
-         * PostgreSQL sends 'A' (NotificationResponse) asynchronously on any
-         * connection that has issued LISTEN.  These messages arrive interspersed
-         * with regular query responses and must be forwarded to the client
-         * immediately without affecting query state, transaction tracking, or
-         * the query-complete signal.
-         *
-         * Wire format:
-         *   'A'  1 byte  — message type
-         *   len  4 bytes — message length (includes itself, excludes type byte)
-         *   pid  4 bytes — notifying backend PID
-         *   channel NUL-terminated string
-         *   payload NUL-terminated string (empty string = no payload)
-         */
-        if (data[pos] == 'A' && (sf->pins & KEEL_FPIN_LISTEN)) {
-            /* Flush any pending batch before this out-of-band relay. */
-            if (batch_active) {
-                size_t batch_len = pos - batch_unsent_start;
-                ssize_t bs = keel_try_send_nb(session->client_fd,
-                                              data + batch_unsent_start,
-                                              batch_len);
-                if (bs < 0) {
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                        "W%u: notify pre-flush failed: %s",
-                        worker->id, strerror(errno));
-                    return KEEL_FLOW_ERROR;
-                }
-                if ((size_t)bs < batch_len) {
-                    /* Partial batch — save remainder + notify + rest of buffer */
-                    size_t relay_start = pos;
-                    size_t rest_start  = pos + (size_t)flen;
-                    if (rest_start < len)
-                        keel_residual_append(&session->server_residual,
-                                            data + rest_start, len - rest_start);
-                    keel_residual_append(&session->server_residual,
-                                        data + relay_start, (size_t)flen);
-                    return defer_send(sf, session->client_fd,
-                                      data + batch_unsent_start + (size_t)bs,
-                                      batch_len - (size_t)bs,
-                                      KEEL_FLOW_WAIT_BACKEND);
-                }
-                batch_active = false;
-            }
-            /* Relay the 'A' frame directly to the client. */
-            ssize_t ns = keel_try_send_nb(session->client_fd,
-                                          data + pos, (size_t)flen);
-            if (ns < 0) {
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                    "W%u: notify relay send failed: %s",
-                    worker->id, strerror(errno));
-                return KEEL_FLOW_ERROR;
-            }
-            worker->stats.bytes_sent += (uint64_t)flen;
-            if (worker->stats_ctx)
-                KEEL_STAT_ADD(worker->stats_ctx, bytes_sent, flen);
-            if (worker->stats_ctx)
-                KEEL_STAT_INC(worker->stats_ctx, notify_relayed);
-            if ((size_t)ns < (size_t)flen) {
-                size_t rest_start = pos + (size_t)flen;
-                if (rest_start < len)
-                    keel_residual_append(&session->server_residual,
-                                        data + rest_start, len - rest_start);
-                return defer_send(sf, session->client_fd,
-                                  data + pos + (size_t)ns,
-                                  (size_t)flen - (size_t)ns,
-                                  KEEL_FLOW_WAIT_BACKEND);
-            }
-            KEEL_LOG_DEBUG(KEEL_LOG_CAT_CONN,
-                "W%u: relayed NotificationResponse (%zu bytes) fd=%d → fd=%d",
-                worker->id, (size_t)flen,
-                session->server_fd, session->client_fd);
-            /* Reset batch start to skip past the relayed 'A' frame */
-            batch_unsent_start = pos + (size_t)flen;
-            pos += (size_t)flen;
-            continue;
-        }
-
         keel_be_action_t act;
         uint64_t _be_t0 = keel_instr_begin(WORKER_INSTR(worker), KEEL_INSTR_PROTO_BE_MSG);
         int rc = flow->on_be_msg(sf->ctx, data+pos, (size_t)flen, &act);
@@ -4636,39 +4548,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             if (worker->stats_ctx)
                 KEEL_STAT_INC(worker->stats_ctx, proxy_state_desync_total);
             return KEEL_FLOW_ERROR;
-        }
-
-        /* Log ErrorResponse messages to help diagnose "already exists" */
-        if (act.type == KEEL_BE_ACT_ERROR && (size_t)flen >= 5 &&
-            data[pos] == 'E') {
-            const uint8_t* emsg = data + pos + 5;
-            size_t ebody = (size_t)flen - 5;
-            char errbuf2[256] = {0};
-            char sqlstate2[8] = {0};
-            size_t ei = 0, oi = 0, si = 0;
-            while (ei < ebody) {
-                uint8_t field = emsg[ei++];
-                if (!field) break;
-                const char* fval = (const char*)(emsg + ei);
-                size_t flen2 = strnlen(fval, ebody - ei);
-                if (field == 'M' && oi < sizeof(errbuf2)-1) {
-                    size_t cp = flen2 < sizeof(errbuf2)-oi-1 ? flen2 : sizeof(errbuf2)-oi-1;
-                    memcpy(errbuf2+oi, fval, cp); oi += cp;
-                }
-                if (field == 'C' && si < sizeof(sqlstate2)-1) {
-                    size_t cp = flen2 < sizeof(sqlstate2)-si-1 ? flen2 : sizeof(sqlstate2)-si-1;
-                    memcpy(sqlstate2+si, fval, cp); si += cp;
-                }
-                ei += flen2 + 1;
-            }
-            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                "W%u: BE ErrorResponse: fd=%d sqlstate='%s' msg='%s'"
-                " be_stmt_hash=0x%016llx session_pins=0x%x",
-                worker->id, session->server_fd,
-                sqlstate2, errbuf2,
-                session->backend_conn
-                    ? (unsigned long long)session->backend_conn->stmt_set_hash : 0ULL,
-                (unsigned)sf->pins);
         }
 
         /* ---- Plugin error classification (Phase 5) ----
@@ -4693,6 +4572,12 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                   worker->id,
                                   einfo.sqlstate ? einfo.sqlstate : "?");
                 }
+                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                    "W%u: backend error class=%d sqlstate=%s msg=%s",
+                    worker->id,
+                    (int)einfo.error_class,
+                    einfo.sqlstate ? einfo.sqlstate : "?",
+                    einfo.message ? einfo.message : "?");
             }
             /* Error response — do not cache this result */
             if (sf->cache_pending) {
@@ -4765,39 +4650,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
          * Flush happens at the end of the loop or on non-contiguous payload. */
         if ((act.type == KEEL_BE_ACT_FORWARD_FE || act.type == KEEL_BE_ACT_ERROR) &&
             act.fe_payload && act.fe_payload_len > 0) {
-            /* Log backend FATAL/ERROR messages (severity + SQLSTATE + text)
-             * before forwarding so they appear in Keel logs with the server
-             * that sent them — critical for diagnosing replica kill events. */
-            if (act.type == KEEL_BE_ACT_ERROR &&
-                act.fe_payload_len > 5 && act.fe_payload[0] == 'E') {
-                const uint8_t* ep   = act.fe_payload + 5;
-                const uint8_t* eend = act.fe_payload + act.fe_payload_len;
-                const char* sev      = NULL;
-                const char* msg      = NULL;
-                const char* sqlstate = NULL;
-                while (ep < eend && *ep != '\0') {
-                    uint8_t ftype = *ep++;
-                    const char* fval = (const char*)ep;
-                    size_t fvl = strnlen(fval, (size_t)(eend - ep));
-                    ep += fvl + 1;
-                    if      (ftype == 'S') sev      = fval;
-                    else if (ftype == 'M') msg      = fval;
-                    else if (ftype == 'C') sqlstate = fval;
-                }
-                const char* be_host = "?";
-                uint16_t    be_port = 0;
-                if (session->backend_conn && session->backend_conn->pool) {
-                    be_host = session->backend_conn->pool->config.host;
-                    be_port = session->backend_conn->pool->config.port;
-                }
-                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
-                    "W%u: backend error [%s:%u] %s %s: %s",
-                    worker->id, be_host, (unsigned)be_port,
-                    sev      ? sev      : "?",
-                    sqlstate ? sqlstate : "?",
-                    msg      ? msg      : "(no message)");
-            }
-
             /* Check if this is a raw passthrough (payload is contiguous
              * in the original data buffer at the current position) */
             if (act.fe_payload == (const uint8_t*)(data + pos) &&

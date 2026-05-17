@@ -642,6 +642,127 @@ static void test_cleanup_notification_closes(void)
     TEST_END();
 }
 
+static void test_cleanup_timeout_closes_backend(void)
+{
+    TEST_BEGIN("cleanup timeout closes backend and never returns to idle");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x123456;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Force timeout eligibility and run cleaner supervision. */
+    conn->cleanup_started_ms = 1;
+    size_t closed = backend_pool_drain_cleaning(pool);
+    TEST_ASSERT_EQ(closed, 1U);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLEANUP_TIMEOUT);
+    TEST_ASSERT_EQ(conn->cleanup_last_result, BACKEND_CLEANUP_RESULT_TIMEOUT);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_backend_eof_during_cleanup_closes(void)
+{
+    TEST_BEGIN("backend EOF during cleanup closes backend");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0xCAFE;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Backend disappears while cleanup drain is waiting. */
+    close(be_fds[0]);
+    be_fds[0] = -1;
+
+    for (int i = 0; i < 20 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(conn->cleanup_last_result, BACKEND_CLEANUP_RESULT_BACKEND_EOF);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_waiters_wake_only_when_cleaning_backend_becomes_idle(void)
+{
+    TEST_BEGIN("pool waiters wake only when a cleaning backend returns idle");
+
+    int be_fds[3];
+    backend_pool_t* pool = make_test_pool(3, be_fds);
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* c0 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c1 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c2 = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(c0);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_NOT_NULL(c2);
+
+    c0->current_state_hash = 0x10;
+    c1->current_state_hash = 0x20;
+    c2->current_state_hash = 0x30;
+    backend_pool_return(pool, c0, false);
+    backend_pool_return(pool, c1, false);
+    backend_pool_return(pool, c2, false);
+    TEST_ASSERT_EQ(pool->cleaning_count, 3U);
+
+    int waiter = 42;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &waiter, pool), 0);
+    TEST_ASSERT_EQ(g_wait_count, 0);
+
+    /* Flush cleanup command on one backend and feed successful cleanup response. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+
+    uint8_t response[] = {
+        'C', 0, 0, 0, 16,
+        'D','I','S','C','A','R','D',' ','A','L','L', 0,
+        'Z', 0, 0, 0, 5, 'I'
+    };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 20 && g_wait_count == 0; i++)
+        reactor_tick(pool->reactor, 10);
+
+    TEST_ASSERT_EQ(g_wait_count, 1);
+    TEST_ASSERT_EQ(g_wait_order[0], 42);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 3);
+    TEST_END();
+}
+
 /* ============================================================================
  * Test: conn_is_alive — dead connection is discarded by borrow
  * ============================================================================ */
@@ -1080,6 +1201,9 @@ int main(void)
     test_borrow_rejects_cleaning();
     test_drain_cleaning_reclaims();
     test_cleanup_notification_closes();
+    test_cleanup_timeout_closes_backend();
+    test_backend_eof_during_cleanup_closes();
+    test_waiters_wake_only_when_cleaning_backend_becomes_idle();
     test_borrow_skips_dead_connection();
     test_borrow_returns_alive_when_one_dead();
     test_drain_idle_closes_all_lists();

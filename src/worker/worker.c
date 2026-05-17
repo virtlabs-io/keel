@@ -1633,40 +1633,7 @@ static void on_accept_complete(void* userdata, int result)
         KEEL_LOG_DEBUG(KEEL_LOG_CAT_CONN,
             "Worker %u: rejecting new connection during drain (fd=%d)",
             worker->id, client_fd);
-        /* Best-effort: send a PostgreSQL FATAL error so the client
-         * sees "server is shutting down" rather than a raw TCP close.
-         * For MySQL protocol the greeting handshake hasn't started, so
-         * a clean close is the only safe option. */
-        const char* proto = worker->backend_protocol ? worker->backend_protocol : "postgres";
-        if (proto[0] == 'p') {
-            /* Build PG ErrorResponse: FATAL 57P03 (cannot_connect_now) */
-            uint8_t buf[128];
-            size_t pos = 0;
-            buf[pos++] = 'E';         /* message type */
-            pos += 4;                 /* length placeholder (bytes 1-4) */
-            #define PG_DRAIN_FIELD(tag, val) do { \
-                buf[pos++] = (tag); \
-                size_t vlen = strlen(val) + 1; \
-                memcpy(&buf[pos], (val), vlen); \
-                pos += vlen; \
-            } while (0)
-            PG_DRAIN_FIELD('S', "FATAL");
-            PG_DRAIN_FIELD('V', "FATAL");
-            PG_DRAIN_FIELD('C', "57P03");
-            PG_DRAIN_FIELD('M', "the database system is shutting down");
-            PG_DRAIN_FIELD('D', "server is draining");
-            #undef PG_DRAIN_FIELD
-            buf[pos++] = '\0';        /* terminator */
-            /* Patch length (includes self 4 bytes, excludes 'E') */
-            uint32_t len = (uint32_t)(pos - 1);
-            buf[1] = (uint8_t)(len >> 24);
-            buf[2] = (uint8_t)(len >> 16);
-            buf[3] = (uint8_t)(len >> 8);
-            buf[4] = (uint8_t)(len);
-            int fl = fcntl(client_fd, F_GETFL, 0);
-            if (fl >= 0) fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
-            keel_try_send_nb(client_fd, buf, pos);
-        }
+        /* Handshake protocol is not established yet; close directly. */
         close(client_fd);
         /* Don't rearm accept — we're shutting down */
         return;
@@ -2027,9 +1994,14 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
                             errbuf, sizeof(errbuf));
                     if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                 }
-                if (flow->name && strcmp(flow->name, "postgres") == 0) {
-                    uint8_t z[] = {'Z',0,0,0,5,'I'};
-                    memcpy(sendbuf + sendlen, z, sizeof(z)); sendlen += sizeof(z);
+                if (flow->generate_ready_for_query) {
+                    uint8_t z[16];
+                    ssize_t zlen = flow->generate_ready_for_query(
+                        recv_ctx->flow.ctx, z, sizeof(z));
+                    if (zlen > 0) {
+                        memcpy(sendbuf + sendlen, z, (size_t)zlen);
+                        sendlen += (size_t)zlen;
+                    }
                 }
                 if (sendlen > 0)
                     keel_try_send_nb(session->client_fd, sendbuf, sendlen);
@@ -3746,10 +3718,14 @@ static void on_backend_recv_complete(void* userdata, int result)
                     memcpy(sendbuf, errbuf, (size_t)el);
                     sendlen += (size_t)el;
                 }
-                if (flow->name && strcmp(flow->name, "postgres") == 0) {
-                    uint8_t z[] = {'Z', 0, 0, 0, 5, 'I'};
-                    memcpy(sendbuf + sendlen, z, sizeof(z));
-                    sendlen += sizeof(z);
+                if (flow->generate_ready_for_query) {
+                    uint8_t z[16];
+                    ssize_t zlen = flow->generate_ready_for_query(
+                        client_ctx->flow.ctx, z, sizeof(z));
+                    if (zlen > 0) {
+                        memcpy(sendbuf + sendlen, z, (size_t)zlen);
+                        sendlen += (size_t)zlen;
+                    }
                 }
                 if (sendlen > 0)
                     keel_try_send_nb(session->client_fd, sendbuf, sendlen);

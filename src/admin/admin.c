@@ -1029,6 +1029,17 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
     ROW_COUNTER("backend_close_cleanup_timeout", backend_close_cleanup_timeout);
     ROW_COUNTER("backend_close_client_disconnect", backend_close_client_disconnect);
     ROW_COUNTER("cleaning_timeout_total", cleaning_timeout_total);
+    ROW_COUNTER("cleanup_result_success", cleanup_result_success);
+    ROW_COUNTER("cleanup_result_protocol_error", cleanup_result_protocol_error);
+    ROW_COUNTER("cleanup_result_timeout", cleanup_result_timeout);
+    ROW_COUNTER("cleanup_result_backend_eof", cleanup_result_backend_eof);
+    ROW_COUNTER("cleanup_result_send_failure", cleanup_result_send_failure);
+    ROW_COUNTER("replay_result_success", replay_result_success);
+    ROW_COUNTER("replay_result_parse_error", replay_result_parse_error);
+    ROW_COUNTER("replay_result_drain_error", replay_result_drain_error);
+    ROW_COUNTER("replay_result_timeout", replay_result_timeout);
+    ROW_COUNTER("replay_result_oom", replay_result_oom);
+    ROW_COUNTER("replay_result_partial_send_failure", replay_result_partial_send_failure);
     ROW_COUNTER("pin_reason_transaction", pin_reason_transaction);
     ROW_COUNTER("pin_reason_extended_protocol", pin_reason_extended_protocol);
     ROW_COUNTER("pin_reason_prepared_stmt", pin_reason_prepared_stmt);
@@ -1467,6 +1478,8 @@ static void show_latency(keel_admin_t *admin, pgbuf_t *b) {
     LAT_ROW("connect_latency", connect_latency_ns);
     LAT_ROW("session_duration",session_duration_ns);
     LAT_ROW("wait_latency",    wait_latency_ns);
+    LAT_ROW("cleanup_duration", cleanup_duration_ns);
+    LAT_ROW("replay_duration", replay_duration_ns);
 
 #undef LAT_ROW
 
@@ -4690,6 +4703,17 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         PROM_COUNTER("backend_close_cleanup_timeout", "Backends closed after cleanup timeout", backend_close_cleanup_timeout);
         PROM_COUNTER("backend_close_client_disconnect", "Backends closed because owning client disconnected", backend_close_client_disconnect);
         PROM_COUNTER("cleaning_timeout_total", "Backend cleanup timeout events", cleaning_timeout_total);
+        PROM_COUNTER("cleanup_result_success", "Cleanup runs completed at reusable boundary", cleanup_result_success);
+        PROM_COUNTER("cleanup_result_protocol_error", "Cleanup runs aborted on unsafe protocol stream", cleanup_result_protocol_error);
+        PROM_COUNTER("cleanup_result_timeout", "Cleanup runs timed out", cleanup_result_timeout);
+        PROM_COUNTER("cleanup_result_backend_eof", "Cleanup runs interrupted by backend EOF", cleanup_result_backend_eof);
+        PROM_COUNTER("cleanup_result_send_failure", "Cleanup runs aborted on send failure", cleanup_result_send_failure);
+        PROM_COUNTER("replay_result_success", "Pre-query replay/setup runs completed", replay_result_success);
+        PROM_COUNTER("replay_result_parse_error", "Replay/setup failed due to protocol parse error", replay_result_parse_error);
+        PROM_COUNTER("replay_result_drain_error", "Replay/setup failed while draining setup responses", replay_result_drain_error);
+        PROM_COUNTER("replay_result_timeout", "Replay/setup timed out", replay_result_timeout);
+        PROM_COUNTER("replay_result_oom", "Replay/setup failed due to allocation failure", replay_result_oom);
+        PROM_COUNTER("replay_result_partial_send_failure", "Replay/setup failed during send/deferred-send path", replay_result_partial_send_failure);
         PROM_COUNTER("pin_reason_transaction", "Transaction pin activations", pin_reason_transaction);
         PROM_COUNTER("pin_reason_extended_protocol", "Extended protocol pin activations", pin_reason_extended_protocol);
         PROM_COUNTER("pin_reason_prepared_stmt", "Prepared statement pin activations", pin_reason_prepared_stmt);
@@ -4725,6 +4749,16 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
             uint64_t stale_conn_workers = 0;
             int64_t sessions_active = keel_gauge_get(&snap.basic.sessions_active);
             int64_t sticky_sessions = keel_gauge_get(&snap.basic.sessions_pinned);
+            uint64_t cleanup_success =
+                keel_counter_get(&snap.basic.cleanup_result_success);
+            uint64_t cleanup_protocol_error =
+                keel_counter_get(&snap.basic.cleanup_result_protocol_error);
+            uint64_t cleanup_timeout =
+                keel_counter_get(&snap.basic.cleanup_result_timeout);
+            uint64_t cleanup_backend_eof =
+                keel_counter_get(&snap.basic.cleanup_result_backend_eof);
+            uint64_t cleanup_send_failure =
+                keel_counter_get(&snap.basic.cleanup_result_send_failure);
 
             for (uint32_t i = 0; i < nw; i++) {
                 const keel_worker_t* w = keel_engine_get_worker(admin->engine, i);
@@ -4858,6 +4892,35 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
             fprintf(f, "# HELP keel_tls_downgrade_rejected Plaintext connections rejected in TLS-require mode\n");
             fprintf(f, "# TYPE keel_tls_downgrade_rejected counter\n");
             fprintf(f, "keel_tls_downgrade_rejected %llu\n", (unsigned long long)tls_stats.downgrade_rejected);
+
+            fprintf(f, "# HELP keel_cleanup_total Cleanup result totals by outcome\n");
+            fprintf(f, "# TYPE keel_cleanup_total counter\n");
+            fprintf(f, "keel_cleanup_total{result=\"success\"} %llu\n",
+                    (unsigned long long)cleanup_success);
+            fprintf(f, "keel_cleanup_total{result=\"protocol_error\"} %llu\n",
+                    (unsigned long long)cleanup_protocol_error);
+            fprintf(f, "keel_cleanup_total{result=\"timeout\"} %llu\n",
+                    (unsigned long long)cleanup_timeout);
+            fprintf(f, "keel_cleanup_total{result=\"backend_eof\"} %llu\n",
+                    (unsigned long long)cleanup_backend_eof);
+            fprintf(f, "keel_cleanup_total{result=\"send_failure\"} %llu\n",
+                    (unsigned long long)cleanup_send_failure);
+
+            fprintf(f, "# HELP keel_cleanup_timeout_total Cleanup runs that exceeded timeout\n");
+            fprintf(f, "# TYPE keel_cleanup_timeout_total counter\n");
+            fprintf(f, "keel_cleanup_timeout_total %llu\n",
+                    (unsigned long long)cleanup_timeout);
+
+            fprintf(f, "# HELP keel_backend_close_total Backend close totals by reason\n");
+            fprintf(f, "# TYPE keel_backend_close_total counter\n");
+            fprintf(f, "keel_backend_close_total{reason=\"failed_cleanup\"} %llu\n",
+                    (unsigned long long)keel_counter_get(&snap.basic.backend_close_cleanup_error));
+            fprintf(f, "keel_backend_close_total{reason=\"cleanup_timeout\"} %llu\n",
+                    (unsigned long long)keel_counter_get(&snap.basic.backend_close_cleanup_timeout));
+            fprintf(f, "keel_backend_close_total{reason=\"dead_idle\"} %llu\n",
+                    (unsigned long long)keel_counter_get(&snap.basic.backend_close_dead_idle));
+            fprintf(f, "keel_backend_close_total{reason=\"client_disconnect\"} %llu\n",
+                    (unsigned long long)keel_counter_get(&snap.basic.backend_close_client_disconnect));
         }
 
         /* Higher stats levels unlock progressively more expensive metrics. */
@@ -4872,6 +4935,10 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
                 "Frontend session duration", &snap.extended.session_duration_ns);
             prom_write_histogram(f, "keel_wait_latency_ns",
                 "Time waiting for pool backend", &snap.extended.wait_latency_ns);
+            prom_write_histogram(f, "keel_cleanup_duration_ns",
+                "Cleanup state-machine duration", &snap.extended.cleanup_duration_ns);
+            prom_write_histogram(f, "keel_replay_duration_ns",
+                "Pre-query setup/replay duration", &snap.extended.replay_duration_ns);
         }
 
         /* System metrics are sampled on demand because they are colder-path data. */

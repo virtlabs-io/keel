@@ -72,6 +72,31 @@ static size_t build_error_response(uint8_t* buf, const char* message)
     return 1 + 4 + body_len;
 }
 
+static size_t build_notice_response(uint8_t* buf, const char* message)
+{
+    size_t mlen = strlen(message) + 1; /* include NUL */
+    size_t body_len = 1 + mlen + 1;    /* 'M' + message + terminator */
+    buf[0] = 'N';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    buf[5] = 'M';
+    memcpy(buf + 6, message, mlen);
+    buf[6 + mlen] = 0;
+    return 1 + 4 + body_len;
+}
+
+static size_t build_parameter_status(uint8_t* buf,
+                                     const char* key,
+                                     const char* value)
+{
+    size_t klen = strlen(key) + 1;
+    size_t vlen = strlen(value) + 1;
+    buf[0] = 'S';
+    wr32(buf + 1, (uint32_t)(4 + klen + vlen));
+    memcpy(buf + 5, key, klen);
+    memcpy(buf + 5 + klen, value, vlen);
+    return 1 + 4 + klen + vlen;
+}
+
 static int make_socketpair(int sv[2])
 {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
@@ -117,6 +142,7 @@ enum {
     FAKE_CLEANUP_MORE_THEN_COMPLETE = 1,
     FAKE_CLEANUP_ERROR = 2,
     FAKE_CLEANUP_BAD_CONSUMED = 3,
+    FAKE_CLEANUP_CONSUME_FIRST_FRAME = 4,
 };
 
 static ssize_t fake_build_cleanup(void* ctx, keel_cleanup_reason_t reason,
@@ -155,6 +181,25 @@ static keel_proto_drain_result_t fake_drain_cleanup_response(
             *consumed_out = len + 1;
         return KEEL_PROTO_DRAIN_COMPLETE;
     }
+    if (rctx->cleanup_mode == FAKE_CLEANUP_CONSUME_FIRST_FRAME) {
+        if (len < 5) {
+            if (consumed_out)
+                *consumed_out = 0;
+            return KEEL_PROTO_DRAIN_MORE;
+        }
+        uint32_t mlen = ((uint32_t)data[1] << 24) |
+                        ((uint32_t)data[2] << 16) |
+                        ((uint32_t)data[3] << 8)  |
+                        (uint32_t)data[4];
+        if (mlen < 4 || (1u + mlen) > len) {
+            if (consumed_out)
+                *consumed_out = 0;
+            return KEEL_PROTO_DRAIN_MORE;
+        }
+        if (consumed_out)
+            *consumed_out = 1u + mlen;
+        return KEEL_PROTO_DRAIN_COMPLETE;
+    }
     if (rctx->cleanup_mode == FAKE_CLEANUP_MORE_THEN_COMPLETE &&
         rctx->cleanup_calls == 1) {
         if (consumed_out)
@@ -164,6 +209,64 @@ static keel_proto_drain_result_t fake_drain_cleanup_response(
     if (consumed_out)
         *consumed_out = len;
     return KEEL_PROTO_DRAIN_COMPLETE;
+}
+
+static ssize_t fake_frame_len(void* ctx, const uint8_t* data, size_t len, int dir)
+{
+    (void)ctx;
+    (void)dir;
+    if (!data || len < 5)
+        return 0;
+    uint32_t ml = ((uint32_t)data[1] << 24) |
+                  ((uint32_t)data[2] << 16) |
+                  ((uint32_t)data[3] << 8)  |
+                  (uint32_t)data[4];
+    if (ml < 4)
+        return -1;
+    return (size_t)(1u + ml) <= len ? (ssize_t)(1u + ml) : 0;
+}
+
+static int fake_on_be_msg(void* ctx,
+                          const uint8_t* data,
+                          size_t len,
+                          keel_be_action_t* act)
+{
+    (void)ctx;
+    *act = keel_be_action_default();
+    if (!data || len < 5) {
+        act->type = KEEL_BE_ACT_ERROR;
+        return -1;
+    }
+
+    act->type = KEEL_BE_ACT_FORWARD_FE;
+    act->fe_payload = data;
+    act->fe_payload_len = len;
+
+    switch (data[0]) {
+    case '1':
+        act->stmt_replay_accepted = true;
+        break;
+    case 'E':
+        act->type = KEEL_BE_ACT_ERROR;
+        break;
+    case 'Z':
+        if (len >= 6) {
+            act->tx_state_changed = true;
+            act->query_complete = true;
+            if (data[5] == 'I') {
+                act->tx_status = KEEL_TX_IDLE;
+                act->backend_reusable = true;
+            } else if (data[5] == 'T') {
+                act->tx_status = KEEL_TX_ACTIVE;
+            } else {
+                act->tx_status = KEEL_TX_FAILED;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    return 0;
 }
 
 static int fake_get_stmt_replay(void* ctx,
@@ -191,6 +294,8 @@ static int fake_get_stmt_replay(void* ctx,
 }
 
 static const keel_proto_flow_vtable_t s_fake_replay_vt = {
+    .frame_len = fake_frame_len,
+    .on_be_msg = fake_on_be_msg,
     .build_cleanup = fake_build_cleanup,
     .drain_cleanup_response = fake_drain_cleanup_response,
     .get_stmt_replay = fake_get_stmt_replay,
@@ -895,6 +1000,99 @@ static void test_cleanup_more_then_complete_keeps_follow_held(void)
     TEST_END();
 }
 
+static void test_cleanup_and_replay_coalesced_response_preserved(void)
+{
+    TEST_BEGIN("pre_query: coalesced cleanup terminal + replay responses preserved");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 12;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+    be.needs_full_cleanup = true;
+    be.stmt_set_hash = 0x7070ULL;
+
+    static const uint8_t replay_msg[] = {
+        'P', 0, 0, 0, 9, 0, 0, 0, 0, 0,
+        'S', 0, 0, 0, 4
+    };
+    fake_replay_ctx_t rctx = {
+        .replay_buf = replay_msg,
+        .replay_len = sizeof(replay_msg),
+        .replay_count = 1,
+        .replay_hash = 0x3030ULL,
+        .cleanup_mode = FAKE_CLEANUP_CONSUME_FIRST_FRAME,
+    };
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.backend_conn = &be;
+
+    static const uint8_t follow[] = {
+        'Q', 0, 0, 0, 13, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '5', 0
+    };
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.mode = KEEL_TIER_FULL;
+    sf.pins = KEEL_FPIN_PREPARED_STMT;
+    sf.pending_msg = follow;
+    sf.pending_msg_len = sizeof(follow);
+
+    keel_flow_result_t r = keel_engine_flow_resume_from_pool(&sf, &session, &be);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_STMT_REPLAY);
+    TEST_ASSERT(sf.stmt_replay_needs_cleanup);
+    TEST_ASSERT_EQ(sf.pre_query_count, 1u);
+
+    uint8_t sent_cleanup[64];
+    ssize_t n1 = recv(be_sv[1], sent_cleanup, sizeof(sent_cleanup), 0);
+    TEST_ASSERT(n1 > 0);
+    TEST_ASSERT_EQ(sent_cleanup[0], (uint8_t)'Q');
+
+    uint8_t combo[64];
+    size_t cl = 0;
+    cl += build_ready_for_query(combo + cl, 'I');
+    cl += build_parse_complete(combo + cl);
+    cl += build_ready_for_query(combo + cl, 'I');
+
+    r = keel_engine_flow_on_be_data(&sf, &session, combo, cl);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_STMT_REPLAY);
+    TEST_ASSERT_EQ(sf.stmt_replay_needs_cleanup, false);
+    TEST_ASSERT_EQ(sf.stmt_replay_count, 1u);
+
+    uint8_t sent_replay[64];
+    ssize_t n2 = recv(be_sv[1], sent_replay, sizeof(sent_replay), 0);
+    TEST_ASSERT_EQ(n2, (ssize_t)sizeof(replay_msg));
+    TEST_ASSERT(memcmp(sent_replay, replay_msg, sizeof(replay_msg)) == 0);
+
+    size_t tail_len = keel_residual_len(&session.server_residual);
+    TEST_ASSERT_EQ(tail_len, cl - 6u);
+    uint8_t tail[64];
+    size_t consumed = keel_residual_consume(&session.server_residual, tail, tail_len);
+    TEST_ASSERT_EQ(consumed, tail_len);
+
+    r = keel_engine_flow_on_be_data(&sf, &session, tail, tail_len);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(be.stmt_set_hash, rctx.replay_hash);
+
+    uint8_t sent_follow[64];
+    ssize_t n3 = recv(be_sv[1], sent_follow, sizeof(sent_follow), 0);
+    TEST_ASSERT_EQ(n3, (ssize_t)sizeof(follow));
+    TEST_ASSERT(memcmp(sent_follow, follow, sizeof(follow)) == 0);
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
 static void test_cleanup_error_never_forwards_follow(void)
 {
     TEST_BEGIN("pre_query: cleanup ERROR never forwards follow");
@@ -1017,7 +1215,7 @@ static void test_replay_error_response_never_forwards_follow(void)
     uint8_t emsg[128];
     size_t elen = build_error_response(emsg, "duplicate prepared statement");
     keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, emsg, elen);
-    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
     TEST_ASSERT_EQ(sf.stmt_replay_count, 0u);
     TEST_ASSERT_EQ(sf.stmt_replay_rfq_pending, false);
     TEST_ASSERT_EQ(sf.pending_pre_query_len, 0u);
@@ -1026,8 +1224,7 @@ static void test_replay_error_response_never_forwards_follow(void)
 
     uint8_t be_out[64];
     ssize_t n1 = recv(be_sv[1], be_out, sizeof(be_out), 0);
-    TEST_ASSERT_EQ(n1, 5);
-    TEST_ASSERT_EQ(be_out[0], (uint8_t)'S'); /* Sync */
+    TEST_ASSERT(n1 < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
 
     uint8_t fe_out[256];
     ssize_t n2 = recv(fe_sv[1], fe_out, sizeof(fe_out), 0);
@@ -1094,6 +1291,127 @@ static void test_replay_parsecomplete_waits_for_rfq_before_forward(void)
 
     ssize_t n2 = recv(be_sv[1], out, sizeof(out), 0);
     TEST_ASSERT_EQ(n2, (ssize_t)sizeof(follow));
+    TEST_ASSERT(memcmp(out, follow, sizeof(follow)) == 0);
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_replay_discards_notice_and_parameter_status(void)
+{
+    TEST_BEGIN("pre_query: replay drains Notice/ParameterStatus before RFQ");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.backend_conn = &be;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.stmt_replay_count = 1;
+    sf.stmt_replay_hash = 0x8888ULL;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    static const uint8_t follow[] = {
+        'Q', 0, 0, 0, 13, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '6', 0
+    };
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    uint8_t replay_resp[128];
+    size_t n = 0;
+    n += build_parse_complete(replay_resp + n);
+    n += build_notice_response(replay_resp + n, "replay notice");
+    n += build_parameter_status(replay_resp + n, "application_name", "keel");
+    n += build_ready_for_query(replay_resp + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, replay_resp, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.stmt_replay_count, 0u);
+    TEST_ASSERT_EQ(sf.stmt_replay_rfq_pending, false);
+    TEST_ASSERT_EQ(be.stmt_set_hash, 0x8888ULL);
+
+    uint8_t out[64];
+    ssize_t nr = recv(be_sv[1], out, sizeof(out), 0);
+    TEST_ASSERT_EQ(nr, (ssize_t)sizeof(follow));
+    TEST_ASSERT(memcmp(out, follow, sizeof(follow)) == 0);
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_replay_partial_rfq_header_is_preserved(void)
+{
+    TEST_BEGIN("pre_query: replay preserves partial RFQ header via residual");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.backend_conn = &be;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.stmt_replay_count = 1;
+    sf.stmt_replay_hash = 0x4545ULL;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    static const uint8_t follow[] = {
+        'Q', 0, 0, 0, 13, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '7', 0
+    };
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    uint8_t first[16];
+    size_t n1 = 0;
+    n1 += build_parse_complete(first + n1);
+    first[n1++] = 'Z';
+    first[n1++] = 0;
+    first[n1++] = 0;
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, first, n1);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_STMT_REPLAY);
+    TEST_ASSERT_EQ(sf.stmt_replay_count, 0u);
+    TEST_ASSERT_EQ(sf.stmt_replay_rfq_pending, true);
+    TEST_ASSERT_EQ(keel_residual_len(&session.server_residual), 3u);
+
+    uint8_t tail[16];
+    size_t residual_len = keel_residual_len(&session.server_residual);
+    size_t got = keel_residual_consume(&session.server_residual, tail, residual_len);
+    TEST_ASSERT_EQ(got, residual_len);
+    tail[got++] = 0;
+    tail[got++] = 5;
+    tail[got++] = 'I';
+
+    r = keel_engine_flow_on_be_data(&sf, &session, tail, got);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.stmt_replay_rfq_pending, false);
+    TEST_ASSERT_EQ(be.stmt_set_hash, 0x4545ULL);
+
+    uint8_t out[64];
+    ssize_t nr = recv(be_sv[1], out, sizeof(out), 0);
+    TEST_ASSERT_EQ(nr, (ssize_t)sizeof(follow));
     TEST_ASSERT(memcmp(out, follow, sizeof(follow)) == 0);
 
     close_pair(be_sv);
@@ -1182,10 +1500,13 @@ int main(void)
     test_resume_from_pool_sequences_state_sync_then_begin();
     test_resume_from_pool_cleanup_then_stmt_replay_queue();
     test_cleanup_more_then_complete_keeps_follow_held();
+    test_cleanup_and_replay_coalesced_response_preserved();
     test_cleanup_error_never_forwards_follow();
     test_cleanup_bad_consumed_never_forwards_follow();
     test_replay_error_response_never_forwards_follow();
     test_replay_parsecomplete_waits_for_rfq_before_forward();
+    test_replay_discards_notice_and_parameter_status();
+    test_replay_partial_rfq_header_is_preserved();
     test_state_sync_rejects_non_idle_rfq();
     test_state_sync_rejects_malformed_frame();
 
