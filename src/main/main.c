@@ -976,6 +976,9 @@ typedef struct worker_group {
     uint32_t        pool_refill_interval_ms;  /* Pool reconnect poll period */
     uint32_t        pool_refill_backoff_ms;   /* Slower poll when pool is full */
     uint32_t        pool_max_waiting;         /* Max queued sessions (0=auto) */
+    uint64_t        pool_wait_timeout_ms;     /* Max wait for pool slot — 0=use connect_timeout_ms */
+    size_t          session_max_buffered_bytes; /* Per-session buffer cap — 0=unlimited */
+    size_t          backend_max_replay_bytes;   /* Per-backend PS replay cap — 0=unlimited */
     uint32_t        listen_backlog;           /* TCP listen() queue depth */
     bool            use_buf_rings;            /* io_uring buf rings for recv */
     uint32_t        buf_ring_size;            /* Buf ring slots (0 = queue_depth) */
@@ -1333,6 +1336,64 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
     }
 
+    /* pool_wait_timeout_ms */
+    {
+        int64_t new_wt = keel_config_get_int(config, section, "pool_wait_timeout_ms",
+                                              (int64_t)wg->pool_wait_timeout_ms);
+        if (new_wt >= 0 && (uint64_t)new_wt != wg->pool_wait_timeout_ms) {
+            KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                "[%s] pool_wait_timeout_ms: %llu -> %lld",
+                wg->name, (unsigned long long)wg->pool_wait_timeout_ms, (long long)new_wt);
+            wg->pool_wait_timeout_ms = (uint64_t)new_wt;
+            if (ecfg) ecfg->pool_wait_timeout_ms = wg->pool_wait_timeout_ms;
+            applied++;
+        }
+    }
+
+    /* session_max_buffered_bytes */
+    {
+        int64_t new_smb = keel_config_get_int(config, section,
+                                               "session_max_buffered_bytes",
+                                               (int64_t)wg->session_max_buffered_bytes);
+        if (new_smb == 0 || new_smb >= 4096) {
+            if ((size_t)new_smb != wg->session_max_buffered_bytes) {
+                KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                    "[%s] session_max_buffered_bytes: %zu -> %lld",
+                    wg->name, wg->session_max_buffered_bytes, (long long)new_smb);
+                wg->session_max_buffered_bytes = (size_t)new_smb;
+                if (ecfg) ecfg->session_max_buffered_bytes = wg->session_max_buffered_bytes;
+                applied++;
+            }
+        } else if (new_smb > 0) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                "[%s] session_max_buffered_bytes=%lld is below minimum 4096; "
+                "use 0 (unlimited) or a value >= 4096",
+                wg->name, (long long)new_smb);
+        }
+    }
+
+    /* backend_max_replay_bytes */
+    {
+        int64_t new_mrb = keel_config_get_int(config, section,
+                                               "backend_max_replay_bytes",
+                                               (int64_t)wg->backend_max_replay_bytes);
+        if (new_mrb == 0 || new_mrb >= 4096) {
+            if ((size_t)new_mrb != wg->backend_max_replay_bytes) {
+                KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                    "[%s] backend_max_replay_bytes: %zu -> %lld",
+                    wg->name, wg->backend_max_replay_bytes, (long long)new_mrb);
+                wg->backend_max_replay_bytes = (size_t)new_mrb;
+                if (ecfg) ecfg->backend_max_replay_bytes = wg->backend_max_replay_bytes;
+                applied++;
+            }
+        } else if (new_mrb > 0) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                "[%s] backend_max_replay_bytes=%lld is below minimum 4096; "
+                "use 0 (unlimited) or a value >= 4096",
+                wg->name, (long long)new_mrb);
+        }
+    }
+
     /* ------------------------------------------------------------------
      * §3 — Timeouts (safe to change)
      * ------------------------------------------------------------------ */
@@ -1452,6 +1513,56 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
                 }
             }
             applied++;
+        }
+
+        /* pool_wait_timeout_ms */
+        v = keel_config_get_int(config, section, "pool_wait_timeout_ms",
+                                 (int64_t)wg->pool_wait_timeout_ms);
+        if (v >= 0 && (uint64_t)v != wg->pool_wait_timeout_ms) {
+            KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                "[%s] pool_wait_timeout_ms: %llu -> %lld",
+                wg->name, (unsigned long long)wg->pool_wait_timeout_ms, (long long)v);
+            wg->pool_wait_timeout_ms = (uint64_t)v;
+            if (ecfg) ecfg->pool_wait_timeout_ms = (uint64_t)v;
+            applied++;
+        }
+
+        /* session_max_buffered_bytes */
+        v = keel_config_get_int(config, section, "session_max_buffered_bytes",
+                                 (int64_t)wg->session_max_buffered_bytes);
+        if (v == 0 || v >= 4096) {
+            if ((size_t)v != wg->session_max_buffered_bytes) {
+                KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                    "[%s] session_max_buffered_bytes: %zu -> %lld",
+                    wg->name, wg->session_max_buffered_bytes, (long long)v);
+                wg->session_max_buffered_bytes = (size_t)v;
+                if (ecfg) ecfg->session_max_buffered_bytes = (size_t)v;
+                applied++;
+            }
+        } else {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                "[%s] session_max_buffered_bytes=%lld is below minimum 4096; "
+                "use 0 (unlimited) or a value >= 4096",
+                wg->name, (long long)v);
+        }
+
+        /* backend_max_replay_bytes */
+        v = keel_config_get_int(config, section, "backend_max_replay_bytes",
+                                 (int64_t)wg->backend_max_replay_bytes);
+        if (v == 0 || v >= 4096) {
+            if ((size_t)v != wg->backend_max_replay_bytes) {
+                KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                    "[%s] backend_max_replay_bytes: %zu -> %lld",
+                    wg->name, wg->backend_max_replay_bytes, (long long)v);
+                wg->backend_max_replay_bytes = (size_t)v;
+                if (ecfg) ecfg->backend_max_replay_bytes = (size_t)v;
+                applied++;
+            }
+        } else {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                "[%s] backend_max_replay_bytes=%lld is below minimum 4096; "
+                "use 0 (unlimited) or a value >= 4096",
+                wg->name, (long long)v);
         }
     }
 
@@ -1661,6 +1772,9 @@ static void worker_group_defaults(worker_group_t* g) {
     g->pool_refill_interval_ms    = 100;
     g->pool_refill_backoff_ms     = 5000;
     g->pool_max_waiting           = 0;
+    g->pool_wait_timeout_ms       = 0;  /* 0 = use connect_timeout_ms */
+    g->session_max_buffered_bytes = 0;  /* 0 = unlimited */
+    g->backend_max_replay_bytes   = 0;  /* 0 = unlimited */
     g->listen_backlog             = 4096;
     g->use_buf_rings              = false;
     g->buf_ring_size              = 0;
@@ -2948,6 +3062,25 @@ int main(int argc, char** argv) {
 
                     v = keel_config_get_int(config, section, "pool_max_waiting", 0);
                     if (v >= 0) wg->pool_max_waiting = (uint32_t)v;
+
+                    v = keel_config_get_int(config, section, "pool_wait_timeout_ms", 0);
+                    if (v >= 0) wg->pool_wait_timeout_ms = (uint64_t)v;
+
+                    v = keel_config_get_int(config, section, "session_max_buffered_bytes", 0);
+                    if (v == 0 || v >= 4096)
+                        wg->session_max_buffered_bytes = (size_t)v;
+                    else if (v > 0)
+                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                            "[%s] session_max_buffered_bytes=%lld below minimum 4096 — ignored",
+                            wg->name, (long long)v);
+
+                    v = keel_config_get_int(config, section, "backend_max_replay_bytes", 0);
+                    if (v == 0 || v >= 4096)
+                        wg->backend_max_replay_bytes = (size_t)v;
+                    else if (v > 0)
+                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
+                            "[%s] backend_max_replay_bytes=%lld below minimum 4096 — ignored",
+                            wg->name, (long long)v);
 
                     v = keel_config_get_int(config, section, "listen_backlog",
                                             (int64_t)wg->listen_backlog);

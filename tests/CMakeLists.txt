@@ -1018,6 +1018,34 @@ target_link_libraries(test_admission PRIVATE
 target_link_options(test_admission PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_admission COMMAND test_admission)
 
+# Backpressure/hardening tests (Issue 10: memory, FD, pool wait timeout limits)
+add_executable(test_backpressure test_backpressure.c)
+target_include_directories(test_backpressure PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_backpressure PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelcore
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_backpressure PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_backpressure COMMAND test_backpressure)
+
 # Pool Correctness tests (CLEANING state, admission control, quarantine)
 add_executable(test_pool_correctness test_pool_correctness.c)
 target_include_directories(test_pool_correctness PRIVATE
@@ -2002,6 +2030,7 @@ set_tests_properties(test_residual test_session_engine test_hooks
     PROPERTIES LABELS "session")
 
 set_tests_properties(test_pool_correctness test_conn_lifecycle
+                     test_backpressure
     PROPERTIES LABELS "pool")
 
 set_tests_properties(test_plugin_contract test_pg_protocol_flow
@@ -2232,7 +2261,7 @@ add_custom_target(test-session
 add_custom_target(test-pool
     COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
             -L "^pool$" --output-on-failure -j
-    DEPENDS test_pool_correctness
+    DEPENDS test_pool_correctness test_backpressure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running pool module tests"
     USES_TERMINAL
@@ -2360,6 +2389,7 @@ add_custom_target(build_tests DEPENDS
     test_alloc_inject
     test_audit_log
     test_auth
+    test_backpressure
     test_buffer
     test_cancel_forwarding
     test_cloud_auth

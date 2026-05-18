@@ -4065,7 +4065,9 @@ int keel_worker_init(
             .max_waiting = max_waiting,
             .idle_timeout_ms = cfg->pool_idle_timeout_ms,
             .max_connection_age_ms = cfg->pool_max_connection_age_ms,
-            .wait_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000,
+            .wait_timeout_ms = cfg->pool_wait_timeout_ms > 0
+                ? cfg->pool_wait_timeout_ms
+                : (cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000),
             .tls_config = worker->backend_tls_config,
         };
 
@@ -4089,7 +4091,9 @@ int keel_worker_init(
                     .max_waiting = max_waiting,
                     .idle_timeout_ms = cfg->pool_idle_timeout_ms,
                     .max_connection_age_ms = cfg->pool_max_connection_age_ms,
-                    .wait_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000,
+                    .wait_timeout_ms = cfg->pool_wait_timeout_ms > 0
+                        ? cfg->pool_wait_timeout_ms
+                        : (cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000),
                     .tls_config = worker->backend_tls_config,
                 };
                 backend_pool_t* p = backend_pool_create(&pool_cfg);

@@ -90,6 +90,8 @@ typedef int32_t keel_error_t;
 #define KEEL_ERR_POOL_CLOSED         ((keel_error_t)-403)
 #define KEEL_ERR_POOL_CONFIG         ((keel_error_t)-404)
 #define KEEL_ERR_UNAVAILABLE         ((keel_error_t)-405)
+#define KEEL_ERR_MSG_TOO_LARGE       ((keel_error_t)-406) /**< Frontend message exceeds session buffer limit */
+#define KEEL_ERR_REPLAY_TOO_LARGE    ((keel_error_t)-407) /**< Prepared-statement replay buffer limit exceeded */
 
 /* SQL errors (-500 to -599) */
 #define KEEL_ERR_SQL                 ((keel_error_t)-500)
