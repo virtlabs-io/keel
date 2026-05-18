@@ -148,6 +148,7 @@ typedef struct options {
     bool            help;
     bool            version;
     bool            strict_auth;   /**< --strict-auth: reject deprecated auth methods at startup */
+    bool            check_config;  /**< --check-config: validate config file and exit */
 } options_t;
 
 static const struct option long_options[] = {
@@ -162,6 +163,7 @@ static const struct option long_options[] = {
     {"help",         no_argument,       NULL, 'h'},
     {"version",      no_argument,       NULL, 'V'},
     {"strict-auth",  no_argument,       NULL, 1001},
+    {"check-config", no_argument,       NULL, 1002},
     {NULL, 0, NULL, 0}
 };
 
@@ -195,6 +197,7 @@ static void print_usage(const char* prog) {
     printf("  -h, --help                Show this help message\n");
     printf("  -V, --version             Show version information\n");
     printf("      --strict-auth         Reject deprecated auth methods (md5, trust) at startup\n");
+    printf("      --check-config         Validate configuration file and exit (0=ok, 1=error)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  %s -c /etc/keel/keel.ini\n", prog);
@@ -308,6 +311,9 @@ static int parse_options(int argc, char** argv, options_t* opts) {
             return 0;
         case 1001:
             opts->strict_auth = true;
+            break;
+        case 1002:
+            opts->check_config = true;
             break;
         case '?':
             return -1;
@@ -4479,6 +4485,15 @@ int main(int argc, char** argv) {
                 "Set [keel] experimental_features=true to opt in.");
             return 1;
         }
+    }
+
+    /* Issue 9: --check-config exits here after successful config validation.
+     * No sockets are opened, no threads are started.  Exit 0 = config valid. */
+    if (opts.check_config) {
+        printf("Configuration OK\n");
+        if (config) keel_config_free(config);
+        keel_mem_shutdown();
+        return 0;
     }
 
     /* Command line options override config file (global settings only) */

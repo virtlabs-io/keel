@@ -492,6 +492,17 @@ target_link_libraries(test_config PRIVATE
 target_link_options(test_config PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_config COMMAND test_config)
 
+# Issue 9 — Result Cache Must Remain Disabled: config-layer gate tests
+add_executable(test_result_cache_gate test_result_cache_gate.c)
+target_link_libraries(test_result_cache_gate PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_result_cache_gate PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_result_cache_gate COMMAND test_result_cache_gate)
+set_tests_properties(test_result_cache_gate PROPERTIES LABELS "core")
+
 # Configuration reload tests (SIGHUP live reload infrastructure)
 add_executable(test_config_reload test_config_reload.c)
 target_link_libraries(test_config_reload PRIVATE 
@@ -1898,6 +1909,7 @@ set_tests_properties(
     test_util
     test_sql
     test_config
+    test_result_cache_gate
     test_log
     test_query_log
     test_stats_alignment
@@ -1980,7 +1992,7 @@ set_tests_properties(test_trace test_otlp_encoding
 set_tests_properties(test_parser test_sql test_admin_sql
     PROPERTIES LABELS "sql")
 
-set_tests_properties(test_auth test_config test_router test_router_plugin
+set_tests_properties(test_auth test_config test_result_cache_gate test_router test_router_plugin
     test_cloud_auth test_cloud_auth_internals test_cloud_auth_e2e test_cluster
     test_cluster_election test_cluster_fuzz
     PROPERTIES LABELS "core")
@@ -2199,7 +2211,7 @@ add_custom_target(test-sql
 add_custom_target(test-core
     COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
             -L "^core$" --output-on-failure -j
-    DEPENDS test_auth test_config test_config_reload test_router test_router_plugin test_cluster
+    DEPENDS test_auth test_config test_result_cache_gate test_config_reload test_router test_router_plugin test_cluster
             test_cluster_election test_cluster_fuzz
             test_audit_log test_throttle test_compress
             test_probe test_reactor test_log_plugins
@@ -2317,6 +2329,22 @@ set_tests_properties(check_forbidden_blocking PROPERTIES
     TIMEOUT 30
 )
 
+# =============================================================================
+# Issue 9 — Result Cache gate: validate binary-level config rejection.
+# Runs the keel binary with --check-config to verify that result_cache=on
+# is rejected without experimental_features=true.
+# =============================================================================
+add_test(
+    NAME  check_result_cache_gate
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_result_cache_gate.sh
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(check_result_cache_gate PROPERTIES
+    LABELS "gate"
+    TIMEOUT 30
+)
+
 # build_tests — compile every test executable without running them.
 # Use this before ctest when the build was configured with a specific --target
 # (e.g. --target keel) that skips test binaries:
@@ -2343,6 +2371,7 @@ add_custom_target(build_tests DEPENDS
     test_compress
     test_concurrency_stress
     test_config
+    test_result_cache_gate
     test_config_reload
     test_conn_lifecycle
     test_connpool
@@ -2427,6 +2456,7 @@ add_custom_target(build_tests DEPENDS
     test_tls_ktls
     test_tls_security
     test_tls_splice_matrix
+    test_result_cache_gate
     test_trace
     test_util
     test_web_ui
