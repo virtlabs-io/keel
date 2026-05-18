@@ -1200,6 +1200,34 @@ target_link_libraries(test_failover PRIVATE
 target_link_options(test_failover PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_failover COMMAND test_failover)
 
+# Issue 8 — Failover gate & commit-in-doubt tests
+add_executable(test_failover_gates test_failover_gates.c)
+target_link_libraries(test_failover_gates PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_engine_flow
+    keel_session
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keelcore
+    keel_probe
+    keellog
+    keellog_plugin
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_failover_gates PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_failover_gates COMMAND test_failover_gates)
+
 # Connection Migration tests (eligibility, FD transfer, ring serialisation)
 add_executable(test_migration test_migration.c)
 target_include_directories(test_migration PRIVATE

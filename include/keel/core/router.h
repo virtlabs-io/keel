@@ -169,14 +169,50 @@ typedef struct keel_route_session {
 } keel_route_session_t;
 
 /**
+ * @brief Typed reason code for a routing decision.
+ *
+ * Added alongside the existing human-readable `reason` string so callers can
+ * branch on the outcome programmatically without string comparison.  The
+ * numeric value is suitable for structured logging and metrics.
+ */
+typedef enum keel_route_reason {
+    KEEL_ROUTE_REASON_NORMAL = 0,        /**< Normal strategy selection */
+    KEEL_ROUTE_REASON_IN_TRANSACTION,    /**< Pinned: active transaction */
+    KEEL_ROUTE_REASON_PINNED_SESSION,    /**< Pinned: session-level state (SET vars) */
+    KEEL_ROUTE_REASON_PINNED_PS,         /**< Pinned: named prepared statements */
+    KEEL_ROUTE_REASON_HARD_PINNED,       /**< Hard-pinned (LISTEN / TEMP / CURSOR) */
+    KEEL_ROUTE_REASON_WRITE_REQUIRED,    /**< Query requires a write-capable server */
+    KEEL_ROUTE_REASON_READ_SPLIT,        /**< Read dispatched to replica (r/w split) */
+    KEEL_ROUTE_REASON_FAILOVER_PRIMARY,  /**< Replicas unavailable, fell back to primary */
+    KEEL_ROUTE_REASON_LAG_EXCEEDED,      /**< Replica lag above threshold */
+    KEEL_ROUTE_REASON_HEALTH_DEGRADED,   /**< Server degraded, rerouted */
+    KEEL_ROUTE_REASON_NO_PRIMARY,        /**< No write-capable server available */
+    KEEL_ROUTE_REASON_CID_BLOCKED,       /**< Write blocked: commit-in-doubt in progress */
+    KEEL_ROUTE_REASON_TIMELINE_STALE,    /**< LSN token stale after timeline switch */
+    KEEL_ROUTE_REASON_PATRONI_UNAVAIL,   /**< Patroni API unavailable, frozen */
+    KEEL_ROUTE_REASON_ROLE_FLAPPING,     /**< Server role unstable, conservative routing */
+    KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
+    KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
+    KEEL_ROUTE_REASON_COUNT,
+} keel_route_reason_t;
+
+/**
+ * @brief Return a stable ASCII name for a route reason code.
+ *
+ * Returns `"UNKNOWN"` for values outside the known range.
+ */
+const char* keel_route_reason_name(keel_route_reason_t r);
+
+/**
  * @brief Result object populated by routing functions.
  */
 typedef struct keel_route_decision {
-    keel_route_server_t* server;             /**< Selected server */
-    const char*         reason;             /**< Human-readable reason */
-    bool                is_read;            /**< Query is read-only */
-    bool                was_pinned;         /**< Decision due to pinning */
-    size_t              shard_index;        /**< Resolved shard for explicit sharded routing */
+    keel_route_server_t*  server;       /**< Selected server */
+    const char*           reason;       /**< Human-readable reason string */
+    keel_route_reason_t   reason_code;  /**< Typed reason code for programmatic use */
+    bool                  is_read;      /**< Query is read-only */
+    bool                  was_pinned;   /**< Decision due to pinning */
+    size_t                shard_index;  /**< Resolved shard for sharded routing */
 } keel_route_decision_t;
 
 /**

@@ -3724,6 +3724,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
 
     /* Mirror to session so engine drain can avoid force-closing this session */
     session->commit_in_doubt = true;
+    session->indoubt_xid     = sf->indoubt_xid;
     if (worker->stats_ctx) {
         KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_started);
         KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3733,7 +3734,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_XID, 0);
         sf->commit_in_doubt = false;
-        session->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3753,7 +3754,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_RW_POOL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
-        session->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3766,7 +3767,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_CHECK_CONN, sf->indoubt_xid);
         sf->commit_in_doubt = false;
-        session->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3785,7 +3786,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_CHECK_BUILD_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
-        session->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3799,7 +3800,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_CHECK_SEND_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
-        session->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
         if (worker->stats_ctx) {
             KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
             KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
@@ -3969,7 +3970,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     session->server_fd = -1;
                 }
                 sf->commit_in_doubt = false;
-                session->commit_in_doubt = false;
+                session->commit_in_doubt = false; session->indoubt_xid = 0;
                 if (worker->stats_ctx) {
                     if (sf->indoubt_check_result == 1 || sf->indoubt_check_result == 2)
                         KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_resolved);

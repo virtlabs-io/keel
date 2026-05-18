@@ -1393,6 +1393,74 @@ static void show_clients(keel_admin_t *admin, pgbuf_t *b) {
 }
 
 /**
+ * @brief Emit a table of sessions that are currently in commit-in-doubt state.
+ *
+ * Columns: id, worker, username, database, cid_xid, cid_check_fd, age_ms.
+ * This is intentionally narrow — only the fields an operator needs to decide
+ * whether to intervene (pg_xact_status / manual replay / discard).
+ *
+ * Usage:
+ *   SHOW CID SESSIONS
+ *   SELECT * FROM cid_sessions
+ */
+static void show_cid_sessions(keel_admin_t *admin, pgbuf_t *b) {
+    uint32_t nw  = keel_engine_get_num_workers(admin->engine);
+    uint64_t now = admin_now_ns();
+
+    const char *cols[] = {
+        "id", "worker", "username", "database",
+        "cid_xid", "cid_check_fd", "age_ms"
+    };
+    pg_row_desc(b, cols, 7);
+
+    int nrows = 0;
+    char c_id[20], c_wk[24], c_xid[24], c_cfd[8], c_age[20];
+
+    for (uint32_t i = 0; i < nw; i++) {
+        const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
+        if (!w) continue;
+
+        snprintf(c_wk, sizeof(c_wk), "%u", i);
+
+        for (size_t s = 0; s < w->sessions.capacity; s++) {
+            const keel_session_t *sess = &w->sessions.sessions[s];
+            if (sess->client_fd < 0)          continue;
+            if (!sess->commit_in_doubt)        continue;
+
+            fmt_u64(c_id,  sizeof(c_id),  sess->id);
+
+            /* indoubt_xid is mirrored onto the session when CID is entered */
+            uint64_t xid = sess->indoubt_xid;
+            int check_fd = -1;
+            /* check_fd is available only if the backend_conn is still borrowed */
+            if (sess->backend_conn)
+                check_fd = sess->backend_conn->fd;
+            if (xid == 0)
+                snprintf(c_xid, sizeof(c_xid), "unknown");
+            else
+                fmt_u64(c_xid, sizeof(c_xid), xid);
+            snprintf(c_cfd, sizeof(c_cfd), "%d", check_fd);
+
+            uint64_t age_ms = 0;
+            if (sess->created_at > 0 && now > sess->created_at)
+                age_ms = (now - sess->created_at) / 1000000ULL;
+            fmt_u64(c_age, sizeof(c_age), age_ms);
+
+            const char *vals[] = {
+                c_id, c_wk,
+                sess->username[0] ? sess->username : "(none)",
+                sess->database[0] ? sess->database : "(none)",
+                c_xid, c_cfd, c_age
+            };
+            pg_data_row(b, vals, 7);
+            nrows++;
+        }
+    }
+
+    pg_cmd_complete(b, nrows);
+}
+
+/**
  * @brief Emit a selected subset of the live engine configuration.
  *
  * @param admin Admin subsystem handle used to fetch mutable config.
@@ -3843,6 +3911,8 @@ static bool admin_sql_dispatch(keel_admin_t* admin, pgbuf_t* out,
             show_query_rules(admin, out);
         else if (strcasecmp(tbl, "osc_sessions") == 0)
             show_osc_sessions(admin, out);
+        else if (strcasecmp(tbl, "cid_sessions") == 0)
+            show_cid_sessions(admin, out);
         else if (strcasecmp(tbl, "cluster") == 0)
             show_cluster(admin, out);
         else if (strcasecmp(tbl, "cluster_config") == 0)
@@ -4422,6 +4492,8 @@ static void handle_admin_pg(keel_admin_t *admin, int fd) {
             show_topology(admin, out);
         else if (strcasecmp(query, "SHOW OSC SESSIONS") == 0)
             show_osc_sessions(admin, out);
+        else if (strcasecmp(query, "SHOW CID SESSIONS") == 0)
+            show_cid_sessions(admin, out);
         else if (strncasecmp(query, "EXPLAIN SHARD PLAN FOR ", 23) == 0)
             show_shard_plan(admin, out, query + 23);
         else if (strcasecmp(query, "SHOW CLUSTER") == 0)

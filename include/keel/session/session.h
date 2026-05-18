@@ -311,6 +311,7 @@ typedef struct keel_session {
     uint64_t            backend_generation; /* Snapshot of backend_conn->generation at bind time */
     bool                in_transaction; /* Inside BEGIN...COMMIT */
     bool                commit_in_doubt; /* CID recovery in progress — do not force-close */
+    uint64_t            indoubt_xid;    /* XID being checked via txid_status() (0=unknown) */
     uint64_t            state_hash;     /* Hash of SET variables */
 
     /* State profile (spec §5) */
