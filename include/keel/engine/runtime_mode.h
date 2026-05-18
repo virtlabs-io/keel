@@ -101,6 +101,15 @@ typedef enum keel_tier {
  *  POOL tier collects only basic counters (queries_total, pool_borrows). */
 #define KEEL_TIER_HAS_FULL_STATS(t)  ((t) >= KEEL_TIER_SMART)
 
+/**
+ * True if the tier enables hardening/experimental subsystems (hooks, txn
+ * tracking, LSN capture) that are NOT recommended for production in v0.2-alpha.
+ *
+ * Use this in config validation to require `experimental_features = true`
+ * whenever `mode = full` is configured.
+ */
+#define KEEL_TIER_IS_EXPERIMENTAL(t) ((t) == KEEL_TIER_FULL)
+
 /* ============================================================================
  * Parse / Name Helpers
  * ============================================================================ */
@@ -110,14 +119,15 @@ typedef enum keel_tier {
  *
  * The parser uses a fast first-character dispatch instead of `strcasecmp()` to
  * keep startup parsing simple and dependency-free. Unknown strings fall back to
- * `FULL`, which is the safest operational default because it preserves all
- * features rather than silently disabling routing or consistency logic.
+ * `POOL`, the conservative production default.  Callers that want to require
+ * `full` tier must check `experimental_features` themselves — see
+ * `KEEL_TIER_IS_EXPERIMENTAL()`.
  *
- * @param str  NUL-terminated string (case-insensitive).  NULL → FULL.
- * @return The matching tier, or KEEL_TIER_FULL if unrecognised.
+ * @param str  NUL-terminated string (case-insensitive).  NULL → POOL.
+ * @return The matching tier, or KEEL_TIER_POOL if unrecognised.
  */
 static inline keel_tier_t keel_tier_parse(const char* str) {
-    if (!str || !str[0]) return KEEL_TIER_FULL;
+    if (!str || !str[0]) return KEEL_TIER_POOL;
     /* Fast first-char dispatch */
     switch (str[0] | 0x20) {  /* lowercase */
     case 'p':
@@ -127,7 +137,7 @@ static inline keel_tier_t keel_tier_parse(const char* str) {
     case 's': return KEEL_TIER_SMART;
     case 'f': return KEEL_TIER_FULL;
     }
-    return KEEL_TIER_FULL;  /* unknown → safest default */
+    return KEEL_TIER_POOL;  /* unknown → conservative pool default */
 }
 
 /**

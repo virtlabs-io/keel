@@ -1896,6 +1896,19 @@ static bool validate_experimental_feature_gates(bool cluster_compression_enabled
         const char* section = wg->section[0] ? wg->section : "(worker_group)";
         bool allow_group_experimental =
             g_experimental_features_enabled || wg->experimental_features;
+        /* mode = full enables hooks, transaction tracking, and LSN capture —
+         * all of which are hardening/experimental in v0.2-alpha.  Require an
+         * explicit experimental_features opt-in rather than silently enabling
+         * them for users who copy a config without reading the fine print. */
+        if (KEEL_TIER_IS_EXPERIMENTAL(wg->runtime_mode) && !allow_group_experimental) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONFIG,
+                "Experimental feature requires experimental_features=true: [%s] mode=full. "
+                "mode=full enables hardening/experimental subsystems (hooks, transaction "
+                "tracking, LSN capture) and is not the recommended production default for "
+                "v0.2-alpha. Use mode=pool or mode=smart instead.",
+                section);
+            valid = false;
+        }
         if (!allow_group_experimental && wg->result_cache) {
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CONFIG,
                 "Experimental feature requires experimental_features=true: [%s] result_cache=on",
@@ -4526,6 +4539,11 @@ int main(int argc, char** argv) {
         printf("    Protocol: %s\n", wg->default_protocol);
         printf("    Runtime tier: %s. Enabled features: [%s]\n",
                keel_tier_name(wg->runtime_mode), enabled_features);
+        if (KEEL_TIER_IS_EXPERIMENTAL(wg->runtime_mode)) {
+            printf("    WARNING: mode=full enables hardening/experimental subsystems "
+                   "(hooks, transaction tracking, LSN capture) and is not the "
+                   "recommended production default for v0.2-alpha.\n");
+        }
     }
     printf("  Stats:    level=%s", g_config.stats_level_str);
     if (g_config.stats_interval_ms > 0)

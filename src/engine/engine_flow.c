@@ -1046,11 +1046,12 @@ int keel_session_flow_init(keel_session_flow_t* sf,
     else
         sf->ps_mode = KEEL_PS_MODE_VIRTUALIZE;
 
-    /* Inherit runtime mode tier */
+    /* Inherit runtime mode tier.  Fall back to POOL (not FULL) when there is
+     * no worker, so unit tests and standalone tools stay conservative. */
     if (session && session->worker)
         sf->mode = session->worker->runtime_mode;
     else
-        sf->mode = KEEL_TIER_FULL;
+        sf->mode = KEEL_TIER_POOL;
 
     /* Inherit replication uncertainty tracking */
     sf->txn_tracking = (session && session->worker)
