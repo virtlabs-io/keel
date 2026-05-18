@@ -1619,6 +1619,127 @@ static void test_state_sync_error_response_only(void)
     TEST_END();
 }
 
+/* §15.3 fault injection: backend kill (EOF) while STATE_SYNC is waiting for RFQ.
+ *
+ * The engine sends a SET command to the backend and waits for RFQ.  If the
+ * backend socket closes (recv returns 0, represented here as data=NULL len=0)
+ * before RFQ arrives the absorber must:
+ *   - Return KEEL_FLOW_ERROR immediately.
+ *   - Clear all pending pre-query state.
+ *   - NOT stamp the new hash onto the backend (hash remains stale/dirty).
+ *   - Leave needs_sync=true so the slot is marked for cleanup or close.
+ *
+ * This is distinct from test_disconnect_during_absorb which tests EOF during
+ * KEEL_PRE_QUERY_BEGIN_REPLAY, not during KEEL_PRE_QUERY_STATE_SYNC.
+ */
+static void test_backend_eof_during_state_sync(void)
+{
+    TEST_BEGIN("pre_query: backend EOF during state sync aborts without stamping hash");
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 20;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.current_state_hash = 0xDEAD1111ULL;
+    be.needs_sync = true;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.backend_conn = &be;
+    session.state_hash = 0xBEEF2222ULL;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query      = KEEL_PRE_QUERY_STATE_SYNC;
+    sf.pending_state_sync_hash = session.state_hash;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    sf.pending_pre_query_len   = 6; /* simulate a queued follow message */
+
+    /* Backend closes socket mid-sync: data=NULL, len=0. */
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, NULL, 0);
+
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+
+    /* Hash must NOT be stamped — backend is still dirty. */
+    TEST_ASSERT_EQ(be.current_state_hash, 0xDEAD1111ULL);
+    TEST_ASSERT_EQ(be.needs_sync, true);
+
+    /* All pre-query tracking must be cleared. */
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+    TEST_ASSERT_EQ(sf.pending_state_sync_hash, 0ULL);
+    TEST_ASSERT_EQ(sf.pending_pre_query_len, 0U);
+
+    TEST_END();
+}
+
+/* §15.3 fault injection: backend EOF while stmt replay is waiting for ParseComplete + RFQ.
+ *
+ * The engine has sent a Parse message to replay a prepared statement.  The
+ * backend closes the connection before ParseComplete arrives.  The absorber must:
+ *   - Return KEEL_FLOW_ERROR.
+ *   - NOT forward the held follow payload to the backend.
+ *   - Clear stmt_replay state (count, hash, rfq_pending).
+ *   - NOT update be.stmt_set_hash.
+ */
+static void test_backend_eof_during_stmt_replay(void)
+{
+    TEST_BEGIN("pre_query: backend EOF during stmt replay clears replay state");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 21;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.fd = be_sv[0];
+    be.stmt_set_hash = 0xCAFEBABEULL;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.backend_conn = &be;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.stmt_replay_count  = 2;
+    sf.stmt_replay_hash   = 0xFACEFEEDULL;
+    sf.stmt_replay_rfq_pending = false;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    static const uint8_t follow[] = { 'Q', 0, 0, 0, 5, 0 };
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    /* Backend closes socket while we are waiting for ParseComplete. */
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, NULL, 0);
+
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+
+    /* stmt_replay tracking must be cleared. */
+    TEST_ASSERT_EQ(sf.stmt_replay_count, 0u);
+    TEST_ASSERT_EQ(sf.stmt_replay_rfq_pending, false);
+    TEST_ASSERT_EQ(sf.pending_pre_query_len, 0u);
+
+    /* stmt_set_hash on the backend must NOT be updated. */
+    TEST_ASSERT_EQ(be.stmt_set_hash, 0xCAFEBABEULL);
+
+    /* The follow message must NOT have been forwarded to the backend. */
+    uint8_t out[64];
+    ssize_t nr = recv(be_sv[1], out, sizeof(out), 0);
+    TEST_ASSERT(nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
 int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
@@ -1647,6 +1768,8 @@ int main(void)
     test_deferred_begin_error_response_aborts();
     test_state_sync_error_response_aborts_sync();
     test_state_sync_error_response_only();
+    test_backend_eof_during_state_sync();
+    test_backend_eof_during_stmt_replay();
 
     return test_summary();
 }

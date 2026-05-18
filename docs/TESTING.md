@@ -23,6 +23,10 @@ This document describes how to build, test, and benchmark the KEEL (Database Pro
 8. [Interpreting Results](#interpreting-results)
 9. [Troubleshooting](#troubleshooting)
 
+### Python Test Framework sub-sections
+- [Soak Suite H01–H09 Test Reference](#soak-suite-h----individual-test-reference)
+- [Shadow Correctness Workloads (§15.5)](#shadow-correctness-workloads-155)
+
 ---
 
 ## Prerequisites
@@ -108,7 +112,7 @@ cd build && ctest -N
 
 ## Unit Tests
 
-KEEL currently includes **106 test suites** covering core components, protocol behavior, hardening checks, TLS/kTLS regressions, TLS security enforcement, graceful drain/shutdown, combinatorial matrix tests, formal invariant models, runtime mode tier gating, live configuration reload infrastructure, formal state machine verification (exhaustive walks, fuzz, concurrent stress), route cache correctness and adversarial collision stress, admission control, SQL admin query language, cloud-native authentication (AWS SigV4, GCP OAuth2, Azure IMDS), white-box provider internals, query result caching, comprehensive horizontal sharding (Phases 1–6: key extraction, bound parameters, unified plan API, shard rule registry, scatter fan-out), **scatter-merge aggregation engine** (end-to-end merge pipeline, prepared-statement scatter, GROUP BY + LIMIT correctness, COUNT DISTINCT, 2PC full commit/abort/crash-recovery matrix, deterministic GIDs, 64-shard boundary), **scatter Prometheus histogram** (bucket accuracy, PromQL output), **scatter SQL fuzz** (134-assertion randomized aggregate SQL generator), OOM/allocation-failure injection (systematic fault coverage via `keel_mem_set_fail_countdown()`), split-at-every-byte protocol generator testing (all PG and MySQL wire messages), connection pool exhaustion and wait-queue verification, prepared-statement replay × failover × session-hash stability (PS/failover/TLS matrix), NOTIFY/LISTEN transparent proxying, declarative INI-based query routing and rewriting rules, Online Schema Change connection affinity, cross-service Read-Your-Writes via GUC propagation, embedded web management UI (HTML/CSS/JS structure, JSON API, security hardening), plus deep unit coverage of the probe subsystem, growable byte-buffers, string hashing, encoding helpers, NUMA topology, the memory-safety layer, the I/O reactor, and the log-plugin system.
+KEEL currently includes **107 test suites** covering core components, protocol behavior, hardening checks, TLS/kTLS regressions, TLS security enforcement, graceful drain/shutdown, combinatorial matrix tests, formal invariant models, runtime mode tier gating, live configuration reload infrastructure, formal state machine verification (exhaustive walks, fuzz, concurrent stress), route cache correctness and adversarial collision stress, admission control, SQL admin query language, cloud-native authentication (AWS SigV4, GCP OAuth2, Azure IMDS), white-box provider internals, query result caching, comprehensive horizontal sharding (Phases 1–6: key extraction, bound parameters, unified plan API, shard rule registry, scatter fan-out), **scatter-merge aggregation engine** (end-to-end merge pipeline, prepared-statement scatter, GROUP BY + LIMIT correctness, COUNT DISTINCT, 2PC full commit/abort/crash-recovery matrix, deterministic GIDs, 64-shard boundary), **scatter Prometheus histogram** (bucket accuracy, PromQL output), **scatter SQL fuzz** (134-assertion randomized aggregate SQL generator), OOM/allocation-failure injection (systematic fault coverage via `keel_mem_set_fail_countdown()`), split-at-every-byte protocol generator testing (all PG and MySQL wire messages), connection pool exhaustion and wait-queue verification, prepared-statement replay × failover × session-hash stability (PS/failover/TLS matrix), NOTIFY/LISTEN transparent proxying, declarative INI-based query routing and rewriting rules, Online Schema Change connection affinity, cross-service Read-Your-Writes via GUC propagation, embedded web management UI (HTML/CSS/JS structure, JSON API, security hardening), plus deep unit coverage of the probe subsystem, growable byte-buffers, string hashing, encoding helpers, NUMA topology, the memory-safety layer, the I/O reactor, and the log-plugin system. This includes the full **async pre-query pipeline** (deferred-BEGIN FSM, state-sync FSM, prepared-statement replay FSM) tested at 26 test functions with fault-injection coverage (§15.3).
 
 Before broad feature expansion, production gates prioritize deterministic
 correctness tests for reactor ownership, pool state transitions, protocol
@@ -163,7 +167,7 @@ Use `ctest -N` to see the full, current list in your build directory.
 | 13 | `test_xxhash` | Hash functions (xxhash) |
 | 14 | `test_residual` | Residual data handling |
 | 15 | `test_session_engine` | Session engine lifecycle, including transaction-tracking commit rewrite and commit-in-doubt recovery |
-| 16 | `test_pool_correctness` | Pool borrow/return correctness and connection reuse |
+| 16 | `test_pool_correctness` | White-box backend pool lifecycle (20 tests): dirty-connection → CLEANING state entry, clean bypass of DISCARD ALL, `clean_gen` increment, full borrow-predicate matrix (state/owner/quarantine/transaction/sync/replay/desync/needs_cleanup), stale-reference generation validation, close-reason-once invariant, CLEANING state not borrowable, drain-cleaning → IDLE → clean list, protocol error during cleanup → CLOSED, cleanup timeout → CLOSED, EOF during cleanup → CLOSED, waiter not woken until IDLE, RFQ(E) and RFQ(T) during cleanup → CLOSED, split-response cleanup absorption, cleanup-failure wakes stranded waiter, MSG_PEEK dead-connection detection, drain_idle closes all lists |
 | 17 | `test_plugin_contract` | Plugin contract verification (router/hook ABI) |
 | 18 | `test_pg_protocol_flow` | PostgreSQL wire-protocol flow: parse/bind/execute/sync, all four PS pooling modes (virtualize/pinning/tracking/anonymous), replication tracking XID capture, commit-in-doubt synthesis |
 | 19 | `test_mysql_protocol_flow` | MySQL wire-protocol flow: COM_QUERY classification (SELECT/INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT/SET/CALL/DO/XA), COM_STMT_PREPARE/EXECUTE/CLOSE/RESET, prepared-statement tracking (64-slot session map, FNV-1a session hash, `get_stmt_replay` replay buffer), SESSION_TRACK_SCHEMA/GTIDS capture in OK packets, cross-service RYW intercepts (`SET`/`SELECT @keel_write_gtid`), `notify_write_lsn` hook, XA distributed-transaction pinning, transaction-pin/unpin lifecycle, LOAD DATA, multi-result-set, SSV session-track, admin commands, error classification (340 assertions) |
@@ -242,6 +246,7 @@ Use `ctest -N` to see the full, current list in your build directory.
 | 92 | `test_mem_safety` | Memory safety layer — `keel_safe_alloc`/`keel_safe_free`: alloc/free lifecycle, NULL-arg guards, zero-size allocation, large allocation (1 MB), head-canary validation, tail-canary validation (detects write past end), freed-pointer state check (validates returns non-OK on already-freed ptr), leak report (zero leaks after balanced alloc/free), stress (10 000 allocs × 5 sizes, all validated, all freed), double-free detection via leak report (20 193 assertions total) |
 | 93 | `test_reactor` | I/O reactor (io_uring / epoll) — `keel_reactor_t`: create AUTO/EPOLL/IOURING, get type, tick empty reactor, write-readability via socketpair, recv callback, multiple concurrent fds (3-way socketpair fan-out), 50 ms timeout fires (50 × 20 ms ticks), cancel in-flight op, stress (100 iterations × write + recv), create/destroy lifecycle leak check (44 assertions) |
 | 94 | `test_log_plugins` | Log plugin system: stdout plugin create/open/write/close/destroy lifecycle, NULL-record guard (lifecycle-only, no crash), file plugin round-trip (write + verify file content), file plugin bad-path rejection (`/dev/null/…`), syslog plugin lifecycle, plugin level filtering (INFO passes, DEBUG filtered), concurrent writes (8 threads × 50 records per plugin, ≥ 400 writes), plugin replace/reload sequence (45 assertions) |
+| 95 | `test_pre_query_replay` | Async pre-query pipeline — deferred-BEGIN FSM, state-sync FSM, and prepared-statement replay FSM (26 tests): deferred-BEGIN flag lifecycle and forward-on-RFQ, absorb-without-RFQ, partial-then-completion, disconnect during absorb, stash overflow on resume, runaway absorption guard, state-sync absorbs setup stream, state-sync waits until RFQ, resume-from-pool sends state-sync first, resume-from-pool sequences state-sync then BEGIN, resume-from-pool cleanup-then-stmt-replay queue, cleanup-more-then-complete keeps follow held, cleanup-and-replay coalesced response preserved, cleanup error never forwards follow, cleanup bad-consumed never forwards follow, replay error response never forwards follow, replay ParseComplete waits for RFQ before forward, replay discards NOTICE and ParameterStatus, replay partial RFQ header preserved, state-sync rejects non-idle RFQ, state-sync rejects malformed frame, deferred-BEGIN error response aborts, state-sync error response aborts sync, state-sync error-response-only, **backend EOF during state-sync** (§15.3 — clears all pre-query state, does not stamp new hash onto backend), **backend EOF during stmt replay** (§15.3 — clears stmt-replay FSM atomically, does not forward follow payload; this test caught a real engine bug: missing `pre_query_fail_clear` in the `engine_flow.c` stmt-replay EOF path) |
 
 #### Scatter-Merge Test Suites (Phase 4)
 
@@ -456,7 +461,198 @@ python3 tests/suites/suite_soak.py     --duration 120 --proxy-pid 12345
 | `KEEL_SOAK_DURATION_S` | `60` | Soak test total duration |
 | `KEEL_SOAK_CLIENTS` | `5` | Soak worker threads |
 | `KEEL_PROXY_PID` | — | Proxy PID for RSS/FD monitoring in soak suite |
+| `KEEL_SOAK_MAX_RSS_GROWTH_MB` | `50` | RSS growth limit for H02 (MiB) |
+| `KEEL_SOAK_SAMPLE_INTERVAL_S` | `5` | Metric sampling interval for H02/H03 (seconds) |
+| `KEEL_PATRONI_URL` | — | Patroni leader REST endpoint (e.g. `http://patroni-primary:8008`). **Required for H09**; H09 is auto-skipped when unset |
+| `KEEL_PATRONI_SWITCHOVER_INTERVAL_S` | `30` | Seconds between `POST /switchover` calls in H09 |
 | `KEEL_CHAOS_IFACE` | `lo` | Network interface for tc netem |
+
+---
+
+### Soak Suite (H) — Individual Test Reference
+
+The soak suite (`tests/suites/suite_soak.py`) contains nine stability tests (H01–H09) executed sequentially by default. All tests connect through a live KEEL proxy via psycopg2 and require the standard proxy env vars. Each test can be run in isolation with `--filter`.
+
+| Test | Function | Duration cap | Pass criteria |
+|------|----------|--------------|---------------|
+| H01 | `test_h01_latency_stability` | `_duration` | P99 last window ≤ 2× P99 first window |
+| H02 | `test_h02_memory_non_growth` | `_duration` | RSS growth ≤ `KEEL_SOAK_MAX_RSS_GROWTH_MB` |
+| H03 | `test_h03_fd_stability` | `_duration` | FD count not monotonically increasing |
+| H04 | `test_h04_error_rate_stability` | `_duration` | Error rate ≤ 1% |
+| H05 | `test_h05_connection_churn_longevity` | `_duration` | Error rate < 1% under rapid open/close |
+| H06 | `test_h06_mixed_workload_correctness` | min(_duration, 30 s) | Committed row count matches in-memory count |
+| H07 | `test_h07_transaction_pool_correctness` | min(_duration, 60 s) | Zero row mismatches, error rate < 2% |
+| H08 | `test_h08_prepared_statement_replay_correctness` | min(_duration, 60 s) | Zero result mismatches, error rate < 2% |
+| H09 | `test_h09_failover_soak` | min(_duration, 120 s) | Error rate ≤ 5% across Patroni switchovers |
+
+#### H01 — Latency Stability
+
+**What it tests**: Under sustained query load, the P99 latency must not grow unboundedly. A growing P99 over time indicates a deferred-work accumulation bug — unbounded stash buffers, slow-growing lock contention, or a timer/event loop that loses slots under load.
+
+**How it works**: Runs concurrent `SELECT 1` workers for `_duration` seconds, collecting latency samples in sliding windows. Compares the last window's P99 against the first window's P99. A ratio > 2× is a fail.
+
+**Pass criteria**: `p99_last_window / p99_first_window ≤ 2.0`
+
+```bash
+python3 tests/suites/suite_soak.py --filter H01 --duration 120 --clients 5
+```
+
+#### H02 — Memory Non-Growth (RSS)
+
+**What it tests**: Proxy resident set size (RSS) must not grow monotonically under steady load. RSS growth indicates a memory leak — allocated buffers, cached protocol state, or pool slots that are never freed.
+
+**How it works**: Samples RSS via `/proc/<PID>/status` (VmRSS field) at `KEEL_SOAK_SAMPLE_INTERVAL_S` intervals throughout the run. Compares final RSS against initial RSS.
+
+**Pass criteria**: `rss_end − rss_start ≤ KEEL_SOAK_MAX_RSS_GROWTH_MB` (default 50 MiB)
+
+```bash
+KEEL_PROXY_PID=$(pgrep keel) \
+KEEL_SOAK_MAX_RSS_GROWTH_MB=20 \
+python3 tests/suites/suite_soak.py --filter H02 --duration 300
+```
+
+#### H03 — File Descriptor Stability
+
+**What it tests**: Open file descriptor count must not grow monotonically. A monotonically increasing FD count is a strong signal of a connection leak (sessions opened but never closed) or an event-loop registration leak (io_uring SQEs or epoll registrations never de-registered).
+
+**How it works**: Counts entries in `/proc/<PID>/fd/` at `KEEL_SOAK_SAMPLE_INTERVAL_S` intervals throughout the run. Checks for strictly increasing sequences.
+
+**Pass criteria**: FD count must not strictly increase across every sample window.
+
+```bash
+KEEL_PROXY_PID=$(pgrep keel) \
+python3 tests/suites/suite_soak.py --filter H03 --duration 120
+```
+
+#### H04 — Error Rate Stability
+
+**What it tests**: Under sustained load, the proxy must not silently error more than 1% of queries. A growing error rate indicates connection pool exhaustion, protocol state desync, or backend connection failures not handled by retry.
+
+**How it works**: Every worker thread counts psycopg2 exceptions. Total errors divided by total attempts must not exceed 1%.
+
+**Pass criteria**: `error_count / total_attempts ≤ 0.01`
+
+```bash
+python3 tests/suites/suite_soak.py --filter H04 --duration 120 --clients 10
+```
+
+#### H05 — Connection Churn Longevity
+
+**What it tests**: Rapid, repeated connection open/close cycles must not degrade the proxy. This exercises the full connection lifecycle — TCP handshake, PostgreSQL authentication, pool acquire/release, backend state cleanup — at high frequency.
+
+**How it works**: Each worker thread opens a new connection, executes a single `SELECT 1`, closes the connection, and repeats. The borrow/return/cleanup path is exercised on every iteration.
+
+**Pass criteria**: Error rate < 1% across all churn cycles.
+
+```bash
+python3 tests/suites/suite_soak.py --filter H05 --duration 60 --clients 5
+```
+
+#### H06 — Mixed Workload Correctness
+
+**What it tests**: A concurrent mix of reads (`SELECT`) and writes (`INSERT`) through the proxy must produce correct aggregate results. The final DB row count must match the number of successful inserts logged by workers — no phantom commits, no lost commits, no cross-session contamination.
+
+**How it works**: Worker threads randomly choose between a read (`SELECT COUNT(*)`) and a write (`INSERT INTO keel_soak_correctness`) on each iteration. Writes are tracked in-memory by each thread. At the end, a final `SELECT COUNT(*)` is compared against the in-memory aggregate.
+
+**Pass criteria**: `final_db_count == sum(inserts_by_all_workers)`. Duration capped at `min(_duration, 30)` seconds.
+
+```bash
+python3 tests/suites/suite_soak.py --filter H06 --duration 30
+```
+
+#### H07 — Transaction Pool Correctness (§15.4)
+
+**What it tests**: Explicit multi-statement transactions (`BEGIN` → `INSERT` → `SELECT` → `COMMIT`) must not lose committed rows or contaminate sessions with a prior session's transaction state. This is the core correctness gate for **transaction-mode pooling**: when the pool returns a backend to a new client, all dirty state from the previous session — open transaction, deferred BEGIN, aborted transaction — must be fully cleaned up before the new session borrows that backend.
+
+**How it works**: Each worker opens a non-autocommit connection (`autocommit=False`) and runs a tight loop:
+
+1. `INSERT INTO keel_txn_soak(tag) VALUES (sentinel_tag)` — inserts a row uniquely identified by `txsoak_<timestamp>_<worker>_<idx>`.
+2. `SELECT COUNT(*) WHERE tag = sentinel_tag` — asserts `pre_commit_count == 1`, proving the row is visible within the same open transaction.
+3. `conn.commit()` — commits the transaction.
+4. Opens a **fresh autocommit connection** and re-asserts `post_commit_count == 1` — proves the row is durable from a different session.
+
+**Why this catches dirty-connection bugs**: If the pool hands back a backend whose transaction was already open (dirty), the `INSERT` silently executes inside the ghost transaction. When `COMMIT` runs, it commits both the ghost state and the new row — or the backend may be in an aborted state, yielding `ERROR: current transaction is aborted`. Either way the per-sentinel row-count assertion catches the contamination.
+
+**Pass criteria**:
+- Zero mismatches: `pre_commit_count == 1` AND `post_commit_count == 1` for every committed sentinel.
+- Overall error rate < 2%.
+- **Duration**: `min(_duration, 60)` s, `min(_clients, 4)` workers.
+- **Requires**: KEEL proxy in transaction pooling mode + writable database. The test auto-creates and auto-cleans `keel_txn_soak`.
+
+```bash
+python3 tests/suites/suite_soak.py --filter H07 --duration 60 --clients 4
+```
+
+#### H08 — Prepared Statement Replay Correctness (§15.4)
+
+**What it tests**: The PostgreSQL extended protocol (Parse → Bind → Execute) must return correct results when backends are borrowed from the pool. When KEEL returns a backend previously used by a different session (with a different prepared-statement set), it must replay the current session's Parse messages before forwarding Bind. A wrong or missing replay produces incorrect results or a protocol desync.
+
+**How it works**: Each worker opens a **fresh connection per iteration** (to force a pool borrow) and runs:
+
+```sql
+SELECT %s::int * 2 + %s::int
+```
+
+psycopg2 automatically uses the PostgreSQL extended protocol (Parse/Bind/Execute) for parameterised queries. The expected result is computed locally and compared against the proxy result. Because each new connection borrows a pool backend — potentially one with a stale prepared-statement profile from a prior session — KEEL must execute the stmt-replay FSM (clean prior stmts, replay current session's Parse frames) before forwarding the Bind.
+
+**Pass criteria**:
+- Zero result mismatches: `actual == expected` for every query.
+- Error rate < 2%.
+- **Duration**: `min(_duration, 60)` s, `min(_clients, 4)` workers.
+
+```bash
+python3 tests/suites/suite_soak.py --filter H08 --duration 60 --clients 4
+```
+
+#### H09 — Failover Soak (§15.4, Patroni-gated)
+
+**What it tests**: During a live Patroni primary switchover, the proxy must continue serving queries with a bounded error rate. The error rate during the failover transition window is expected to spike briefly; the test allows up to 5% overall, which accommodates ~3–5 seconds of unavailability per switchover in a typical Patroni cluster.
+
+This test is **automatically skipped** when `KEEL_PATRONI_URL` is not set, so CI pipelines without a Patroni topology continue to pass.
+
+**How it works**:
+
+1. Worker threads run a continuous `SELECT 1` workload through the proxy, reconnecting after each error.
+2. The main thread fires `POST /switchover` to the Patroni REST API at `KEEL_PATRONI_SWITCHOVER_INTERVAL_S`-second intervals (default 30 s), using Python's `urllib.request`.
+3. After each switchover Patroni elects a new primary. KEEL must detect the topology change via probes and re-route connections to the new primary within the probe interval.
+4. Client errors during the transition window are counted. Reconnect-after-error exercises KEEL's reconnection, re-authentication, and pool-rebind paths.
+
+**Pass criteria**: `total_errors / total_queries ≤ 0.05`
+
+**Duration**: `min(_duration, 120)` s, `min(_clients, 4)` workers.
+
+**Skip behaviour**: When `KEEL_PATRONI_URL` is unset the test prints:
+
+```
+[SKIP] H09 failover_soak: KEEL_PATRONI_URL not set — skipping failover soak
+       (set to http://<patroni-leader>:8008 to enable)
+```
+
+```bash
+# Requires a live Patroni cluster:
+KEEL_PATRONI_URL=http://patroni-primary:8008 \
+KEEL_PATRONI_SWITCHOVER_INTERVAL_S=30 \
+python3 tests/suites/suite_soak.py --filter H09 --duration 120 --clients 4
+```
+
+#### Running the Full Soak Suite
+
+```bash
+# Run H01–H09 in sequence (H09 auto-skipped unless KEEL_PATRONI_URL is set)
+python3 tests/suites/suite_soak.py \
+  --duration 120 \
+  --clients 5 \
+  --proxy-pid "$(pgrep keel)"
+
+# Run only a specific test by ID prefix
+python3 tests/suites/suite_soak.py --filter H07 --duration 60
+
+# Run via the master coordinator alongside other suites
+python3 tests/run_tests.py \
+  --suite soak \
+  --soak-duration 300 --soak-clients 10 \
+  --proxy-pid "$(pgrep keel)"
+```
 
 ---
 
@@ -590,7 +786,56 @@ This forces a very slow client read rate while streaming a large result through 
 SQL_FILE=./bench/pgbench_read_rw_split.sql ./scripts/hardening-shadow-diff.sh
 ```
 
-This executes the same SQL workload against direct DB and proxy and diffs normalized output.
+This executes the same SQL workload against both direct PostgreSQL and the KEEL proxy, then diffs the normalised output. Any divergence is a correctness bug.
+
+#### Shadow Correctness Workloads (§15.5)
+
+Ready-made SQL workload files live in `tests/hardening/sql/`:
+
+| Workload | What it tests |
+|----------|---------------|
+| `shadow_rollback.sql` | Explicit transactions with `ROLLBACK` and `SAVEPOINT`: committed rows visible, rolled-back rows absent, savepoint rollback semantics |
+| `shadow_search_path.sql` | `SET search_path` state sync after pool borrow: `SET search_path TO public`, `SET search_path TO pg_catalog, public`, `RESET search_path`, schema-qualified queries |
+| `shadow_large_results.sql` | Multi-packet responses: `generate_series(1, 10000)`, 1 000 wide rows (text + md5), 40-column × 500-row result set |
+| `shadow_ddl_ps.sql` | DDL + `PREPARE`/`EXECUTE`/`DEALLOCATE`: `CREATE TABLE`, named prepared statements, `ALTER TABLE ADD COLUMN`, re-`PREPARE` after schema change, `DROP TABLE` |
+| `shadow_copy.sql` | `COPY … TO STDOUT` sub-protocol (CopyOutResponse/CopyData/CopyDone): plain text and CSV with header, 200-row table |
+
+Run a single workload:
+
+```bash
+SQL_FILE=tests/hardening/sql/shadow_rollback.sql \
+    ./scripts/hardening-shadow-diff.sh
+
+SQL_FILE=tests/hardening/sql/shadow_ddl_ps.sql \
+    ./scripts/hardening-shadow-diff.sh
+```
+
+Run all workloads in sequence with `hardening-shadow-diff-all.sh`:
+
+```bash
+# Iterates every *.sql in tests/hardening/sql/ through hardening-shadow-diff.sh
+# Reports PASS / FAIL / SKIP per workload; exits 1 if any FAIL
+./tests/hardening/hardening-shadow-diff-all.sh
+
+# Custom workload directory
+SQL_WORKLOAD_DIR=./my_workloads ./tests/hardening/hardening-shadow-diff-all.sh
+```
+
+Expected output:
+
+```
+[RUN]  shadow_rollback.sql
+[PASS] shadow_rollback.sql
+[RUN]  shadow_search_path.sql
+[PASS] shadow_search_path.sql
+[RUN]  shadow_large_results.sql
+[PASS] shadow_large_results.sql
+[RUN]  shadow_ddl_ps.sql
+[PASS] shadow_ddl_ps.sql
+[RUN]  shadow_copy.sql
+[PASS] shadow_copy.sql
+All 5 workloads passed.
+```
 
 ### Phase 3 — Fault Injection (Jepsen-Lite)
 

@@ -3990,6 +3990,10 @@ int keel_worker_init(
         /* Sticky-primary TTL */
         worker->sticky_primary_ttl_ms = cfg->sticky_primary_ttl_ms;
 
+        /* Buffer caps (0 = unlimited) */
+        worker->session_max_buffered_bytes = cfg->session_max_buffered_bytes;
+        worker->backend_max_replay_bytes   = cfg->backend_max_replay_bytes;
+
         /* TLS configuration (frontend + backend) */
         worker->tls_config         = cfg->tls_config;
         worker->backend_tls_config = cfg->backend_tls_config;

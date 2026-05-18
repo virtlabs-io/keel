@@ -176,6 +176,11 @@ typedef struct keel_session_flow {
     size_t                         be_fwd_remaining;
     bool                           fe_fwd_wait_be;
 
+    /* Per-session buffer caps (0 = unlimited; propagated from worker config).
+     * Enforced at jumbo-message detection time and PS replay buffer build. */
+    size_t                         session_max_buffered_bytes; /**< max FE message size (0=unlimited) */
+    size_t                         backend_max_replay_bytes;   /**< max PS replay buffer (0=unlimited) */
+
     /* Prepared-statement replay state (spec §17 — PS Virtualization).
      *
      * When a session with named prepared statements gets a clean backend

@@ -1067,6 +1067,12 @@ int keel_session_flow_init(keel_session_flow_t* sf,
                                 ? session->worker->sticky_primary_ttl_ms
                                 : (uint32_t)KEEL_STICKY_PRIMARY_TTL_MS;
 
+    /* Inherit buffer caps (0 = unlimited) */
+    sf->session_max_buffered_bytes = (session && session->worker)
+                                     ? session->worker->session_max_buffered_bytes : 0;
+    sf->backend_max_replay_bytes   = (session && session->worker)
+                                     ? session->worker->backend_max_replay_bytes : 0;
+
     /* PROXY mode: force PS off and disable txn tracking — the session
      * is hard-pinned to one backend, no pooling sophistication needed. */
     if (sf->mode == KEEL_TIER_PROXY) {
@@ -1798,6 +1804,24 @@ copy_scan_done:
             jumbo_msg = true;
             jumbo_remaining = (size_t)flen - available;
             flen = (ssize_t)available;
+        }
+
+        /* Oversized message guard: if session_max_buffered_bytes is set and
+         * the declared frame length (including any jumbo tail) exceeds the
+         * limit, reject the connection rather than buffer an unbounded msg. */
+        if (sf->session_max_buffered_bytes > 0) {
+            size_t total_frame = (size_t)flen + jumbo_remaining;
+            if (total_frame > sf->session_max_buffered_bytes) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "Worker %u: session %lu: message too large "
+                    "(%zu bytes > limit %zu) — closing",
+                    worker ? worker->id : 0u,
+                    session ? (unsigned long)session->id : 0ul,
+                    total_frame, sf->session_max_buffered_bytes);
+                if (worker && worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, errors_proto);
+                return KEEL_FLOW_ERROR;
+            }
         }
 
         /* Ask protocol what to do */
@@ -2997,6 +3021,20 @@ copy_scan_done:
 
                 int gr = flow->get_stmt_replay(sf->ctx, &rbuf, &rlen, &rcount, &rhash);
                 if (gr == 0 && rbuf && rlen > 0 && rcount > 0) {
+                    /* Replay buffer size guard */
+                    if (sf->backend_max_replay_bytes > 0 &&
+                        rlen > sf->backend_max_replay_bytes) {
+                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                            "Worker %u: session %lu: PS replay buffer too large "
+                            "(%zu bytes > limit %zu) — closing",
+                            worker ? worker->id : 0u,
+                            session ? (unsigned long)session->id : 0ul,
+                            rlen, sf->backend_max_replay_bytes);
+                        keel_free(rbuf);
+                        if (worker && worker->stats_ctx)
+                            KEEL_STAT_INC(worker->stats_ctx, errors_proto);
+                        return KEEL_FLOW_ERROR;
+                    }
                     /* Determine what to send to the backend after replay.
                      *
                      * Normal case (no payload rewrite): capture the whole
@@ -4284,7 +4322,10 @@ keel_flow_result_t keel_engine_flow_on_be_data(
      * ------------------------------------------------------------------ */
     if (sf->stmt_replay_count > 0 || sf->stmt_replay_rfq_pending) {
         if (len == 0) {
+            /* Backend closed socket during stmt replay — clear all pre-query state
+             * before returning, consistent with all other error paths. */
             pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            pre_query_fail_clear(sf);
             return KEEL_FLOW_ERROR;
         }
         if (!flow->frame_len || !flow->on_be_msg) {
