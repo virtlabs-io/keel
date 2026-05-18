@@ -1051,6 +1051,7 @@ uint32_t keel_engine_get_num_workers(keel_engine_t* engine) {
  */
 const keel_worker_t* keel_engine_get_worker(keel_engine_t* engine, uint32_t idx) {
     if (!engine || idx >= engine->num_workers) return NULL;
+    if (!engine->worker_pool.workers) return NULL;
     return &engine->worker_pool.workers[idx];
 }
 
@@ -1063,6 +1064,7 @@ const keel_worker_t* keel_engine_get_worker(keel_engine_t* engine, uint32_t idx)
  */
 keel_worker_t* keel_engine_get_worker_mut(keel_engine_t* engine, uint32_t idx) {
     if (!engine || idx >= engine->num_workers) return NULL;
+    if (!engine->worker_pool.workers) return NULL;
     return &engine->worker_pool.workers[idx];
 }
 

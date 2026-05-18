@@ -696,6 +696,80 @@ endif()
 target_link_options(test_drain_shutdown PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_drain_shutdown COMMAND test_drain_shutdown)
 
+# Admin live integration test (admin TCP console + Prometheus HTTP)
+add_executable(test_admin_live test_admin_live.c)
+target_link_libraries(test_admin_live PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_admin
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_admin_live PRIVATE uring)
+endif()
+target_link_options(test_admin_live PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_admin_live COMMAND test_admin_live)
+set_tests_properties(test_admin_live PROPERTIES LABELS "core" TIMEOUT 30)
+
+# Mock proxy integration tests — exercises engine_flow, worker, backend_connect_async
+# using an in-process mock PostgreSQL backend (no real database needed).
+add_executable(test_mock_proxy test_mock_proxy.c)
+target_link_libraries(test_mock_proxy PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_mock_proxy PRIVATE uring)
+endif()
+target_link_options(test_mock_proxy PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_mock_proxy COMMAND test_mock_proxy)
+set_tests_properties(test_mock_proxy PROPERTIES LABELS "core" TIMEOUT 120)
+
 # Graceful worker restart tests
 add_executable(test_graceful_restart test_graceful_restart.c)
 target_link_libraries(test_graceful_restart PRIVATE

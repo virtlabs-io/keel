@@ -2735,6 +2735,19 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             ctx->stmt_semantic_unknown = false;
             pg_stmt_clear_all(ctx);
             act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
+            /* DISCARD ALL resets all GUC settings and role back to session
+             * defaults (equivalent to RESET ALL + SET SESSION AUTHORIZATION
+             * DEFAULT).  DISCARD PLANS only drops cached plans; GUC values
+             * are unaffected.  Reset the context fields so the compatibility
+             * signature and replay buffer reflect the cleaned-up state. */
+            if (pg_sql_contains_word_ci(sql, sl, "all")) {
+                pg_stmt_guc_change_t reset_all = {
+                    .valid = true, .is_reset_all = true
+                };
+                pg_stmt_apply_guc_change(ctx, &reset_all);
+                ctx->stmt_role[0]         = '\0';
+                ctx->stmt_session_auth[0] = '\0';
+            }
             pg_stmt_restamp_context(ctx);
         }
 
@@ -3298,6 +3311,48 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                 ctx->stmt_last_tx_end_was_rollback = false;
             } else if (ctx->cached_query_type == KEEL_QUERY_ROLLBACK) {
                 ctx->stmt_last_tx_end_was_rollback = true;
+            }
+
+            /* Semantic invalidation for DDL, DISCARD ALL/PLANS, and unknown
+             * utility — mirrors the Simple Query path so protocol context
+             * stays consistent regardless of whether extended protocol is
+             * used.  Must run before the temp-epoch and GUC blocks below. */
+            if (ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
+                uint32_t cqt  = ctx->cached_query_type;
+                const char* csql = ctx->cached_sql;
+                size_t csl    = ctx->cached_sql_len;
+                keel_query_effect_flags_t ceff = ctx->cached_effect;
+
+                if (cqt == KEEL_QUERY_UNKNOWN || (ceff & KEEL_QE_UNKNOWN_STATE)) {
+                    ctx->stmt_semantic_unknown = true;
+                    pg_stmt_clear_all(ctx);
+                    pg_stmt_restamp_context(ctx);
+                } else if ((cqt == KEEL_QUERY_CREATE ||
+                            cqt == KEEL_QUERY_ALTER  ||
+                            cqt == KEEL_QUERY_DROP) &&
+                           !pg_stmt_is_temp_context_change(ctx, csql, csl, cqt)) {
+                    ctx->stmt_schema_epoch++;
+                    ctx->stmt_semantic_unknown = false;
+                    pg_stmt_clear_all(ctx);
+                    pg_stmt_restamp_context(ctx);
+                } else if ((cqt == KEEL_QUERY_DISCARD ||
+                            (cqt == KEEL_QUERY_RESET &&
+                             pg_sql_contains_word_ci(csql, csl, "discard"))) &&
+                           (pg_sql_contains_word_ci(csql, csl, "all") ||
+                            pg_sql_contains_word_ci(csql, csl, "plans"))) {
+                    ctx->stmt_schema_epoch++;
+                    ctx->stmt_semantic_unknown = false;
+                    pg_stmt_clear_all(ctx);
+                    if (pg_sql_contains_word_ci(csql, csl, "all")) {
+                        pg_stmt_guc_change_t reset_all = {
+                            .valid = true, .is_reset_all = true
+                        };
+                        pg_stmt_apply_guc_change(ctx, &reset_all);
+                        ctx->stmt_role[0]         = '\0';
+                        ctx->stmt_session_auth[0] = '\0';
+                    }
+                    pg_stmt_restamp_context(ctx);
+                }
             }
 
             if (ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS &&

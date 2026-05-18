@@ -519,7 +519,7 @@ static void pg_cmd_complete(pgbuf_t *b, int nrows) {
 static void pg_error(pgbuf_t *b, const char *msg) {
     uint32_t mlen = (uint32_t)strlen(msg) + 1;
     /* S severity + V severity + C code + M message + terminator */
-    uint32_t len = 4 + 2 + 6 + 2 + 6 + 2 + 6 + 2 + mlen + 1;
+    uint32_t len = 4 + 1 + 6 + 1 + 6 + 1 + 6 + 1 + mlen + 1;
     pgbuf_addbyte(b, 'E');
     pgbuf_add32(b, len);
     pgbuf_addbyte(b, 'S'); pgbuf_addstr(b, "ERROR");
@@ -5810,4 +5810,20 @@ void keel_admin_set_throttle_rules(keel_admin_t *admin,
 
 void keel_admin_set_discovery(keel_admin_t *admin, keel_discovery_t *discovery) {
     if (admin) admin->discovery = discovery;
+}
+
+uint16_t keel_admin_get_port(const keel_admin_t *admin) {
+    if (!admin || admin->admin_fd < 0) return 0;
+    struct sockaddr_in sa;
+    socklen_t slen = sizeof(sa);
+    if (getsockname(admin->admin_fd, (struct sockaddr *)&sa, &slen) < 0) return 0;
+    return ntohs(sa.sin_port);
+}
+
+uint16_t keel_admin_get_prom_port(const keel_admin_t *admin) {
+    if (!admin || admin->prom_fd < 0) return 0;
+    struct sockaddr_in sa;
+    socklen_t slen = sizeof(sa);
+    if (getsockname(admin->prom_fd, (struct sockaddr *)&sa, &slen) < 0) return 0;
+    return ntohs(sa.sin_port);
 }
