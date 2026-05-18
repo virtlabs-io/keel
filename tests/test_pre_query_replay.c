@@ -1484,6 +1484,141 @@ static void test_state_sync_rejects_malformed_frame(void)
     TEST_END();
 }
 
+static void test_deferred_begin_error_response_aborts(void)
+{
+    TEST_BEGIN("pre_query: deferred BEGIN ErrorResponse aborts and does not forward follow");
+
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 10;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.backend_conn = &be;
+    session.client_fd = fe_sv[0];
+
+    const uint8_t follow[] = { 'Q', 0, 0, 0, 13, 'S','E','L','E','C','T',' ','1', 0 };
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query = KEEL_PRE_QUERY_BEGIN_REPLAY;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    memcpy(sf.pending_pre_query_buf, follow, sizeof(follow));
+    sf.pending_pre_query_len = sizeof(follow);
+
+    /* Backend rejects BEGIN — e.g. already in a transaction or server error. */
+    uint8_t emsg[128];
+    size_t elen = build_error_response(emsg, "cannot execute BEGIN in a transaction block");
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, emsg, elen);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+
+    /* Pre-query state must be cleared; the buffered follow payload must not survive. */
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+    TEST_ASSERT_EQ(sf.pending_pre_query_len, 0U);
+
+    close_pair(fe_sv);
+    TEST_END();
+}
+
+static void test_state_sync_error_response_aborts_sync(void)
+{
+    TEST_BEGIN("pre_query: state sync ErrorResponse aborts without stamping hash");
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 8;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.current_state_hash = 0xAAAA;
+    be.needs_sync = true;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.backend_conn = &be;
+    session.state_hash = 0xBBBB;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query = KEEL_PRE_QUERY_STATE_SYNC;
+    sf.pending_state_sync_hash = session.state_hash;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    sf.pending_pre_query_len = 4; /* simulate a held client payload */
+
+    /* Backend responds to a failed SET: ErrorResponse + ReadyForQuery(I).
+     * The absorber must detect the ErrorResponse, abort, and NOT stamp the
+     * backend hash or clear needs_sync. */
+    uint8_t bebuf[128];
+    size_t n = 0;
+    n += build_error_response(bebuf + n, "invalid value for parameter");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+
+    /* Hash must NOT have been stamped; backend remains dirty. */
+    TEST_ASSERT_EQ(be.current_state_hash, 0xAAAAULL);
+    TEST_ASSERT_EQ(be.needs_sync, true);
+
+    /* Pre-query state must be fully cleared. */
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+    TEST_ASSERT_EQ(sf.pending_state_sync_hash, 0ULL);
+    TEST_ASSERT_EQ(sf.pending_pre_query_len, 0U);
+
+    TEST_END();
+}
+
+static void test_state_sync_error_response_only(void)
+{
+    TEST_BEGIN("pre_query: state sync bare ErrorResponse (no trailing RFQ) aborts");
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 9;
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.current_state_hash = 0x1111;
+    be.needs_sync = true;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.backend_conn = &be;
+    session.state_hash = 0x2222;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = VT;
+    sf.pending_pre_query = KEEL_PRE_QUERY_STATE_SYNC;
+    sf.pending_state_sync_hash = session.state_hash;
+    sf.pending_pre_query_resume = KEEL_FLOW_WAIT_BACKEND;
+    sf.pending_pre_query_len = 4;
+
+    /* Only ErrorResponse, no ReadyForQuery yet — must still abort immediately. */
+    uint8_t emsg[128];
+    size_t elen = build_error_response(emsg, "SET rejected");
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, emsg, elen);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+    TEST_ASSERT_EQ(be.current_state_hash, 0x1111ULL);
+    TEST_ASSERT_EQ(be.needs_sync, true);
+    TEST_ASSERT_EQ(sf.pending_pre_query, KEEL_PRE_QUERY_NONE);
+
+    TEST_END();
+}
+
 int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
@@ -1509,6 +1644,9 @@ int main(void)
     test_replay_partial_rfq_header_is_preserved();
     test_state_sync_rejects_non_idle_rfq();
     test_state_sync_rejects_malformed_frame();
+    test_deferred_begin_error_response_aborts();
+    test_state_sync_error_response_aborts_sync();
+    test_state_sync_error_response_only();
 
     return test_summary();
 }

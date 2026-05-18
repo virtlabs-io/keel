@@ -285,6 +285,13 @@ typedef struct keel_be_action {
      * response stream (e.g. PostgreSQL txid_status). */
     bool                    commit_doubt_outcome_changed;
     uint8_t                 commit_doubt_outcome; /**< 0=unknown, 1=committed, 2=aborted */
+
+    /* True when this message is a backend error response (ErrorResponse in
+     * PostgreSQL, ERR packet in MySQL).  Set regardless of the action type so
+     * that pre-query absorbers (state sync, deferred BEGIN, PS replay) can
+     * detect and reject backend-reported failures without relying on the
+     * action type, which may vary per-protocol or per-context. */
+    bool                    is_error_response;
 } keel_be_action_t;
 
 #define KEEL_PROTO_DRAIN_STATE_BYTES 64

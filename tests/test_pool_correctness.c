@@ -764,6 +764,194 @@ static void test_waiters_wake_only_when_cleaning_backend_becomes_idle(void)
 }
 
 /* ============================================================================
+ * §6.8.2 — Cleanup closes backend on non-idle ReadyForQuery status
+ * ============================================================================ */
+
+/*
+ * pgf_drain_cleanup_response returns KEEL_PROTO_DRAIN_ERROR when it sees a
+ * ReadyForQuery with status 'E' (error/failed transaction) or 'T' (open
+ * transaction) instead of the expected 'I' (idle).  The pool must respond by
+ * closing the backend, not recycling it.
+ */
+static void test_cleanup_rfq_transaction_error_closes(void)
+{
+    TEST_BEGIN("cleanup closes backend when ReadyForQuery reports non-idle status");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x5678;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Drain the cleanup command (DISCARD ALL) sent to the backend. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Respond with ReadyForQuery('E') — transaction error state.
+     * pgf_drain_cleanup_response returns KEEL_PROTO_DRAIN_ERROR for non-'I'. */
+    uint8_t response[] = { 'Z', 0, 0, 0, 5, 'E' };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * §6.8.7 — Cleanup drain handles response split across multiple recv calls
+ * ============================================================================ */
+
+/*
+ * The cleanup response may arrive in fragments.  pgf_drain_cleanup_response
+ * preserves per-message parse state (pg_cleanup_drain_state_t) between calls
+ * so a response header split in the middle does not corrupt the drain or cause
+ * a spurious close.  The backend must reach IDLE only after the complete valid
+ * response sequence is received.
+ */
+static void test_cleanup_split_response(void)
+{
+    TEST_BEGIN("cleanup drain handles response split across two reactor recv calls");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0xABCD;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Drain the cleanup command sent to the backend. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Valid response: CommandComplete("DISCARD ALL") + ReadyForQuery('I').
+     * Split after the first 3 bytes — the 5-byte PG message header is
+     * intentionally incomplete so the drain returns KEEL_PROTO_DRAIN_MORE
+     * and re-arms recv before the full message is processed. */
+    uint8_t full_response[] = {
+        'C', 0, 0, 0, 16,
+        'D','I','S','C','A','R','D',' ','A','L','L', 0,
+        'Z', 0, 0, 0, 5, 'I'
+    };
+
+    /* Part 1: first 3 bytes — incomplete header. */
+    ssize_t sw = send(be_fds[0], full_response, 3, MSG_NOSIGNAL);
+    TEST_ASSERT(sw == 3);
+
+    /* Tick: drain consumes partial header, returns DRAIN_MORE, re-arms recv. */
+    for (int i = 0; i < 10; i++)
+        reactor_tick(pool->reactor, 10);
+
+    /* Backend must still be cleaning — partial data is not enough to reclaim. */
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Part 2: remainder of response. */
+    sw = send(be_fds[0], full_response + 3, sizeof(full_response) - 3, MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)(sizeof(full_response) - 3));
+
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(conn->current_state_hash, 0ULL);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * §6.8.8 — Cleanup failure wakes pool waiters to prevent starvation
+ * ============================================================================ */
+
+/*
+ * When a backend under cleanup fails (protocol error, EOF, non-idle RFQ, etc.)
+ * the slot is closed without becoming idle.  Any session queued in the wait
+ * queue must be woken so it can react (attempt to borrow, fail fast, or
+ * escalate an error) rather than waiting forever for a slot that will never
+ * arrive.
+ */
+static void test_cleanup_failure_wakes_waiter(void)
+{
+    TEST_BEGIN("cleanup failure wakes waiting session to prevent starvation");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x9999;
+
+    /* Return dirty — backend enters CLEANING, no idle connections remain. */
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    /* Queue a waiter — must block until cleanup finishes. */
+    int session = 77;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &session, pool), 0);
+    TEST_ASSERT_EQ(g_wait_count, 0);
+
+    /* Drain the cleanup command. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Respond with RFQ('T') — open transaction, not idle.
+     * Cleanup fails; backend is closed without becoming idle.
+     * The waiter must be woken despite no idle slot being available,
+     * preventing permanent starvation. */
+    uint8_t response[] = { 'Z', 0, 0, 0, 5, 'T' };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 20 && g_wait_count == 0; i++)
+        reactor_tick(pool->reactor, 10);
+
+    TEST_ASSERT_EQ(g_wait_count, 1);
+    TEST_ASSERT_EQ(g_wait_order[0], 77);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
  * Test: conn_is_alive — dead connection is discarded by borrow
  * ============================================================================ */
 
@@ -1244,6 +1432,9 @@ int main(void)
     test_cleanup_timeout_closes_backend();
     test_backend_eof_during_cleanup_closes();
     test_waiters_wake_only_when_cleaning_backend_becomes_idle();
+    test_cleanup_rfq_transaction_error_closes();
+    test_cleanup_split_response();
+    test_cleanup_failure_wakes_waiter();
     test_borrow_skips_dead_connection();
     test_borrow_returns_alive_when_one_dead();
     test_drain_idle_closes_all_lists();

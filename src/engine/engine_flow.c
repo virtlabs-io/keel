@@ -485,8 +485,10 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
         ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (s < 0 && errno == EPERM) {
             /* Some sandbox/seccomp environments deny send* while allowing
-             * write() on connected sockets. Preserve non-blocking semantics. */
-            s = write(fd, p + sent, len - sent);
+             * write() on connected sockets. Preserve non-blocking semantics:
+             * the fd is always O_NONBLOCK so write() will return EAGAIN rather
+             * than blocking if the send buffer is full. */
+            s = write(fd, p + sent, len - sent); /* NOLINT(keel-blocking) */
         }
         if (s > 0) {
             sent += (size_t)s;
@@ -4071,6 +4073,20 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 return KEEL_FLOW_ERROR;
             }
 
+            /* A backend ErrorResponse during state sync or deferred BEGIN means
+             * the operation failed (e.g. a SET command was rejected).  The sync
+             * hash must NOT be stamped; close the backend immediately. */
+            if (act.is_error_response) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: ErrorResponse from backend during %s; aborting session",
+                    worker->id, is_state_sync ? "state sync" : "deferred BEGIN");
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+                pre_query_fail_clear(sf);
+                return KEEL_FLOW_ERROR;
+            }
+
             if (act.tx_state_changed) {
                 saw_tx_state = true;
                 observed_tx = act.tx_status;
@@ -4290,7 +4306,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 return KEEL_FLOW_ERROR;
             }
 
-                if (act.type == KEEL_BE_ACT_ERROR) {
+                if (act.is_error_response) {
                 if (act.fe_payload && act.fe_payload_len > 0 && session->client_fd >= 0)
                     keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)

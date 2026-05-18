@@ -3490,6 +3490,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             return 0;
         case 'E':
             act->type = KEEL_BE_ACT_ERROR;
+            act->is_error_response = true;
             return 0;
         case 'Z':
             if (len >= 6) {
@@ -3544,6 +3545,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         }
         if (t == 'E') {
             /* Keep unknown outcome and wait for RFQ boundary. */
+            act->is_error_response = true;
             return 0;
         }
         if (t == 'Z' && len >= 6) {
@@ -3714,6 +3716,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         }
         return 0;
     case 'E': /* ErrorResponse */
+        act->is_error_response = true;
         /* Tracking mode: backend rejected the staged PREPARE — roll back the
          * cache entry to the prior confirmed state (or remove it if there was
          * no prior entry).  The ErrorResponse is still forwarded to the client

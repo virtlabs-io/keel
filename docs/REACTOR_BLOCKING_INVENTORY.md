@@ -22,24 +22,18 @@ shrink.
 
 ---
 
-## Category A &mdash; Deferred BEGIN inline send/recv (target: PR #4)
+## Category A &mdash; Deferred BEGIN inline send/recv (RESOLVED in PR #4)
 
-The session-flow code temporarily clears `O_NONBLOCK`, sends the deferred
-`BEGIN` payload, then loops on `recv()` to drain the backend's
-`ReadyForQuery` before resuming. That stalls the entire worker reactor for the
+The session-flow code previously cleared `O_NONBLOCK`, sent the deferred
+`BEGIN` payload, then looped on `recv()` to drain the backend's
+`ReadyForQuery` before resuming. That stalled the entire worker reactor for the
 duration of one network round-trip.
 
-| File | Line | Call | Notes |
-|---|---|---|---|
-| [src/engine/engine_flow.c](../src/engine/engine_flow.c#L761) | 761 | `send` | Auth-notify path: writes `begin_deferred_payload` |
-| [src/engine/engine_flow.c](../src/engine/engine_flow.c#L767) | 767 | `recv` | Blocking drain of backend response |
-| [src/engine/engine_flow.c](../src/engine/engine_flow.c#L2610) | 2610 | `send` | FE-continuation path: duplicate of 761 |
-| [src/engine/engine_flow.c](../src/engine/engine_flow.c#L2617) | 2617 | `recv` | Duplicate of 767 |
-
-**Action:** convert deferred BEGIN into a session-flow state
-(`DEFERRED_BEGIN_SEND → DEFERRED_BEGIN_AWAIT_RFQ → READY`) driven by the
-reactor's BE-recv completion. Once both call pairs are gone, drop their four
-entries from the baseline.
+**Status: RESOLVED.**  `defer_begin_replay()` now enqueues a `KEEL_PQOP_DEFERRED_BEGIN`
+pre-query operation.  The reactor's BE-recv completion drives the absorber in
+`keel_engine_flow_on_be_data()`, which drains the backend's response stream
+and forwards the stashed client payload only after `ReadyForQuery` is confirmed.
+All four former call sites have been removed from the baseline.
 
 ---
 
@@ -88,25 +82,17 @@ eventfd lifecycle invariant. Drop the baseline entry once annotated.
 
 ---
 
-## Category E &mdash; Backend pool cleanup (target: PR #3 &mdash; primary)
+## Category E &mdash; Backend pool cleanup (RESOLVED in PR #3)
 
-The conservative pool reusable-gate uses `keel_fd_wait()` plus a `recv()` with
-a 50&nbsp;ms timeout to verify the backend has drained before returning the
-connection to the idle pool. Real worker threads cannot afford that pause.
+The conservative pool reusable-gate previously used `keel_fd_wait()` plus a `recv()` with
+a 50&nbsp;ms timeout to verify the backend had drained before returning the
+connection to the idle pool.
 
-| File | Line | Call | Notes |
-|---|---|---|---|
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L185) | 185 | `send` | Initial `DISCARD ALL` send |
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L196) | 196 | `keel_fd_wait` | The 50&nbsp;ms blocking wait |
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L574) | 574 | `send` | DISCARD ALL on idle-return path A |
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L803) | 803 | `send` | DISCARD ALL on idle-return path B |
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L1079) | 1079 | `send` | DISCARD ALL on idle-return path C |
-| [src/worker/backend_pool.c](../src/worker/backend_pool.c#L1254) | 1254 | `send` | DISCARD ALL on idle-return path D |
-
-**Action:** introduce a per-connection cleanup state machine
-(`CLEANING_SEND_RESET → CLEANING_DRAIN → CLEANING_DONE | CLEANING_FAILED`)
-driven by reactor read events and a deadline tracked in the timer wheel.
-Eliminate `keel_fd_wait()` from this file entirely.
+**Status: RESOLVED.**  `keel_fd_wait` has been removed from `backend_pool.c`.
+The only remaining recv-family call in that file is a one-byte
+`MSG_PEEK | MSG_DONTWAIT` liveness probe (non-blocking by construction).
+All DISCARD-ALL sends now route through `keel_reactor_send` / `keel_reactor_recv`
+(async reactor paths).  No entries remain in the baseline for this category.
 
 ---
 

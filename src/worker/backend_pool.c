@@ -397,6 +397,11 @@ static void backend_pool_close_cleaning_locked(backend_pool_t* pool,
     backend_pool_close_slot_locked(pool, conn, reason, false);
     backend_pool_assert_owner_invariant(conn);
     KEEL_CHECK_POOL_INVARIANTS(pool);
+    /* Wake one waiter so sessions are not stranded when cleanup fails and no
+     * idle backend becomes available.  The woken session may attempt to borrow
+     * (which will fail if the pool is empty and trigger new-connection logic),
+     * retry, or surface an error to the client — all preferable to starving. */
+    backend_pool_wake_one_locked(pool);
 }
 
 static void backend_pool_reclaim_clean_locked(backend_pool_t* pool,
