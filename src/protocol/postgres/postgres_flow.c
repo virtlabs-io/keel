@@ -106,6 +106,43 @@ static void pg_stmt_remove(pg_flow_ctx_t* ctx, const char* name) {
     pg_stmt_recompute_session_hash(ctx);
 }
 
+/** Clear all tracked named prepared statements and pending tracking state. */
+static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
+{
+    if (!ctx) return;
+
+    if (ctx->pending_track_valid) {
+        if (ctx->pending_track_prior.wire_msg) {
+            keel_free(ctx->pending_track_prior.wire_msg);
+            ctx->pending_track_prior.wire_msg = NULL;
+        }
+        ctx->pending_track_valid = false;
+        ctx->pending_track_had_prior = false;
+    }
+
+    ctx->pending_parse_valid = false;
+    ctx->pending_parse_hash = 0;
+    ctx->pending_parse_name[0] = '\0';
+    ctx->pending_deallocate_valid = false;
+    ctx->pending_deallocate_absorbed_error = false;
+    ctx->named_stmt_count = 0;
+
+    for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
+        if (ctx->stmt_cache[i].wire_msg) {
+            keel_free(ctx->stmt_cache[i].wire_msg);
+            ctx->stmt_cache[i].wire_msg = NULL;
+        }
+        memset(&ctx->stmt_cache[i], 0, sizeof(ctx->stmt_cache[i]));
+    }
+
+    if (ctx->anon_map) {
+        keel_free(ctx->anon_map);
+        ctx->anon_map = NULL;
+    }
+
+    ctx->session_stmt_hash = 0;
+}
+
 /** Copy stmt_cache entry classification into the active cached_* fields. */
 static void pg_stmt_activate(pg_flow_ctx_t* ctx, const pg_stmt_entry_t* e) {
     size_t copy_len = e->sql_len < sizeof(ctx->cached_sql) - 1
@@ -910,21 +947,24 @@ static bool pg_stmt_restore_tx_local_gucs(pg_flow_ctx_t* ctx)
     return changed;
 }
 
-/**
- * @brief Compute a 64-bit FNV-1a signature of all tracked GUC values.
- *
- * The signature is built by XOR-folding `|key=value` strings for all
- * 15 tracked GUC parameters plus role, session_auth, and temp_epoch.
- * Used to detect GUC state changes that affect prepared-statement
- * compatibility between sessions.
- *
- * @param ctx  Flow context (read-only).
- * @return 64-bit context signature.
- */
-static uint64_t pg_stmt_context_sig(const pg_flow_ctx_t* ctx)
+static uint64_t pg_stmt_hash_search_path(const pg_flow_ctx_t* ctx)
 {
-    uint64_t hash = keel_hash_fnv1a_64(ctx->stmt_search_path,
-                                       strlen(ctx->stmt_search_path));
+    return keel_hash_fnv1a_64(ctx->stmt_search_path,
+                              strlen(ctx->stmt_search_path));
+}
+
+static uint64_t pg_stmt_hash_role(const pg_flow_ctx_t* ctx)
+{
+    uint64_t h = keel_hash_fnv1a_64(ctx->stmt_role, strlen(ctx->stmt_role));
+    h ^= keel_hash_fnv1a_64("|sauth=", 7);
+    h ^= keel_hash_fnv1a_64(ctx->stmt_session_auth,
+                            strlen(ctx->stmt_session_auth));
+    return h;
+}
+
+static uint64_t pg_stmt_hash_gucs(const pg_flow_ctx_t* ctx)
+{
+    uint64_t hash = 0;
     hash ^= keel_hash_fnv1a_64("|timezone=", 10);
     hash ^= keel_hash_fnv1a_64(ctx->stmt_timezone, strlen(ctx->stmt_timezone));
     hash ^= keel_hash_fnv1a_64("|datestyle=", 11);
@@ -965,11 +1005,30 @@ static uint64_t pg_stmt_context_sig(const pg_flow_ctx_t* ctx)
     hash ^= keel_hash_fnv1a_64("|client_encoding=", 17);
     hash ^= keel_hash_fnv1a_64(ctx->stmt_client_encoding,
                                strlen(ctx->stmt_client_encoding));
+    return hash;
+}
+
+/**
+ * @brief Compute a 64-bit FNV-1a signature of all tracked GUC values.
+ *
+ * The signature is built by XOR-folding `|key=value` strings for all
+ * 15 tracked GUC parameters plus role, session_auth, and temp_epoch.
+ * Used to detect GUC state changes that affect prepared-statement
+ * compatibility between sessions.
+ *
+ * @param ctx  Flow context (read-only).
+ * @return 64-bit context signature.
+ */
+static uint64_t pg_stmt_context_sig(const pg_flow_ctx_t* ctx)
+{
+    uint64_t hash = pg_stmt_hash_search_path(ctx);
+    hash ^= keel_hash_fnv1a_64("|gucs=", 6);
+    hash ^= pg_stmt_hash_gucs(ctx);
     hash ^= keel_hash_fnv1a_64("|role=", 6);
-    hash ^= keel_hash_fnv1a_64(ctx->stmt_role, strlen(ctx->stmt_role));
-    hash ^= keel_hash_fnv1a_64("|sauth=", 7);
-    hash ^= keel_hash_fnv1a_64(ctx->stmt_session_auth,
-                               strlen(ctx->stmt_session_auth));
+    hash ^= pg_stmt_hash_role(ctx);
+    hash ^= keel_hash_fnv1a_64("|sepoch=", 8);
+    hash ^= keel_hash_fnv1a_64(&ctx->stmt_schema_epoch,
+                               sizeof(ctx->stmt_schema_epoch));
     hash ^= keel_hash_fnv1a_64("|tepoch=", 8);
     hash ^= keel_hash_fnv1a_64(&ctx->stmt_temp_epoch,
                                sizeof(ctx->stmt_temp_epoch));
@@ -1048,6 +1107,9 @@ static void pg_stmt_recompute_session_hash(pg_flow_ctx_t* ctx)
  */
 static void pg_stmt_restamp_context(pg_flow_ctx_t* ctx)
 {
+    ctx->stmt_search_path_hash = pg_stmt_hash_search_path(ctx);
+    ctx->stmt_role_hash = pg_stmt_hash_role(ctx);
+    ctx->stmt_guc_hash = pg_stmt_hash_gucs(ctx);
     ctx->stmt_context_sig = pg_stmt_context_sig(ctx);
     for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
         pg_stmt_entry_t* entry = &ctx->stmt_cache[i];
@@ -1976,6 +2038,8 @@ static void* pgf_create(keel_session_t* s) {
     ctx->stmt_role[0] = '\0';
     ctx->stmt_session_auth[0] = '\0';
     ctx->stmt_temp_epoch = 0;
+    ctx->stmt_schema_epoch = 0;
+    ctx->stmt_semantic_unknown = false;
     ctx->stmt_temp_tx_reset_pending = false;
     ctx->stmt_temp_tx_rollback_reset_pending = false;
     ctx->stmt_last_tx_end_was_rollback = false;
@@ -2472,6 +2536,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                 keel_free(final_msg);
 
                 ctx->startup_complete = true;
+                pg_stmt_restamp_context(ctx);
                 ctx->reusable         = true;
                 act->type             = KEEL_FE_ACT_AUTH_COMPLETE;
                 act->fe_response      = ctx->handshake_buf;
@@ -2562,6 +2627,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                 ctx->auth_ctx = NULL;
                 build_auth_success_response(ctx, NULL, 0);
                 ctx->startup_complete = true;
+                pg_stmt_restamp_context(ctx);
                 ctx->reusable         = true;
                 act->type             = KEEL_FE_ACT_AUTH_COMPLETE;
                 act->fe_response      = ctx->handshake_buf;
@@ -2600,6 +2666,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         /* Trust mode (no auth manager): send handshake immediately */
         build_handshake_response(ctx);
         ctx->startup_complete = true;
+        pg_stmt_restamp_context(ctx);
         ctx->reusable = true;
         act->type = KEEL_FE_ACT_AUTH_COMPLETE;
         act->fe_response = ctx->handshake_buf;
@@ -2638,6 +2705,37 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             ctx->stmt_last_tx_end_was_rollback = false;
         } else if (qtype == KEEL_QUERY_ROLLBACK) {
             ctx->stmt_last_tx_end_was_rollback = true;
+        }
+
+        /* Conservative semantic invalidation:
+         * - Unknown/unmodellable utility semantics => never reuse stmt set.
+         * - DDL or DISCARD PLANS/ALL => invalidate prepared-stmt set and
+         *   bump schema epoch so semantic compatibility changes deterministically.
+         */
+        if (qtype == KEEL_QUERY_UNKNOWN || (eff & KEEL_QE_UNKNOWN_STATE)) {
+            ctx->stmt_semantic_unknown = true;
+            pg_stmt_clear_all(ctx);
+            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
+            pg_stmt_restamp_context(ctx);
+        } else if ((qtype == KEEL_QUERY_CREATE ||
+                    qtype == KEEL_QUERY_ALTER ||
+                    qtype == KEEL_QUERY_DROP) &&
+                   !pg_stmt_is_temp_context_change(ctx, sql, sl, qtype)) {
+            ctx->stmt_schema_epoch++;
+            ctx->stmt_semantic_unknown = false;
+            pg_stmt_clear_all(ctx);
+            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
+            pg_stmt_restamp_context(ctx);
+        } else if ((qtype == KEEL_QUERY_DISCARD ||
+                    (qtype == KEEL_QUERY_RESET &&
+                     pg_sql_contains_word_ci(sql, sl, "discard"))) &&
+                   (pg_sql_contains_word_ci(sql, sl, "all") ||
+                    pg_sql_contains_word_ci(sql, sl, "plans"))) {
+            ctx->stmt_schema_epoch++;
+            ctx->stmt_semantic_unknown = false;
+            pg_stmt_clear_all(ctx);
+            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
+            pg_stmt_restamp_context(ctx);
         }
 
         /* Replication tracking: rewrite COMMIT to capture XID first.
@@ -2722,23 +2820,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             }
 
             if (!handled_by_name) {
-                ctx->named_stmt_count = 0;
-                /* Wipe the entire stmt cache and reset the session hash */
-                for (int _i = 0; _i < PG_STMT_CACHE_SIZE; _i++) {
-                    if (ctx->stmt_cache[_i].wire_msg) {
-                        keel_free(ctx->stmt_cache[_i].wire_msg);
-                        ctx->stmt_cache[_i].wire_msg = NULL;
-                        ctx->stmt_cache[_i].wire_msg_len = 0;
-                    }
-                    ctx->stmt_cache[_i].valid = false;
-                    ctx->stmt_cache[_i].hash  = 0;
-                }
-                ctx->session_stmt_hash = 0;
-                /* Also clear the anonymous map */
-                if (ctx->anon_map) {
-                    keel_free(ctx->anon_map);
-                    ctx->anon_map = NULL;
-                }
+                pg_stmt_clear_all(ctx);
             }
         }
 
@@ -4630,6 +4712,11 @@ static int pgf_get_stmt_replay(void* vctx,
     if (stmt_count_out) *stmt_count_out = 0;
     if (hash_out)       *hash_out       = ctx->session_stmt_hash;
 
+    if (ctx->stmt_semantic_unknown) {
+        if (hash_out) *hash_out = 0;
+        return 0;
+    }
+
     /* If caller only wants the hash, stop here. */
     if (!replay_buf_out)
         return 0;
@@ -4759,6 +4846,24 @@ static int pgf_get_stmt_replay(void* vctx,
     *replay_buf_out = buf_with_sync;
     *replay_len_out = total_len + sizeof(pg_sync);
     *stmt_count_out = stmt_count;
+    return 0;
+}
+
+static int pgf_get_stmt_compat_profile(void* vctx,
+                                       keel_stmt_compat_profile_t* out)
+{
+    pg_flow_ctx_t* ctx = (pg_flow_ctx_t*)vctx;
+    if (!ctx || !out)
+        return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->stmt_set_hash = ctx->session_stmt_hash;
+    out->semantic_profile_hash = ctx->stmt_context_sig;
+    out->schema_epoch = ctx->stmt_schema_epoch;
+    out->role_hash = ctx->stmt_role_hash;
+    out->search_path_hash = ctx->stmt_search_path_hash;
+    out->guc_hash = ctx->stmt_guc_hash;
+    out->semantic_unknown = ctx->stmt_semantic_unknown;
     return 0;
 }
 
@@ -5417,6 +5522,7 @@ const keel_proto_flow_vtable_t keel_proto_flow_postgres = {
     .build_commit_doubt_check = pgf_build_commit_doubt_check,
     .generate_commit_doubt_response = pgf_generate_commit_doubt_response,
     .get_stmt_replay           = pgf_get_stmt_replay,
+    .get_stmt_compat_profile   = pgf_get_stmt_compat_profile,
     .rewrite_execute_anonymous = pgf_rewrite_execute_anonymous,
     .captured_fe_pin_effects   = pgf_captured_fe_pin_effects,
 };

@@ -1877,6 +1877,150 @@ static void test_ps_tracking_reset_role_rehashes_stmt_set(void) {
     TEST_END();
 }
 
+static void test_ps_tracking_stmt_compat_profile_hashes_update(void) {
+    TEST_BEGIN("ps_mode/tracking: stmt compat profile hashes update on semantic changes");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pcompat AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t p0;
+    memset(&p0, 0, sizeof(p0));
+    rc = VT->get_stmt_compat_profile(ctx, &p0);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p0.stmt_set_hash != 0);
+    TEST_ASSERT(!p0.semantic_unknown);
+
+    len = build_query(buf, "SET search_path TO tenant_sem, public");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    keel_stmt_compat_profile_t p1;
+    memset(&p1, 0, sizeof(p1));
+    rc = VT->get_stmt_compat_profile(ctx, &p1);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p1.semantic_profile_hash != p0.semantic_profile_hash);
+    TEST_ASSERT(p1.search_path_hash != p0.search_path_hash);
+    TEST_ASSERT(p1.role_hash == p0.role_hash);
+
+    len = build_query(buf, "SET ROLE app_reader");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    keel_stmt_compat_profile_t p2;
+    memset(&p2, 0, sizeof(p2));
+    rc = VT->get_stmt_compat_profile(ctx, &p2);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p2.semantic_profile_hash != p1.semantic_profile_hash);
+    TEST_ASSERT(p2.role_hash != p1.role_hash);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: DDL invalidates stmt set and bumps schema epoch");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pddl AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    len = build_query(buf, "ALTER TABLE t ADD COLUMN c int");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+    TEST_ASSERT(!after.semantic_unknown);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_discard_plans_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: DISCARD PLANS invalidates stmt set");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pdisc AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    len = build_query(buf, "DISCARD PLANS");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_unknown_semantic_marks_incompatible(void) {
+    TEST_BEGIN("ps_mode/tracking: unknown utility marks semantic_unknown");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE punk AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    len = build_query(buf, "CALL do_work()");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+
+    keel_stmt_compat_profile_t p;
+    memset(&p, 0, sizeof(p));
+    rc = VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p.semantic_unknown);
+    TEST_ASSERT_EQ(p.stmt_set_hash, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
 static void test_ps_tracking_set_session_auth_rehashes_stmt_set(void) {
     TEST_BEGIN("ps_mode/tracking: SET SESSION AUTHORIZATION rehashes stmt set");
 
@@ -4184,6 +4328,10 @@ int main(void) {
     test_ps_tracking_search_path_rehashes_stmt_set();
     test_ps_tracking_set_role_rehashes_stmt_set();
     test_ps_tracking_reset_role_rehashes_stmt_set();
+    test_ps_tracking_stmt_compat_profile_hashes_update();
+    test_ps_tracking_ddl_invalidates_stmt_set();
+    test_ps_tracking_discard_plans_invalidates_stmt_set();
+    test_ps_tracking_unknown_semantic_marks_incompatible();
     test_ps_tracking_set_session_auth_rehashes_stmt_set();
     test_ps_tracking_reset_session_auth_rehashes_stmt_set();
     test_ps_tracking_set_timezone_rehashes_stmt_set();

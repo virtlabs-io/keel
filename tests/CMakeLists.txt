@@ -1500,6 +1500,35 @@ target_link_libraries(test_ps_pool_matrix PRIVATE
 target_link_options(test_ps_pool_matrix PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_ps_pool_matrix COMMAND test_ps_pool_matrix)
 
+# Phase 4 acceptance gate: prepared-statement semantic compatibility
+# Exercises VIRTUALIZE mode (extended-protocol Parse path) and the
+# backend_pool_stmt_compatible() predicate for cross-backend reuse.
+add_executable(test_ps_semantic_compat test_ps_semantic_compat.c)
+target_include_directories(test_ps_semantic_compat PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_ps_semantic_compat PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_ps_semantic_compat PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_ps_semantic_compat COMMAND test_ps_semantic_compat)
+
 # TLS/splice × data frames × large result sets × partial writes matrix
 add_executable(test_tls_splice_matrix test_tls_splice_matrix.c)
 target_link_libraries(test_tls_splice_matrix PRIVATE
@@ -1799,6 +1828,7 @@ set_tests_properties(
     test_shadow_diff_harness
     test_runtime_security_harness
     test_ps_pool_matrix
+    test_ps_semantic_compat
     test_tls_splice_matrix
     test_session_hooks_matrix
     test_crash_recovery_matrix
@@ -1894,7 +1924,8 @@ set_tests_properties(test_tls_security test_tls_ktls test_drain_shutdown
                      test_graceful_restart test_tls_auto
     PROPERTIES LABELS "hardening")
 
-set_tests_properties(test_ps_pool_matrix test_tls_splice_matrix
+set_tests_properties(test_ps_pool_matrix test_ps_semantic_compat
+                     test_tls_splice_matrix
                      test_session_hooks_matrix test_crash_recovery_matrix
                      test_pre_query_replay
                      test_dual_protocol_matrix test_invariant_model
@@ -2129,7 +2160,8 @@ add_custom_target(test-hardening
             test_shadow_diff_harness test_runtime_security_harness test_stats_alignment
             test_tls_security test_tls_ktls test_drain_shutdown
             test_graceful_restart test_tls_auto
-            test_ps_pool_matrix test_tls_splice_matrix test_session_hooks_matrix
+            test_ps_pool_matrix test_ps_semantic_compat
+            test_tls_splice_matrix test_session_hooks_matrix
             test_crash_recovery_matrix test_pre_query_replay
             test_dual_protocol_matrix test_invariant_model
             test_mem_safety
@@ -2251,6 +2283,7 @@ add_custom_target(build_tests DEPENDS
     test_proxy_ssv_e2e
     test_ps_failover_tls
     test_ps_pool_matrix
+    test_ps_semantic_compat
     test_query_cache
     test_query_log
     test_query_rules

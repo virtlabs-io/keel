@@ -2717,17 +2717,28 @@ copy_scan_done:
                             KEEL_STAT_INC(worker->stats_ctx, osc_sessions_detected);
                     } else {
                         /* Stmt-only pin: prefer a backend with matching prepared stmts */
-                        uint64_t stmt_hash = 0;
-                        flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &stmt_hash);
+                        keel_stmt_compat_profile_t stmt_profile;
+                        memset(&stmt_profile, 0, sizeof(stmt_profile));
+                        flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL,
+                                              &stmt_profile.stmt_set_hash);
+                        if (flow->get_stmt_compat_profile) {
+                            if (flow->get_stmt_compat_profile(sf->ctx, &stmt_profile) < 0)
+                                memset(&stmt_profile, 0, sizeof(stmt_profile));
+                        } else if (stmt_profile.stmt_set_hash != 0) {
+                            /* No semantic callback: force conservative replay path. */
+                            stmt_profile.semantic_unknown = true;
+                        }
                         bool needs_replay = false;
                         be_conn = backend_pool_borrow_with_stmts(pool, session->state_hash,
-                                                                  stmt_hash, &needs_replay);
+                                                                  &stmt_profile, &needs_replay);
                         /* Signal the replay path below — non-zero means replay needed */
-                        sf->stmt_replay_hash = (needs_replay && stmt_hash) ? stmt_hash : 0;
+                        sf->stmt_replay_hash = (needs_replay && stmt_profile.stmt_set_hash)
+                            ? stmt_profile.stmt_set_hash : 0;
+                        sf->stmt_replay_profile = stmt_profile;
                         KEEL_DEBUG_LOG("W%u: FE borrow_with_stmts: stmt_hash=0x%016llx"
                             " needs_replay=%d be_fd=%d be_stmt_hash=0x%016llx"
                             " replay_hash=0x%016llx msg[0]=0x%02x\n",
-                            worker->id, (unsigned long long)stmt_hash,
+                            worker->id, (unsigned long long)stmt_profile.stmt_set_hash,
                             (int)needs_replay,
                             be_conn ? be_conn->fd : -1,
                             be_conn ? (unsigned long long)be_conn->stmt_set_hash : 0ULL,
@@ -2738,6 +2749,8 @@ copy_scan_done:
                     /* pins_stable == NONE: no sticky state — free borrow */
                     be_conn = backend_pool_borrow(pool, session->state_hash);
                     sf->stmt_replay_hash = 0;
+                    memset(&sf->stmt_replay_profile, 0,
+                           sizeof(sf->stmt_replay_profile));
                 }
 
                 if (!be_conn) {
@@ -4277,11 +4290,15 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                 return KEEL_FLOW_ERROR;
             }
 
-            if (act.type == KEEL_BE_ACT_ERROR) {
+                if (act.type == KEEL_BE_ACT_ERROR) {
                 if (act.fe_payload && act.fe_payload_len > 0 && session->client_fd >= 0)
                     keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)
+                {
                     session->backend_conn->stmt_set_hash = 0;
+                    memset(&session->backend_conn->stmt_profile, 0,
+                           sizeof(session->backend_conn->stmt_profile));
+                }
                 sf->stmt_replay_count       = 0;
                 sf->stmt_replay_rfq_pending = false;
                 sf->stmt_replay_orig_msg    = NULL;
@@ -4316,6 +4333,8 @@ keel_flow_result_t keel_engine_flow_on_be_data(
              * Stamp the backend with the session's stmt_set_hash. */
             if (session->backend_conn && sf->stmt_replay_hash) {
                 session->backend_conn->stmt_set_hash = sf->stmt_replay_hash;
+                session->backend_conn->stmt_profile = sf->stmt_replay_profile;
+                session->backend_conn->stmt_profile.stmt_set_hash = sf->stmt_replay_hash;
             }
             sf->stmt_replay_hash = 0;
 
@@ -5053,6 +5072,8 @@ fe_forward_done: ;
              */
             backend_conn_t* be = session->backend_conn;
             if (be->pool) {
+                keel_stmt_compat_profile_t stmt_profile;
+                memset(&stmt_profile, 0, sizeof(stmt_profile));
                 /* Unknown-state rule: if the protocol adapter flagged a
                  * command it could not semantically model, any cached
                  * backend state (SET variables, prepared stmts) may be
@@ -5061,30 +5082,34 @@ fe_forward_done: ;
                 if (keel_ssv_opaque_has_unknown(sf->opaque_atoms)) {
                     be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     be->stmt_set_hash      = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }
 
                 if ((sf->pins & KEEL_FPIN_PREPARED_STMT) && flow->get_stmt_replay
                     && sf->ps_mode != KEEL_PS_MODE_PINNING
                     && sf->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
-                    /* VIRTUALIZE / TRACKING: only preserve stmt_set_hash when the
-                     * backend's existing prepared statements are still semantically
-                     * aligned with the session's current stmt hash.
-                     *
-                     * If the session changed a replay-sensitive semantic context
-                     * (for example DateStyle or TimeZone) after preparing named
-                     * statements, the backend still physically holds the OLD parse
-                     * semantics.  Blindly restamping it to the NEW session hash
-                     * would create a false exact-match backend and skip replay on
-                     * the next borrow.  Force DISCARD ALL in that case so reuse
-                     * always goes through clean borrow + replay under the current
-                     * context. */
-                    uint64_t stmt_hash = 0;
-                    flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &stmt_hash);
-                    if (be->stmt_set_hash != 0 && be->stmt_set_hash != stmt_hash) {
+                    bool have_stmt_profile = false;
+                    if (flow->get_stmt_compat_profile &&
+                        flow->get_stmt_compat_profile(sf->ctx, &stmt_profile) == 0) {
+                        have_stmt_profile = true;
+                    }
+                    flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL,
+                                          &stmt_profile.stmt_set_hash);
+                    if (!have_stmt_profile && stmt_profile.stmt_set_hash != 0)
+                        stmt_profile.semantic_unknown = true;
+
+                    if (stmt_profile.semantic_unknown) {
                         be->stmt_set_hash = 0;
+                        memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
+                        be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                    } else if (be->stmt_set_hash != 0 &&
+                               !backend_pool_stmt_compatible(&stmt_profile, be)) {
+                        be->stmt_set_hash = 0;
+                        memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                         be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     } else {
-                        be->stmt_set_hash = stmt_hash;
+                        be->stmt_set_hash = stmt_profile.stmt_set_hash;
+                        be->stmt_profile = stmt_profile;
                     }
                 } else if (sf->ps_mode == KEEL_PS_MODE_PINNING
                            && (sf->pins & KEEL_FPIN_PREPARED_STMT)) {
@@ -5094,11 +5119,13 @@ fe_forward_done: ;
                      * CLEANING path (DISCARD ALL), clearing all named
                      * prepared statements from the backend. */
                     be->stmt_set_hash       = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                     be->current_state_hash  = 0xFFFFFFFFFFFFFFFFULL;  /* sentinel → DISCARD ALL */
                 } else {
                     /* No prepared stmts (or ANONYMOUS) — clear hash so backend
                      * can go to clean_list (or get DISCARD ALL if SET vars exist) */
                     be->stmt_set_hash = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }
                 backend_pool_return(be->pool, be, false);
                 if (worker->stats_ctx)

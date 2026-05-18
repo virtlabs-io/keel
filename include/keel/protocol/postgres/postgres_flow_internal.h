@@ -151,6 +151,11 @@ typedef struct pg_flow_ctx {
     char     stmt_role[64];       /**< Current stmt-relevant effective role. */
     char     stmt_session_auth[64]; /**< Current stmt-relevant session auth. */
     uint64_t stmt_temp_epoch;     /**< Conservative temp-object context epoch. */
+    uint64_t stmt_schema_epoch;   /**< Schema/DDL epoch for PS semantic invalidation. */
+    uint64_t stmt_role_hash;      /**< Cached role/session-auth hash component. */
+    uint64_t stmt_search_path_hash; /**< Cached search_path hash component. */
+    uint64_t stmt_guc_hash;       /**< Cached tracked-GUC hash component. */
+    bool     stmt_semantic_unknown; /**< Conservative semantic-unknown marker. */
     bool     stmt_temp_tx_reset_pending; /**< Temp context changes again when txn ends. */
     bool     stmt_temp_tx_rollback_reset_pending; /**< Temp context changes again if the txn rolls back. */
     bool     stmt_last_tx_end_was_rollback; /**< Most recent tx-end statement was ROLLBACK. */

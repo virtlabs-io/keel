@@ -117,6 +117,7 @@ typedef struct backend_conn {
                                                  *   and must not receive full cleanup on pool return —
                                                  *   the stmts are kept for reuse by matching sessions.
                                                  *   Cleared when full cleanup is sent. */
+    keel_stmt_compat_profile_t stmt_profile;    /**< Prepared-stmt semantic compatibility profile. */
     bool                    in_transaction;     /**< Inside BEGIN...COMMIT */
     bool                    needs_sync;         /**< Needs state sync before use */
     bool                    syncing;            /**< Backend sync in progress */
@@ -343,6 +344,18 @@ bool backend_pool_validate_generation(const backend_conn_t* conn,
                                       uint64_t expected_generation);
 
 /**
+ * @brief Evaluate whether a backend's prepared-statement profile is compatible.
+ *
+ * Compatibility requires:
+ * - semantic_unknown == false on both sides
+ * - stmt_set_hash match
+ * - semantic_profile_hash match
+ * - role/search_path/GUC/schema components match
+ */
+bool backend_pool_stmt_compatible(const keel_stmt_compat_profile_t* required,
+                                  const backend_conn_t* conn);
+
+/**
  * @brief Borrow a connection, preferring one with matching prepared-statement set.
  *
  * Used when a session has named prepared statements.  Search order:
@@ -367,7 +380,7 @@ bool backend_pool_validate_generation(const backend_conn_t* conn,
  */
 backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                                                 uint64_t required_state_hash,
-                                                uint64_t required_stmt_hash,
+                                                const keel_stmt_compat_profile_t* required_stmt_profile,
                                                 bool* out_needs_replay);
 
 /**

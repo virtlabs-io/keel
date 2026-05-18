@@ -310,6 +310,23 @@ typedef enum keel_commit_doubt_reason {
     KEEL_CIDR_RESOLVED_UNKNOWN,   /**< Outcome check inconclusive */
 } keel_commit_doubt_reason_t;
 
+/**
+ * @brief Prepared-statement semantic compatibility profile.
+ *
+ * This profile separates statement identity (stmt_set_hash) from semantic
+ * execution context (search_path, role/auth, GUCs, schema epoch). Core code
+ * uses it to decide whether backend statement reuse is safe.
+ */
+typedef struct keel_stmt_compat_profile {
+    uint64_t stmt_set_hash;          /**< Hash of confirmed named statement set */
+    uint64_t semantic_profile_hash;  /**< Combined semantic context hash */
+    uint64_t schema_epoch;           /**< Monotonic schema/DDL epoch */
+    uint64_t role_hash;              /**< Role/session-auth hash */
+    uint64_t search_path_hash;       /**< search_path hash */
+    uint64_t guc_hash;               /**< Replay-relevant GUC hash */
+    bool     semantic_unknown;       /**< Conservative "do not reuse" marker */
+} keel_stmt_compat_profile_t;
+
 /* ============================================================================
  * Backend Cleanup Reason
  * ============================================================================ */
@@ -931,6 +948,21 @@ typedef struct keel_proto_flow_vtable {
         size_t*   replay_len_out,
         uint32_t* stmt_count_out,
         uint64_t* hash_out
+    );
+
+    /**
+     * @brief Retrieve the current prepared-statement compatibility profile.
+     *
+     * OPTIONAL — may be NULL. When absent, the engine must conservatively
+     * avoid semantic exact-match reuse and fall back to clean-replay paths.
+     *
+     * @param ctx    Protocol flow context (session-scoped)
+     * @param out    Output profile
+     * @return 0 on success, -1 on error/unsupported.
+     */
+    int (*get_stmt_compat_profile)(
+        void* ctx,
+        keel_stmt_compat_profile_t* out
     );
 
     /**

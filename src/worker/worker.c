@@ -2059,15 +2059,24 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
      * would send Parse("sbstmt1") onto a backend that already has "sbstmt1"
      * → ErrorResponse → backend stuck in error-recovery (needs Sync) →
      * keel waiting for RFQ → permanent deadlock. */
-    uint64_t stmt_hash = 0;
+    keel_stmt_compat_profile_t stmt_profile;
+    memset(&stmt_profile, 0, sizeof(stmt_profile));
     const keel_proto_flow_vtable_t* flow = recv_ctx->flow.flow;
     if (flow && flow->get_stmt_replay && recv_ctx->flow.ctx) {
         flow->get_stmt_replay(recv_ctx->flow.ctx,
-                              NULL, NULL, NULL, &stmt_hash);
+                              NULL, NULL, NULL, &stmt_profile.stmt_set_hash);
+    }
+    if (flow && flow->get_stmt_compat_profile && recv_ctx->flow.ctx) {
+        if (flow->get_stmt_compat_profile(recv_ctx->flow.ctx, &stmt_profile) < 0) {
+            memset(&stmt_profile, 0, sizeof(stmt_profile));
+        }
+    } else if (stmt_profile.stmt_set_hash != 0) {
+        /* No semantic profile callback: force conservative replay paths. */
+        stmt_profile.semantic_unknown = true;
     }
     bool needs_replay = false;
     backend_conn_t* be_conn = backend_pool_borrow_with_stmts(
-            pool, 0, stmt_hash, &needs_replay);
+            pool, 0, &stmt_profile, &needs_replay);
 
     if (!be_conn) {
         /* Opportunistic reclaim: a backend may have completed DISCARD ALL
@@ -2077,7 +2086,7 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
 
         bool needs_replay_retry = false;
         be_conn = backend_pool_borrow_with_stmts(
-                pool, 0, stmt_hash, &needs_replay_retry);
+                pool, 0, &stmt_profile, &needs_replay_retry);
         if (be_conn) {
             needs_replay = needs_replay_retry;
         }
@@ -2088,10 +2097,10 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
          * A returning backend (or the refill timer) will wake it. */
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pool_wait_resume_requeues);
-        KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
             "W%u: pool_wait_resume: no backend for stmt_hash=0x%016llx "
             "(active=%zu clean=%zu wait=%zu) re-queuing",
-            worker->id, (unsigned long long)stmt_hash,
+            worker->id, (unsigned long long)stmt_profile.stmt_set_hash,
             pool->active_count, pool->clean_count,
             pool->wait_queue_size);
         if (recv_ctx->flow.pending_msg) {

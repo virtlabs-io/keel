@@ -230,6 +230,35 @@ static inline void backend_pool_mark_borrowed(backend_conn_t* conn)
     conn->active_owner = conn;
 }
 
+static inline void backend_pool_reset_stmt_profile(backend_conn_t* conn)
+{
+    if (!conn) return;
+    memset(&conn->stmt_profile, 0, sizeof(conn->stmt_profile));
+}
+
+bool backend_pool_stmt_compatible(const keel_stmt_compat_profile_t* required,
+                                  const backend_conn_t* conn)
+{
+    if (!required || !conn)
+        return false;
+
+    if (required->semantic_unknown || conn->stmt_profile.semantic_unknown)
+        return false;
+    if (conn->stmt_set_hash != required->stmt_set_hash)
+        return false;
+    if (conn->stmt_profile.semantic_profile_hash != required->semantic_profile_hash)
+        return false;
+    if (conn->stmt_profile.schema_epoch != required->schema_epoch)
+        return false;
+    if (conn->stmt_profile.role_hash != required->role_hash)
+        return false;
+    if (conn->stmt_profile.search_path_hash != required->search_path_hash)
+        return false;
+    if (conn->stmt_profile.guc_hash != required->guc_hash)
+        return false;
+    return true;
+}
+
 bool backend_pool_can_borrow(const backend_conn_t* conn)
 {
     if (!conn) return false;
@@ -297,6 +326,7 @@ static void backend_pool_close_slot_locked(backend_pool_t* pool,
     conn->protocol_desync = false;
     conn->current_state_hash = 0;
     conn->stmt_set_hash = 0;
+    backend_pool_reset_stmt_profile(conn);
     conn->quarantine = BACKEND_QUARANTINE_NONE;
     conn->close_reason = reason;
     conn->generation++;
@@ -377,6 +407,7 @@ static void backend_pool_reclaim_clean_locked(backend_pool_t* pool,
     backend_pool_cleanup_reset(conn);
     conn->current_state_hash = 0;
     conn->stmt_set_hash = 0;
+    backend_pool_reset_stmt_profile(conn);
     conn->needs_sync = false;
     conn->syncing = false;
     conn->replay_active = false;
@@ -942,6 +973,7 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
             if (conn->stmt_set_hash != 0) {
                 conn->needs_full_cleanup = true;
                 conn->stmt_set_hash = 0;
+                backend_pool_reset_stmt_profile(conn);
                 POOL_STAT_INC(pool, pool_borrow_cleanup_required);
             }
             pool_record_borrow_result(pool, BORROW_RESULT_SUCCESS);
@@ -1031,9 +1063,12 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
  */
 backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                                                 uint64_t required_state_hash,
-                                                uint64_t required_stmt_hash,
+                                                const keel_stmt_compat_profile_t* required_stmt_profile,
                                                 bool* out_needs_replay)
 {
+    uint64_t required_stmt_hash = required_stmt_profile
+        ? required_stmt_profile->stmt_set_hash
+        : 0;
     bool replay_dummy = false;
     if (!out_needs_replay)
         out_needs_replay = &replay_dummy;
@@ -1057,7 +1092,9 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                 conn = conn->next;
                 continue;
             }
-            if (conn->stmt_set_hash == required_stmt_hash) {
+            if (conn->stmt_set_hash == required_stmt_hash &&
+                required_stmt_profile &&
+                backend_pool_stmt_compatible(required_stmt_profile, conn)) {
                 backend_conn_state_t expected = BACKEND_CONN_IDLE;
                 if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
                     *prev = conn->next;
@@ -1259,6 +1296,7 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                     backend_pool_mark_borrowed(conn);
                     /* Clear stale stmt hash; engine will clean before replay */
                     conn->stmt_set_hash      = 0;
+                    backend_pool_reset_stmt_profile(conn);
                     conn->needs_full_cleanup  = true;
                     POOL_STAT_INC(pool, pool_borrow_cleanup_required);
                     *out_needs_replay        = (required_stmt_hash != 0);

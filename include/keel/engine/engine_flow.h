@@ -196,6 +196,7 @@ typedef struct keel_session_flow {
     const uint8_t*                 stmt_replay_orig_msg;
     size_t                         stmt_replay_orig_len;
     uint64_t                       stmt_replay_hash;
+    keel_stmt_compat_profile_t     stmt_replay_profile; /**< Session profile captured at borrow time. */
     bool                           stmt_replay_needs_cleanup; /**< True: waiting for plugin cleanup to finish
                                                                *   before replaying protocol-owned prepared state.
                                                                *   Set when a borrowed backend still carries

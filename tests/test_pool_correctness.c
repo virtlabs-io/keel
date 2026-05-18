@@ -1181,6 +1181,46 @@ static void test_wait_queue_fifo_resume_order(void)
     TEST_END();
 }
 
+static void test_stmt_semantic_compatibility_predicate(void)
+{
+    TEST_BEGIN("stmt semantic profile compatibility predicate");
+
+    backend_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.stmt_set_hash = 0xABCDEFULL;
+    conn.stmt_profile.stmt_set_hash = 0xABCDEFULL;
+    conn.stmt_profile.semantic_profile_hash = 0x1111ULL;
+    conn.stmt_profile.schema_epoch = 3;
+    conn.stmt_profile.role_hash = 0x2222ULL;
+    conn.stmt_profile.search_path_hash = 0x3333ULL;
+    conn.stmt_profile.guc_hash = 0x4444ULL;
+    conn.stmt_profile.semantic_unknown = false;
+
+    keel_stmt_compat_profile_t req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+    TEST_ASSERT(backend_pool_stmt_compatible(&req, &conn));
+
+    req.semantic_profile_hash ^= 0x1ULL;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+    req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+
+    req.role_hash ^= 0x1ULL;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+    req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+
+    req.semantic_unknown = true;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+
+    conn.stmt_profile.semantic_unknown = true;
+    req.semantic_unknown = false;
+    req.stmt_set_hash = conn.stmt_set_hash;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+
+    TEST_END();
+}
+
 /* ============================================================================
  * Main
  * ============================================================================ */
@@ -1217,6 +1257,7 @@ int main(void)
     test_wait_queue_cancel_removes_dead_session();
     test_wait_queue_timeout_no_leak();
     test_wait_queue_fifo_resume_order();
+    test_stmt_semantic_compatibility_predicate();
 
     printf("\n");
     return test_summary();
