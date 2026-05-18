@@ -196,6 +196,13 @@ enum {
     KEEL_PINV_LIST_DUPLICATE         = (1 << 7),
     KEEL_PINV_CLEANING_BORROWABLE    = (1 << 8),
     KEEL_PINV_CLEANUP_STATE_INVALID  = (1 << 9),
+    /* Non-borrowable flags (syncing/replay_active/protocol_desync) on a
+     * borrowable list means the backend can never be selected by can_borrow,
+     * causing it to silently starve the pool.  Catch it here. */
+    KEEL_PINV_UNBORRWABLE_ON_IDLE    = (1 << 10),
+    /* ACTIVE backend without an active_owner is a dangling reference: the
+     * worker that borrowed it has no way to return or discard it. */
+    KEEL_PINV_ACTIVE_WITHOUT_OWNER   = (1 << 11),
 };
 
 /**
@@ -236,6 +243,11 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
             if (c->current_state_hash != 0 || c->stmt_set_hash != 0 ||
                 c->needs_full_cleanup || (c->profile && c->profile->count != 0))
                 v |= KEEL_PINV_CLEAN_LIST_DIRTY;
+            /* syncing/replay_active/protocol_desync connections cannot be
+             * borrowed (can_borrow rejects them), so they must never sit on
+             * the clean or idle lists where they would permanently block a slot. */
+            if (c->syncing || c->replay_active || c->protocol_desync)
+                v |= KEEL_PINV_UNBORRWABLE_ON_IDLE;
             if (v) break;
             c = c->next;
         }
@@ -254,6 +266,9 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
                 v |= KEEL_PINV_BORROWABLE_HAS_OWNER;
             if (c->needs_full_cleanup)
                 v |= KEEL_PINV_CLEAN_LIST_DIRTY;
+            /* Same as clean_list: un-borrowable flags must not appear here. */
+            if (c->syncing || c->replay_active || c->protocol_desync)
+                v |= KEEL_PINV_UNBORRWABLE_ON_IDLE;
             if (v) break;
             c = c->next;
         }
@@ -312,6 +327,13 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
                 v |= KEEL_PINV_LIST_DUPLICATE;
             if (refs > 0 && s != BACKEND_CONN_IDLE)
                 v |= KEEL_PINV_IDLE_ON_WRONG_LIST;
+
+            if (s == BACKEND_CONN_ACTIVE) {
+                /* An ACTIVE backend with no owner is a dangling reference:
+                 * nobody can return or discard it. */
+                if (slot->active_owner == NULL)
+                    v |= KEEL_PINV_ACTIVE_WITHOUT_OWNER;
+            }
 
             if (s == BACKEND_CONN_CLEANING) {
                 actual_cleaning++;

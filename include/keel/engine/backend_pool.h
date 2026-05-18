@@ -436,10 +436,12 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
  *
  * Calling this on a connection that is not in ACTIVE state is a safe no-op.
  *
- * @param pool Pool the connection belongs to
- * @param conn Connection to discard
+ * @param pool   Pool the connection belongs to
+ * @param conn   Connection to discard
+ * @param reason Why this connection is being discarded (stored in conn->close_reason)
  */
-void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn);
+void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn,
+                          backend_close_reason_t reason);
 
 /**
  * @brief Close a backend slot and emit exactly one close reason for this close.

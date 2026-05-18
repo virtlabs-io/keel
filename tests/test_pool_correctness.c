@@ -1082,13 +1082,13 @@ static void test_discard_decrements_active_count(void)
     /* Simulate an error: close the fd and discard */
     close(conn->fd);
     conn->fd = -1;
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
 
     TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
     TEST_ASSERT_EQ(pool->active_count, 0U);
 
     /* Second discard must be a safe no-op (state is already CLOSED) */
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
     TEST_ASSERT_EQ(pool->active_count, 0U);
 
     /* Peer fd still open; fd in slot was already closed above */
@@ -1211,7 +1211,7 @@ static void test_update_state_hash_pins_connection(void)
     /* Discard instead of return because state is no longer ACTIVE */
     close(conn->fd);
     conn->fd = -1;
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
     destroy_test_pool(pool, be_fds, 1);
     TEST_END();
 }

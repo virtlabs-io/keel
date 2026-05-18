@@ -41,11 +41,19 @@
 #include <netdb.h>
 #include "keel/util/platform_compat.h"
 
-/* Debug logging - set KEEL_DEBUG to enable */
-#ifdef KEEL_DEBUG
+/* Debug logging - active when NDEBUG is not defined */
+#ifndef NDEBUG
 #define KEEL_DEBUG_LOG(...) KEEL_LOG_TRACE(KEEL_LOG_CAT_IO, __VA_ARGS__)
+#define KEEL_ASSERT(expr, msg) \
+    do { \
+        if (__builtin_expect(!(expr), 0)) { \
+            fprintf(stderr, "BACKEND ASSERT FAIL: %s (%s:%d)\n", (msg), __FILE__, __LINE__); \
+            __builtin_trap(); \
+        } \
+    } while (0)
 #else
 #define KEEL_DEBUG_LOG(...) ((void)0)
+#define KEEL_ASSERT(expr, msg) ((void)0)
 #endif
 
 /* Stats helpers for CLEANING gauge — pool->stats_ctx may be NULL */
@@ -202,7 +210,7 @@ static void backend_pool_cleanup_reset(backend_conn_t* conn);
 
 static inline void backend_pool_assert_owner_invariant(const backend_conn_t* conn)
 {
-#ifdef KEEL_DEBUG
+#ifndef NDEBUG
     if (!conn) return;
     backend_conn_state_t st = atomic_load_explicit(&((backend_conn_t*)conn)->state,
                                                    memory_order_relaxed);
@@ -1560,7 +1568,8 @@ backend_conn_t* backend_pool_borrow_profiled(backend_pool_t* pool,
  * @param conn Connection to return.
  * @param in_transaction `true` if the connection has an open transaction.
  */
-void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn)
+void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn,
+                          backend_close_reason_t reason)
 {
     if (!conn) return;
     pthread_mutex_lock(&pool->lock);
@@ -1568,7 +1577,7 @@ void backend_pool_discard(backend_pool_t* pool, backend_conn_t* conn)
         pthread_mutex_unlock(&pool->lock);
         return;
     }
-    backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, true);
+    backend_pool_close_slot_locked(pool, conn, reason, true);
     KEEL_CHECK_POOL_INVARIANTS(pool);
     pthread_mutex_unlock(&pool->lock);
 }
