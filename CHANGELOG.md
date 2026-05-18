@@ -34,6 +34,17 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 - Helm `webhook.yaml` template and `webhook.*` values stanza
 - `BENCHMARKS.md` — throughput and latency comparison vs PgBouncer 1.22
 
+### Changed
+- Production-status documentation now separates `v0.2-alpha` features into
+  `Production candidate`, `Hardening`, `Experimental`, and `Aspirational`
+  buckets across `README.md`, `docs/PRODUCTION_READINESS.md`, and config examples
+- Recommended production deployment is now documented consistently as
+  PostgreSQL `pool` mode with `prepared_statement = virtualize` and
+  `experimental_features = false`
+- Config examples now visibly mark experimental profiles and require explicit
+  opt-in; sharding, scatter-merge, WAL/GTID capture, and multi-proxy
+  clustering examples are no longer presented as default production candidates
+
 ---
 
 ## [alpha-0.3.0] — 2026-05-07
@@ -188,4 +199,3 @@ Initial internal alpha release. Core engine, PostgreSQL pooling, basic routing, 
 [alpha-0.3.0]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
 [0.3.0-dev]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
 [alpha-0.1]: https://github.com/virtlabs-io/dbcp-keel/releases/tag/alpha-0.1
-

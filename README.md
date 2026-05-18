@@ -7,7 +7,7 @@
 [![codecov](https://codecov.io/gh/virtlabs-io/dbcp-keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/dbcp-keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, intelligent query routing, transaction pooling, automatic failover, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols.
+A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.2-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
 
 Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Performance](docs/PERF_STRICT_AB3_SUMMARY.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
@@ -23,9 +23,20 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Multi-protocol** — PostgreSQL and MySQL from the same binary
 - **Transaction pooling** — connections returned to the pool after each transaction
 
-## Features
+## Production Support Status for v0.2-alpha
 
-### Feature Status
+Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize` and `experimental_features = false`.
+
+| Status | Features |
+|--------|----------|
+| **Production candidate** | PostgreSQL pool mode, PostgreSQL prepared-statement virtualization after replay validation, admin inspection and basic metrics |
+| **Hardening** | Smart routing, SSV, Patroni failover, transaction tracking |
+| **Experimental** | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
+| **Aspirational** | Result cache correctness guarantees |
+
+`smart` and `full` remain useful tiers, but they are not the default production recommendation for `v0.2-alpha`. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
+
+## Feature Status
 
 KEEL has a broad feature surface. The labels below keep the advertised model
 aligned with the implementation state:
@@ -61,7 +72,7 @@ Experimental features require explicit opt-in:
 experimental_features = true
 
 [worker_group.main]
-mode = smart
+mode = smart                  # hardening tier, not the default production tier
 result_cache = on
 scatter_merge = on
 wal_lsn_capture = on
@@ -548,11 +559,14 @@ primary = host=db.local port=5432 dbname=app user=app password=secret role=RW we
 
 #### Scenario 2: PostgreSQL with Read/Write Splitting + Patroni HA
 
+This profile is in the **hardening** bucket for `v0.2-alpha`. Use it only when
+you need read/write routing and have validated failover behavior in your own environment.
+
 ```ini
 [worker_group.prod]
 protocol            = postgresql
 bind_port           = 5432
-mode                = smart
+mode                = smart        # hardening, not default production tier
 prepared_statement  = virtualize
 transaction_tracking = on          # read-after-write consistency
 min_pool_size       = 10

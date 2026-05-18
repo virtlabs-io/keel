@@ -87,14 +87,14 @@ prepared_statement = virtualize
 **Intelligent routing with observability:**
 ```ini
 [worker-group:main]
-mode = smart
+mode = smart   # hardening tier for v0.2-alpha
 query_log = all
 ```
 
 **Full programmability with hooks and safety:**
 ```ini
 [worker-group:main]
-mode = full
+mode = full    # explicit opt-in; not the default production profile
 transaction_tracking = on
 hook_script_lua = /etc/keel/hooks/audit.lua
 ```
@@ -201,8 +201,9 @@ backend with zero pooling sophistication.
                                        SMART               FULL
 ```
 
-**When in doubt, start with `pool`.** Move to `smart` or `full` only after
-you have validated the higher-tier behavior you need in your environment.
+**When in doubt, start with `pool`.** For `v0.2-alpha`, that is the recommended
+production tier. Move to `smart` or `full` only after you have validated the
+higher-tier behavior you need in your environment.
 
 ---
 
