@@ -239,6 +239,14 @@ typedef struct pg_flow_ctx {
     uint8_t* anon_rewrite_buf;
     size_t   anon_rewrite_cap;
 
+    /* Tracking mode: after transaction-local temp context changes, force the
+     * next SQL EXECUTE through DISCARD PLANS + EXECUTE and absorb the DISCARD
+     * command tag so PostgreSQL replans against the temp namespace. */
+    bool     stmt_discard_plans_before_execute;
+    bool     stmt_discard_plans_absorb_pending;
+    uint8_t* stmt_discard_plans_rewrite_buf;
+    size_t   stmt_discard_plans_rewrite_cap;
+
     /* Cross-service RYW: latest captured write LSN (from notify_write_lsn).
      * Returned verbatim in response to SHOW keel.write_lsn queries. */
     char     keel_write_lsn[128];

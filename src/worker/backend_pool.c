@@ -250,20 +250,43 @@ bool backend_pool_stmt_compatible(const keel_stmt_compat_profile_t* required,
     if (!required || !conn)
         return false;
 
-    if (required->semantic_unknown || conn->stmt_profile.semantic_unknown)
+    if (required->semantic_unknown || conn->stmt_profile.semantic_unknown) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL semantic_unknown req=%d conn=%d\n",
+            (int)required->semantic_unknown, (int)conn->stmt_profile.semantic_unknown);
         return false;
-    if (conn->stmt_set_hash != required->stmt_set_hash)
+    }
+    if (conn->stmt_set_hash != required->stmt_set_hash) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL stmt_set_hash req=%016llx conn=%016llx\n",
+            (unsigned long long)required->stmt_set_hash, (unsigned long long)conn->stmt_set_hash);
         return false;
-    if (conn->stmt_profile.semantic_profile_hash != required->semantic_profile_hash)
+    }
+    if (conn->stmt_profile.semantic_profile_hash != required->semantic_profile_hash) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL semantic_profile_hash req=%016llx conn=%016llx\n",
+            (unsigned long long)required->semantic_profile_hash,
+            (unsigned long long)conn->stmt_profile.semantic_profile_hash);
         return false;
-    if (conn->stmt_profile.schema_epoch != required->schema_epoch)
+    }
+    if (conn->stmt_profile.schema_epoch != required->schema_epoch) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL schema_epoch req=%u conn=%u\n",
+            (unsigned)required->schema_epoch, (unsigned)conn->stmt_profile.schema_epoch);
         return false;
-    if (conn->stmt_profile.role_hash != required->role_hash)
+    }
+    if (conn->stmt_profile.role_hash != required->role_hash) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL role_hash req=%016llx conn=%016llx\n",
+            (unsigned long long)required->role_hash, (unsigned long long)conn->stmt_profile.role_hash);
         return false;
-    if (conn->stmt_profile.search_path_hash != required->search_path_hash)
+    }
+    if (conn->stmt_profile.search_path_hash != required->search_path_hash) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL search_path_hash req=%016llx conn=%016llx\n",
+            (unsigned long long)required->search_path_hash,
+            (unsigned long long)conn->stmt_profile.search_path_hash);
         return false;
-    if (conn->stmt_profile.guc_hash != required->guc_hash)
+    }
+    if (conn->stmt_profile.guc_hash != required->guc_hash) {
+        fprintf(stderr, "[DBG-COMPAT] FAIL guc_hash req=%016llx conn=%016llx\n",
+            (unsigned long long)required->guc_hash, (unsigned long long)conn->stmt_profile.guc_hash);
         return false;
+    }
     return true;
 }
 

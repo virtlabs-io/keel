@@ -2145,6 +2145,9 @@ copy_scan_done:
                 if (worker->router &&
                     (act.effect & KEEL_QE_BEGINS_TX) &&
                     !(act.effect & KEEL_QE_READONLY) &&
+                    (sf->pins & ~(keel_flow_pin_reason_t)(
+                        KEEL_FPIN_TRANSACTION | KEEL_FPIN_EXTENDED_PROTO)) ==
+                        KEEL_FPIN_NONE &&
                     act.be_payload && act.be_payload_len > 0 &&
                     act.be_payload_len <= sizeof(sf->begin_deferred_payload)) {
                     memcpy(sf->begin_deferred_payload, act.be_payload,
@@ -2715,6 +2718,15 @@ copy_scan_done:
                 keel_flow_pin_reason_t pins_stable =
                     sf->pins & ~(keel_flow_pin_reason_t)KEEL_FPIN_EXTENDED_PROTO;
 
+                keel_flow_pin_reason_t pins_for_borrow = pins_stable;
+                if ((act.effect & KEEL_QE_BEGINS_TX) &&
+                    keel_ssv_is_stmt_only_pin(
+                        pins_stable & ~(keel_flow_pin_reason_t)KEEL_FPIN_TRANSACTION,
+                        sf->ps_mode)) {
+                    pins_for_borrow =
+                        pins_stable & ~(keel_flow_pin_reason_t)KEEL_FPIN_TRANSACTION;
+                }
+
                 if (pins_stable != KEEL_FPIN_NONE) {
                     /* KEEL_FPIN_PREPARED_STMT alone does NOT require hard-pin (spec §17).
                      * The backend is released at each transaction boundary and re-borrowed
@@ -2728,7 +2740,7 @@ copy_scan_done:
                      *
                      * All other pins (transaction, copy, cursor, etc.) always require
                      * the exact same backend connection. */
-                    bool only_stmt_pin = keel_ssv_is_stmt_only_pin(pins_stable,
+                    bool only_stmt_pin = keel_ssv_is_stmt_only_pin(pins_for_borrow,
                                                                   sf->ps_mode);
                     /* OFF mode: hard-pin like PINNING but with zero tracking overhead.
                      * No stmt_cache on the protocol side means no hash to match and
@@ -3013,7 +3025,6 @@ copy_scan_done:
              * We wait for ParseComplete responses in on_be_data. */
             if (sf->stmt_replay_hash != 0 && flow->get_stmt_replay &&
                 act.be_payload && act.be_payload_len > 0) {
-
                 uint8_t* rbuf   = NULL;
                 size_t   rlen   = 0;
                 uint32_t rcount = 0;

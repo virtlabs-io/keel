@@ -2557,6 +2557,62 @@ static void test_ps_tracking_temp_table_bumps_temp_epoch(void) {
     TEST_END();
 }
 
+static void test_ps_tracking_temp_shadow_execute_discards_plans(void) {
+    TEST_BEGIN("ps_mode/tracking: temp shadow rewrites next EXECUTE with DISCARD PLANS");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t fact;
+    keel_be_action_t bact;
+
+    size_t len = build_query(buf, "PREPARE pshadow AS SELECT COUNT(*) FROM shadow_target");
+    int rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    len = build_query(buf, "BEGIN");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    len = build_ready_for_query(buf, 'T');
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(c->in_transaction);
+
+    len = build_query(buf, "CREATE TEMP TABLE shadow_target (id int)");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(c->stmt_discard_plans_before_execute);
+
+    len = build_query(buf, "EXECUTE pshadow");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(fact.be_payload != buf);
+    TEST_ASSERT_EQ(fact.be_payload[0], 'Q');
+    TEST_ASSERT(strstr((const char*)fact.be_payload + 5,
+                       "DISCARD PLANS;EXECUTE pshadow") != NULL);
+    TEST_ASSERT(!c->stmt_discard_plans_before_execute);
+    TEST_ASSERT(c->stmt_discard_plans_absorb_pending);
+
+    len = build_command_complete(buf, "DISCARD PLANS");
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(bact.type, KEEL_BE_ACT_ABSORB);
+    TEST_ASSERT(!c->stmt_discard_plans_absorb_pending);
+
+    len = build_command_complete(buf, "SELECT 1");
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(bact.type != KEEL_BE_ACT_ABSORB);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
 static void test_ps_tracking_extended_temp_table_bumps_temp_epoch(void) {
     TEST_BEGIN("ps_mode/tracking: extended Execute temp DDL bumps temp stmt epoch");
 
@@ -4948,6 +5004,7 @@ int main(void) {
     test_ps_tracking_extended_set_local_search_path_rehashes_and_reverts();
     test_ps_tracking_local_overlay_and_temp_shadow_rehash_order_on_rollback();
     test_ps_tracking_temp_table_bumps_temp_epoch();
+    test_ps_tracking_temp_shadow_execute_discards_plans();
     test_ps_tracking_extended_temp_table_bumps_temp_epoch();
     test_ps_tracking_temp_on_commit_drop_rehashes_at_tx_end();
     test_ps_tracking_extended_temp_on_commit_drop_rehashes_at_tx_end();

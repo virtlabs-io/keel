@@ -125,6 +125,8 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
     ctx->pending_parse_name[0] = '\0';
     ctx->pending_deallocate_valid = false;
     ctx->pending_deallocate_absorbed_error = false;
+    ctx->stmt_discard_plans_before_execute = false;
+    ctx->stmt_discard_plans_absorb_pending = false;
     ctx->named_stmt_count = 0;
 
     for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
@@ -141,6 +143,20 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
     }
 
     ctx->session_stmt_hash = 0;
+}
+
+/** Return true if the session has any confirmed prepared statement entries. */
+static bool pg_stmt_has_confirmed_entries(const pg_flow_ctx_t* ctx)
+{
+    if (!ctx) return false;
+
+    for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
+        const pg_stmt_entry_t* e = &ctx->stmt_cache[i];
+        if (e->valid && e->confirmed)
+            return true;
+    }
+
+    return false;
 }
 
 /** Copy stmt_cache entry classification into the active cached_* fields. */
@@ -2102,6 +2118,10 @@ static void pgf_destroy(void* v) {
         keel_free(ctx->anon_rewrite_buf);
         ctx->anon_rewrite_buf = NULL;
     }
+    if (ctx->stmt_discard_plans_rewrite_buf) {
+        keel_free(ctx->stmt_discard_plans_rewrite_buf);
+        ctx->stmt_discard_plans_rewrite_buf = NULL;
+    }
     /* Free anonymous mode map */
     if (ctx->anon_map) {
         keel_free(ctx->anon_map);
@@ -2849,6 +2869,11 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             if (qtype != KEEL_QUERY_SELECT &&
                 pg_stmt_is_temp_context_change(ctx, sql, sl, qtype)) {
                 pg_stmt_bump_temp_epoch(ctx);
+                if (ctx->ps_mode == KEEL_PS_MODE_TRACKING &&
+                    ctx->in_transaction &&
+                    pg_stmt_has_confirmed_entries(ctx)) {
+                    ctx->stmt_discard_plans_before_execute = true;
+                }
                 if (pg_stmt_temp_change_resets_on_tx_end(sql, sl))
                     ctx->stmt_temp_tx_reset_pending = true;
                 if (ctx->in_transaction)
@@ -2920,23 +2945,15 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                                        trk_body, sizeof(trk_body),
                                        &trk_body_len)
                 && trk_name[0] != '\0') {
-                /* Build a Parse wire message for the stmt_cache so replay
-                 * can reproduce it on a new backend.
-                 * Format: 'P' | int32 len | stmt_name\0 | body_sql\0 | int16 0 */
-                size_t wire_len = 1 + 4                 /* type + length */
-                                + strlen(trk_name) + 1  /* stmt_name\0 */
-                                + trk_body_len + 1      /* sql\0 */
-                                + 2;                    /* int16 num_params = 0 */
+                /* Preserve SQL-level PREPARE for replay.  PostgreSQL's SQL
+                 * PREPARE and extended Parse share a namespace, but SQL
+                 * PREPARE has subtly different invalidation behavior around
+                 * transaction-local temp table shadowing. */
+                size_t wire_len = len;
                 if (wire_len <= PG_STMT_MAX_WIRE) {
                     uint8_t* wire = keel_malloc(wire_len);
                     if (wire) {
-                        uint8_t* wp = wire;
-                        *wp++ = 'P';
-                        wr32(wp, (uint32_t)(wire_len - 1)); wp += 4;
-                        size_t nl = strlen(trk_name);
-                        memcpy(wp, trk_name, nl + 1); wp += nl + 1;
-                        memcpy(wp, trk_body, trk_body_len + 1); wp += trk_body_len + 1;
-                        wp[0] = 0; wp[1] = 0; /* num_params = 0 */
+                        memcpy(wire, data, wire_len);
 
                         /* Save prior entry (if any confirmed entry exists for this
                          * name) so we can restore it if the backend rejects the PREPARE.
@@ -3004,6 +3021,43 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                             keel_free(wire);
                         }
                     }
+                }
+            }
+        }
+
+        if (ctx->stmt_discard_plans_before_execute &&
+            ctx->ps_mode == KEEL_PS_MODE_TRACKING &&
+            qtype == (uint32_t)KEEL_QUERY_EXECUTE &&
+            act->be_payload == data) {
+            static const char discard_prefix[] = "DISCARD PLANS;";
+            size_t prefix_len = sizeof(discard_prefix) - 1;
+            size_t new_sql_len = prefix_len + sl;
+            size_t total = 1 + 4 + new_sql_len + 1;
+            if (total <= UINT32_MAX) {
+                if (ctx->stmt_discard_plans_rewrite_cap < total) {
+                    keel_free(ctx->stmt_discard_plans_rewrite_buf);
+                    ctx->stmt_discard_plans_rewrite_buf =
+                        (uint8_t*)keel_malloc(total);
+                    ctx->stmt_discard_plans_rewrite_cap =
+                        ctx->stmt_discard_plans_rewrite_buf ? total : 0;
+                }
+
+                if (ctx->stmt_discard_plans_rewrite_buf &&
+                    ctx->stmt_discard_plans_rewrite_cap >= total) {
+                    uint8_t* wp = ctx->stmt_discard_plans_rewrite_buf;
+                    *wp++ = 'Q';
+                    wr32(wp, (uint32_t)(4 + new_sql_len + 1));
+                    wp += 4;
+                    memcpy(wp, discard_prefix, prefix_len);
+                    wp += prefix_len;
+                    memcpy(wp, sql, sl);
+                    wp += sl;
+                    *wp = '\0';
+
+                    act->be_payload = ctx->stmt_discard_plans_rewrite_buf;
+                    act->be_payload_len = total;
+                    ctx->stmt_discard_plans_before_execute = false;
+                    ctx->stmt_discard_plans_absorb_pending = true;
                 }
             }
         }
@@ -3361,6 +3415,11 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                                                ctx->cached_sql_len,
                                                ctx->cached_query_type)) {
                 pg_stmt_bump_temp_epoch(ctx);
+                if (ctx->ps_mode == KEEL_PS_MODE_TRACKING &&
+                    ctx->in_transaction &&
+                    pg_stmt_has_confirmed_entries(ctx)) {
+                    ctx->stmt_discard_plans_before_execute = true;
+                }
                 if (pg_stmt_temp_change_resets_on_tx_end(ctx->cached_sql,
                                                          ctx->cached_sql_len)) {
                     ctx->stmt_temp_tx_reset_pending = true;
@@ -3750,8 +3809,17 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         return 0;
     case 'C': /* CommandComplete */
         /* Tracking mode: confirm a staged simple-query PREPARE on success. */
+    {
+        const char* tag = (len > 5) ? (const char*)(data + 5) : "";
+        if (ctx->stmt_discard_plans_absorb_pending &&
+            strncmp(tag, "DISCARD PLANS", 13) == 0) {
+            ctx->stmt_discard_plans_absorb_pending = false;
+            act->type = KEEL_BE_ACT_ABSORB;
+            act->fe_payload = NULL;
+            act->fe_payload_len = 0;
+            return 0;
+        }
         if (ctx->pending_track_valid) {
-            const char* tag = (len > 5) ? (const char*)(data + 5) : "";
             if (strncmp(tag, "PREPARE", 7) == 0 &&
                 (tag[7] == '\0' || !isalnum((unsigned char)tag[7]))) {
                 pg_stmt_entry_t* pe = pg_stmt_find(ctx, ctx->pending_track_name);
@@ -3769,9 +3837,15 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 ctx->pending_track_had_prior = false;
             }
         }
+        if (strncmp(tag, "PREPARE", 7) == 0 &&
+            (tag[7] == '\0' || !isalnum((unsigned char)tag[7]))) {
+            act->stmt_replay_accepted = true;
+        }
         return 0;
+    }
     case 'E': /* ErrorResponse */
         act->is_error_response = true;
+        ctx->stmt_discard_plans_absorb_pending = false;
         /* Tracking mode: backend rejected the staged PREPARE — roll back the
          * cache entry to the prior confirmed state (or remove it if there was
          * no prior entry).  The ErrorResponse is still forwarded to the client
@@ -3843,6 +3917,8 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 }
                 if (prev != 'I')
                     pg_stmt_restore_tx_local_gucs(ctx);
+                ctx->stmt_discard_plans_before_execute = false;
+                ctx->stmt_discard_plans_absorb_pending = false;
                 ctx->stmt_temp_tx_rollback_reset_pending = false;
                 ctx->stmt_last_tx_end_was_rollback = false;
             } else if (s == 'T') {
@@ -4770,6 +4846,10 @@ static int pgf_get_stmt_replay(void* vctx,
     if (stmt_count_out) *stmt_count_out = 0;
     if (hash_out)       *hash_out       = ctx->session_stmt_hash;
 
+    fprintf(stderr, "[DBG-GETSRP] session_stmt_hash=%016llx full=%d semantic_unknown=%d datestyle='%s'\n",
+        (unsigned long long)ctx->session_stmt_hash, (int)(replay_buf_out != NULL),
+        (int)ctx->stmt_semantic_unknown, ctx->stmt_datestyle);
+
     if (ctx->stmt_semantic_unknown) {
         if (hash_out) *hash_out = 0;
         return 0;
@@ -4838,6 +4918,7 @@ static int pgf_get_stmt_replay(void* vctx,
     /* Pass 1: count total bytes and number of replayable stmts */
     size_t   total_len  = 0;
     uint32_t stmt_count = 0;
+    bool     has_parse_replay = false;
     size_t   sync_msg_len = 0;
     if (sync_sql_len > 0)
         sync_msg_len = 1 + 4 + sync_sql_len + 1;  /* 'Q' + len + sql + NUL */
@@ -4851,10 +4932,15 @@ static int pgf_get_stmt_replay(void* vctx,
             continue;
         total_len  += e->wire_msg_len;
         stmt_count++;
+        if (e->wire_msg[0] == 'P')
+            has_parse_replay = true;
     }
 
     if (stmt_count == 0 || total_len == 0)
         return 0;
+
+    if (has_parse_replay)
+        total_len += 5;  /* Sync */
 
     /* Pass 2: build concatenated buffer */
     uint8_t* buf = (uint8_t*)keel_malloc(total_len);
@@ -4872,37 +4958,27 @@ static int pgf_get_stmt_replay(void* vctx,
         buf[offset++] = '\0';
     }
 
-    for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
-        pg_stmt_entry_t* e = &ctx->stmt_cache[i];
-        if (!e->valid || !e->confirmed || e->name[0] == '\0' ||
-            !e->wire_msg || e->wire_msg_len == 0)
-            continue;
-        memcpy(buf + offset, e->wire_msg, e->wire_msg_len);
-        offset += e->wire_msg_len;
+    for (int pass = 0; pass < 2; pass++) {
+        uint8_t replay_kind = pass == 0 ? 'Q' : 'P';
+        for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
+            pg_stmt_entry_t* e = &ctx->stmt_cache[i];
+            if (!e->valid || !e->confirmed || e->name[0] == '\0' ||
+                !e->wire_msg || e->wire_msg_len == 0 ||
+                e->wire_msg[0] != replay_kind)
+                continue;
+            memcpy(buf + offset, e->wire_msg, e->wire_msg_len);
+            offset += e->wire_msg_len;
+        }
     }
 
-    /* Append a Sync message ('S' + uint32 4) after all Parse frames.
-     * PostgreSQL extended query protocol: the backend only emits
-     * ParseComplete responses AFTER it receives a Sync.  Without Sync
-     * the backend queues all responses indefinitely, so the
-     * WAIT_STMT_REPLAY path would never receive any ParseComplete and
-     * would deadlock forever (io_uring recv CQE never fires).
-     *
-     * The resulting ReadyForQuery ('Z') that the Sync generates will
-     * arrive after all ParseCompletes and will be silently consumed by
-     * the WAIT_STMT_REPLAY on_be_data handler (the handler only counts
-     * '1' messages; non-'1'/non-'E' messages advance scan_pos past them,
-     * and the 'Z' arrives after count has already reached 0, so it is
-     * harmlessly discarded when we return KEEL_FLOW_WAIT_BACKEND). */
-    static const uint8_t pg_sync[] = { 'S', 0, 0, 0, 4 };
-    uint8_t* buf_with_sync = (uint8_t*)keel_malloc(total_len + sizeof(pg_sync));
-    if (!buf_with_sync) { keel_free(buf); return -1; }
-    memcpy(buf_with_sync, buf, total_len);
-    memcpy(buf_with_sync + total_len, pg_sync, sizeof(pg_sync));
-    keel_free(buf);
+    if (has_parse_replay) {
+        static const uint8_t pg_sync[] = { 'S', 0, 0, 0, 4 };
+        memcpy(buf + offset, pg_sync, sizeof(pg_sync));
+        offset += sizeof(pg_sync);
+    }
 
-    *replay_buf_out = buf_with_sync;
-    *replay_len_out = total_len + sizeof(pg_sync);
+    *replay_buf_out = buf;
+    *replay_len_out = offset;
     *stmt_count_out = stmt_count;
     return 0;
 }
