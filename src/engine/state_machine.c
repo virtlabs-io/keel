@@ -389,6 +389,7 @@ keel_session_contract_t keel_session_contract_sync(
  */
 keel_backend_contract_t keel_backend_contract_sync(const backend_conn_t* conn)
 {
+    keel_quarantine_reason_t q = KEEL_QUARANTINE_NONE;
     if (!conn) {
         return (keel_backend_contract_t){
             .conn_state    = BACKEND_CONN_CLOSED,
@@ -399,10 +400,20 @@ keel_backend_contract_t keel_backend_contract_sync(const backend_conn_t* conn)
             .in_transaction = false,
         };
     }
+
+    switch (conn->quarantine) {
+    case BACKEND_QUARANTINE_NONE: q = KEEL_QUARANTINE_NONE; break;
+    case BACKEND_QUARANTINE_DIRTY: q = KEEL_QUARANTINE_DIRTY_STATE; break;
+    case BACKEND_QUARANTINE_SYNCING: q = KEEL_QUARANTINE_FAILED_SYNC; break;
+    case BACKEND_QUARANTINE_REPLAYING: q = KEEL_QUARANTINE_REPLAY_MISMATCH; break;
+    case BACKEND_QUARANTINE_PROTOCOL_DESYNC: q = KEEL_QUARANTINE_PROTOCOL_DESYNC; break;
+    case BACKEND_QUARANTINE_CLEANUP_FAILED: q = KEEL_QUARANTINE_FAILED_CLEANUP; break;
+    }
+
     return (keel_backend_contract_t){
         .conn_state    = atomic_load_explicit(&conn->state, memory_order_relaxed),
-        .quarantine    = KEEL_QUARANTINE_NONE, /* quarantine tracked externally for now */
-        .has_owner     = conn->pinned_session != NULL,
+        .quarantine    = q,
+        .has_owner     = (conn->active_owner != NULL) || (conn->pinned_session != NULL),
         .has_stmts     = conn->stmt_set_hash != 0,
         .needs_sync    = conn->needs_sync,
         .in_transaction = conn->in_transaction,
@@ -526,6 +537,7 @@ int keel_session_transition_bind(
 
     /* Perform the bind */
     session->backend_conn = conn;
+    session->backend_generation = conn ? conn->generation : 0;
     session->server_fd = conn->fd;
     conn->pinned_session = session;
     atomic_store_explicit(&conn->state, BACKEND_CONN_ACTIVE, memory_order_release);
@@ -581,6 +593,7 @@ int keel_session_transition_unbind(
     }
 
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->server_fd = -1;
     session->in_transaction = false;
     session->hard_pinned = false;

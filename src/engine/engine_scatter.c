@@ -853,11 +853,9 @@ done:
         /* Response not fully consumed — connection is in an unknown protocol
          * state.  Close the fd and mark the pool slot CLOSED so the pool's
          * background refill timer can reconnect it. */
-        close(be->fd);
-        be->fd = -1;
-        atomic_store(&be->state, BACKEND_CONN_CLOSED);
+        backend_pool_close_connection(pool, be, BACKEND_CLOSE_REASON_IO_ERROR);
+        return rc;
     }
-    /* backend_pool_return is a no-op when state == BACKEND_CONN_CLOSED */
     backend_pool_return(pool, be, false);
     return rc;
 }
@@ -2183,7 +2181,7 @@ int keel_engine_scatter_write(
                      "scatter-write: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             continue;
         }
 
@@ -2193,7 +2191,7 @@ int keel_engine_scatter_write(
              * active_count is decremented and the slot can be refilled. */
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             continue;
         }
         sh->active = true;
@@ -2205,7 +2203,7 @@ int keel_engine_scatter_write(
              * pool can refill the slot and avoid stale-transaction cascades. */
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             sh->active = false;
             continue;
         }
@@ -2280,7 +2278,7 @@ int keel_engine_scatter_write(
         if (conn_broken) {
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[sh->shard_idx], sh->be);
+            backend_pool_discard(server_pools[sh->shard_idx], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
         }
         /* Restore O_NONBLOCK before returning to pool. */
         if (!conn_broken && sh->be->fd >= 0 && sh->orig_flags >= 0)

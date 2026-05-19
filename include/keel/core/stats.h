@@ -242,6 +242,9 @@ typedef struct keel_stats_basic {
     keel_counter_t   pool_borrow_state_replay;        /**< Borrow selected backend requiring state replay */
     keel_counter_t   pool_borrow_stmt_replay;         /**< Borrow selected backend requiring statement replay */
     keel_counter_t   pool_borrow_cleanup_required;    /**< Borrow selected backend requiring cleanup before use */
+    keel_counter_t   backend_borrow_success;          /**< Central borrow predicate accepted and borrow succeeded */
+    keel_counter_t   backend_borrow_failed_incompatible; /**< Borrow rejected by lifecycle incompatibility */
+    keel_counter_t   backend_borrow_failed_quarantined;  /**< Borrow rejected because backend is quarantined */
 
     /* -- Session metrics -- */
     keel_counter_t   sessions_created;   /**< Frontend connections accepted */
@@ -313,6 +316,17 @@ typedef struct keel_stats_basic {
     keel_counter_t   pre_query_proto_violation; /**< Malformed wire frame during absorption */
     keel_counter_t   pre_query_overflow;        /**< FE payload exceeded KEEL_PRE_QUERY_REPLAY_BUFSZ */
     keel_counter_t   pre_query_runaway;         /**< Absorbed too many bytes without ReadyForQuery */
+    keel_counter_t   cleanup_result_success;        /**< Cleanup finished at reusable boundary */
+    keel_counter_t   cleanup_result_protocol_error; /**< Cleanup failed due to unsafe response stream */
+    keel_counter_t   cleanup_result_timeout;        /**< Cleanup timed out */
+    keel_counter_t   cleanup_result_backend_eof;    /**< Backend disconnected during cleanup */
+    keel_counter_t   cleanup_result_send_failure;   /**< Cleanup command send failure */
+    keel_counter_t   replay_result_success;         /**< Replay/setup pipeline completed */
+    keel_counter_t   replay_result_parse_error;     /**< Replay failed with protocol parse error */
+    keel_counter_t   replay_result_drain_error;     /**< Replay failed while draining setup responses */
+    keel_counter_t   replay_result_timeout;         /**< Replay/setup timed out */
+    keel_counter_t   replay_result_oom;             /**< Replay/setup failed due to allocation failure */
+    keel_counter_t   replay_result_partial_send_failure; /**< Replay/setup failed after partial send path */
 
     /* -- Connection migration metrics -- */
     keel_counter_t   migrations_sent;         /**< Sessions migrated away to another worker */
@@ -382,6 +396,8 @@ typedef struct keel_stats_extended {
     keel_histogram_t wait_latency_ns;        /**< Time waiting for pool conn */
     keel_histogram_t discard_latency_ns;     /**< DISCARD ALL round-trip latency */
     keel_histogram_t state_sync_latency_ns;  /**< State sync SET/RESET latency */
+    keel_histogram_t cleanup_duration_ns;    /**< Cleanup state-machine duration */
+    keel_histogram_t replay_duration_ns;     /**< Setup replay/state-sync duration */
 } keel_stats_extended_t;
 
 /* ============================================================================

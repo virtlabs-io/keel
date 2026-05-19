@@ -1379,6 +1379,7 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
     /* -------- ERR Packet (0xFF) — always checked, can abort any state -------- */
     if (marker == MY_ERR) {
         act->type = KEEL_BE_ACT_ERROR;
+        act->is_error_response = true;
         act->query_complete = true;
         ctx->result_state = MY_RS_IDLE;
 

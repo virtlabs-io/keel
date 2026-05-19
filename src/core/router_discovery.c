@@ -31,25 +31,55 @@
  * Discovery Structure
  * ============================================================================ */
 
+/** Maximum number of per-server states tracked for flap detection. */
+#define KEEL_DISC_MAX_SERVER_STATES 16
+
+/**
+ * @brief Per-server tracking record: role, timeline, and flap counters.
+ *
+ * Indexed by position in a small flat array and matched by @c name on each
+ * topology refresh.  The array is at most KEEL_DISC_MAX_SERVER_STATES entries
+ * and is O(n) scanned — topology is small and refreshes are infrequent.
+ */
+typedef struct keel_disc_server_state {
+    char               name[64];       /**< Server identifier (matches keel_server_info.name) */
+    keel_server_role_t last_role;       /**< Last confirmed role */
+    int                last_timeline;   /**< Last seen WAL timeline (0 = unknown) */
+    uint32_t           flap_count;      /**< Total role-change events for this server */
+    keel_time_t        last_role_change; /**< Timestamp of most recent role change */
+    bool               dampened;        /**< Currently suppressed: flapping too fast */
+} keel_disc_server_state_t;
+
 struct keel_discovery {
     keel_discovery_config_t  config;
-    
+
     /* Background thread */
     pthread_t               thread;
     _Atomic bool            running;
     _Atomic bool            should_stop;
-    
+
     /* Router to update */
     keel_router_t*           router;
-    
+
     /* Failover detection */
     keel_failover_callback_fn failover_cb;
     void*                   failover_user_data;
-    
+
+    /* Role-change detection */
+    keel_role_change_callback_fn role_change_cb;
+    void*                       role_change_user_data;
+
+    /* Per-server state (for flap tracking + timeline) */
+    keel_disc_server_state_t server_states[KEEL_DISC_MAX_SERVER_STATES];
+    size_t                   server_state_count;
+
+    /* Current primary timeline (for failover events) */
+    int                     primary_timeline;
+
     /* Last known topology */
     char*                   last_primary;
     keel_time_t              last_refresh;
-    
+
     /* Thread synchronization */
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
@@ -80,7 +110,68 @@ keel_discovery_config_t keel_discovery_config_default(void) {
         .service_name   = NULL,
         .consul_url     = NULL,
         .etcd_endpoints = NULL,
+        /* Flap dampening: suppress if > 3 role changes within 30 s */
+        .flap_dampening_window_s   = 30,
+        .flap_dampening_threshold  = 3,
     };
+}
+
+/* ============================================================================
+ * Per-server state helpers (flap tracking + timeline)
+ * ============================================================================ */
+
+/**
+ * @brief Locate or create the per-server state record for @p name.
+ *
+ * Returns NULL only when the server-state table is full and @p name is new.
+ * This is a linear scan; the table is at most KEEL_DISC_MAX_SERVER_STATES.
+ */
+static keel_disc_server_state_t*
+disc_get_server_state(keel_discovery_t* disc, const char* name)
+{
+    for (size_t i = 0; i < disc->server_state_count; i++) {
+        if (strcmp(disc->server_states[i].name, name) == 0)
+            return &disc->server_states[i];
+    }
+    if (disc->server_state_count >= KEEL_DISC_MAX_SERVER_STATES)
+        return NULL;
+    keel_disc_server_state_t* s = &disc->server_states[disc->server_state_count++];
+    memset(s, 0, sizeof(*s));
+    strncpy(s->name, name, sizeof(s->name) - 1);
+    s->last_role     = KEEL_SERVER_ROLE_AUTO;  /* unknown until first probe */
+    s->last_timeline = 0;
+    return s;
+}
+
+/**
+ * @brief Evaluate whether @p s is currently flapping and update the dampened flag.
+ *
+ * Flapping is defined as @c flap_count role changes within the configured
+ * @c flap_dampening_window_s.  Once dampened, a server remains dampened until
+ * no role change is observed for a full window.
+ *
+ * @return true if the new role change should be suppressed.
+ */
+static bool
+disc_is_flapping(keel_discovery_t* disc, keel_disc_server_state_t* s,
+                 keel_time_t now_ns)
+{
+    uint32_t window_s = disc->config.flap_dampening_window_s;
+    uint32_t threshold = disc->config.flap_dampening_threshold;
+    if (window_s == 0 || threshold == 0)
+        return false;  /* dampening disabled */
+
+    uint64_t window_ns = (uint64_t)window_s * 1000000000ULL;
+    if (s->last_role_change > 0 && (now_ns - s->last_role_change) > window_ns) {
+        /* Outside window — reset dampening */
+        s->dampened = false;
+    }
+    if (s->flap_count >= threshold &&
+        s->last_role_change > 0 &&
+        (now_ns - s->last_role_change) <= window_ns) {
+        s->dampened = true;
+    }
+    return s->dampened;
 }
 
 /* ============================================================================
@@ -706,7 +797,7 @@ keel_error_t keel_discovery_apply(
             }
             
             keel_router_set_server_health(router, srv->name, health);
-            
+
             /* Update role if changed (e.g. after a failover / promotion). */
             {
                 keel_route_server_t* rsrv = keel_router_get_server(router, srv->name);
@@ -714,10 +805,69 @@ keel_error_t keel_discovery_apply(
                     keel_server_role_t new_role = srv->is_primary
                         ? KEEL_SERVER_PRIMARY : KEEL_SERVER_REPLICA;
                     if (rsrv->role != new_role) {
-                        KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
-                            "discovery: server '%s' role changed %d -> %d",
-                            srv->name, (int)rsrv->role, (int)new_role);
-                        rsrv->role = new_role;
+                        keel_time_t now = keel_time_now();
+
+                        /* Per-server flap tracking */
+                        keel_disc_server_state_t* ss =
+                            disc_get_server_state(disc, srv->name);
+                        int old_tl = ss ? ss->last_timeline : 0;
+                        int new_tl = srv->timeline;
+                        bool dampened = false;
+
+                        if (ss) {
+                            ss->flap_count++;
+                            dampened = disc_is_flapping(disc, ss, now);
+                            ss->last_role_change = now;
+                            ss->last_role        = new_role;
+                            ss->last_timeline    = new_tl;
+                        }
+
+                        /* Always emit a structured log — dampened ones are
+                         * logged at DEBUG so they don't flood the operator. */
+                        keel_server_role_t old_role = rsrv->role;
+                        if (dampened) {
+                            KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
+                                "role-change suppressed (flapping): "
+                                "server='%s' old_role=%d new_role=%d "
+                                "timeline=%d->%d flap_count=%u",
+                                srv->name,
+                                (int)rsrv->role, (int)new_role,
+                                old_tl, new_tl,
+                                ss ? ss->flap_count : 0);
+                        } else {
+                            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+                                "role-change: server='%s' old_role=%d new_role=%d "
+                                "timeline=%d->%d flap_count=%u",
+                                srv->name,
+                                (int)rsrv->role, (int)new_role,
+                                old_tl, new_tl,
+                                ss ? ss->flap_count : 0);
+                            rsrv->role = new_role;
+                        }
+
+                        /* Invoke role-change callback (dampened events too,
+                         * with event->dampened=true). */
+                        if (disc->role_change_cb) {
+                            keel_role_change_event_t ev = {
+                                .old_role     = old_role,
+                                .new_role     = new_role,
+                                .old_timeline = old_tl,
+                                .new_timeline = new_tl,
+                                .changed_at   = now,
+                                .flap_count   = ss ? ss->flap_count : 0,
+                                .dampened     = dampened,
+                            };
+                            strncpy(ev.server_name, srv->name,
+                                    sizeof(ev.server_name) - 1);
+                            disc->role_change_cb(
+                                disc->role_change_user_data, &ev);
+                        }
+                    } else {
+                        /* Role unchanged — still update timeline cache */
+                        keel_disc_server_state_t* ss =
+                            disc_get_server_state(disc, srv->name);
+                        if (ss)
+                            ss->last_timeline = srv->timeline;
                     }
                 }
             }
@@ -743,30 +893,37 @@ keel_error_t keel_discovery_apply(
     /* Check for primary change (failover) */
     if (topology->primary_index != (size_t)-1) {
         const char* new_primary = topology->servers[topology->primary_index].name;
-        
+        int new_tl = topology->servers[topology->primary_index].timeline;
+
         pthread_mutex_lock(&disc->mutex);
-        
-        if (disc->last_primary && 
+
+        if (disc->last_primary &&
             strcmp(disc->last_primary, new_primary) != 0) {
-            /* Failover detected */
+            int old_tl = disc->primary_timeline;
+
+            /* Emit a structured failover warning with timeline info */
             KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                         "Failover detected: %s -> %s",
-                         disc->last_primary, new_primary);
-            
+                "FAILOVER: old_primary='%s' new_primary='%s' "
+                "old_timeline=%d new_timeline=%d",
+                disc->last_primary, new_primary, old_tl, new_tl);
+
             if (disc->failover_cb) {
                 keel_failover_event_t event = {
-                    .old_primary = disc->last_primary,
-                    .new_primary = new_primary,
-                    .detected_at = keel_time_now(),
-                    .reason = "topology change",
+                    .old_primary  = disc->last_primary,
+                    .new_primary  = new_primary,
+                    .detected_at  = keel_time_now(),
+                    .reason       = "topology change",
+                    .old_timeline = old_tl,
+                    .new_timeline = new_tl,
                 };
                 disc->failover_cb(disc->failover_user_data, &event);
             }
         }
-        
+
+        disc->primary_timeline = new_tl;
         keel_free(disc->last_primary);
         disc->last_primary = keel_strdup(new_primary);
-        
+
         pthread_mutex_unlock(&disc->mutex);
     }
     
@@ -901,9 +1058,29 @@ void keel_discovery_on_failover(
     void* user_data
 ) {
     if (!disc) return;
-    
+
     pthread_mutex_lock(&disc->mutex);
     disc->failover_cb = callback;
     disc->failover_user_data = user_data;
+    pthread_mutex_unlock(&disc->mutex);
+}
+
+/**
+ * @brief Register a role-change callback.
+ *
+ * @param disc      Discovery handle.
+ * @param callback  Callback (NULL to deregister).
+ * @param user_data Opaque value forwarded to every invocation.
+ */
+void keel_discovery_on_role_change(
+    keel_discovery_t*            disc,
+    keel_role_change_callback_fn callback,
+    void*                        user_data
+) {
+    if (!disc) return;
+
+    pthread_mutex_lock(&disc->mutex);
+    disc->role_change_cb        = callback;
+    disc->role_change_user_data = user_data;
     pthread_mutex_unlock(&disc->mutex);
 }

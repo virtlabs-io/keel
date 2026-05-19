@@ -165,6 +165,35 @@ static size_t build_error_response(uint8_t *buf) {
     return 1 + 4 + fl;
 }
 
+static bool pg_error_response_message_contains(const uint8_t *msg,
+                                               size_t msg_len,
+                                               const char *needle)
+{
+    if (!msg || msg_len < 6 || !needle || needle[0] == '\0')
+        return false;
+    if (msg[0] != 'E')
+        return false;
+
+    size_t i = 5; /* field stream starts after tag+len */
+    while (i < msg_len) {
+        uint8_t field = msg[i++];
+        if (field == 0)
+            break;
+
+        size_t start = i;
+        while (i < msg_len && msg[i] != '\0')
+            i++;
+        if (i >= msg_len)
+            return false;
+
+        if (field == 'M') {
+            return strstr((const char *)(msg + start), needle) != NULL;
+        }
+        i++; /* skip terminating NUL for this field value */
+    }
+    return false;
+}
+
 /* ============================================================================
  * Helpers
  * ============================================================================ */
@@ -757,6 +786,141 @@ static void test_cleanup_buffer_guard(void) {
 }
 
 /* ============================================================================
+ * 16) Commit-in-doubt check payload builder (plugin-owned wire contract)
+ * ============================================================================ */
+
+static void test_commit_doubt_check_payload_builder(void) {
+    TEST_BEGIN("crash_cid_build: build_commit_doubt_check builds PG query payload");
+
+    void *ctx = create_and_startup();
+    TEST_ASSERT_NOT_NULL(ctx);
+    pg_flow_ctx_t *c = (pg_flow_ctx_t *)ctx;
+
+    uint8_t out[256];
+    memset(out, 0, sizeof(out));
+
+    ssize_t n = VT->build_commit_doubt_check(ctx, 424242ULL, out, sizeof(out));
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT_EQ(out[0], 'Q');
+    TEST_ASSERT(strstr((const char *)(out + 5), "txid_status(424242)") != NULL);
+    TEST_ASSERT(c->commit_doubt_check_active);
+    TEST_ASSERT_EQ(c->commit_doubt_outcome, 0);
+
+    /* xid=0 is invalid */
+    n = VT->build_commit_doubt_check(ctx, 0ULL, out, sizeof(out));
+    TEST_ASSERT(n <= 0);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
+ * 17) Commit-in-doubt synthetic response matrix
+ * ============================================================================ */
+
+static void test_commit_doubt_response_matrix(void) {
+    struct {
+        keel_commit_doubt_reason_t reason;
+        uint64_t xid;
+        bool expect_commit_ok;
+        const char *contains;
+    } cases[] = {
+        { KEEL_CIDR_RESOLVED_COMMITTED, 321ULL, true,  "COMMIT" },
+        { KEEL_CIDR_RESOLVED_ABORTED,   321ULL, false, "transaction was rolled back" },
+        { KEEL_CIDR_NO_XID,             0ULL,   false, "outcome unknown (no XID captured)" },
+        { KEEL_CIDR_NO_RW_POOL,         321ULL, false, "no RW pool" },
+        { KEEL_CIDR_NO_CHECK_CONN,      321ULL, false, "pool unavailable" },
+        { KEEL_CIDR_CHECK_BUILD_FAIL,   321ULL, false, "XID-check failed" },
+        { KEEL_CIDR_CHECK_SEND_FAIL,    321ULL, false, "XID-check failed" },
+        { KEEL_CIDR_RESOLVED_UNKNOWN,   321ULL, false, "outcome uncertain" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char desc[160];
+        snprintf(desc, sizeof(desc),
+                 "crash_cid_resp/%zu: reason=%u", i, (unsigned)cases[i].reason);
+        TEST_BEGIN(desc);
+
+        void *ctx = create_and_startup();
+        TEST_ASSERT_NOT_NULL(ctx);
+
+        uint8_t out[768];
+        memset(out, 0, sizeof(out));
+        ssize_t n = VT->generate_commit_doubt_response(ctx, cases[i].reason,
+                                                       cases[i].xid,
+                                                       out, sizeof(out));
+        TEST_ASSERT(n > 0);
+
+        if (cases[i].expect_commit_ok) {
+            TEST_ASSERT_EQ(out[0], 'C');
+            TEST_ASSERT(strstr((const char *)(out + 5), cases[i].contains) != NULL);
+            /* COMMIT success response must end with ReadyForQuery('I'). */
+            TEST_ASSERT_EQ(out[n - 6], 'Z');
+            TEST_ASSERT_EQ(out[n - 1], 'I');
+        } else {
+            TEST_ASSERT_EQ(out[0], 'E');
+            TEST_ASSERT(pg_error_response_message_contains(out, (size_t)n,
+                                                           cases[i].contains));
+            /* Error path includes RFQ(I) terminator. */
+            TEST_ASSERT_EQ(out[n - 6], 'Z');
+            TEST_ASSERT_EQ(out[n - 1], 'I');
+        }
+
+        VT->destroy_context(ctx);
+        TEST_END();
+    }
+}
+
+/* ============================================================================
+ * 18) Commit-in-doubt response-stream parsing and completion boundary
+ * ============================================================================ */
+
+static void test_commit_doubt_outcome_parsing(void) {
+    TEST_BEGIN("crash_cid_parse: commit_doubt check stream parses D + Z correctly");
+
+    void *ctx = create_and_startup();
+    TEST_ASSERT_NOT_NULL(ctx);
+    pg_flow_ctx_t *c = (pg_flow_ctx_t *)ctx;
+
+    /* Arm commit-doubt check mode exactly as engine would after sending check SQL. */
+    c->commit_doubt_check_active = true;
+    c->commit_doubt_outcome = 0;
+
+    uint8_t buf[128];
+    keel_be_action_t act;
+
+    /* DataRow('committed') should update outcome and be absorbed. */
+    size_t len = build_be_data_row_text(buf, "committed");
+    VT->on_be_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(act.type, KEEL_BE_ACT_ABSORB);
+    TEST_ASSERT(act.commit_doubt_outcome_changed);
+    TEST_ASSERT_EQ(act.commit_doubt_outcome, 1);
+    TEST_ASSERT_EQ(c->commit_doubt_outcome, 1);
+    TEST_ASSERT(c->commit_doubt_check_active);
+
+    /* ReadyForQuery('I') marks completion and clears active check state. */
+    len = build_ready_for_query(buf, 'I');
+    VT->on_be_msg(ctx, buf, len, &act);
+    TEST_ASSERT(act.query_complete);
+    TEST_ASSERT(act.tx_state_changed);
+    TEST_ASSERT_EQ(act.tx_status, KEEL_TX_IDLE);
+    TEST_ASSERT(act.backend_reusable);
+    TEST_ASSERT(!c->commit_doubt_check_active);
+
+    /* Repeat for aborted path. */
+    c->commit_doubt_check_active = true;
+    c->commit_doubt_outcome = 0;
+    len = build_be_data_row_text(buf, "aborted");
+    VT->on_be_msg(ctx, buf, len, &act);
+    TEST_ASSERT(act.commit_doubt_outcome_changed);
+    TEST_ASSERT_EQ(act.commit_doubt_outcome, 2);
+    TEST_ASSERT_EQ(c->commit_doubt_outcome, 2);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
  * main()
  * ============================================================================ */
 
@@ -778,6 +942,9 @@ int main(void) {
     test_tx_state_full_lifecycle();
     test_error_recovery_in_tx();
     test_cleanup_buffer_guard();
+    test_commit_doubt_check_payload_builder();
+    test_commit_doubt_response_matrix();
+    test_commit_doubt_outcome_parsing();
 
     printf("\n--- Results: %d run, %d passed, %d failed ---\n",
            g_tests_run, g_tests_passed, g_tests_failed);

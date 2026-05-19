@@ -53,6 +53,47 @@ typedef enum keel_flow_result {
     KEEL_FLOW_TLS_HANDSHAKE,     /**< TLS accepted ('S' sent) — worker must drive handshake */
 } keel_flow_result_t;
 
+typedef enum keel_pre_query_op_type {
+    KEEL_PQOP_NONE = 0,
+    KEEL_PQOP_DEFERRED_BEGIN,
+    KEEL_PQOP_STATE_SYNC,
+    KEEL_PQOP_PS_REPLAY,
+    KEEL_PQOP_CLEAN_CHECK,
+} keel_pre_query_op_type_t;
+
+typedef enum keel_pre_query_state {
+    KEEL_PQSTATE_IDLE = 0,
+    KEEL_PQSTATE_SEND,
+    KEEL_PQSTATE_WAIT_RESPONSE,
+    KEEL_PQSTATE_COMPLETE,
+    KEEL_PQSTATE_FAILED,
+} keel_pre_query_state_t;
+
+/**
+ * @brief Outcome taxonomy for setup replay paths (state sync / stmt replay).
+ */
+typedef enum keel_replay_result {
+    KEEL_REPLAY_RESULT_NONE = 0,
+    KEEL_REPLAY_RESULT_SUCCESS,
+    KEEL_REPLAY_RESULT_PARSE_ERROR,
+    KEEL_REPLAY_RESULT_DRAIN_ERROR,
+    KEEL_REPLAY_RESULT_TIMEOUT,
+    KEEL_REPLAY_RESULT_OOM,
+    KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE,
+} keel_replay_result_t;
+
+typedef struct keel_pre_query_op {
+    keel_pre_query_op_type_t type;
+    keel_pre_query_state_t   state;
+    uint64_t                 deadline_ns;
+    uint32_t                 expected_msgs;
+    uint32_t                 seen_msgs;
+    uint8_t*                 payload;
+    size_t                   payload_len;
+    uint64_t                 state_sync_hash;
+    keel_flow_result_t       resume;
+} keel_pre_query_op_t;
+
 /* ============================================================================
  * Session Flow State (stored alongside session)
  * ============================================================================ */
@@ -135,6 +176,11 @@ typedef struct keel_session_flow {
     size_t                         be_fwd_remaining;
     bool                           fe_fwd_wait_be;
 
+    /* Per-session buffer caps (0 = unlimited; propagated from worker config).
+     * Enforced at jumbo-message detection time and PS replay buffer build. */
+    size_t                         session_max_buffered_bytes; /**< max FE message size (0=unlimited) */
+    size_t                         backend_max_replay_bytes;   /**< max PS replay buffer (0=unlimited) */
+
     /* Prepared-statement replay state (spec §17 — PS Virtualization).
      *
      * When a session with named prepared statements gets a clean backend
@@ -155,6 +201,7 @@ typedef struct keel_session_flow {
     const uint8_t*                 stmt_replay_orig_msg;
     size_t                         stmt_replay_orig_len;
     uint64_t                       stmt_replay_hash;
+    keel_stmt_compat_profile_t     stmt_replay_profile; /**< Session profile captured at borrow time. */
     bool                           stmt_replay_needs_cleanup; /**< True: waiting for plugin cleanup to finish
                                                                *   before replaying protocol-owned prepared state.
                                                                *   Set when a borrowed backend still carries
@@ -277,6 +324,16 @@ typedef struct keel_session_flow {
     size_t  pending_pre_query_absorbed;      /**< BE bytes absorbed; runaway-cap */
     uint64_t pending_state_sync_hash;        /**< backend state hash to stamp after sync RFQ */
     keel_flow_result_t pending_pre_query_resume; /**< Result after stashed payload is forwarded */
+    uint64_t pending_pre_query_started_ns;     /**< Active pre-query op start timestamp */
+    keel_replay_result_t replay_last_result;   /**< Last replay/setup outcome */
+    uint64_t replay_last_duration_ns;          /**< Last replay/setup duration in ns */
+    /* Generic pre-query operation queue (sequential, never parallel).
+     * Used to compose deferred BEGIN, state sync, prepared replay, and
+     * cleanup checks while holding client bytes atomically. */
+    keel_pre_query_op_t             pre_query_ops[4];
+    uint8_t                         pre_query_head;
+    uint8_t                         pre_query_tail;
+    uint8_t                         pre_query_count;
 
     /** eventfd for async auth (KEEL_FLOW_WAIT_AUTH).
      *  Set to ≥0 while an off-thread auth operation is in flight;

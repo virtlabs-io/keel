@@ -7,9 +7,9 @@
 [![codecov](https://codecov.io/gh/virtlabs-io/dbcp-keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/dbcp-keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, intelligent query routing, transaction pooling, automatic failover, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols.
+A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.2-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
 
-Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Performance](docs/PERF_STRICT_AB3_SUMMARY.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
+Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Benchmarks](bench/README.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
 ## Overview
 
@@ -23,9 +23,20 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Multi-protocol** — PostgreSQL and MySQL from the same binary
 - **Transaction pooling** — connections returned to the pool after each transaction
 
-## Features
+## Production Support Status for v0.2-alpha
 
-### Feature Status
+Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize` and `experimental_features = false`.
+
+| Status | Features |
+|--------|----------|
+| **Production candidate** | PostgreSQL pool mode, PostgreSQL prepared-statement virtualization after replay validation, admin inspection and basic metrics |
+| **Hardening** | Smart routing, SSV, Patroni failover, transaction tracking |
+| **Experimental** | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
+| **Aspirational** | Result cache correctness guarantees |
+
+`smart` and `full` remain useful tiers, but they are not the default production recommendation for `v0.2-alpha`. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
+
+## Feature Status
 
 KEEL has a broad feature surface. The labels below keep the advertised model
 aligned with the implementation state:
@@ -39,6 +50,37 @@ aligned with the implementation state:
 For the full maturity inventory, failure-mode matrix, and failover semantics,
 see [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md). New production
 claims should be added there before feature docs or UI copy are expanded.
+
+### Production Profiles (v0.2-alpha)
+
+`pool` is now the default runtime tier and only production-safe defaults are enabled by default.
+
+```ini
+[keel]
+experimental_features = false
+
+[worker_group.main]
+mode = pool
+prepared_statement = virtualize
+result_cache = off
+```
+
+Experimental features require explicit opt-in:
+
+```ini
+[keel]
+experimental_features = true
+
+[worker_group.main]
+mode = smart                  # hardening tier, not the default production tier
+result_cache = on
+scatter_merge = on
+wal_lsn_capture = on
+```
+
+Startup logs now emit:
+
+`Runtime tier: <tier>. Enabled features: [...]`
 
 ### Core
 - **Native Reactor I/O** — io_uring on Linux 5.6+ (primary), kqueue on macOS, epoll as Linux fallback
@@ -121,7 +163,7 @@ claims should be added there before feature docs or UI copy are expanded.
 - **Query Logging** — configurable per-query log with mode filter (all, read, write, none)
 - **Prometheus Metrics** — `/metrics` endpoint for Prometheus scraping with pool, session, TLS, shard, and query counters
 - **Grafana Dashboard** — pre-built JSON at `etc/grafana/keel-dashboard.json`
-- **Admin Console** — PostgreSQL wire protocol on dedicated TCP port; 21+ commands including virtual tables, JSON output, K8s health endpoints — see [STATUS.md](docs/STATUS.md)
+- **Admin Console** — PostgreSQL wire protocol on dedicated TCP port; 21+ commands including virtual tables, JSON output, K8s health endpoints — see [ADMIN_SQL.md](docs/ADMIN_SQL.md)
 - **Web Management UI** — self-contained dark-themed SPA served at `GET /ui` on the Prometheus port; auto-refreshes every 5 s; shows engine state, workers, uptime, sessions, pool, queries, and errors; no external dependencies
 - **JSON Status API** — `GET /api/status.json` returns current engine state and aggregated metrics as JSON; CORS-enabled for direct browser fetch
 - **Distributed Tracing (OpenTelemetry)** — per-session W3C `traceparent` injection into SQL block comments, per-query spans with SQL digest and route decision, OTLP/HTTP JSON export, per-worker lock-free span ring buffer, configurable head-based sampling rate — see [TRACING.md](docs/TRACING.md)
@@ -161,9 +203,6 @@ claims should be added there before feature docs or UI copy are expanded.
   -- KEEL fans out to both shards, merges groups, sorts, and returns top-5 globally.
   ```
 - **Declarative Query Rules** — INI `[query_rule.*]` sections for no-code routing, blocking, and rewriting rules; POSIX ERE matching on SQL text, username, and database; `route_to` (primary/replica/any), `rewrite_to` (SQL replacement with capture groups), `block` (synthetic error); evaluated after parse, before normal routing; zero hook code required
-- **Online Schema Change Proxying** — detects gh-ost (`_gho`, `_ghc`) and pt-online-schema-change (`_new`, `_old`) shadow-table DML; pins the session to the primary for the migration duration; transparent to the OSC tool — no config changes required
-- **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the latest token known to the protocol context; token-based replica catch-up remains experimental until checks are reactor-owned
-- **NOTIFY/LISTEN Transparent Proxying** — `LISTEN`/`UNLISTEN`/`NOTIFY` intercepted at the protocol layer; LISTEN pins the session to a dedicated backend (session-mode semantics for that session only); UNLISTEN releases the pin and returns to transaction-mode pool; `UNLISTEN *` handled; sessions with active subscriptions survive idle timeout and pool drain
 - **Online Schema Change Proxying** — detects gh-ost (`_gho`, `_ghc`) and pt-online-schema-change (`_new`, `_old`) shadow-table DML; pins the session to the primary for the migration duration; transparent to the OSC tool — no config changes required
 - **Cross-Service Read-Your-Writes** — `SET keel.read_after_lsn = '<lsn>'` stores a client-supplied WAL LSN in the session's consistency atoms; `SHOW keel.write_lsn` returns the latest token known to the protocol context; token-based replica catch-up remains experimental until checks are reactor-owned
 - **NOTIFY/LISTEN Transparent Proxying** — `LISTEN`/`UNLISTEN`/`NOTIFY` intercepted at the protocol layer; LISTEN pins the session to a dedicated backend (session-mode semantics for that session only); UNLISTEN releases the pin and returns to transaction-mode pool; `UNLISTEN *` handled; sessions with active subscriptions survive idle timeout and pool drain
@@ -386,7 +425,7 @@ keel/
 │   │   ├── time.c                 # Time utilities
 │   │   └── hashring.c             # Consistent hashing
 │   └── main/main.c               # Entry point
-├── tests/                         # Test suite (81 tests)
+├── tests/                         # Test suite (116 tests)
 │   ├── test_mem.c                 # Memory allocator tests
 │   ├── test_auth.c                # Authentication tests
 │   ├── test_parser.c              # SQL parser tests
@@ -431,12 +470,12 @@ keel/
 │   ├── PREPARED_STATEMENTS.md     # Prepared statement pooling strategies
 │   ├── TRANSACTION_TRACKING.md    # XID probe & read-after-write consistency
 │   ├── TESTING.md                 # Testing guide
-│   ├── PERF_STRICT_AB3_SUMMARY.md # Performance benchmark results
+│   ├── ADMIN_SQL.md               # Admin SQL virtual tables & commands
+│   ├── OPERATIONS.md              # Day-2 operations guide
 │   ├── SESSION_CONTEXT.md         # Session-context preservation feature guide
 │   ├── RUNTIME_MODES.md           # Runtime mode tiers (PROXY/POOL/SMART/FULL)
 │   ├── STATE_MODEL.md             # Formal 9-domain session state machine
 │   ├── SSV_POSTGRES_IMPLEMENTATION.md # SSV engine implementation
-│   ├── STATUS.md                  # Admin console & control plane reference
 │   └── ROADMAP.md                 # Project roadmap & future plans
 ├── docker/                        # Docker & E2E testing
 │   ├── compose/                   # Docker Compose stacks
@@ -517,11 +556,14 @@ primary = host=db.local port=5432 dbname=app user=app password=secret role=RW we
 
 #### Scenario 2: PostgreSQL with Read/Write Splitting + Patroni HA
 
+This profile is in the **hardening** bucket for `v0.2-alpha`. Use it only when
+you need read/write routing and have validated failover behavior in your own environment.
+
 ```ini
 [worker_group.prod]
 protocol            = postgresql
 bind_port           = 5432
-mode                = smart
+mode                = smart        # hardening, not default production tier
 prepared_statement  = virtualize
 transaction_tracking = on          # read-after-write consistency
 min_pool_size       = 10
@@ -663,6 +705,7 @@ Untested combinations may work but are not supported.
 | MySQL | 8.4 | ✅ Tested in CI (primary) | Service container in `integration-db` CI job |
 | MySQL | 9.x | ✅ Validated | Group Replication, InnoDB Cluster |
 | MariaDB | 10.11 | ✅ Validated | Galera cluster topology |
+| MariaDB | 11.x | ✅ Tested in CI | Galera cluster; `integration-db` CI service |
 | Percona XtraDB Cluster | 8.0 | ✅ Validated | PXC wsrep protocol |
 
 ### Linux Kernel Requirements
@@ -739,11 +782,11 @@ mkdir build && cd build
 # Configure (Release build)
 cmake -DCMAKE_BUILD_TYPE=Release ..
 
-# Build
-make -j$(nproc)
+# Build (with optional ccache for faster incremental rebuilds)
+cmake --build . -j$(nproc)
 
-# Run tests
-ctest --output-on-failure
+# Run tests (parallel)
+ctest --output-on-failure -j$(nproc)
 ```
 
 ### Build Options
@@ -754,6 +797,7 @@ ctest --output-on-failure
 | `KEEL_USE_EPOLL` | `ON` (Linux) | Enable epoll reactor (fallback) |
 | `KEEL_USE_KQUEUE` | `ON` (macOS) | Enable kqueue reactor |
 | `KEEL_ENABLE_TESTS` | `ON` | Build test suite |
+| `KEEL_ENABLE_BENCHMARKS` | `OFF` | Build benchmark binaries (`-DKEEL_ENABLE_BENCHMARKS=ON`) |
 | `KEEL_ENABLE_HARDENING` | `ON` | Stack protection, RELRO, PIE, FORTIFY |
 | `KEEL_ENABLE_ASAN` | `OFF` | AddressSanitizer |
 | `KEEL_ENABLE_TSAN` | `OFF` | ThreadSanitizer |
@@ -812,6 +856,7 @@ replica2 = host=127.0.0.1 port=5434 dbname=mydb role=RO weight=100
 |--------|---------|-------------|
 | `bind_addr` | `0.0.0.0` | Listen address |
 | `bind_port` | `6432` | Listen port |
+| `mode` | `pool` | Runtime tier: `proxy`, `pool`, `smart`, `full` |
 | `num_workers` | `0` (auto) | Worker threads (0 = one per CPU core) |
 | `min_pool_size` | `10` | Minimum backend connections per worker |
 | `max_pool_size` | `50` | Maximum backend connections per worker |
@@ -829,6 +874,10 @@ replica2 = host=127.0.0.1 port=5434 dbname=mydb role=RO weight=100
 | `use_buf_rings` | `0` | io_uring buffer rings (Linux 5.19+) |
 | `prepared_statement` | `virtualize` | PS pooling strategy: virtualize, pinning, tracking, anonymous |
 | `transaction_tracking` | `off` | XID probe + read-after-write consistency tokens |
+| `experimental_features` | `off` | Required to enable experimental feature keys |
+| `scatter_merge` | `off` | Enable scatter-merge routing features (experimental) |
+| `wal_lsn_capture` | `off` | Enable WAL LSN capture (experimental) |
+| `gtid_capture` | `off` | Enable GTID capture (experimental) |
 
 ### TLS Configuration (Frontend + Backend)
 
@@ -971,7 +1020,7 @@ mysql -h 127.0.0.1 -P 7306 -u keel -pkeel mydb
 
 ## Testing
 
-### Unit & Integration Tests (90 tests)
+### Unit & Integration Tests (116 tests)
 
 ```bash
 cd build
@@ -1053,7 +1102,6 @@ ctest --output-on-failure
 | `test_throttle` | Query throttling: token-bucket rule matching, sustained rate, burst, user/db scoping, INI load (34 assertions) |
 | `test_cloud_auth` | Cloud-native auth: AWS SigV4 token, GCP JWT, Azure IMDS; token caching; expiry rotation |
 | `test_enterprise_auth` | Enterprise auth: PAM, LDAP bind+search, cert identity CN extraction, auth_query execution |
-| `test_cluster` | Cluster management: multi-backend topology updates, primary/replica role transitions, Patroni REST health |
 | `test_sharding` | Horizontal sharding: shard-key extraction, modulo/hash/range dispatch, scatter plan, admin virtual table, hot-reload, Prometheus metrics, multi-shard tx coordinator (344 assertions) |
 
 ### Hard Guarantee Gate
@@ -1114,6 +1162,35 @@ tests/integration/test-mysql-pxc.sh
 # MariaDB Galera Cluster
 tests/integration/test-mysql-mariadb.sh
 ```
+
+### Chaos Tests
+
+The `tests/chaos/` directory contains 12 fault-injection scenarios run against a
+live KEEL + PostgreSQL stack. Each scenario injects a specific class of failure
+and verifies that KEEL recovers correctly.
+
+| Scenario | Injects |
+|----------|---------|
+| `commit-in-doubt.sh` | Backend killed after COMMIT sent, before ReadyForQuery |
+| `flip-primary.sh` | Primary role transfer mid-workload |
+| `kill-backend-mid-query.sh` | Backend process killed during active query |
+| `partition-replica.sh` | Network partition isolating replica |
+| `primary-dies-during-txn.sh` | Primary dies with open transaction |
+| `primary-dies-idle.sh` | Primary dies with idle connections in pool |
+| `replica-lag-threshold.sh` | Replica lag exceeds read-after-write threshold |
+| `role-flapping.sh` | Rapid primary/replica role changes |
+| `scatter-backend-mid-scatter.sh` | Shard backend dies during scatter fan-out |
+| `scatter-network-partition.sh` | Network partition during scatter-merge |
+| `sigkill-during-drain.sh` | SIGKILL sent during graceful drain |
+| `timeline-invalidation.sh` | PostgreSQL timeline switch (promotion) |
+
+```bash
+# Requires: docker compose -f docker/compose/pg-chaos.yml up -d --wait
+tests/chaos/run-chaos.sh                       # all scenarios
+tests/chaos/run-chaos.sh kill-backend          # single scenario
+```
+
+The chaos suite is also exercised weekly via `.github/workflows/chaos.yml`.
 
 ### Sanitizer Builds
 
@@ -1227,7 +1304,7 @@ and [ROADMAP.md](docs/ROADMAP.md) for longer-term planning.
 - [x] Online Schema Change proxying: gh-ost and pt-osc transparent primary affinity
 - [x] Kubernetes native: Helm chart, CRD operator (`KeelPool`), sidecar mode
 - [x] Docker official images: multi-arch, `KEEL_*` env var config, production Compose templates
-- [x] 90+ unit/integration/combinatorial/fuzz tests + 7 Docker Compose E2E stacks
+- [x] 116 unit/integration/combinatorial/fuzz tests + 7 Docker Compose E2E stacks
 - [x] Formal 12×12 invariant model + 9-domain state machine with exhaustive verification
 
 ### Remaining Planned Work (P3)
@@ -1256,8 +1333,8 @@ Detailed architecture documentation is available in the [`docs/`](docs/) directo
 | [SHARDING.md](docs/SHARDING.md) | Horizontal sharding architecture, shard rule configuration, API reference, hot-reload, Prometheus metrics |
 | [DOCKER.md](docs/DOCKER.md) | Docker quick-start, multi-arch images, `KEEL_*` env vars, production Compose templates, GitHub Actions publish |
 | [TESTING.md](docs/TESTING.md) | Testing guide, E2E setup, benchmark scripts |
-| [PERF_STRICT_AB3_SUMMARY.md](docs/PERF_STRICT_AB3_SUMMARY.md) | Strict AB3 benchmark summary (200/300 threads), KEEL vs direct-primary comparison, and artifact references |
-| [STATUS.md](docs/STATUS.md) | Control plane reference: 21 admin commands, Prometheus metrics, K8s health, rebalancing, TLS stack, security hardening |
+| [ADMIN_SQL.md](docs/ADMIN_SQL.md) | Admin SQL interface: virtual tables, DML operations, 21 admin commands, Prometheus metrics, K8s health endpoints |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Operations guide: SIGHUP reload, graceful drain, signal reference, upgrade procedures |
 | [ROADMAP.md](docs/ROADMAP.md) | Project roadmap: completed features, planned work (P1-P3), and competitive advantages |
 | [HOOKS.md](docs/HOOKS.md) | Hook/trigger system — Lua, Python, and native plugin extensibility |
 | [SESSION_CONTEXT.md](docs/SESSION_CONTEXT.md) | Session-context preservation: compatibility matrix, architecture, 5-tier pool borrow, diff algorithm, worked examples, competitor comparison |

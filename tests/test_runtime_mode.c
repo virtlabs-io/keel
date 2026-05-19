@@ -39,13 +39,13 @@ static void test_tier_parse(void) {
     TEST_ASSERT_EQ(keel_tier_parse("SMART"), KEEL_TIER_SMART);
     TEST_ASSERT_EQ(keel_tier_parse("Full"),  KEEL_TIER_FULL);
 
-    /* NULL and empty → FULL (safest default) */
-    TEST_ASSERT_EQ(keel_tier_parse(NULL), KEEL_TIER_FULL);
-    TEST_ASSERT_EQ(keel_tier_parse(""),   KEEL_TIER_FULL);
+    /* NULL and empty → POOL (conservative default, not FULL) */
+    TEST_ASSERT_EQ(keel_tier_parse(NULL), KEEL_TIER_POOL);
+    TEST_ASSERT_EQ(keel_tier_parse(""),   KEEL_TIER_POOL);
 
-    /* Unknown string → FULL */
-    TEST_ASSERT_EQ(keel_tier_parse("turbo"),   KEEL_TIER_FULL);
-    TEST_ASSERT_EQ(keel_tier_parse("minimal"), KEEL_TIER_FULL);
+    /* Unknown string → POOL (fail-safe: do not silently enable experimental tier) */
+    TEST_ASSERT_EQ(keel_tier_parse("turbo"),   KEEL_TIER_POOL);
+    TEST_ASSERT_EQ(keel_tier_parse("minimal"), KEEL_TIER_POOL);
 }
 
 /* ============================================================================
@@ -211,7 +211,7 @@ static void test_proxy_forces_overrides(void) {
 }
 
 /* ============================================================================
- * §6 — Default session flow init (no worker) → FULL tier
+ * §6 — Default session flow init (no worker) → POOL tier
  * ============================================================================ */
 
 static void test_default_tier_no_worker(void) {
@@ -228,8 +228,45 @@ static void test_default_tier_no_worker(void) {
 
     keel_session_flow_init(&sf, NULL, &session);
 
-    /* No worker → default FULL */
-    TEST_ASSERT_EQ(sf.mode, KEEL_TIER_FULL);
+    /* No worker → conservative POOL (not FULL) */
+    TEST_ASSERT_EQ(sf.mode, KEEL_TIER_POOL);
+}
+
+/* ============================================================================
+ * §7 — KEEL_TIER_IS_EXPERIMENTAL macro and full-tier gate semantics
+ * ============================================================================ */
+
+static void test_experimental_tier_gate(void) {
+    printf("  §7 Experimental tier gate...\n");
+
+    /* Only FULL is experimental */
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(KEEL_TIER_PROXY));
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(KEEL_TIER_POOL));
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(KEEL_TIER_SMART));
+    TEST_ASSERT( KEEL_TIER_IS_EXPERIMENTAL(KEEL_TIER_FULL));
+
+    /* keel_tier_parse never returns FULL for an unrecognised string: an
+     * operator typo must not silently enable experimental hot-path code. */
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse(NULL)));
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse("")));
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse("turbo")));
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse("MAXIMUM")));
+
+    /* Explicit "full" string must still map to FULL */
+    TEST_ASSERT( KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse("full")));
+    TEST_ASSERT( KEEL_TIER_IS_EXPERIMENTAL(keel_tier_parse("FULL")));
+
+    /* Default session flow (no worker) must not start in experimental tier */
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker    = NULL;
+    session.client_fd = -1;
+    session.server_fd = -1;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    keel_session_flow_init(&sf, NULL, &session);
+    TEST_ASSERT(!KEEL_TIER_IS_EXPERIMENTAL(sf.mode));
 }
 
 /* ============================================================================
@@ -245,6 +282,7 @@ int main(void) {
     test_tier_name_roundtrip();
     test_proxy_forces_overrides();
     test_default_tier_no_worker();
+    test_experimental_tier_gate();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            g_tests_passed, g_tests_failed, g_tests_run);

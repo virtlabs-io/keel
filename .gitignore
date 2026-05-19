@@ -113,6 +113,16 @@ etc/certs/*.pem
 etc/certs/*.srl
 etc/certs/*.ext
 
+# Coverage reports and artifacts (but not src/coverage which contains source files used for coverage builds)
+coverage-html/
+coverage-xml/
+coverage-lcov/
+coverage.css
+coverage.json
+coverage.html
+coverage.functions.html
+proposals/
+
 artifacts/
 
 reports/

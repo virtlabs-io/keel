@@ -492,6 +492,17 @@ target_link_libraries(test_config PRIVATE
 target_link_options(test_config PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_config COMMAND test_config)
 
+# Issue 9 — Result Cache Must Remain Disabled: config-layer gate tests
+add_executable(test_result_cache_gate test_result_cache_gate.c)
+target_link_libraries(test_result_cache_gate PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_result_cache_gate PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_result_cache_gate COMMAND test_result_cache_gate)
+set_tests_properties(test_result_cache_gate PROPERTIES LABELS "core")
+
 # Configuration reload tests (SIGHUP live reload infrastructure)
 add_executable(test_config_reload test_config_reload.c)
 target_link_libraries(test_config_reload PRIVATE 
@@ -695,6 +706,80 @@ if(KEEL_USE_IOURING AND URING_FOUND)
 endif()
 target_link_options(test_drain_shutdown PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_drain_shutdown COMMAND test_drain_shutdown)
+
+# Admin live integration test (admin TCP console + Prometheus HTTP)
+add_executable(test_admin_live test_admin_live.c)
+target_link_libraries(test_admin_live PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_admin
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_admin_live PRIVATE uring)
+endif()
+target_link_options(test_admin_live PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_admin_live COMMAND test_admin_live)
+set_tests_properties(test_admin_live PROPERTIES LABELS "core" TIMEOUT 30)
+
+# Mock proxy integration tests — exercises engine_flow, worker, backend_connect_async
+# using an in-process mock PostgreSQL backend (no real database needed).
+add_executable(test_mock_proxy test_mock_proxy.c)
+target_link_libraries(test_mock_proxy PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_mock_proxy PRIVATE uring)
+endif()
+target_link_options(test_mock_proxy PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_mock_proxy COMMAND test_mock_proxy)
+set_tests_properties(test_mock_proxy PROPERTIES LABELS "core" TIMEOUT 120)
 
 # Graceful worker restart tests
 add_executable(test_graceful_restart test_graceful_restart.c)
@@ -933,6 +1018,34 @@ target_link_libraries(test_admission PRIVATE
 target_link_options(test_admission PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_admission COMMAND test_admission)
 
+# Backpressure/hardening tests (Issue 10: memory, FD, pool wait timeout limits)
+add_executable(test_backpressure test_backpressure.c)
+target_include_directories(test_backpressure PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_backpressure PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelcore
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_backpressure PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_backpressure COMMAND test_backpressure)
+
 # Pool Correctness tests (CLEANING state, admission control, quarantine)
 add_executable(test_pool_correctness test_pool_correctness.c)
 target_include_directories(test_pool_correctness PRIVATE
@@ -1125,6 +1238,34 @@ target_link_libraries(test_failover PRIVATE
 )
 target_link_options(test_failover PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_failover COMMAND test_failover)
+
+# Issue 8 — Failover gate & commit-in-doubt tests
+add_executable(test_failover_gates test_failover_gates.c)
+target_link_libraries(test_failover_gates PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_engine_flow
+    keel_session
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keelcore
+    keel_probe
+    keellog
+    keellog_plugin
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_failover_gates PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_failover_gates COMMAND test_failover_gates)
 
 # Connection Migration tests (eligibility, FD transfer, ring serialisation)
 add_executable(test_migration test_migration.c)
@@ -1500,6 +1641,35 @@ target_link_libraries(test_ps_pool_matrix PRIVATE
 target_link_options(test_ps_pool_matrix PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_ps_pool_matrix COMMAND test_ps_pool_matrix)
 
+# Phase 4 acceptance gate: prepared-statement semantic compatibility
+# Exercises VIRTUALIZE mode (extended-protocol Parse path) and the
+# backend_pool_stmt_compatible() predicate for cross-backend reuse.
+add_executable(test_ps_semantic_compat test_ps_semantic_compat.c)
+target_include_directories(test_ps_semantic_compat PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_ps_semantic_compat PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_ps_semantic_compat PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_ps_semantic_compat COMMAND test_ps_semantic_compat)
+
 # TLS/splice × data frames × large result sets × partial writes matrix
 add_executable(test_tls_splice_matrix test_tls_splice_matrix.c)
 target_link_libraries(test_tls_splice_matrix PRIVATE
@@ -1767,6 +1937,7 @@ set_tests_properties(
     test_util
     test_sql
     test_config
+    test_result_cache_gate
     test_log
     test_query_log
     test_stats_alignment
@@ -1799,6 +1970,7 @@ set_tests_properties(
     test_shadow_diff_harness
     test_runtime_security_harness
     test_ps_pool_matrix
+    test_ps_semantic_compat
     test_tls_splice_matrix
     test_session_hooks_matrix
     test_crash_recovery_matrix
@@ -1848,7 +2020,7 @@ set_tests_properties(test_trace test_otlp_encoding
 set_tests_properties(test_parser test_sql test_admin_sql
     PROPERTIES LABELS "sql")
 
-set_tests_properties(test_auth test_config test_router test_router_plugin
+set_tests_properties(test_auth test_config test_result_cache_gate test_router test_router_plugin
     test_cloud_auth test_cloud_auth_internals test_cloud_auth_e2e test_cluster
     test_cluster_election test_cluster_fuzz
     PROPERTIES LABELS "core")
@@ -1858,11 +2030,15 @@ set_tests_properties(test_residual test_session_engine test_hooks
     PROPERTIES LABELS "session")
 
 set_tests_properties(test_pool_correctness test_conn_lifecycle
+                     test_backpressure
     PROPERTIES LABELS "pool")
 
 set_tests_properties(test_plugin_contract test_pg_protocol_flow
                      test_mysql_protocol_flow
     PROPERTIES LABELS "protocol")
+
+set_tests_properties(test_pg_protocol_flow
+    PROPERTIES LABELS "protocol openssl")
 
 set_tests_properties(test_failover
     PROPERTIES LABELS "engine")
@@ -1894,7 +2070,8 @@ set_tests_properties(test_tls_security test_tls_ktls test_drain_shutdown
                      test_graceful_restart test_tls_auto
     PROPERTIES LABELS "hardening")
 
-set_tests_properties(test_ps_pool_matrix test_tls_splice_matrix
+set_tests_properties(test_ps_pool_matrix test_ps_semantic_compat
+                     test_tls_splice_matrix
                      test_session_hooks_matrix test_crash_recovery_matrix
                      test_pre_query_replay
                      test_dual_protocol_matrix test_invariant_model
@@ -1931,7 +2108,7 @@ target_link_libraries(test_probe PRIVATE
 )
 target_link_options(test_probe PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_probe COMMAND test_probe)
-set_tests_properties(test_probe PROPERTIES LABELS "core" TIMEOUT 30)
+set_tests_properties(test_probe PROPERTIES LABELS "core openssl" TIMEOUT 30)
 
 # Buffer API (growable byte buffer)
 add_executable(test_buffer test_buffer.c)
@@ -2066,7 +2243,7 @@ add_custom_target(test-sql
 add_custom_target(test-core
     COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
             -L "^core$" --output-on-failure -j
-    DEPENDS test_auth test_config test_config_reload test_router test_router_plugin test_cluster
+    DEPENDS test_auth test_config test_result_cache_gate test_config_reload test_router test_router_plugin test_cluster
             test_cluster_election test_cluster_fuzz
             test_audit_log test_throttle test_compress
             test_probe test_reactor test_log_plugins
@@ -2087,7 +2264,7 @@ add_custom_target(test-session
 add_custom_target(test-pool
     COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
             -L "^pool$" --output-on-failure -j
-    DEPENDS test_pool_correctness
+    DEPENDS test_pool_correctness test_backpressure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running pool module tests"
     USES_TERMINAL
@@ -2129,7 +2306,8 @@ add_custom_target(test-hardening
             test_shadow_diff_harness test_runtime_security_harness test_stats_alignment
             test_tls_security test_tls_ktls test_drain_shutdown
             test_graceful_restart test_tls_auto
-            test_ps_pool_matrix test_tls_splice_matrix test_session_hooks_matrix
+            test_ps_pool_matrix test_ps_semantic_compat
+            test_tls_splice_matrix test_session_hooks_matrix
             test_crash_recovery_matrix test_pre_query_replay
             test_dual_protocol_matrix test_invariant_model
             test_mem_safety
@@ -2183,6 +2361,22 @@ set_tests_properties(check_forbidden_blocking PROPERTIES
     TIMEOUT 30
 )
 
+# =============================================================================
+# Issue 9 — Result Cache gate: validate binary-level config rejection.
+# Runs the keel binary with --check-config to verify that result_cache=on
+# is rejected without experimental_features=true.
+# =============================================================================
+add_test(
+    NAME  check_result_cache_gate
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_result_cache_gate.sh
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(check_result_cache_gate PROPERTIES
+    LABELS "gate"
+    TIMEOUT 30
+)
+
 # build_tests — compile every test executable without running them.
 # Use this before ctest when the build was configured with a specific --target
 # (e.g. --target keel) that skips test binaries:
@@ -2198,6 +2392,7 @@ add_custom_target(build_tests DEPENDS
     test_alloc_inject
     test_audit_log
     test_auth
+    test_backpressure
     test_buffer
     test_cancel_forwarding
     test_cloud_auth
@@ -2209,6 +2404,7 @@ add_custom_target(build_tests DEPENDS
     test_compress
     test_concurrency_stress
     test_config
+    test_result_cache_gate
     test_config_reload
     test_conn_lifecycle
     test_connpool
@@ -2251,6 +2447,7 @@ add_custom_target(build_tests DEPENDS
     test_proxy_ssv_e2e
     test_ps_failover_tls
     test_ps_pool_matrix
+    test_ps_semantic_compat
     test_query_cache
     test_query_log
     test_query_rules
@@ -2292,6 +2489,7 @@ add_custom_target(build_tests DEPENDS
     test_tls_ktls
     test_tls_security
     test_tls_splice_matrix
+    test_result_cache_gate
     test_trace
     test_util
     test_web_ui

@@ -4,6 +4,18 @@ This document separates the code that is ready for production hardening from
 features that are implemented but still under failure-mode validation, and from
 features that are aspirational or roadmap-only.
 
+## Production Support Status for v0.2-alpha
+
+Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize`
+and `experimental_features = false`.
+
+| Status | Features |
+|--------|----------|
+| Production candidate | PostgreSQL pool mode, PostgreSQL prepared-statement virtualization after replay validation, admin inspection and basic metrics |
+| Hardening | Smart routing, SSV, Patroni failover, transaction tracking |
+| Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
+| Aspirational | Result cache correctness guarantees |
+
 ## Maturity Levels
 
 | Level | Meaning | Operational rule |
@@ -34,6 +46,36 @@ features that are aspirational or roadmap-only.
 | Web management UI | Experimental | Useful as a read-only view, but not a production control plane. |
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |
+
+## Production-Supported Profiles (v0.2-alpha)
+
+Default profile (enabled without opt-in):
+
+```ini
+[keel]
+experimental_features = false
+
+[worker_group.main]
+mode = pool
+prepared_statement = virtualize
+result_cache = off
+```
+
+Experimental profile (explicitly opt-in):
+
+```ini
+[keel]
+experimental_features = true
+
+[worker_group.main]
+mode = smart    # hardening tier
+scatter_merge = on
+wal_lsn_capture = on
+gtid_capture = on
+```
+
+Do not treat the experimental profile as a supported production baseline. It is
+meant for deliberate feature evaluation with targeted tests and rollout controls.
 
 ## Required Failure-Mode Matrix
 

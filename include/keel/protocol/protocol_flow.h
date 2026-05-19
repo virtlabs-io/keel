@@ -264,6 +264,10 @@ typedef struct keel_be_action {
     /* Query cycle complete — backend has sent all results for this query */
     bool                    query_complete;     /**< ReadyForQuery / OK seen */
 
+    /* Prepared-statement replay progress.
+     * Set when this backend message acknowledges one replayed statement. */
+    bool                    stmt_replay_accepted; /**< Replay acknowledgement for one statement */
+
     /* Zero-copy eligibility */
     bool                    splice_eligible;    /**< Can use zero-copy splice */
 
@@ -275,6 +279,19 @@ typedef struct keel_be_action {
      * query txid_status() on the new primary and resolve the uncertainty. */
     bool                    commit_xid_captured; /**< pending_commit_xid is valid */
     uint64_t                commit_xid;          /**< PostgreSQL txid_current() for the in-flight COMMIT */
+
+    /* Commit-in-doubt check stream outcome update.
+     * Plugins set this while draining their protocol-specific "outcome check"
+     * response stream (e.g. PostgreSQL txid_status). */
+    bool                    commit_doubt_outcome_changed;
+    uint8_t                 commit_doubt_outcome; /**< 0=unknown, 1=committed, 2=aborted */
+
+    /* True when this message is a backend error response (ErrorResponse in
+     * PostgreSQL, ERR packet in MySQL).  Set regardless of the action type so
+     * that pre-query absorbers (state sync, deferred BEGIN, PS replay) can
+     * detect and reject backend-reported failures without relying on the
+     * action type, which may vary per-protocol or per-context. */
+    bool                    is_error_response;
 } keel_be_action_t;
 
 #define KEEL_PROTO_DRAIN_STATE_BYTES 64
@@ -288,6 +305,34 @@ typedef enum keel_proto_drain_result {
 typedef struct keel_proto_drain_state {
     uint8_t opaque[KEEL_PROTO_DRAIN_STATE_BYTES];
 } keel_proto_drain_state_t;
+
+typedef enum keel_commit_doubt_reason {
+    KEEL_CIDR_NO_XID = 0,         /**< Lost commit confirmation before capturing commit token */
+    KEEL_CIDR_NO_RW_POOL,         /**< No writable pool available for outcome check */
+    KEEL_CIDR_NO_CHECK_CONN,      /**< Could not borrow a check connection */
+    KEEL_CIDR_CHECK_BUILD_FAIL,   /**< Plugin failed to build check query */
+    KEEL_CIDR_CHECK_SEND_FAIL,    /**< Check query send failed */
+    KEEL_CIDR_RESOLVED_COMMITTED, /**< Outcome check says committed */
+    KEEL_CIDR_RESOLVED_ABORTED,   /**< Outcome check says aborted */
+    KEEL_CIDR_RESOLVED_UNKNOWN,   /**< Outcome check inconclusive */
+} keel_commit_doubt_reason_t;
+
+/**
+ * @brief Prepared-statement semantic compatibility profile.
+ *
+ * This profile separates statement identity (stmt_set_hash) from semantic
+ * execution context (search_path, role/auth, GUCs, schema epoch). Core code
+ * uses it to decide whether backend statement reuse is safe.
+ */
+typedef struct keel_stmt_compat_profile {
+    uint64_t stmt_set_hash;          /**< Hash of confirmed named statement set */
+    uint64_t semantic_profile_hash;  /**< Combined semantic context hash */
+    uint64_t schema_epoch;           /**< Monotonic schema/DDL epoch */
+    uint64_t role_hash;              /**< Role/session-auth hash */
+    uint64_t search_path_hash;       /**< search_path hash */
+    uint64_t guc_hash;               /**< Replay-relevant GUC hash */
+    bool     semantic_unknown;       /**< Conservative "do not reuse" marker */
+} keel_stmt_compat_profile_t;
 
 /* ============================================================================
  * Backend Cleanup Reason
@@ -700,6 +745,50 @@ typedef struct keel_proto_flow_vtable {
     );
 
     /**
+     * @brief Build protocol-specific commit-in-doubt outcome check payload.
+     *
+     * Called when the engine lost the original backend before COMMIT
+     * confirmation and needs a fresh backend to determine outcome.
+     *
+     * Example implementations:
+     *   PG:    "Q('SELECT txid_status(<xid>)')"
+     *   MySQL: "COM_QUERY('SELECT ...')" / GTID-specific check
+     *
+     * @param ctx      Protocol context.
+     * @param xid      Captured commit token (protocol-specific numeric id).
+     * @param out_buf  Output payload buffer.
+     * @param out_cap  Output buffer capacity.
+     * @return Bytes written (>0), 0 unsupported, -1 error.
+     */
+    ssize_t (*build_commit_doubt_check)(
+        void* ctx,
+        uint64_t xid,
+        uint8_t* out_buf,
+        size_t out_cap
+    );
+
+    /**
+     * @brief Generate a client-facing response for commit-in-doubt outcomes.
+     *
+     * Implementations should include any protocol-specific terminator/state
+     * frame needed by clients (e.g. PostgreSQL ReadyForQuery).
+     *
+     * @param ctx      Protocol context.
+     * @param reason   Commit-in-doubt stage/outcome reason.
+     * @param xid      Captured commit token (0 when unavailable).
+     * @param out_buf  Output response buffer.
+     * @param out_cap  Output buffer capacity.
+     * @return Bytes written (>0), 0 unsupported, -1 error.
+     */
+    ssize_t (*generate_commit_doubt_response)(
+        void* ctx,
+        keel_commit_doubt_reason_t reason,
+        uint64_t xid,
+        uint8_t* out_buf,
+        size_t out_cap
+    );
+
+    /**
      * @brief Begin a streaming operation (COPY IN/OUT, LOAD DATA).
      *
      * @param ctx      Protocol context
@@ -869,6 +958,21 @@ typedef struct keel_proto_flow_vtable {
     );
 
     /**
+     * @brief Retrieve the current prepared-statement compatibility profile.
+     *
+     * OPTIONAL — may be NULL. When absent, the engine must conservatively
+     * avoid semantic exact-match reuse and fall back to clean-replay paths.
+     *
+     * @param ctx    Protocol flow context (session-scoped)
+     * @param out    Output profile
+     * @return 0 on success, -1 on error/unsupported.
+     */
+    int (*get_stmt_compat_profile)(
+        void* ctx,
+        keel_stmt_compat_profile_t* out
+    );
+
+    /**
      * @brief (Optional) Rewrite a named-statement Bind into an anonymous
      *        Parse+Bind+Execute triplet.  Used by ANONYMOUS PS mode only.
      *
@@ -991,7 +1095,10 @@ static inline keel_be_action_t keel_be_action_default(void) {
         .has_profile_update = false,
         .enters_copy_mode = false, .exits_copy_mode = false,
         .query_complete = false,
+        .stmt_replay_accepted = false,
         .splice_eligible = false,
+        .commit_doubt_outcome_changed = false,
+        .commit_doubt_outcome = 0,
     };
 }
 

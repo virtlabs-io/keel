@@ -267,6 +267,10 @@ keel_stats_collector_t *keel_stats_collector_create(keel_stats_level_t level,
                 keel_histogram_reset(&c->contexts[i].extended.connect_latency_ns);
                 keel_histogram_reset(&c->contexts[i].extended.session_duration_ns);
                 keel_histogram_reset(&c->contexts[i].extended.wait_latency_ns);
+                keel_histogram_reset(&c->contexts[i].extended.discard_latency_ns);
+                keel_histogram_reset(&c->contexts[i].extended.state_sync_latency_ns);
+                keel_histogram_reset(&c->contexts[i].extended.cleanup_duration_ns);
+                keel_histogram_reset(&c->contexts[i].extended.replay_duration_ns);
             }
 
             /* Initialize instrumentation probes (mask set later by config) */
@@ -345,6 +349,10 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         keel_histogram_reset(&snap->extended.connect_latency_ns);
         keel_histogram_reset(&snap->extended.session_duration_ns);
         keel_histogram_reset(&snap->extended.wait_latency_ns);
+        keel_histogram_reset(&snap->extended.discard_latency_ns);
+        keel_histogram_reset(&snap->extended.state_sync_latency_ns);
+        keel_histogram_reset(&snap->extended.cleanup_duration_ns);
+        keel_histogram_reset(&snap->extended.replay_duration_ns);
     }
 
     for (size_t i = 0; i < collector->num_workers; i++) {
@@ -364,6 +372,11 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->pool_borrow_state_replay,      &src->pool_borrow_state_replay);
         counter_add_to(&dst->pool_borrow_stmt_replay,       &src->pool_borrow_stmt_replay);
         counter_add_to(&dst->pool_borrow_cleanup_required,  &src->pool_borrow_cleanup_required);
+        counter_add_to(&dst->backend_borrow_success,          &src->backend_borrow_success);
+        counter_add_to(&dst->backend_borrow_failed_incompatible,
+                       &src->backend_borrow_failed_incompatible);
+        counter_add_to(&dst->backend_borrow_failed_quarantined,
+                       &src->backend_borrow_failed_quarantined);
 
         /* Sessions */
         counter_add_to(&dst->sessions_created, &src->sessions_created);
@@ -437,6 +450,18 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
         counter_add_to(&dst->pre_query_proto_violation, &src->pre_query_proto_violation);
         counter_add_to(&dst->pre_query_overflow,        &src->pre_query_overflow);
         counter_add_to(&dst->pre_query_runaway,         &src->pre_query_runaway);
+        counter_add_to(&dst->cleanup_result_success,        &src->cleanup_result_success);
+        counter_add_to(&dst->cleanup_result_protocol_error, &src->cleanup_result_protocol_error);
+        counter_add_to(&dst->cleanup_result_timeout,        &src->cleanup_result_timeout);
+        counter_add_to(&dst->cleanup_result_backend_eof,    &src->cleanup_result_backend_eof);
+        counter_add_to(&dst->cleanup_result_send_failure,   &src->cleanup_result_send_failure);
+        counter_add_to(&dst->replay_result_success,         &src->replay_result_success);
+        counter_add_to(&dst->replay_result_parse_error,     &src->replay_result_parse_error);
+        counter_add_to(&dst->replay_result_drain_error,     &src->replay_result_drain_error);
+        counter_add_to(&dst->replay_result_timeout,         &src->replay_result_timeout);
+        counter_add_to(&dst->replay_result_oom,             &src->replay_result_oom);
+        counter_add_to(&dst->replay_result_partial_send_failure,
+                       &src->replay_result_partial_send_failure);
 
         /* Connection migration */
         counter_add_to(&dst->migrations_sent,     &src->migrations_sent);
@@ -519,6 +544,11 @@ void keel_stats_snapshot_take(keel_stats_collector_t *collector,
             histogram_merge(&edst->connect_latency_ns,  &esrc->connect_latency_ns);
             histogram_merge(&edst->session_duration_ns, &esrc->session_duration_ns);
             histogram_merge(&edst->wait_latency_ns,     &esrc->wait_latency_ns);
+            histogram_merge(&edst->discard_latency_ns,  &esrc->discard_latency_ns);
+            histogram_merge(&edst->state_sync_latency_ns,
+                            &esrc->state_sync_latency_ns);
+            histogram_merge(&edst->cleanup_duration_ns, &esrc->cleanup_duration_ns);
+            histogram_merge(&edst->replay_duration_ns,  &esrc->replay_duration_ns);
         }
 
         /* Merge instrumentation probes */
@@ -555,6 +585,10 @@ void keel_stats_collector_reset(keel_stats_collector_t *collector)
             keel_histogram_reset(&ctx->extended.connect_latency_ns);
             keel_histogram_reset(&ctx->extended.session_duration_ns);
             keel_histogram_reset(&ctx->extended.wait_latency_ns);
+            keel_histogram_reset(&ctx->extended.discard_latency_ns);
+            keel_histogram_reset(&ctx->extended.state_sync_latency_ns);
+            keel_histogram_reset(&ctx->extended.cleanup_duration_ns);
+            keel_histogram_reset(&ctx->extended.replay_duration_ns);
         }
 
         /* Reset instrumentation probes */

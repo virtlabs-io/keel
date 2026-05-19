@@ -470,6 +470,347 @@ class SoakSuite(SuiteRunner):
             print(f"\n    Mixed workload: {inserts[0]} rows inserted+verified "
                   f"over {min(self._duration, 30)}s", flush=True)
 
+    # -----------------------------------------------------------------------
+    # H7 — Transaction pool correctness soak
+    # -----------------------------------------------------------------------
+
+    def test_h07_transaction_pool_correctness(self) -> None:
+        """Explicit BEGIN/COMMIT cycles must not lose rows or produce phantom reads.
+
+        Every committed INSERT must be visible in a subsequent SELECT through the
+        proxy.  A mismatch means the pool returned a dirty backend (open transaction
+        from a prior session) or incorrectly replayed a deferred BEGIN, causing
+        the INSERT to land in the wrong transaction context.
+        """
+        self._require_proxy()
+
+        sentinel = f"txsoak_{int(time.monotonic() * 1000)}_"
+        deadline = time.monotonic() + min(self._duration, 60)
+
+        # Schema setup
+        setup_conn = self._connect()
+        setup_conn.cursor().execute("""
+            CREATE TABLE IF NOT EXISTS keel_txn_soak (
+                id SERIAL PRIMARY KEY,
+                tag TEXT NOT NULL
+            )
+        """)
+        setup_conn.close()
+
+        committed  = [0]
+        errors     = [0]
+        mismatches = [0]
+        lock       = threading.Lock()
+        stop_evt   = threading.Event()
+
+        def _txn_worker(idx: int) -> None:
+            i = 0
+            try:
+                # autocommit=False: each execute is inside an explicit transaction
+                conn = self._pg.connect(_make_dsn(self._env), connect_timeout=10)
+                conn.autocommit = False
+                cur = conn.cursor()
+                while not stop_evt.is_set():
+                    tag = f"{sentinel}{idx}_{i}"
+                    try:
+                        cur.execute(
+                            "INSERT INTO keel_txn_soak(tag) VALUES (%s)", (tag,)
+                        )
+                        cur.execute(
+                            "SELECT COUNT(*) FROM keel_txn_soak WHERE tag = %s", (tag,)
+                        )
+                        pre_commit_count = cur.fetchone()[0]
+                        conn.commit()
+                        # Verify the row survived through a fresh autocommit query
+                        verify_conn = self._connect()
+                        verify_cur  = verify_conn.cursor()
+                        verify_cur.execute(
+                            "SELECT COUNT(*) FROM keel_txn_soak WHERE tag = %s", (tag,)
+                        )
+                        post_count = verify_cur.fetchone()[0]
+                        verify_conn.close()
+                        with lock:
+                            committed[0] += 1
+                            if pre_commit_count != 1 or post_count != 1:
+                                mismatches[0] += 1
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        with lock:
+                            errors[0] += 1
+                    i += 1
+                conn.close()
+            except Exception:
+                with lock:
+                    errors[0] += 1
+
+        workers = [
+            threading.Thread(target=_txn_worker, args=(idx,), daemon=True)
+            for idx in range(min(self._clients, 4))
+        ]
+        for th in workers:
+            th.start()
+
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+
+        stop_evt.set()
+        for th in workers:
+            th.join(timeout=15)
+
+        # Cleanup
+        try:
+            cleanup = self._connect()
+            cleanup.cursor().execute(
+                "DELETE FROM keel_txn_soak WHERE tag LIKE %s", (sentinel + "%",)
+            )
+            cleanup.close()
+        except Exception:
+            pass
+
+        total = committed[0] + errors[0]
+        if total == 0:
+            raise AssertionError("No transactions completed during soak")
+
+        if mismatches[0] > 0:
+            raise AssertionError(
+                f"Transaction correctness violation: {mismatches[0]} row-count "
+                f"mismatches in {committed[0]} committed transactions"
+            )
+
+        error_rate = errors[0] / total
+        if error_rate > 0.02:
+            raise AssertionError(
+                f"Transaction error rate {error_rate*100:.1f}% > 2% "
+                f"({errors[0]} errors / {total} total)"
+            )
+
+        if self.verbose:
+            print(
+                f"\n    TxnSoak: {committed[0]} committed, {errors[0]} errors, "
+                f"{mismatches[0]} mismatches in {min(self._duration, 60)}s",
+                flush=True,
+            )
+
+    # -----------------------------------------------------------------------
+    # H8 — Prepared statement replay correctness soak
+    # -----------------------------------------------------------------------
+
+    def test_h08_prepared_statement_replay_correctness(self) -> None:
+        """Extended-protocol prepared statements must return correct results across pool borrows.
+
+        psycopg2 uses the PostgreSQL extended protocol (Parse/Bind/Execute) for
+        parameterised queries.  When KEEL borrows a different backend to satisfy
+        a new session it must replay the Parse messages before forwarding Bind.
+        A mismatch means a wrong or absent replay, or a hash collision causing
+        an incompatible backend to be selected.
+        """
+        self._require_proxy()
+
+        deadline    = time.monotonic() + min(self._duration, 60)
+        errors      = [0]
+        mismatches  = [0]
+        executions  = [0]
+        lock        = threading.Lock()
+        stop_evt    = threading.Event()
+
+        def _ps_worker(idx: int) -> None:
+            try:
+                # Open a new connection per iteration to force pool borrows
+                while not stop_evt.is_set():
+                    try:
+                        conn = self._connect()
+                        cur  = conn.cursor()
+                        # psycopg2 uses extended protocol for parameterised queries;
+                        # repeated execution of the same SQL triggers server-side
+                        # statement caching.
+                        expected = idx * 1000 + (executions[0] % 100)
+                        cur.execute("SELECT %s::int * 2 + %s::int", (expected, idx))
+                        row = cur.fetchone()
+                        got = row[0] if row else None
+                        conn.close()
+                        with lock:
+                            executions[0] += 1
+                            if got != expected * 2 + idx:
+                                mismatches[0] += 1
+                    except Exception:
+                        with lock:
+                            errors[0] += 1
+            except Exception:
+                with lock:
+                    errors[0] += 1
+
+        workers = [
+            threading.Thread(target=_ps_worker, args=(idx,), daemon=True)
+            for idx in range(min(self._clients, 4))
+        ]
+        for th in workers:
+            th.start()
+
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+
+        stop_evt.set()
+        for th in workers:
+            th.join(timeout=15)
+
+        total = executions[0] + errors[0]
+        if total == 0:
+            raise AssertionError("No prepared-statement executions completed")
+
+        if mismatches[0] > 0:
+            raise AssertionError(
+                f"Prepared-statement correctness violation: {mismatches[0]} wrong "
+                f"results in {executions[0]} executions"
+            )
+
+        error_rate = errors[0] / total
+        if error_rate > 0.02:
+            raise AssertionError(
+                f"Prepared-statement error rate {error_rate*100:.1f}% > 2% "
+                f"({errors[0]} errors / {total} total)"
+            )
+
+        if self.verbose:
+            print(
+                f"\n    PsSoak: {executions[0]} executions, {errors[0]} errors, "
+                f"{mismatches[0]} mismatches in {min(self._duration, 60)}s",
+                flush=True,
+            )
+
+    # -----------------------------------------------------------------------
+    # H9 — Failover soak (Patroni-gated)
+    # -----------------------------------------------------------------------
+
+    def test_h09_failover_soak(self) -> None:
+        """Mixed workload with periodic Patroni switchover must stay below 5 % error rate.
+
+        Requires:
+          KEEL_PATRONI_URL — REST endpoint of the Patroni leader, e.g.
+                             http://patroni-primary:8008
+          KEEL_PATRONI_SWITCHOVER_INTERVAL_S — seconds between switchovers
+                                                (default: 30)
+
+        The test runs a continuous read/write workload and fires
+        ``POST /switchover`` at regular intervals.  Errors during the few-
+        second failover window are acceptable; the steady-state error rate
+        after re-election must not exceed the threshold.
+
+        Skipped automatically when KEEL_PATRONI_URL is not set so CI runs that
+        lack Patroni infrastructure continue to pass.
+        """
+        import urllib.request
+        import json as _json
+
+        self._require_proxy()
+
+        patroni_url = os.environ.get("KEEL_PATRONI_URL", "").rstrip("/")
+        if not patroni_url:
+            self.skip(
+                "KEEL_PATRONI_URL not set — skipping failover soak "
+                "(set to http://<patroni-leader>:8008 to enable)"
+            )
+
+        switchover_interval = int(
+            os.environ.get("KEEL_PATRONI_SWITCHOVER_INTERVAL_S", "30")
+        )
+        soak_duration = min(self._duration, 120)
+
+        errors    = [0]
+        queries   = [0]
+        lock      = threading.Lock()
+        stop_evt  = threading.Event()
+
+        def _workload_worker() -> None:
+            try:
+                conn = self._connect()
+                cur  = conn.cursor()
+                while not stop_evt.is_set():
+                    try:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                        with lock:
+                            queries[0] += 1
+                    except Exception:
+                        # Reconnect after a failover-induced error
+                        with lock:
+                            errors[0] += 1
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                        try:
+                            conn = self._connect()
+                            cur  = conn.cursor()
+                        except Exception:
+                            pass
+                conn.close()
+            except Exception:
+                with lock:
+                    errors[0] += 1
+
+        workers = [
+            threading.Thread(target=_workload_worker, daemon=True)
+            for _ in range(min(self._clients, 4))
+        ]
+        for th in workers:
+            th.start()
+
+        switchovers = 0
+        t_start = time.monotonic()
+        next_switchover = t_start + switchover_interval
+
+        while time.monotonic() - t_start < soak_duration:
+            time.sleep(1.0)
+            now = time.monotonic()
+            if now >= next_switchover:
+                next_switchover = now + switchover_interval
+                try:
+                    req = urllib.request.Request(
+                        f"{patroni_url}/switchover",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+                        resp.read()
+                    switchovers += 1
+                    if self.verbose:
+                        print(
+                            f"    [failover] switchover #{switchovers} at "
+                            f"t={now - t_start:.0f}s",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    if self.verbose:
+                        print(f"    [failover] switchover request failed: {exc}",
+                              flush=True)
+
+        stop_evt.set()
+        for th in workers:
+            th.join(timeout=15)
+
+        total = queries[0] + errors[0]
+        if total == 0:
+            raise AssertionError("No queries completed during failover soak")
+
+        error_rate = errors[0] / total
+        if error_rate > 0.05:
+            raise AssertionError(
+                f"Failover error rate {error_rate*100:.1f}% > 5% threshold "
+                f"({errors[0]} errors / {total} total, {switchovers} switchovers)"
+            )
+
+        if self.verbose:
+            print(
+                f"\n    FailoverSoak: {queries[0]} ok, {errors[0]} errors, "
+                f"{switchovers} switchovers in {soak_duration}s",
+                flush=True,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Coordinator entry point

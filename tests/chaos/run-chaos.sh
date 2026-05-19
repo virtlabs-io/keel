@@ -219,6 +219,13 @@ ALL_SCENARIOS=(
     "partition-replica"
     "sigkill-during-drain"
     "flip-primary"
+    # Issue 8 — Failover Gate scenarios
+    "primary-dies-idle"
+    "primary-dies-during-txn"
+    "commit-in-doubt"
+    "role-flapping"
+    "replica-lag-threshold"
+    "timeline-invalidation"
 )
 
 if [[ $# -gt 0 ]]; then

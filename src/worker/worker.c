@@ -1446,6 +1446,7 @@ static int worker_setup_session(keel_worker_t* worker, int client_fd)
     session->last_activity = session->created_at;
     session->id = ++worker->stats.sessions_created;
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->in_transaction = false;
 
     /* Start trace span (if tracing is enabled and this session is sampled) */
@@ -1632,40 +1633,7 @@ static void on_accept_complete(void* userdata, int result)
         KEEL_LOG_DEBUG(KEEL_LOG_CAT_CONN,
             "Worker %u: rejecting new connection during drain (fd=%d)",
             worker->id, client_fd);
-        /* Best-effort: send a PostgreSQL FATAL error so the client
-         * sees "server is shutting down" rather than a raw TCP close.
-         * For MySQL protocol the greeting handshake hasn't started, so
-         * a clean close is the only safe option. */
-        const char* proto = worker->backend_protocol ? worker->backend_protocol : "postgres";
-        if (proto[0] == 'p') {
-            /* Build PG ErrorResponse: FATAL 57P03 (cannot_connect_now) */
-            uint8_t buf[128];
-            size_t pos = 0;
-            buf[pos++] = 'E';         /* message type */
-            pos += 4;                 /* length placeholder (bytes 1-4) */
-            #define PG_DRAIN_FIELD(tag, val) do { \
-                buf[pos++] = (tag); \
-                size_t vlen = strlen(val) + 1; \
-                memcpy(&buf[pos], (val), vlen); \
-                pos += vlen; \
-            } while (0)
-            PG_DRAIN_FIELD('S', "FATAL");
-            PG_DRAIN_FIELD('V', "FATAL");
-            PG_DRAIN_FIELD('C', "57P03");
-            PG_DRAIN_FIELD('M', "the database system is shutting down");
-            PG_DRAIN_FIELD('D', "server is draining");
-            #undef PG_DRAIN_FIELD
-            buf[pos++] = '\0';        /* terminator */
-            /* Patch length (includes self 4 bytes, excludes 'E') */
-            uint32_t len = (uint32_t)(pos - 1);
-            buf[1] = (uint8_t)(len >> 24);
-            buf[2] = (uint8_t)(len >> 16);
-            buf[3] = (uint8_t)(len >> 8);
-            buf[4] = (uint8_t)(len);
-            int fl = fcntl(client_fd, F_GETFL, 0);
-            if (fl >= 0) fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
-            keel_try_send_nb(client_fd, buf, pos);
-        }
+        /* Handshake protocol is not established yet; close directly. */
         close(client_fd);
         /* Don't rearm accept — we're shutting down */
         return;
@@ -1725,17 +1693,21 @@ static void backend_cleanup_and_return(keel_worker_t*        worker,
     (void)flow;
     (void)reason;
 
+    if (!backend_pool_validate_generation(be_conn, session->backend_generation)) {
+        session->backend_conn = NULL;
+        session->backend_generation = 0;
+        session->server_fd = -1;
+        return;
+    }
+
     /* Close backend — don't try to reuse a connection that was mid-transaction
      * when the FE disconnected.  Non-blocking cleanup is race-prone. */
-    if (be_conn->fd >= 0) { close(be_conn->fd); be_conn->fd = -1; }
-    atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-    be_conn->pinned_session     = NULL;
-    be_conn->in_transaction     = false;
-    be_conn->current_state_hash = 0;
-    be_conn->stmt_set_hash      = 0;
-    be_conn->hard_pinned        = false;
-    if (be_conn->pool) be_conn->pool->active_count--;
+    if (be_conn->pool) {
+        backend_pool_close_connection(be_conn->pool, be_conn,
+                                      BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    }
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->server_fd    = -1;
 
     if (worker->stats_ctx)
@@ -1791,22 +1763,14 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
          * by pinned_session, which is NOT set for non-pinned connections. */
         if (session->backend_conn) {
             backend_conn_t* be_conn = session->backend_conn;
-            /* Note: server_fd == be_conn->fd, close via be_conn */
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-                if (worker->stats_ctx)
-                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
-            }
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->current_state_hash = 0;
-            be_conn->hard_pinned = false;
-            if (be_conn->pool) {
-                be_conn->pool->active_count--;
+            if (backend_pool_validate_generation(be_conn, session->backend_generation)) {
+                if (be_conn->pool) {
+                    backend_pool_close_connection(be_conn->pool, be_conn,
+                                                  BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+                }
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         } else if (session->server_fd >= 0) {
             close(session->server_fd);
@@ -1848,6 +1812,12 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
      *   - hard-pinned (prepared statements / SET) */
     if (session->backend_conn) {
         backend_conn_t* be_conn = session->backend_conn;
+        if (!backend_pool_validate_generation(be_conn, session->backend_generation)) {
+            session->backend_conn = NULL;
+            session->backend_generation = 0;
+            session->server_fd = -1;
+            goto backend_release_done;
+        }
         
         bool can_return = (be_conn->fd >= 0) &&
                           !be_conn->in_transaction &&
@@ -1857,6 +1827,7 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
         if (can_return && be_conn->pool) {
             /* Safe to return — backend is idle after last query completed */
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
             backend_pool_return(be_conn->pool, be_conn, false);
             if (worker->stats_ctx)
@@ -1879,27 +1850,19 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
                                        be_conn, KEEL_CLEANUP_FE_DISCONNECT);
         } else {
             /* Unsafe — close the backend fd and mark slot as CLOSED */
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-                if (worker->stats_ctx)
-                    KEEL_STAT_INC(worker->stats_ctx, backend_close_client_disconnect);
-            }
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->current_state_hash = 0;
-            be_conn->hard_pinned = false;
             if (be_conn->pool) {
-                be_conn->pool->active_count--;
+                backend_pool_close_connection(be_conn->pool, be_conn,
+                                              BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         }
     } else if (session->server_fd >= 0) {
         close(session->server_fd);
         session->server_fd = -1;
     }
+backend_release_done:
     
     /* plugin_state borrow is cleared; the flow vtable owns the context and
      * frees it in keel_session_flow_destroy() called above or below. */
@@ -2031,9 +1994,14 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
                             errbuf, sizeof(errbuf));
                     if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                 }
-                if (flow->name && strcmp(flow->name, "postgres") == 0) {
-                    uint8_t z[] = {'Z',0,0,0,5,'I'};
-                    memcpy(sendbuf + sendlen, z, sizeof(z)); sendlen += sizeof(z);
+                if (flow->generate_ready_for_query) {
+                    uint8_t z[16];
+                    ssize_t zlen = flow->generate_ready_for_query(
+                        recv_ctx->flow.ctx, z, sizeof(z));
+                    if (zlen > 0) {
+                        memcpy(sendbuf + sendlen, z, (size_t)zlen);
+                        sendlen += (size_t)zlen;
+                    }
                 }
                 if (sendlen > 0)
                     keel_try_send_nb(session->client_fd, sendbuf, sendlen);
@@ -2091,15 +2059,24 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
      * would send Parse("sbstmt1") onto a backend that already has "sbstmt1"
      * → ErrorResponse → backend stuck in error-recovery (needs Sync) →
      * keel waiting for RFQ → permanent deadlock. */
-    uint64_t stmt_hash = 0;
+    keel_stmt_compat_profile_t stmt_profile;
+    memset(&stmt_profile, 0, sizeof(stmt_profile));
     const keel_proto_flow_vtable_t* flow = recv_ctx->flow.flow;
     if (flow && flow->get_stmt_replay && recv_ctx->flow.ctx) {
         flow->get_stmt_replay(recv_ctx->flow.ctx,
-                              NULL, NULL, NULL, &stmt_hash);
+                              NULL, NULL, NULL, &stmt_profile.stmt_set_hash);
+    }
+    if (flow && flow->get_stmt_compat_profile && recv_ctx->flow.ctx) {
+        if (flow->get_stmt_compat_profile(recv_ctx->flow.ctx, &stmt_profile) < 0) {
+            memset(&stmt_profile, 0, sizeof(stmt_profile));
+        }
+    } else if (stmt_profile.stmt_set_hash != 0) {
+        /* No semantic profile callback: force conservative replay paths. */
+        stmt_profile.semantic_unknown = true;
     }
     bool needs_replay = false;
     backend_conn_t* be_conn = backend_pool_borrow_with_stmts(
-            pool, 0, stmt_hash, &needs_replay);
+            pool, 0, &stmt_profile, &needs_replay);
 
     if (!be_conn) {
         /* Opportunistic reclaim: a backend may have completed DISCARD ALL
@@ -2109,7 +2086,7 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
 
         bool needs_replay_retry = false;
         be_conn = backend_pool_borrow_with_stmts(
-                pool, 0, stmt_hash, &needs_replay_retry);
+                pool, 0, &stmt_profile, &needs_replay_retry);
         if (be_conn) {
             needs_replay = needs_replay_retry;
         }
@@ -2120,10 +2097,10 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
          * A returning backend (or the refill timer) will wake it. */
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pool_wait_resume_requeues);
-        KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
             "W%u: pool_wait_resume: no backend for stmt_hash=0x%016llx "
             "(active=%zu clean=%zu wait=%zu) re-queuing",
-            worker->id, (unsigned long long)stmt_hash,
+            worker->id, (unsigned long long)stmt_profile.stmt_set_hash,
             pool->active_count, pool->clean_count,
             pool->wait_queue_size);
         if (recv_ctx->flow.pending_msg) {
@@ -3688,18 +3665,14 @@ static void on_backend_recv_complete(void* userdata, int result)
         /* Mark pooled connection as broken so it gets discarded */
         if (session->backend_conn) {
             backend_conn_t* be_conn = session->backend_conn;
-            atomic_store(&be_conn->state, BACKEND_CONN_CLOSED);
-            if (be_conn->fd >= 0) {
-                close(be_conn->fd);
-                be_conn->fd = -1;
-            }
-            be_conn->pinned_session = NULL;
-            be_conn->in_transaction = false;
-            be_conn->hard_pinned = false;
-            if (be_conn->pool) {
-                be_conn->pool->active_count--;
+            if (backend_pool_validate_generation(be_conn, session->backend_generation)) {
+                if (be_conn->pool) {
+                    backend_pool_close_connection(be_conn->pool, be_conn,
+                                                  BACKEND_CLOSE_REASON_IO_ERROR);
+                }
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         } else if (session->server_fd >= 0) {
             close(session->server_fd);
@@ -3754,10 +3727,14 @@ static void on_backend_recv_complete(void* userdata, int result)
                     memcpy(sendbuf, errbuf, (size_t)el);
                     sendlen += (size_t)el;
                 }
-                if (flow->name && strcmp(flow->name, "postgres") == 0) {
-                    uint8_t z[] = {'Z', 0, 0, 0, 5, 'I'};
-                    memcpy(sendbuf + sendlen, z, sizeof(z));
-                    sendlen += sizeof(z);
+                if (flow->generate_ready_for_query) {
+                    uint8_t z[16];
+                    ssize_t zlen = flow->generate_ready_for_query(
+                        client_ctx->flow.ctx, z, sizeof(z));
+                    if (zlen > 0) {
+                        memcpy(sendbuf + sendlen, z, (size_t)zlen);
+                        sendlen += (size_t)zlen;
+                    }
                 }
                 if (sendlen > 0)
                     keel_try_send_nb(session->client_fd, sendbuf, sendlen);
@@ -4013,6 +3990,10 @@ int keel_worker_init(
         /* Sticky-primary TTL */
         worker->sticky_primary_ttl_ms = cfg->sticky_primary_ttl_ms;
 
+        /* Buffer caps (0 = unlimited) */
+        worker->session_max_buffered_bytes = cfg->session_max_buffered_bytes;
+        worker->backend_max_replay_bytes   = cfg->backend_max_replay_bytes;
+
         /* TLS configuration (frontend + backend) */
         worker->tls_config         = cfg->tls_config;
         worker->backend_tls_config = cfg->backend_tls_config;
@@ -4088,7 +4069,9 @@ int keel_worker_init(
             .max_waiting = max_waiting,
             .idle_timeout_ms = cfg->pool_idle_timeout_ms,
             .max_connection_age_ms = cfg->pool_max_connection_age_ms,
-            .wait_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000,
+            .wait_timeout_ms = cfg->pool_wait_timeout_ms > 0
+                ? cfg->pool_wait_timeout_ms
+                : (cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000),
             .tls_config = worker->backend_tls_config,
         };
 
@@ -4112,7 +4095,9 @@ int keel_worker_init(
                     .max_waiting = max_waiting,
                     .idle_timeout_ms = cfg->pool_idle_timeout_ms,
                     .max_connection_age_ms = cfg->pool_max_connection_age_ms,
-                    .wait_timeout_ms = cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000,
+                    .wait_timeout_ms = cfg->pool_wait_timeout_ms > 0
+                        ? cfg->pool_wait_timeout_ms
+                        : (cfg->connect_timeout_ms > 0 ? cfg->connect_timeout_ms : 10000),
                     .tls_config = worker->backend_tls_config,
                 };
                 backend_pool_t* p = backend_pool_create(&pool_cfg);

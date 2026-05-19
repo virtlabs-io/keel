@@ -304,6 +304,10 @@ typedef struct keel_worker {
     /* Sticky-primary TTL (0 = disabled) */
     uint32_t        sticky_primary_ttl_ms; /**< ms to force reads to primary after a write (0 = off) */
 
+    /* Per-session and per-backend buffer caps (0 = unlimited) */
+    size_t          session_max_buffered_bytes; /**< max FE message size; 0 = unlimited */
+    size_t          backend_max_replay_bytes;   /**< max PS replay buffer; 0 = unlimited */
+
     /* TLS configuration (frontend: client→proxy, backend: proxy→database).
      * Copied from engine_config at worker init; worker accesses these on
      * every connection accept to decide whether to start TLS handshake. */
