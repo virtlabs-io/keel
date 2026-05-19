@@ -1110,7 +1110,7 @@ static int iouring_chain_send_recv(
     recv_op->callback  = on_recv_done;
     recv_op->type      = KEEL_OP_RECV;
     recv_op->multishot = false;
-    recv_op->orig_buf  = NULL;
+    recv_op->orig_buf  = recv_buf;
     recv_op->fd        = -1;
 
     io_uring_prep_recv(sqe_recv, recv_fd, recv_buf, recv_len, recv_flags);

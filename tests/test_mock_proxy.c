@@ -219,7 +219,7 @@ static size_t mock_make_error_response(uint8_t *b, const char *msg)
 
 typedef struct {
     int            listen_fd;
-    volatile bool  running;
+    _Atomic bool   running;
     atomic_int     connections_accepted;
     atomic_int     queries_handled;
     pthread_t      listener_tid;

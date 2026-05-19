@@ -67,6 +67,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,7 +100,7 @@ struct keel_admin {
     keel_throttle_rules_t *throttle_rules;
     keel_discovery_t    *discovery;
     pthread_t           thread;
-    volatile bool       running;
+    _Atomic bool        running;
     int                 admin_fd;
     int                 prom_fd;
     keel_auth_manager_t *auth_mgr;
