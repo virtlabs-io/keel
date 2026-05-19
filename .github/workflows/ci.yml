@@ -65,7 +65,13 @@ jobs:
             lua5.4 \
             liblua5.4-dev \
             python3 \
-            python3-dev
+            python3-dev \
+            ccache
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: build-and-test-${{ runner.os }}
 
       - name: Configure
         run: |
@@ -73,6 +79,7 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_STANDARD=23 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DKEEL_ENABLE_TESTS=ON \
             -DKEEL_ENABLE_HARDENING=ON
 
@@ -179,8 +186,7 @@ jobs:
 
       - name: Test (TSan)
         env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
-          TSAN_SUPPRESSIONS: cmake/tsan_suppressions.txt
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=cmake/tsan_suppressions.txt"
         run: ctest --test-dir build-tsan --output-on-failure -j$(nproc)
 
       - name: Python concurrency suite (TSAN build)
@@ -216,6 +222,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libssl-dev \
             lua5.4 \
             liblua5.4-dev \
             python3 \
@@ -556,11 +563,11 @@ jobs:
           fail_ci_if_error: false
 
   # ===========================================================================
-  # Real Database Integration Tests (PostgreSQL 16 + MySQL 8)
+  # Real Database Integration Tests (PostgreSQL 16 + MySQL 8 + MariaDB 11)
   # ===========================================================================
   integration-db:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     if: github.event_name == 'pull_request'
 
     services:
@@ -589,6 +596,21 @@ jobs:
           - 13306:3306
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pmysql --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: mariadb
+          MARIADB_DATABASE: keeltest
+          MARIADB_USER: keel
+          MARIADB_PASSWORD: keel
+        ports:
+          - 13307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 15
@@ -634,6 +656,10 @@ jobs:
       - name: Verify MySQL is reachable
         run: |
           mysql -h 127.0.0.1 -P 13306 -u root -pmysql -e "SELECT VERSION();"
+
+      - name: Verify MariaDB is reachable
+        run: |
+          mysql -h 127.0.0.1 -P 13307 -u root -pmariadb -e "SELECT VERSION();"
 
       - name: Run proxy E2E tests (PostgreSQL)
         env:
