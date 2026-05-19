@@ -2037,6 +2037,9 @@ set_tests_properties(test_plugin_contract test_pg_protocol_flow
                      test_mysql_protocol_flow
     PROPERTIES LABELS "protocol")
 
+set_tests_properties(test_pg_protocol_flow
+    PROPERTIES LABELS "protocol openssl")
+
 set_tests_properties(test_failover
     PROPERTIES LABELS "engine")
 
@@ -2105,7 +2108,7 @@ target_link_libraries(test_probe PRIVATE
 )
 target_link_options(test_probe PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_probe COMMAND test_probe)
-set_tests_properties(test_probe PROPERTIES LABELS "core" TIMEOUT 30)
+set_tests_properties(test_probe PROPERTIES LABELS "core openssl" TIMEOUT 30)
 
 # Buffer API (growable byte buffer)
 add_executable(test_buffer test_buffer.c)
