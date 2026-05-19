@@ -1835,13 +1835,18 @@ static void test_keel_binary_e2e(void)
 {
     TEST_BEGIN("mock proxy: keel binary launched with config pointing to mock backend");
 
+    /* The spawned keel binary inherits sanitizer instrumentation and has
+     * stderr redirected to /dev/null.  Under MSan any uninstrumented syscall
+     * aborts it silently before readiness; under TSan a detected race aborts
+     * it silently after readiness, causing the query timeout and SIGPIPE.
+     * Functional correctness is covered by the in-process tests above. */
+#if defined(__SANITIZE_THREAD__)
+    printf("  SKIP: keel binary e2e test disabled under ThreadSanitizer\n");
+    TEST_END();
+    return;
+#endif
 #if defined(__has_feature)
 #  if __has_feature(memory_sanitizer)
-    /* Under MemorySanitizer the spawned keel binary inherits
-     * MSAN_OPTIONS=halt_on_error=1 but has stderr redirected to /dev/null,
-     * so any uninstrumented-library call causes a silent crash before keel
-     * can accept connections.  Functional correctness is covered by the
-     * in-process tests above; skip the binary e2e check under MSan. */
     printf("  SKIP: keel binary e2e test disabled under MemorySanitizer\n");
     TEST_END();
     return;
