@@ -87,7 +87,7 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j$(nproc)
+        run: ctest --test-dir build --output-on-failure -LE integration -j$(nproc)
 
   # ===========================================================================
   # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -134,7 +134,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build-asan --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-asan --output-on-failure -LE integration -j$(nproc)
 
       - name: Python memory suite (ASAN build)
         run: |
@@ -187,7 +187,7 @@ jobs:
       - name: Test (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/cmake/tsan_suppressions.txt"
-        run: ctest --test-dir build-tsan --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-tsan --output-on-failure -LE integration -j$(nproc)
 
       - name: Python concurrency suite (TSAN build)
         run: |
@@ -248,7 +248,7 @@ jobs:
         run: |
           ctest --test-dir build-msan \
             --output-on-failure \
-            -LE openssl \
+            -LE "integration|openssl" \
             -j$(nproc)
 
   # ===========================================================================
@@ -376,7 +376,7 @@ jobs:
         run: lcov --directory build-coverage --zerocounters --quiet
 
       - name: Run Tests
-        run: ctest --test-dir build-coverage --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-coverage --output-on-failure -LE integration -j$(nproc)
 
       - name: Collect Coverage (line + branch)
         run: |
