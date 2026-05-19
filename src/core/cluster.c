@@ -620,6 +620,10 @@ static bool cluster_apply_sync_config(keel_cluster_t* c,
     /* Timeout must never be shorter than heartbeat interval. */
     if (timeout < interval) timeout = interval;
 
+    /* peer_lock also guards the plain config fields (heartbeat_interval_ms,
+     * heartbeat_timeout_ms, failure_threshold, auto_sync) against races with
+     * keel_cluster_get_stats() which reads them from the caller thread. */
+    pthread_mutex_lock(&c->peer_lock);
     bool changed = false;
     if (interval != c->config.heartbeat_interval_ms) {
         c->config.heartbeat_interval_ms = interval;
@@ -637,6 +641,7 @@ static bool cluster_apply_sync_config(keel_cluster_t* c,
         c->config.auto_sync = remote_auto_sync;
         changed = true;
     }
+    pthread_mutex_unlock(&c->peer_lock);
 
     if (changed) {
         atomic_fetch_add(&c->config_reconciliations, 1);
@@ -2703,10 +2708,12 @@ void keel_cluster_get_stats(const keel_cluster_t* c, keel_cluster_stats_t* stats
     stats->config_reconciliations = atomic_load(&c->config_reconciliations);
     stats->last_sync_apply_ns = atomic_load(&c->last_sync_apply_ns);
     stats->server_notifications = atomic_load(&c->server_notifications);
+    pthread_mutex_lock(&((keel_cluster_t*)c)->peer_lock);
     stats->local_heartbeat_interval_ms = c->config.heartbeat_interval_ms;
     stats->local_heartbeat_timeout_ms = c->config.heartbeat_timeout_ms;
     stats->local_failure_threshold = c->config.failure_threshold;
     stats->local_auto_sync = c->config.auto_sync ? 1U : 0U;
+    pthread_mutex_unlock(&((keel_cluster_t*)c)->peer_lock);
 
     /* Election statistics */
     stats->elections_started  = atomic_load(&c->elections_started);
