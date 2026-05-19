@@ -108,7 +108,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_pre" "pre_promote" "$SENTINEL_N" \
+    "${RUN_TAG}_pre" "pre_promote" "$SENTINEL_N" "phase-A pre-promotion values on original primary" \
     || die "Phase A assertion on original primary failed"
 log "Phase A: ${SENTINEL_N} rows confirmed on original primary."
 
@@ -174,7 +174,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$REPLICA1_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_post" "post_promote" "$SENTINEL_N" \
+    "${RUN_TAG}_post" "post_promote" "$SENTINEL_N" "phase-B post-promotion values on new primary" \
     || die "Phase B: Phase B rows not on new primary (replica1)"
 log "Phase B: ${SENTINEL_N} rows via KEEL confirmed on new primary (replica1)."
 
@@ -182,7 +182,7 @@ log "Phase B: ${SENTINEL_N} rows via KEEL confirmed on new primary (replica1)."
 sentinel_assert_values \
     "$REPLICA1_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_pre" "pre_promote" "$SENTINEL_N" \
+    "${RUN_TAG}_pre" "pre_promote" "$SENTINEL_N" "phase-A pre-promotion values on new primary" \
     || die "Cross-check: Phase A rows missing on new primary — replication was incomplete before promotion"
 log "Cross-check: Phase A rows present on new primary — replication was complete."
 

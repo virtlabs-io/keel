@@ -103,7 +103,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_a" "zero_lag" "$SENTINEL_N" \
+    "${RUN_TAG}_a" "zero_lag" "$SENTINEL_N" "phase-A zero-lag values" \
     || die "Phase A assertion failed"
 
 # Give replica1 time to catch up to zero lag
@@ -166,7 +166,7 @@ sleep "$PROBE_SETTLE_S"
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_c" "all_lag_write" "$SENTINEL_N" \
+    "${RUN_TAG}_c" "all_lag_write" "$SENTINEL_N" "phase-C all-lag values" \
     || die "Phase C assertion failed — rows not found on primary after all-lag scenario"
 
 log "Phase C: all ${SENTINEL_N} rows confirmed on primary."
@@ -182,7 +182,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_d" "post_resume" "$SENTINEL_N" \
+    "${RUN_TAG}_d" "post_resume" "$SENTINEL_N" "phase-D post-resume values" \
     || die "Phase D assertion failed"
 log "Phase D: all ${SENTINEL_N} post-resume rows confirmed."
 

@@ -69,7 +69,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_pre" "pre_flap" "$SENTINEL_N" \
+    "${RUN_TAG}_pre" "pre_flap" "$SENTINEL_N" "phase-A pre-flap values" \
     || die "Phase A assertion failed"
 log "Phase A: all ${SENTINEL_N} rows confirmed."
 
@@ -130,7 +130,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_post" "post_flap" "$SENTINEL_N" \
+    "${RUN_TAG}_post" "post_flap" "$SENTINEL_N" "phase-C post-flap values" \
     || die "Phase C assertion failed"
 log "Phase C: all ${SENTINEL_N} post-flap rows confirmed."
 

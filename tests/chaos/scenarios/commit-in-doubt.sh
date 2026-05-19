@@ -70,7 +70,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_pre" "pre_race" "$SENTINEL_N" \
+    "${RUN_TAG}_pre" "pre_race" "$SENTINEL_N" "phase-A pre-race values" \
     || die "Phase A sentinel assertion failed"
 
 log "Phase A verified — ${SENTINEL_N} rows durable."
@@ -158,7 +158,7 @@ fi
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_pre" "pre_race" "$SENTINEL_N" \
+    "${RUN_TAG}_pre" "pre_race" "$SENTINEL_N" "phase-A pre-race values after restart" \
     || die "Phase A rows missing after primary restart!"
 pass "Phase A: all ${SENTINEL_N} pre-race rows durable after restart."
 

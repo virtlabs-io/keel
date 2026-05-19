@@ -73,7 +73,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_a" "pre_txn" "$SENTINEL_N" \
+    "${RUN_TAG}_a" "pre_txn" "$SENTINEL_N" "phase-A pre-transaction values" \
     || die "Phase A assertion failed"
 log "Phase A: ${SENTINEL_N} rows confirmed."
 
@@ -156,7 +156,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_c" "post_recovery" "$SENTINEL_N" \
+    "${RUN_TAG}_c" "post_recovery" "$SENTINEL_N" "phase-C post-recovery values" \
     || die "Phase C assertion failed"
 log "Phase C: all ${SENTINEL_N} post-recovery rows confirmed."
 

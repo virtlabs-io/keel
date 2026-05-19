@@ -300,207 +300,18 @@ Client → accept (SO_REUSEPORT) → Worker
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │   KEEL Cluster (gossip on TCP 7000)      │
-                    │                                          │
+                    │   KEEL Cluster (gossip on TCP 7000)     │
+                    │                                         │
                ┌────┤  KEEL Node 0       KEEL Node 1          │
   Clients ─────┤    │  (active)          (active)             │
-  (load         └────┤  port 7432         port 7432            │
-  balanced)          └─────────────────────────────────────────┘
+  (load        └────┤  port 7432         port 7432            │
+  balanced)         └─────────────────────────────────────────┘
                                 │ heartbeat / config sync
                          Primary + Replicas
 ```
 
 Each node runs independently; the cluster layer propagates configuration changes and detects peer failures. No shared state in the query path — full share-nothing semantics are preserved.
 
-## Project Structure
-
-```
-keel/
-├── include/keel/                   # Public API headers (60 files)
-│   ├── keel.h                      # Master include
-│   ├── reactor.h                  # Platform-agnostic reactor interface
-│   ├── worker.h                   # Worker thread & group management
-│   ├── engine.h / engine_flow.h   # Session engine & data flow
-│   ├── session.h                  # Client session lifecycle
-│   ├── pool.h                     # Connection pool management
-│   ├── protocol.h                 # Protocol abstraction
-│   ├── protocol_vtable.h          # Protocol virtual dispatch
-│   ├── protocol_flow.h            # Protocol flow state machine
-│   ├── protocol_action.h          # Protocol action types
-│   ├── router.h                   # Query routing core
-│   ├── router_plugin.h            # Pluggable routing plugins
-│   ├── router_metadata.h         # Metadata-aware routing
-│   ├── router_discovery.h         # Server discovery & probing
-│   ├── sql.h / sql_ast.h          # SQL parser & AST
-│   ├── sql_query_tree.h           # Query tree types
-│   ├── auth.h / backend_auth.h    # Client & backend authentication
-│   ├── mem.h / mem_safety.h       # Memory management
-│   ├── ringbuf.h                  # Ring buffer
-│   ├── io_splice.h                # Zero-copy splice
-│   ├── admission.h                # Connection admission control
-│   ├── hardpin.h                  # Hard session pinning
-│   ├── route_cache.h              # Route decision cache
-│   ├── state_profile.h            # Session state profiling
-│   ├── probe.h                    # Health check probes
-│   ├── log.h / print.h            # Logging & output
-│   ├── ini.h                      # INI config parser
-│   ├── string_view.h              # Non-owning string view
-│   ├── xxhash.h                   # Fast hashing
-│   ├── types.h / error.h / util.h # Core types & utilities
-│   └── ...
-├── src/
-│   ├── arch/                      # Platform-specific reactor backends
-│   │   ├── common/reactor_common.c
-│   │   ├── linux/
-│   │   │   ├── reactor_iouring.c  # io_uring reactor (Linux 5.6+)
-│   │   │   ├── reactor_epoll.c    # epoll reactor (Linux fallback)
-│   │   │   └── io_splice.c        # Zero-copy splice
-│   │   └── macos/
-│   │       └── reactor_kqueue.c   # kqueue reactor (macOS/BSD)
-│   ├── core/                      # Core services
-│   │   ├── auth.c                 # Client authentication (SCRAM, MD5)
-│   │   ├── config.c               # INI configuration parser
-│   │   ├── pool.c                 # Connection pool logic
-│   │   ├── router_weighted.c      # Weighted routing
-│   │   ├── router_plugin.c        # Plugin manager
-│   │   ├── router_metadata.c      # Metadata cache
-│   │   └── router_discovery.c     # Server discovery & probing
-│   ├── engine/                    # Session engine
-│   │   ├── engine.c               # Engine core
-│   │   ├── engine_flow.c          # Data flow (client↔backend)
-│   │   └── backend_auth.c         # Backend SCRAM-SHA-256 auth
-│   ├── worker/                    # Worker threads
-│   │   ├── worker.c               # Per-core worker (reactor loop, timers)
-│   │   ├── migration.c/.h         # Worker connection migration (SCM_RIGHTS + SPSC ring)
-│   │   ├── backend_pool.c/.h      # Per-worker backend connection pool
-│   │   └── backend_connect_async.c/.h  # Async backend connect state machine
-│   ├── session/                   # Session management
-│   │   ├── session.c              # Session lifecycle
-│   │   ├── admission.c            # Admission control
-│   │   ├── hardpin.c              # Hard pinning
-│   │   ├── residual.c             # Residual data handling
-│   │   ├── route_cache.c          # Route decision cache
-│   │   └── state_profile.c        # State profiling
-│   ├── protocol/                  # Protocol implementations
-│   │   ├── postgres/              # PostgreSQL wire protocol (v3)
-│   │   │   ├── postgres_proto.c   # Message serialization/parsing
-│   │   │   └── postgres_flow.c    # Protocol flow state machine
-│   │   ├── mysql/                 # MySQL client/server protocol
-│   │   │   ├── mysql_proto.c      # Packet serialization/parsing
-│   │   │   ├── mysql_flow.c       # Protocol flow state machine
-│   │   │   └── mysql_backend_auth.c  # Backend auth (caching_sha2)
-│   │   ├── protocol_registry.c    # Protocol registry
-│   │   └── protocol_flow_registry.c
-│   ├── sql/                       # SQL analysis
-│   │   ├── lexer.c                # SQL tokenizer
-│   │   ├── parser.c               # Recursive descent parser
-│   │   ├── query_tree.c           # Query tree builder
-│   │   └── analyzer.c             # Query classification
-│   ├── mem/                       # Memory subsystem
-│   │   ├── arena.c                # Arena (bump) allocator
-│   │   ├── slab.c                 # Slab allocator
-│   │   ├── pool.c                 # Pool allocator
-│   │   ├── ringbuf.c              # Ring buffer
-│   │   │   ├── mem.c                  # Memory utilities
-│   │   ├── mem_safety.c           # Debug leak tracking
-│   │   └── numa.c                 # NUMA-aware allocator
-│   ├── log/                       # Logging subsystem
-│   │   ├── log_plugin_stdout.c    # Console log plugin
-│   │   ├── log_plugin_file.c      # File log plugin
-│   │   ├── log_plugin_syslog.c    # Syslog log plugin
-│   │   ├── log_plugin_loader.c    # Plugin loader
-│   │   └── query_log.c            # Per-query logging
-│   ├── hook/                       # Hook/trigger system
-│   │   ├── hook.c                 # Core dispatch, dlopen plugin loader
-│   │   ├── lua_bridge.c           # Lua 5.4/LuaJIT integration
-│   │   └── python_bridge.c        # CPython 3.x integration
-│   ├── stats/stats.c              # Per-worker statistics
-│   ├── admin/admin.c              # Admin console listener
-│   ├── util/                      # Utilities
-│   │   ├── log.c / print.c        # Logging & formatted output
-│   │   ├── hash.c / xxhash.c      # Hash functions
-│   │   ├── string.c / string_view.c
-│   │   ├── buffer.c               # Buffer management
-│   │   ├── error.c                # Error handling
-│   │   ├── time.c                 # Time utilities
-│   │   └── hashring.c             # Consistent hashing
-│   └── main/main.c               # Entry point
-├── tests/                         # Test suite (116 tests)
-│   ├── test_mem.c                 # Memory allocator tests
-│   ├── test_auth.c                # Authentication tests
-│   ├── test_parser.c              # SQL parser tests
-│   ├── test_router.c              # Query routing tests
-│   ├── test_router_plugin.c       # Router plugin tests
-│   ├── test_sql.c                 # SQL analysis tests
-│   ├── test_config.c              # Configuration tests
-│   ├── test_log.c                 # Logging tests
-│   ├── test_query_log.c           # Per-query logging tests
-│   ├── test_util.c                # Utility tests
-│   ├── test_string_view.c         # String view tests
-│   ├── test_ringbuf.c             # Ring buffer tests
-│   ├── test_xxhash.c              # Hash function tests
-│   ├── test_residual.c            # Residual data tests
-│   ├── test_session_engine.c      # Session engine tests
-│   ├── test_pool_correctness.c    # Pool borrow/return tests
-│   ├── test_plugin_contract.c     # Plugin contract tests
-│   ├── test_pg_protocol_flow.c    # PostgreSQL protocol flow tests
-│   ├── test_mysql_protocol_flow.c # MySQL protocol flow tests
-│   ├── test_hooks.c               # Hook system tests
-│   ├── test_failover.c            # Failover & probe tests
-│   ├── test_migration.c           # Worker connection migration tests
-│   ├── test_tls_ktls.c            # TLS handshake + kTLS activation/fallback tests
-│   └── ...                        # Integration & E2E test files
-├── etc/                           # Configuration
-│   ├── keel-pg.ini                 # PostgreSQL configuration
-│   ├── keel-my.ini                 # MySQL configuration
-│   ├── keel.ini.example            # Annotated config reference
-│   ├── certs/                     # Sample CA/server/client test PKI
-│   └── userlist.txt               # Client credentials
-├── examples/hooks/                # Hook examples & templates
-│   ├── lua/                       # Lua hook scripts
-│   ├── python/                    # Python hook modules
-│   ├── plugins/                   # Native .so plugin sources
-│   └── hooks.ini.example          # Hook configuration reference
-├── docs/                          # Documentation
-│   ├── STARTUP.md                 # Startup flow & memory architecture
-│   ├── CONNECTION_FLOW.md         # Connection lifecycle & pooling
-│   ├── QUERY_FLOW.md              # Query execution & routing flow
-│   ├── MULTIPLEXING.md            # Worker architecture deep-dive
-│   ├── HOOKS.md                   # Hook/trigger system
-│   ├── PREPARED_STATEMENTS.md     # Prepared statement pooling strategies
-│   ├── TRANSACTION_TRACKING.md    # XID probe & read-after-write consistency
-│   ├── TESTING.md                 # Testing guide
-│   ├── ADMIN_SQL.md               # Admin SQL virtual tables & commands
-│   ├── OPERATIONS.md              # Day-2 operations guide
-│   ├── SESSION_CONTEXT.md         # Session-context preservation feature guide
-│   ├── RUNTIME_MODES.md           # Runtime mode tiers (PROXY/POOL/SMART/FULL)
-│   ├── STATE_MODEL.md             # Formal 9-domain session state machine
-│   ├── SSV_POSTGRES_IMPLEMENTATION.md # SSV engine implementation
-│   └── ROADMAP.md                 # Project roadmap & future plans
-├── docker/                        # Docker & E2E testing
-│   ├── compose/                   # Docker Compose stacks
-│   │   ├── pg-e2e.yml             # PostgreSQL E2E test stack
-│   │   ├── pg-patroni.yml         # PostgreSQL Patroni cluster
-│   │   ├── pg-streaming.yml       # PostgreSQL streaming replication
-│   │   ├── mysql-replication.yml  # MySQL 9 async replication
-│   │   ├── mysql-group.yml        # MySQL 9 Group Replication
-│   │   ├── mysql-pxc.yml          # Percona XtraDB Cluster 8.4
-│   │   └── mysql-mariadb.yml      # MariaDB Galera Cluster
-│   ├── tests/                     # E2E test runner scripts
-│   │   ├── test-pg-e2e-full.sh    # PostgreSQL full E2E
-│   │   ├── test-pg-patroni.sh     # Patroni HA cluster
-│   │   ├── test-pg-streaming.sh   # Streaming replication
-│   │   ├── test-mysql-replication.sh  # MySQL async replication
-│   │   ├── test-mysql-group.sh    # MySQL Group Replication
-│   │   ├── test-mysql-pxc.sh      # Percona XtraDB Cluster
-│   │   └── test-mysql-mariadb.sh  # MariaDB Galera
-│   ├── Dockerfile.build           # Build image
-│   └── Dockerfile.e2e             # E2E test image
-├── cmake/
-│   └── keel_config.h.in            # Generated config header template
-├── CMakeLists.txt                 # Top-level build
-└── LICENSE                        # AGPL-3.0
-```
 
 ## When to Use KEEL
 
@@ -730,7 +541,6 @@ KEEL logs a warning and falls back to userspace TLS silently when kTLS is unavai
 | Debian 12 (Bookworm) | x86_64 | ✅ Validated |
 | RHEL / Rocky Linux 9 | x86_64 | ✅ RPM package tested |
 | Fedora 40 | x86_64 | ✅ Validated |
-| macOS 14+ | arm64 (Apple Silicon) | ✅ Builds and tests pass (epoll → kqueue) |
 
 ### Compiler Support
 
@@ -760,13 +570,6 @@ sudo apt-get install cmake gcc-13 libssl-dev liburing-dev
 
 ```bash
 sudo dnf install cmake gcc openssl-devel liburing-devel
-```
-
-#### macOS
-
-```bash
-brew install cmake openssl
-# io_uring not available — kqueue is used automatically
 ```
 
 ### Build Commands
@@ -1270,51 +1073,9 @@ sudo sysctl -w net.ipv4.tcp_max_tw_buckets=10000
 
 ## Roadmap
 
-KEEL has a broad implemented surface, but not every feature has the same
-production maturity. The list below is a maturity snapshot; see
-[PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) for the source of truth
-and [ROADMAP.md](docs/ROADMAP.md) for longer-term planning.
+KEEL has a broad implemented surface, but not every feature has the same production maturity.See [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) for the source of truth and [ROADMAP.md](docs/ROADMAP.md) for longer-term planning.
 
-### Maturity Snapshot
-
-- [x] io_uring share-nothing reactor with linked SQEs, registered FDs, zero-poll hot path
-- [x] Dual-protocol support (PostgreSQL v3 + MySQL client/server)
-- [x] Transaction pooling with zero-copy splice and MSG_PEEK DataRow bypass
-- [x] Full SQL lexer/parser with automatic read/write splitting
-- [~] Horizontal sharding: shard-key extraction, modulo/hash/range strategies, scatter aggregation, multi-shard tx coordinator, admin virtual tables, hot-reload, Prometheus metrics are implemented but remain experimental for production rollouts
-- [x] Session-context preservation (SET params, search_path across backend reassignment via SSV)
-- [x] Prepared statement pooling (4 strategies: virtualize, pinning, tracking, anonymous)
-- [x] XID probe + commit-in-doubt recovery, with sticky-primary read-after-write safety
-- [x] Cross-service token parsing via `SET keel.read_after_lsn` / `SHOW keel.write_lsn`; reactor-owned replica catch-up probes remain experimental
-- [x] TLS + mTLS + kTLS with cipher enforcement, cert hot-reload, downgrade protection, built-in cert inspection
-- [x] Hook/trigger system (Lua 5.4, Python 3.x, native .so plugins at 4 pipeline stages)
-- [x] Admin console (21+ commands, virtual tables, JSON output, K8s health endpoints, keel-cli)
-- [x] Prometheus metrics, Grafana dashboard, latency histograms, web management UI
-- [x] Distributed tracing: W3C traceparent injection, OTLP/HTTP export, per-query spans
-- [x] Audit logging: structured NDJSON/text security audit log with event filtering
-- [x] Query throttling: per-rule token-bucket rate limiting via `[throttle.N]` INI
-- [x] Live SIGHUP reload (pool sizes, timeouts, weights, probes, TLS certs, log level, shard rules, query rules)
-- [x] Seccomp BPF system-call filter, privilege drop, binary hardening (PIE, Full RELRO, NX)
-- [~] Multi-proxy HA cluster: heartbeat, config gossip, peer discovery, wire-protocol compression (zlib/zstd) is implemented but still under production hardening
-- [x] Cloud-native auth: AWS SigV4, GCP OAuth2, Azure IMDS with token caching
-- [x] Enterprise auth: PAM, LDAP, mTLS certificate identity, auth query
-- [x] Connection lifecycle management: max age, idle eviction, per-user quotas, pool prefill
-- [x] NOTIFY/LISTEN transparent proxying through transaction-mode pool
-- [x] Declarative query rules: INI-driven routing, rewriting, and blocking without hook code
-- [x] Online Schema Change proxying: gh-ost and pt-osc transparent primary affinity
-- [x] Kubernetes native: Helm chart, CRD operator (`KeelPool`), sidecar mode
-- [x] Docker official images: multi-arch, `KEEL_*` env var config, production Compose templates
-- [x] 116 unit/integration/combinatorial/fuzz tests + 7 Docker Compose E2E stacks
-- [x] Formal 12×12 invariant model + 9-domain state machine with exhaustive verification
-
-### Remaining Planned Work (P3)
-
-| Feature | Description |
-|---------|-------------|
-| Database aliases | `[database_aliases]` mapping for zero-downtime DB migrations |
-| Windows native packages | After kqueue macOS path is complete |
-
-See [ROADMAP.md](docs/ROADMAP.md) for full details, competitive advantages, and implementation notes.
+Check [ROADMAP.md](docs/ROADMAP.md) for full details, competitive advantages, and implementation notes.
 
 ## Documentation
 

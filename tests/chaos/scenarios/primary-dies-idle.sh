@@ -68,7 +68,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_a" "pre_death" "$SENTINEL_N" \
+    "${RUN_TAG}_a" "pre_death" "$SENTINEL_N" "phase-A pre-death values" \
     || die "Phase A assertion failed"
 log "Phase A: ${SENTINEL_N} rows confirmed."
 
@@ -81,11 +81,10 @@ log "=== Phase B: 3 write attempts during outage (expected errors) ==="
 for i in 1 2 3; do
     START=$SECONDS
     VAL="${RUN_TAG}:idle_fault:${i}"
-    RESULT=$(PGPASSWORD="$CHAOS_PASS" psql \
+    RESULT=$(PGPASSWORD="$CHAOS_PASS" PGCONNECT_TIMEOUT=5 psql \
         -h "$KEEL_HOST" -p "$KEEL_PORT" \
         -U "$CHAOS_USER" -d "$CHAOS_DB" \
         --no-psqlrc \
-        --connect-timeout=5 \
         -c "INSERT INTO ${SENTINEL_TABLE}(scenario, tag, phase, seq, val, written_via)
             VALUES ('${SCENARIO}', '${RUN_TAG}_b', 'fault', ${i}, '${VAL}', 'keel')
             ON CONFLICT DO NOTHING" 2>&1)
@@ -99,10 +98,10 @@ log "Phase B: all 3 attempts returned without hanging."
 
 # Read-only queries should work via replicas
 log "Checking read-only access via replicas..."
-READ_RESULT=$(PGPASSWORD="$CHAOS_PASS" psql \
+READ_RESULT=$(PGPASSWORD="$CHAOS_PASS" PGCONNECT_TIMEOUT=5 psql \
     -h "$KEEL_HOST" -p "$KEEL_PORT" \
     -U "$CHAOS_USER" -d "$CHAOS_DB" \
-    --no-psqlrc --connect-timeout=5 -tA \
+    --no-psqlrc -tA \
     -c "SELECT 1" 2>/dev/null || echo "error")
 log "Read-only SELECT 1 result: ${READ_RESULT}"
 # Accept either 1 (read-split to replica) or error (no read-split configured)
@@ -139,7 +138,7 @@ sentinel_write_batch \
 sentinel_assert_values \
     "$PRIMARY_HOST" "$PG_PORT" \
     "$CHAOS_USER" "$CHAOS_PASS" "$CHAOS_DB" "$SENTINEL_TABLE" \
-    "$SCENARIO" "${RUN_TAG}_c" "post_recovery" "$SENTINEL_N" \
+    "${RUN_TAG}_c" "post_recovery" "$SENTINEL_N" "phase-C post-recovery values" \
     || die "Phase C assertion failed"
 log "Phase C: all ${SENTINEL_N} post-recovery rows confirmed."
 
