@@ -2377,6 +2377,24 @@ set_tests_properties(check_result_cache_gate PROPERTIES
     TIMEOUT 30
 )
 
+# =============================================================================
+# PostgreSQL Parse/Execute integration test
+# Connects to a live PostgreSQL to verify extended-protocol Parse ('P' message)
+# vs simple-query PREPARE handling, specifically the plan-invalidation behaviour
+# when a temp table shadows a permanent table.
+# Requires: libpq available, live PostgreSQL on 127.0.0.1:15432.
+# =============================================================================
+if(KEEL_HAS_LIBPQ)
+    add_executable(test_pg_parse test_pg_parse.c)
+    target_include_directories(test_pg_parse PRIVATE ${PQ_INCLUDE_DIR})
+    target_link_libraries(test_pg_parse PRIVATE ${PQ_LIBRARY})
+    target_link_options(test_pg_parse PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_pg_parse COMMAND test_pg_parse)
+    set_tests_properties(test_pg_parse PROPERTIES
+        LABELS "e2e;integration"
+        TIMEOUT 60)
+endif()
+
 # build_tests — compile every test executable without running them.
 # Use this before ctest when the build was configured with a specific --target
 # (e.g. --target keel) that skips test binaries:
@@ -2495,3 +2513,8 @@ add_custom_target(build_tests DEPENDS
     test_web_ui
     test_xxhash
 )
+
+# test_pg_parse is only built when libpq is available.
+if(KEEL_HAS_LIBPQ)
+    add_dependencies(build_tests test_pg_parse)
+endif()
