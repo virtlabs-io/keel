@@ -1,0 +1,227 @@
+name: hub-publish
+
+# =============================================================================
+# Builds and pushes official KEEL production images to Docker Hub.
+#
+# Registry : docker.io / vlbsio/keel
+#
+# Tag strategy (per version tag v1.2.3):
+#   vlbsio/keel:1.2.3            → Debian (default)
+#   vlbsio/keel:1.2              → Debian
+#   vlbsio/keel:1                → Debian
+#   vlbsio/keel:latest           → Debian
+#   vlbsio/keel:debian           → Debian
+#   vlbsio/keel:1.2.3-debian     → Debian
+#   vlbsio/keel:1.2-debian       → Debian
+#   vlbsio/keel:ubuntu           → Ubuntu
+#   vlbsio/keel:1.2.3-ubuntu     → Ubuntu
+#   vlbsio/keel:1.2-ubuntu       → Ubuntu
+#   vlbsio/keel:alpine           → Alpine
+#   vlbsio/keel:1.2.3-alpine     → Alpine
+#   vlbsio/keel:1.2-alpine       → Alpine
+#
+# Required secrets:
+#   DOCKERHUB_USERNAME  — Docker Hub login (e.g. vlbsio)
+#   DOCKERHUB_TOKEN     — Docker Hub access token with read/write/delete scope
+# =============================================================================
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DOCKERHUB_REPO: vlbsio/keel
+
+on:
+  # Publish on semantic version tags
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+  # Allow manual triggering with an optional explicit tag
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Additional image tag to apply (default distro only, e.g. 'rc1')"
+        required: false
+        default: ""
+
+concurrency:
+  group: hub-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Build and push — one job per distro (runs in parallel)
+  # ===========================================================================
+  build-and-push:
+    name: "build (${{ matrix.distro }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Debian Bookworm Slim — default distro (owns bare version + latest)
+          - distro: debian
+            dockerfile: docker/hub/Dockerfile.debian
+            is_default: "true"
+          # ── Ubuntu 24.04 Noble
+          - distro: ubuntu
+            dockerfile: docker/hub/Dockerfile.ubuntu
+            is_default: "false"
+          # ── Alpine 3.20 — smallest image
+          - distro: alpine
+            dockerfile: docker/hub/Dockerfile.alpine
+            is_default: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Multi-arch emulation ───────────────────────────────────────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      # ── Registry login ─────────────────────────────────────────────────────
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── Compute tags and OCI labels from git metadata ──────────────────────
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REPO }}
+          # Suppress the automatic 'latest' tag; we control it explicitly below
+          flavor: |
+            latest=false
+          tags: |
+            # ── Distro-suffixed semver tags (every distro) ──────────────────
+            type=semver,pattern={{version}},suffix=-${{ matrix.distro }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.distro }}
+            # ── Bare distro alias (e.g. vlbsio/keel:alpine) ─────────────────
+            type=raw,value=${{ matrix.distro }}
+            # ── Default distro (Debian) owns the unadorned version tags ──────
+            type=semver,pattern={{version}},enable=${{ matrix.is_default == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.is_default == 'true' }}
+            type=semver,pattern={{major}},enable=${{ matrix.is_default == 'true' }}
+            # ── 'latest' only on version tags and only for the default distro ─
+            type=raw,value=latest,enable=${{ matrix.is_default == 'true' && github.ref_type == 'tag' }}
+            # ── Manual dispatch: apply the supplied extra tag (default distro) ─
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && matrix.is_default == 'true' }}
+          labels: |
+            org.opencontainers.image.title=keel
+            org.opencontainers.image.description=KEEL high-performance database connection pooler (${{ matrix.distro }})
+            org.opencontainers.image.url=https://hub.docker.com/r/vlbsio/keel
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/tree/main/docs
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.vendor=Virt Labs
+
+      # ── Build and push ─────────────────────────────────────────────────────
+      - name: Build and push (${{ matrix.distro }})
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          target: runner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache scoped per distro so builds share the apt/apk package cache
+          cache-from: type=gha,scope=hub-${{ matrix.distro }}
+          cache-to: type=gha,mode=max,scope=hub-${{ matrix.distro }}
+          # Attach SBOM and provenance attestations for supply-chain transparency
+          provenance: true
+          sbom: true
+
+      # ── Step summary ───────────────────────────────────────────────────────
+      - name: Summary
+        run: |
+          echo "### :whale: ${{ matrix.distro }} image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tags:**" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Digest:** \`${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Platforms:** linux/amd64, linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Smoke test — pull each published image and verify the binary starts
+  # ===========================================================================
+  smoke-test:
+    name: "smoke (${{ matrix.distro }})"
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, ubuntu, alpine]
+
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}"
+
+      - name: Smoke test — binary responds to --version
+        run: |
+          docker run --rm \
+            "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}" \
+            keel --version
+
+      - name: Smoke test — entrypoint env override (no backend expected)
+        run: |
+          docker run --rm \
+            -e KEEL_LOG_LEVEL=debug \
+            -e KEEL_CLUSTER_ENABLED=false \
+            "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}" \
+            keel --help 2>&1 | head -5
+
+  # ===========================================================================
+  # Update the Docker Hub repository description from README.md
+  # Only runs on version tags or manual dispatch (not on every push).
+  # ===========================================================================
+  update-description:
+    name: Update Docker Hub description
+    needs: smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push README to Docker Hub
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_REPO }}
+          readme-filepath: ./README.md
+          short-description: "KEEL — High-performance PostgreSQL/MySQL connection pooler and proxy"

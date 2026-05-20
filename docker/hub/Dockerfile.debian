@@ -1,0 +1,136 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# KEEL — Production Image (Debian Bookworm Slim)
+# =============================================================================
+# Multi-stage build that compiles KEEL in Release mode and produces a minimal
+# runtime image based on debian:bookworm-slim.
+#
+# Docker Hub:  vlbsio/keel:debian   vlbsio/keel:latest   vlbsio/keel:X.Y.Z
+#
+# Build:
+#   docker build -f docker/hub/Dockerfile.debian -t vlbsio/keel:debian .
+#
+# Run:
+#   docker run -v /path/to/keel.ini:/etc/keel/keel.ini vlbsio/keel:debian
+# =============================================================================
+
+# =============================================================================
+# Stage 1 — builder
+# Compiles KEEL with full optimisations; artefacts are copied out in stage 2.
+# =============================================================================
+FROM debian:bookworm AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Build-time dependencies.  The apt cache is mounted externally by BuildKit so
+# it never lands in an image layer, keeping the builder lean.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        # Toolchain
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        git \
+        # io_uring (Linux 5.6+)
+        liburing-dev \
+        # TLS / authentication
+        libssl-dev \
+        libldap2-dev \
+        # Wire-protocol compression
+        zlib1g-dev \
+        libzstd-dev \
+        # Lua 5.4 hook scripting
+        lua5.4 \
+        liblua5.4-dev \
+        # Python 3 hook scripting
+        python3 \
+        python3-dev
+
+WORKDIR /keel
+
+# Copy source tree (only what is needed for the build)
+COPY CMakeLists.txt README.md LICENSE ./
+COPY cmake/      cmake/
+COPY include/    include/
+COPY src/        src/
+COPY tests/      tests/
+COPY scripts/    scripts/
+COPY etc/        etc/
+COPY docker/keel/ docker/keel/
+
+# Configure and compile with Release optimisations; strip debug info
+RUN cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DKEEL_USE_IOURING=ON \
+        -DKEEL_USE_EPOLL=ON \
+        -DKEEL_ENABLE_TESTS=OFF \
+        -DKEEL_ENABLE_LUA=ON \
+        -DKEEL_ENABLE_PYTHON=ON \
+    && cmake --build build \
+    && strip --strip-unneeded build/src/main/keel
+
+# =============================================================================
+# Stage 2 — runner
+# Minimal debian:bookworm-slim image containing only the runtime libraries.
+# =============================================================================
+FROM debian:bookworm-slim AS runner
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.opencontainers.image.title="keel" \
+      org.opencontainers.image.description="KEEL high-performance database connection pooler (Debian)" \
+      org.opencontainers.image.url="https://hub.docker.com/r/vlbsio/keel" \
+      org.opencontainers.image.documentation="https://github.com/virtlabs-io/keel/tree/main/docs" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.vendor="Virt Labs"
+
+# Runtime libraries only — no headers, no build tools.
+# Combined with user creation in a single layer to minimise layer count.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        # io_uring runtime
+        liburing2 \
+        # TLS
+        libssl3 \
+        # LDAP authentication
+        libldap-2.5-0 \
+        # TLS certificate bundle
+        ca-certificates \
+        # Wire-protocol compression
+        zlib1g \
+        libzstd1 \
+        # Lua 5.4 hook runtime
+        liblua5.4-0 \
+        # Python 3.11 hook runtime (Bookworm default)
+        libpython3.11 \
+        # Minimal network utility for HEALTHCHECK
+        netcat-openbsd \
+    && groupadd -r keel \
+    && useradd -r -g keel -s /sbin/nologin keel
+
+# Binary from builder
+COPY --from=builder --chmod=755 /keel/build/src/main/keel /usr/local/bin/keel
+
+# Config and runtime directories
+RUN mkdir -p /etc/keel /var/log/keel /run/keel \
+    && chown keel:keel /etc/keel /var/log/keel /run/keel
+
+# Ship the example configs; users mount or override with KEEL_* env vars
+COPY --from=builder /keel/etc/keel.ini.example        /etc/keel/keel.ini.example
+COPY docker/keel/keel-cluster.ini                     /etc/keel/keel-cluster.ini.example
+
+COPY --chmod=755 docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+USER keel
+
+# PostgreSQL proxy  MySQL proxy  admin console  cluster peer  Prometheus
+EXPOSE 7432 7306 6433 9100 9101
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD nc -z 127.0.0.1 6433 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["keel"]

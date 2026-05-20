@@ -112,6 +112,9 @@ RUN ls -lh build/src/main/keel && (file build/src/main/keel || echo "Binary buil
 FROM builder AS tester
 
 WORKDIR /keel/build
+# Allow the runtime-security harness to degrade gracefully when the Docker
+# build sandbox blocks seccomp(2) / prctl(PR_SET_NO_NEW_PRIVS) at the kernel.
+ENV KEEL_TEST_ALLOW_RELAXED_NO_NEW_PRIVS=1
 RUN ctest --output-on-failure -j"$(nproc)"
 
 # =============================================================================
