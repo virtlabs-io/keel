@@ -43,7 +43,9 @@ RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
         lua5.4-dev \
         # Python 3 hook scripting
         python3-dev \
-        musl-dev
+        musl-dev \
+        # Linux kernel headers — required for <linux/seccomp.h> and related
+        linux-headers
 
 WORKDIR /keel
 
@@ -59,10 +61,17 @@ COPY docker/keel/ docker/keel/
 
 # Configure and compile with Release optimisations; strip debug info.
 # Disable epoll — Alpine kernel headers may differ; io_uring is the primary backend.
+# Alpine's GCC hardened toolchain defines _FORTIFY_SOURCE in the compiler
+# spec before command-line flags are processed.  CMakeLists.txt then also
+# adds -D_FORTIFY_SOURCE=3, which GCC treats as a redefinition and fails
+# with -Werror.  Passing -U_FORTIFY_SOURCE in CMAKE_C_FLAGS (which is
+# injected before the per-target compile options) cleanly undefines the
+# spec-injected value so the CMakeLists.txt definition wins without warning.
 RUN cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE" \
         -DKEEL_USE_IOURING=ON \
-        -DKEEL_USE_EPOLL=OFF \
+        -DKEEL_USE_EPOLL=ON \
         -DKEEL_ENABLE_TESTS=OFF \
         -DKEEL_ENABLE_LUA=ON \
         -DKEEL_ENABLE_PYTHON=ON \

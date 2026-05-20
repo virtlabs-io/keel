@@ -95,8 +95,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         liburing2 \
         # TLS
         libssl3 \
-        # LDAP authentication
-        libldap-2.5-0 \
+        # LDAP authentication (Ubuntu 24.04 Noble ships OpenLDAP 2.6.x)
+        libldap2 \
         # TLS certificate bundle
         ca-certificates \
         # Wire-protocol compression
