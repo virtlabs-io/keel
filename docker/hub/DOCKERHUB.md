@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/virtlabs-io/keel/main/keel.png" alt="KEEL — More than a pooler. The missing link between your application and a truly elastic database" width="300">
+
 # KEEL — Database Connection Pooler & Proxy
 
 **KEEL** is a high-performance connection pooler and intelligent proxy for **PostgreSQL** and **MySQL**. It sits between your application and your databases, multiplexing thousands of app connections over a small pool of real backend connections — reducing database load, improving tail latency, and adding routing intelligence with zero application changes.
