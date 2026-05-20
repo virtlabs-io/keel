@@ -489,6 +489,7 @@ void keel_session_cleanup(keel_session_t* session)
     session->state_hash = 0;
     session->in_transaction = false;
     session->backend_conn = NULL;
+    session->backend_generation = 0;
 }
 
 /* ============================================================================

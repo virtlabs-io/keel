@@ -120,10 +120,12 @@ static bool write_runtime_config(char* out_path, size_t out_path_len)
         "probe_interval = 2s\n"
         "probe_timeout = 2s\n"
         "probe_retries = 2\n"
+        "probe_password = postgres\n"
         "failover_delay = 5s\n\n"
         "server_user = postgres\n"
         "server_password = postgres\n"
-        "server_auth = scram-sha-256\n"
+        "server_auth = md5\n"
+        "auth_method = trust\n"
         "prepared_statement = tracking\n\n"
         "[worker_group.myapp.servers]\n"
         "primary = host=%s port=%u dbname=postgres role=primary weight=100\n",
@@ -250,7 +252,7 @@ static integ_pg_conn_t* connect_proxy(void)
     /* In transaction pool mode with max_pool_size=1, the proxy may close
      * connections due to internal pool cycling (DISCARD ALL + wake race).
      * Retry with a short delay to ride through the transient state. */
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < 10; attempt++) {
         integ_pg_conn_t* conn = integ_pg_connect("127.0.0.1", KEEL_PROXY_PORT,
                                                   TEST_USER, TEST_PASSWORD, TEST_DATABASE);
         if (!conn) {

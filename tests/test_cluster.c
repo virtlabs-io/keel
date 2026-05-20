@@ -834,12 +834,17 @@ static void test_sync_payload_on_mismatch(void) {
     ASSERT_TRUE(wait_peer_up(a, 0, 30000));
     ASSERT_TRUE(wait_peer_up(b, 0, 30000));
 
-    usleep(1000000); /* allow at least one sync exchange */
-
+    /* Poll until at least one node records a config reconciliation.
+     * A bare usleep() is too short under sanitizers (3-5x slowdown). */
     keel_cluster_stats_t stats_a;
     keel_cluster_stats_t stats_b;
-    keel_cluster_get_stats(a, &stats_a);
-    keel_cluster_get_stats(b, &stats_b);
+    for (int i = 0; i < 100; i++) {
+        usleep(100000); /* 100 ms */
+        keel_cluster_get_stats(a, &stats_a);
+        keel_cluster_get_stats(b, &stats_b);
+        if ((stats_a.config_reconciliations + stats_b.config_reconciliations) > 0)
+            break;
+    }
 
     ASSERT_TRUE((stats_a.sync_requests_sent + stats_b.sync_requests_sent) > 0);
     ASSERT_TRUE((stats_a.sync_responses_sent + stats_b.sync_responses_sent) > 0);

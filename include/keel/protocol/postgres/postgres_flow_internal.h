@@ -151,6 +151,11 @@ typedef struct pg_flow_ctx {
     char     stmt_role[64];       /**< Current stmt-relevant effective role. */
     char     stmt_session_auth[64]; /**< Current stmt-relevant session auth. */
     uint64_t stmt_temp_epoch;     /**< Conservative temp-object context epoch. */
+    uint64_t stmt_schema_epoch;   /**< Schema/DDL epoch for PS semantic invalidation. */
+    uint64_t stmt_role_hash;      /**< Cached role/session-auth hash component. */
+    uint64_t stmt_search_path_hash; /**< Cached search_path hash component. */
+    uint64_t stmt_guc_hash;       /**< Cached tracked-GUC hash component. */
+    bool     stmt_semantic_unknown; /**< Conservative semantic-unknown marker. */
     bool     stmt_temp_tx_reset_pending; /**< Temp context changes again when txn ends. */
     bool     stmt_temp_tx_rollback_reset_pending; /**< Temp context changes again if the txn rolls back. */
     bool     stmt_last_tx_end_was_rollback; /**< Most recent tx-end statement was ROLLBACK. */
@@ -212,6 +217,8 @@ typedef struct pg_flow_ctx {
     bool     txn_tracking;       /**< transaction_tracking config enabled */
     bool     xid_probe_active;   /**< Rewritten COMMIT in flight; absorb SELECT results */
     uint64_t xid_probe_result;   /**< txid_current() captured from DataRow */
+    bool     commit_doubt_check_active; /**< txid_status() check stream in progress */
+    uint8_t  commit_doubt_outcome;      /**< 0=unknown, 1=committed, 2=aborted */
 
     /* Anonymous mode: stmt_name → full SQL text mapping.
      * Parse messages are intercepted and stored here rather than sent to the
@@ -231,6 +238,14 @@ typedef struct pg_flow_ctx {
      * Allocated on demand; freed in pgf_destroy(). */
     uint8_t* anon_rewrite_buf;
     size_t   anon_rewrite_cap;
+
+    /* Tracking mode: after transaction-local temp context changes, force the
+     * next SQL EXECUTE through DISCARD PLANS + EXECUTE and absorb the DISCARD
+     * command tag so PostgreSQL replans against the temp namespace. */
+    bool     stmt_discard_plans_before_execute;
+    bool     stmt_discard_plans_absorb_pending;
+    uint8_t* stmt_discard_plans_rewrite_buf;
+    size_t   stmt_discard_plans_rewrite_cap;
 
     /* Cross-service RYW: latest captured write LSN (from notify_write_lsn).
      * Returned verbatim in response to SHOW keel.write_lsn queries. */

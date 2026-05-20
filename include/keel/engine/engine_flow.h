@@ -23,6 +23,7 @@
 #include "keel/session/session.h"
 #include "keel/session/ssv_atom.h"
 #include "keel/engine/worker.h"
+#include "keel/core/config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,47 @@ typedef enum keel_flow_result {
     KEEL_FLOW_ERROR,             /**< Error — session will be closed */
     KEEL_FLOW_TLS_HANDSHAKE,     /**< TLS accepted ('S' sent) — worker must drive handshake */
 } keel_flow_result_t;
+
+typedef enum keel_pre_query_op_type {
+    KEEL_PQOP_NONE = 0,
+    KEEL_PQOP_DEFERRED_BEGIN,
+    KEEL_PQOP_STATE_SYNC,
+    KEEL_PQOP_PS_REPLAY,
+    KEEL_PQOP_CLEAN_CHECK,
+} keel_pre_query_op_type_t;
+
+typedef enum keel_pre_query_state {
+    KEEL_PQSTATE_IDLE = 0,
+    KEEL_PQSTATE_SEND,
+    KEEL_PQSTATE_WAIT_RESPONSE,
+    KEEL_PQSTATE_COMPLETE,
+    KEEL_PQSTATE_FAILED,
+} keel_pre_query_state_t;
+
+/**
+ * @brief Outcome taxonomy for setup replay paths (state sync / stmt replay).
+ */
+typedef enum keel_replay_result {
+    KEEL_REPLAY_RESULT_NONE = 0,
+    KEEL_REPLAY_RESULT_SUCCESS,
+    KEEL_REPLAY_RESULT_PARSE_ERROR,
+    KEEL_REPLAY_RESULT_DRAIN_ERROR,
+    KEEL_REPLAY_RESULT_TIMEOUT,
+    KEEL_REPLAY_RESULT_OOM,
+    KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE,
+} keel_replay_result_t;
+
+typedef struct keel_pre_query_op {
+    keel_pre_query_op_type_t type;
+    keel_pre_query_state_t   state;
+    uint64_t                 deadline_ns;
+    uint32_t                 expected_msgs;
+    uint32_t                 seen_msgs;
+    uint8_t*                 payload;
+    size_t                   payload_len;
+    uint64_t                 state_sync_hash;
+    keel_flow_result_t       resume;
+} keel_pre_query_op_t;
 
 /* ============================================================================
  * Session Flow State (stored alongside session)
@@ -94,13 +136,15 @@ typedef struct keel_session_flow {
     uint64_t                       last_write_ns;          /**< Timestamp of last write (monotonic ns) */
     uint32_t                       sticky_primary_ttl_ms;  /**< TTL for sticky affinity (0 = disabled) */
 
-    /* Consistency token: WAL LSN (PG) or GTID (MySQL) captured after last
-     * write, used for optional read-after-write consistency checks on replicas */
+    /* Consistency token: latest known WAL LSN (PG) or GTID (MySQL), supplied
+     * by protocol injection today and by future async capture.  Replica
+     * catch-up checks must be reactor-owned before this becomes a hot-path
+     * routing guarantee. */
     keel_consistency_token_t        last_write_token;
 
     /* SSV consistency atoms: structured semantic state for the CONSISTENCY
      * domain.  Indexes match keel_ssv_consistency_key_t:
-     *   [0] WRITE_LSN   — LSN string from last committed write
+     *   [0] WRITE_LSN   — latest known LSN/GTID string
      *   [1] WRITE_LSN_TS — capture timestamp (monotonic ns)
      * These are per-session, per-worker (no locking needed). */
     keel_ssv_atom_t                 consistency_atoms[KEEL_SSV_CK__COUNT];
@@ -132,6 +176,11 @@ typedef struct keel_session_flow {
     size_t                         be_fwd_remaining;
     bool                           fe_fwd_wait_be;
 
+    /* Per-session buffer caps (0 = unlimited; propagated from worker config).
+     * Enforced at jumbo-message detection time and PS replay buffer build. */
+    size_t                         session_max_buffered_bytes; /**< max FE message size (0=unlimited) */
+    size_t                         backend_max_replay_bytes;   /**< max PS replay buffer (0=unlimited) */
+
     /* Prepared-statement replay state (spec §17 — PS Virtualization).
      *
      * When a session with named prepared statements gets a clean backend
@@ -152,10 +201,11 @@ typedef struct keel_session_flow {
     const uint8_t*                 stmt_replay_orig_msg;
     size_t                         stmt_replay_orig_len;
     uint64_t                       stmt_replay_hash;
-    bool                           stmt_replay_needs_discard; /**< True: waiting for DISCARD ALL ReadyForQuery
-                                                               *   before sending replay Parse msgs.  Set when
-                                                               *   backend was borrowed with a different stmt hash
-                                                               *   (needs_discard_all), cleared after 'Z' arrives. */
+    keel_stmt_compat_profile_t     stmt_replay_profile; /**< Session profile captured at borrow time. */
+    bool                           stmt_replay_needs_cleanup; /**< True: waiting for plugin cleanup to finish
+                                                               *   before replaying protocol-owned prepared state.
+                                                               *   Set when a borrowed backend still carries
+                                                               *   incompatible session state. */
     /* ---- Replication uncertainty tracking (spec §TXN-TRACK) ----
      *
      * When transaction_tracking = on, KEEL intercepts COMMIT queries and
@@ -182,22 +232,18 @@ typedef struct keel_session_flow {
      *  0=unknown/in_progress/NULL, 1=committed, 2=aborted */
     uint8_t  indoubt_check_result;
 
-    /** When a write/DDL query is forwarded to the backend, set this flag
-     *  instead of immediately calling capture_consistency_token() on the
-     *  pool socket.  The pool socket is non-blocking at that point: recv()
-     *  would return EAGAIN and the SELECT response would later leak into the
-     *  client data stream causing protocol corruption.
-     *
-     *  The engine_flow BE path checks this flag after query_complete fires
-     *  (backend is idle), temporarily sets the socket to blocking, calls
-     *  capture_consistency_token(), and restores non-blocking. */
-    bool     capture_lsn_pending;  /**< Capture LSN/GTID after next query_complete */
+    /** When a write/DDL query is forwarded to the backend, this flag records
+     *  that a consistency token would be useful after query completion.  The
+     *  worker no longer performs inline token capture because the legacy
+     *  implementation temporarily switched the backend fd to blocking and
+     *  ran a protocol round trip on the reactor thread. */
+    bool     capture_lsn_pending;  /**< Async LSN/GTID capture wanted after query_complete */
     bool     txn_had_writes;       /**< True if a write/DDL was forwarded inside an
                                     *   explicit BEGIN…COMMIT transaction.  Defers LSN
-                                    *   capture to the COMMIT's query_complete so that
-                                    *   the captured WAL position reflects committed data
+                                    *   capture marker to the COMMIT's query_complete so
+                                    *   that future async capture observes committed data
                                     *   (not an uncommitted mid-transaction LSN).
-                                    *   Cleared on BEGINS_TX and on capture. */
+                                    *   Cleared on BEGINS_TX and on BE completion. */
 
     bool                           stmt_replay_rfq_pending;   /**< True: all ParseCompletes for the replay have
                                                                *   been received but the ReadyForQuery generated
@@ -206,11 +252,8 @@ typedef struct keel_session_flow {
                                                                *   before forwarding orig_msg; otherwise it leaks
                                                                *   into the WAIT_BACKEND response stream and keel
                                                                *   erroneously treats it as an early end-of-txn. */
-    uint32_t                       discard_skip_bytes;        /**< Bytes remaining in the current partially-
-                                                               *   consumed backend message during DISCARD ALL
-                                                               *   scanning.  Non-zero means: skip this many bytes
-                                                               *   (continuation of a message whose header was seen
-                                                               *   in a prior recv) before resuming message parsing. */
+    keel_proto_drain_state_t       stmt_cleanup_drain_state; /**< Opaque plugin parser state while draining
+                                                              *   setup cleanup before replay/original bytes. */
 
     /* Deferred send state: when a non-blocking send can't complete
      * immediately, the unsent data is saved here and the worker
@@ -261,10 +304,36 @@ typedef struct keel_session_flow {
      * immediately (CommandComplete/ReadyForQuery 'T') without acquiring a
      * backend.  The wire payload is buffered here.  On the next routable
      * DML/SELECT the buffered BEGIN is sent to the correct shard backend
-     * first (blocking inline drain), then the actual query follows. */
+     * first via async pre-query replay, then the actual query follows. */
     bool    begin_deferred;                  /**< true: a BEGIN is pending forwarding */
     uint8_t begin_deferred_payload[512];     /**< raw 'Q: BEGIN...' wire bytes */
     size_t  begin_deferred_payload_len;      /**< byte count (0 when begin_deferred=false) */
+
+    /* Async pre-query replay (PR #4 — see docs/REACTOR_BLOCKING_INVENTORY.md
+     * category A).  When set, the BE-side handler absorbs backend bytes until
+     * it sees ReadyForQuery ('Z'), then forwards `pending_pre_query_buf` to
+     * the backend before resuming normal flow.  This replaces the old
+     * blocking BEGIN+drain inline loops in resume_from_pool and on_fe_data. */
+    enum {
+        KEEL_PRE_QUERY_NONE         = 0,
+        KEEL_PRE_QUERY_BEGIN_REPLAY = 1,
+        KEEL_PRE_QUERY_STATE_SYNC   = 2,
+    } pending_pre_query;
+    uint8_t pending_pre_query_buf[KEEL_PRE_QUERY_REPLAY_BUFSZ]; /**< stashed FE payload */
+    size_t  pending_pre_query_len;           /**< bytes valid in stash buffer */
+    size_t  pending_pre_query_absorbed;      /**< BE bytes absorbed; runaway-cap */
+    uint64_t pending_state_sync_hash;        /**< backend state hash to stamp after sync RFQ */
+    keel_flow_result_t pending_pre_query_resume; /**< Result after stashed payload is forwarded */
+    uint64_t pending_pre_query_started_ns;     /**< Active pre-query op start timestamp */
+    keel_replay_result_t replay_last_result;   /**< Last replay/setup outcome */
+    uint64_t replay_last_duration_ns;          /**< Last replay/setup duration in ns */
+    /* Generic pre-query operation queue (sequential, never parallel).
+     * Used to compose deferred BEGIN, state sync, prepared replay, and
+     * cleanup checks while holding client bytes atomically. */
+    keel_pre_query_op_t             pre_query_ops[4];
+    uint8_t                         pre_query_head;
+    uint8_t                         pre_query_tail;
+    uint8_t                         pre_query_count;
 
     /** eventfd for async auth (KEEL_FLOW_WAIT_AUTH).
      *  Set to ≥0 while an off-thread auth operation is in flight;

@@ -82,6 +82,13 @@ option(KEEL_ENABLE_FULL_STATS "Enable L5 SQL fingerprint aggregation" OFF)
 option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" ON)
 option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" ON)
 
+# Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
+# while the BEGIN's ReadyForQuery is being absorbed asynchronously.  Sessions
+# that exceed this buffer return a hard error; bump if you see
+# pre_query_overflow incrementing in production.
+set(KEEL_PRE_QUERY_REPLAY_BUFSZ "8192" CACHE STRING
+    "Inline byte buffer per session for async deferred-BEGIN payload stash (default 8192)")
+
 # ============================================================================
 # C Standard and Compiler Settings
 # ============================================================================
@@ -263,6 +270,10 @@ if(KEEL_ENABLE_COVERAGE)
     # non-atomic single-word write can race and produce values that wrap below
     # zero, causing lcov geninfo to abort with "Unexpected negative count").
     set(KEEL_COVERAGE_FLAGS --coverage -fprofile-arcs -ftest-coverage -fprofile-update=atomic)
+    # Apply globally so every static library and executable is instrumented.
+    # Per-target blocks in subdirectories are redundant but harmless.
+    add_compile_options(${KEEL_COVERAGE_FLAGS})
+    add_link_options(${KEEL_COVERAGE_FLAGS})
     message(STATUS "KEEL: Code coverage enabled")
 endif()
 

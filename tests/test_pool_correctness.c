@@ -18,9 +18,11 @@
 #include "test_utils.h"
 #include "keel/protocol/protocol_flow.h"  /* KEEL_FPIN_QUARANTINE, KEEL_QE_POTENTIALLY_STATEFUL */
 #include "keel/engine/engine_flow.h"    /* keel_session_flow_t */
+#include "keel/reactor/reactor.h"
 #include "keel/mem/mem.h"
 
 #include <stdatomic.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -36,6 +38,42 @@
 /* ============================================================================
  * Helpers
  * ============================================================================ */
+
+static int g_wait_order[8];
+static int g_wait_count;
+static int g_timeout_count;
+
+static void reset_wait_probe(void)
+{
+    memset(g_wait_order, 0, sizeof(g_wait_order));
+    g_wait_count = 0;
+    g_timeout_count = 0;
+}
+
+static void wait_probe_cb(void* session, void* userdata)
+{
+    if (!userdata) {
+        g_timeout_count++;
+        return;
+    }
+    if (g_wait_count < (int)(sizeof(g_wait_order) / sizeof(g_wait_order[0])))
+        g_wait_order[g_wait_count++] = *(int*)session;
+}
+
+static int reactor_tick(keel_reactor_t* r, int timeout_ms)
+{
+    keel_reactor_submit(r);
+    int n = keel_reactor_wait(r, timeout_ms);
+    if (n <= 0) return n;
+    return keel_reactor_process(r);
+}
+
+static void make_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
 /**
  * @brief Assemble a synthetic pool populated with `n` immediately borrowable
@@ -58,6 +96,7 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
         .user = "test",
         .password = "test",
         .database = "test",
+        .protocol = "postgres",
         .min_connections = n,
         .max_connections = n,
         .max_waiting = 4,
@@ -66,6 +105,22 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
     /* Allocate pool manually (bypass actual TCP connect) */
     backend_pool_t* pool = keel_calloc(1, sizeof(backend_pool_t));
     pool->config = cfg;
+    pool->flow_vt = keel_proto_flow_get(cfg.protocol);
+    TEST_ASSERT_NOT_NULL(pool->flow_vt);
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&pool->lock, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
+    {
+        keel_reactor_config_t rcfg = KEEL_REACTOR_CONFIG_DEFAULT;
+        rcfg.type = KEEL_REACTOR_EPOLL;
+        rcfg.max_fds = 128;
+        pool->reactor = keel_reactor_create(&rcfg);
+        TEST_ASSERT_NOT_NULL(pool->reactor);
+    }
     pool->connections = keel_calloc(n, sizeof(backend_conn_t));
     pool->total_count = n;
 
@@ -77,6 +132,8 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
             backend_fds[i] = -1;
             continue;
         }
+        make_nonblocking(sv[0]);
+        make_nonblocking(sv[1]);
         pool->connections[i].fd = sv[0];
         backend_fds[i] = sv[1];
         atomic_store(&pool->connections[i].state, BACKEND_CONN_IDLE);
@@ -106,11 +163,16 @@ static backend_pool_t* make_test_pool(size_t n, int backend_fds[])
  */
 static void destroy_test_pool(backend_pool_t* pool, int backend_fds[], size_t n)
 {
+    if (pool->reactor) {
+        keel_reactor_destroy(pool->reactor);
+        pool->reactor = NULL;
+    }
     for (size_t i = 0; i < n; i++) {
         if (pool->connections[i].fd >= 0) close(pool->connections[i].fd);
         if (backend_fds[i] >= 0) close(backend_fds[i]);
     }
     keel_free(pool->connections);
+    pthread_mutex_destroy(&pool->lock);
     keel_free(pool);
 }
 
@@ -136,23 +198,20 @@ static void test_cleaning_state_transition(void)
     /* Return it — should enter CLEANING since it has state */
     backend_pool_return(pool, conn, false);
 
-    /* The connection should either be CLEANING (DISCARD ALL sent, awaiting response)
-     * or IDLE (if the fake socketpair responded somehow) or CLOSED (send error).
-     * With a socketpair and no ReadyForQuery response, expect CLEANING */
+    /* The connection is not borrowable: cleanup is now reactor-owned and starts
+     * in SEND, waiting for the reactor to flush DISCARD ALL. */
     backend_conn_state_t st = atomic_load(&conn->state);
-    /* With socketpair: send succeeds, recv returns EAGAIN → CLEANING.
-     * OR send succeeds, recv returns data (unlikely from empty socketpair) → ??? */
-    TEST_ASSERT(st == BACKEND_CONN_CLEANING || st == BACKEND_CONN_IDLE || st == BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(st, BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_SEND);
+    TEST_ASSERT(conn->cleanup_io_armed);
+    TEST_ASSERT_EQ(pool->cleaning_count, 1U);
 
-    if (st == BACKEND_CONN_CLEANING) {
-        /* Verify it's not on any list (borrowers can't see it) */
-        bool found_on_clean = false;
-        for (backend_conn_t* c = pool->clean_list; c; c = c->next) {
-            if (c == conn) found_on_clean = true;
-        }
-        TEST_ASSERT(!found_on_clean);
-        TEST_ASSERT(pool->cleaning_count > 0);
+    /* Verify it's not on any list (borrowers can't see it) */
+    bool found_on_clean = false;
+    for (backend_conn_t* c = pool->clean_list; c; c = c->next) {
+        if (c == conn) found_on_clean = true;
     }
+    TEST_ASSERT(!found_on_clean);
 
     destroy_test_pool(pool, be_fds, 2);
     TEST_END();
@@ -213,6 +272,99 @@ static void test_clean_gen_increments(void)
     }
 
     destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+static void test_backend_can_borrow_predicate_matrix(void)
+{
+    TEST_BEGIN("backend_can_borrow rejects illegal lifecycle states");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = &pool->connections[0];
+
+    atomic_store(&conn->state, BACKEND_CONN_IDLE);
+    conn->pinned_session = NULL;
+    conn->quarantine = BACKEND_QUARANTINE_NONE;
+    conn->in_transaction = false;
+    conn->syncing = false;
+    conn->replay_active = false;
+    conn->protocol_desync = false;
+    conn->needs_full_cleanup = false;
+    TEST_ASSERT(backend_pool_can_borrow(conn));
+
+    atomic_store(&conn->state, BACKEND_CONN_CLEANING);
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    atomic_store(&conn->state, BACKEND_CONN_IDLE);
+
+    conn->pinned_session = (void*)0x1;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->pinned_session = NULL;
+
+    conn->quarantine = BACKEND_QUARANTINE_DIRTY;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->quarantine = BACKEND_QUARANTINE_NONE;
+
+    conn->in_transaction = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->in_transaction = false;
+
+    conn->syncing = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->syncing = false;
+
+    conn->replay_active = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->replay_active = false;
+
+    conn->protocol_desync = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+    conn->protocol_desync = false;
+
+    conn->needs_full_cleanup = true;
+    TEST_ASSERT(!backend_pool_can_borrow(conn));
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_backend_generation_validation(void)
+{
+    TEST_BEGIN("backend generation validation rejects stale references");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    uint64_t g = conn->generation;
+    TEST_ASSERT(backend_pool_validate_generation(conn, g));
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
+    TEST_ASSERT(!backend_pool_validate_generation(conn, g));
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_close_reason_once(void)
+{
+    TEST_BEGIN("backend close reason is emitted once per close transition");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    uint64_t gen_after_first = conn->generation;
+
+    backend_pool_close_connection(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    TEST_ASSERT_EQ(conn->generation, gen_after_first);
+
+    destroy_test_pool(pool, be_fds, 1);
     TEST_END();
 }
 
@@ -341,16 +493,20 @@ static void test_borrow_rejects_cleaning(void)
     TEST_ASSERT_NOT_NULL(c1);
     TEST_ASSERT_NOT_NULL(c2);
 
-    /* Manually put c1 into CLEANING state and back on clean_list */
+    /* Manually put c1 into CLEANING state and back on clean_list. This is an
+     * intentionally-invalid fixture used to prove borrow's CAS will not take a
+     * non-IDLE entry even if list membership is wrong. Do not call pool_return
+     * while the invalid fixture is present because production invariant checks
+     * should trap on it. */
     atomic_store(&c1->state, BACKEND_CONN_CLEANING);
-    pool->active_count--;
-    c1->next = pool->clean_list;
+    atomic_store(&c2->state, BACKEND_CONN_IDLE);
+    c1->active_owner = NULL;
+    c2->active_owner = NULL;
+    pool->active_count = 0;
+    c1->next = c2;
+    c2->next = NULL;
     pool->clean_list = c1;
-    pool->clean_count++;
-
-    /* Return c2 as clean */
-    c2->current_state_hash = 0;
-    backend_pool_return(pool, c2, false);
+    pool->clean_count = 2;
 
     /* Now borrow — should get c2 (IDLE), NOT c1 (CLEANING) */
     backend_conn_t* borrowed = backend_pool_borrow(pool, 0);
@@ -358,10 +514,15 @@ static void test_borrow_rejects_cleaning(void)
     TEST_ASSERT(borrowed != c1);  /* Must not get the CLEANING connection */
     TEST_ASSERT_EQ(atomic_load(&borrowed->state), BACKEND_CONN_ACTIVE);
 
-    /* Cleanup */
-    backend_pool_return(pool, borrowed, false);
-    /* Close the CLEANING one manually */
+    /* Cleanup the intentionally invalid fixture manually. */
+    if (borrowed && borrowed->fd >= 0) {
+        close(borrowed->fd);
+        borrowed->fd = -1;
+    }
+    atomic_store(&borrowed->state, BACKEND_CONN_CLOSED);
     atomic_store(&c1->state, BACKEND_CONN_CLOSED);
+    pool->clean_list = NULL;
+    pool->clean_count = 0;
 
     destroy_test_pool(pool, be_fds, 2);
     TEST_END();
@@ -373,7 +534,7 @@ static void test_borrow_rejects_cleaning(void)
 
 static void test_drain_cleaning_reclaims(void)
 {
-    TEST_BEGIN("drain_cleaning reclaims connections with ReadyForQuery response");
+    TEST_BEGIN("reactor cleanup reclaims connections with ReadyForQuery response");
 
     int be_fds[2];
     backend_pool_t* pool = make_test_pool(2, be_fds);
@@ -393,14 +554,22 @@ static void test_drain_cleaning_reclaims(void)
     }
     TEST_ASSERT(be_fd >= 0);
 
-    /* Return it — will send DISCARD ALL, then enter CLEANING */
+    /* Return it — cleanup should enter SEND and stay owned by the reactor. */
     backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_SEND);
 
-    /* Read the DISCARD ALL command from the backend side of the socketpair */
+    /* Drive the reactor until the DISCARD ALL command is written. */
     uint8_t discard_buf[64];
-    ssize_t nr = recv(be_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
-    /* We should have received the DISCARD ALL command */
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fd, discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
     TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+    TEST_ASSERT(conn->cleanup_io_armed);
 
     /* Simulate backend response: CommandComplete + ReadyForQuery('I') */
     /* CommandComplete: 'C' + length(4) + "DISCARD ALL\0" = 'C' + 16 bytes */
@@ -412,16 +581,373 @@ static void test_drain_cleaning_reclaims(void)
     ssize_t sw = send(be_fd, response, sizeof(response), MSG_NOSIGNAL);
     TEST_ASSERT(sw == (ssize_t)sizeof(response));
 
-    /* Now drain_cleaning should reclaim it */
-    if (atomic_load(&conn->state) == BACKEND_CONN_CLEANING) {
-        size_t reclaimed = backend_pool_drain_cleaning(pool);
-        TEST_ASSERT(reclaimed >= 1);
-        TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
-        TEST_ASSERT_EQ(conn->current_state_hash, 0ULL);
-        TEST_ASSERT(pool->cleaning_count == 0);
+    /* Reactor recv callback should parse the response and reclaim it. */
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
     }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_NONE);
+    TEST_ASSERT_EQ(conn->current_state_hash, 0ULL);
+    TEST_ASSERT_EQ(conn->stmt_set_hash, 0ULL);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
 
     destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
+static void test_cleanup_notification_closes(void)
+{
+    TEST_BEGIN("cleanup parser closes on async notification bytes");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x1234;
+
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* NotificationResponse carries meaningful async payload with no session
+     * owner. The pool must not discard it and reuse the backend. */
+    uint8_t notification[] = {
+        'A', 0, 0, 0, 12,
+        0, 0, 0, 1,
+        'c', 0,
+        'p', 0
+    };
+    ssize_t sw = send(be_fds[0], notification, sizeof(notification), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(notification));
+
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_cleanup_timeout_closes_backend(void)
+{
+    TEST_BEGIN("cleanup timeout closes backend and never returns to idle");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x123456;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Force timeout eligibility and run cleaner supervision. */
+    conn->cleanup_started_ms = 1;
+    size_t closed = backend_pool_drain_cleaning(pool);
+    TEST_ASSERT_EQ(closed, 1U);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(conn->close_reason, BACKEND_CLOSE_REASON_CLEANUP_TIMEOUT);
+    TEST_ASSERT_EQ(conn->cleanup_last_result, BACKEND_CLEANUP_RESULT_TIMEOUT);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_backend_eof_during_cleanup_closes(void)
+{
+    TEST_BEGIN("backend EOF during cleanup closes backend");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0xCAFE;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Backend disappears while cleanup drain is waiting. */
+    close(be_fds[0]);
+    be_fds[0] = -1;
+
+    for (int i = 0; i < 20 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(conn->cleanup_last_result, BACKEND_CLEANUP_RESULT_BACKEND_EOF);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_waiters_wake_only_when_cleaning_backend_becomes_idle(void)
+{
+    TEST_BEGIN("pool waiters wake only when a cleaning backend returns idle");
+
+    int be_fds[3];
+    backend_pool_t* pool = make_test_pool(3, be_fds);
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* c0 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c1 = backend_pool_borrow(pool, 0);
+    backend_conn_t* c2 = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(c0);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_NOT_NULL(c2);
+
+    c0->current_state_hash = 0x10;
+    c1->current_state_hash = 0x20;
+    c2->current_state_hash = 0x30;
+    backend_pool_return(pool, c0, false);
+    backend_pool_return(pool, c1, false);
+    backend_pool_return(pool, c2, false);
+    TEST_ASSERT_EQ(pool->cleaning_count, 3U);
+
+    int waiter = 42;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &waiter, pool), 0);
+    TEST_ASSERT_EQ(g_wait_count, 0);
+
+    /* Flush cleanup command on one backend and feed successful cleanup response. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+
+    uint8_t response[] = {
+        'C', 0, 0, 0, 16,
+        'D','I','S','C','A','R','D',' ','A','L','L', 0,
+        'Z', 0, 0, 0, 5, 'I'
+    };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 20 && g_wait_count == 0; i++)
+        reactor_tick(pool->reactor, 10);
+
+    TEST_ASSERT_EQ(g_wait_count, 1);
+    TEST_ASSERT_EQ(g_wait_order[0], 42);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 3);
+    TEST_END();
+}
+
+/* ============================================================================
+ * §6.8.2 — Cleanup closes backend on non-idle ReadyForQuery status
+ * ============================================================================ */
+
+/*
+ * pgf_drain_cleanup_response returns KEEL_PROTO_DRAIN_ERROR when it sees a
+ * ReadyForQuery with status 'E' (error/failed transaction) or 'T' (open
+ * transaction) instead of the expected 'I' (idle).  The pool must respond by
+ * closing the backend, not recycling it.
+ */
+static void test_cleanup_rfq_transaction_error_closes(void)
+{
+    TEST_BEGIN("cleanup closes backend when ReadyForQuery reports non-idle status");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x5678;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Drain the cleanup command (DISCARD ALL) sent to the backend. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Respond with ReadyForQuery('E') — transaction error state.
+     * pgf_drain_cleanup_response returns KEEL_PROTO_DRAIN_ERROR for non-'I'. */
+    uint8_t response[] = { 'Z', 0, 0, 0, 5, 'E' };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * §6.8.7 — Cleanup drain handles response split across multiple recv calls
+ * ============================================================================ */
+
+/*
+ * The cleanup response may arrive in fragments.  pgf_drain_cleanup_response
+ * preserves per-message parse state (pg_cleanup_drain_state_t) between calls
+ * so a response header split in the middle does not corrupt the drain or cause
+ * a spurious close.  The backend must reach IDLE only after the complete valid
+ * response sequence is received.
+ */
+static void test_cleanup_split_response(void)
+{
+    TEST_BEGIN("cleanup drain handles response split across two reactor recv calls");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0xABCD;
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+
+    /* Drain the cleanup command sent to the backend. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Valid response: CommandComplete("DISCARD ALL") + ReadyForQuery('I').
+     * Split after the first 3 bytes — the 5-byte PG message header is
+     * intentionally incomplete so the drain returns KEEL_PROTO_DRAIN_MORE
+     * and re-arms recv before the full message is processed. */
+    uint8_t full_response[] = {
+        'C', 0, 0, 0, 16,
+        'D','I','S','C','A','R','D',' ','A','L','L', 0,
+        'Z', 0, 0, 0, 5, 'I'
+    };
+
+    /* Part 1: first 3 bytes — incomplete header. */
+    ssize_t sw = send(be_fds[0], full_response, 3, MSG_NOSIGNAL);
+    TEST_ASSERT(sw == 3);
+
+    /* Tick: drain consumes partial header, returns DRAIN_MORE, re-arms recv. */
+    for (int i = 0; i < 10; i++)
+        reactor_tick(pool->reactor, 10);
+
+    /* Backend must still be cleaning — partial data is not enough to reclaim. */
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Part 2: remainder of response. */
+    sw = send(be_fds[0], full_response + 3, sizeof(full_response) - 3, MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)(sizeof(full_response) - 3));
+
+    for (int i = 0; i < 10 &&
+         atomic_load(&conn->state) == BACKEND_CONN_CLEANING; i++) {
+        reactor_tick(pool->reactor, 10);
+    }
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_IDLE);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+    TEST_ASSERT_EQ(conn->current_state_hash, 0ULL);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+/* ============================================================================
+ * §6.8.8 — Cleanup failure wakes pool waiters to prevent starvation
+ * ============================================================================ */
+
+/*
+ * When a backend under cleanup fails (protocol error, EOF, non-idle RFQ, etc.)
+ * the slot is closed without becoming idle.  Any session queued in the wait
+ * queue must be woken so it can react (attempt to borrow, fail fast, or
+ * escalate an error) rather than waiting forever for a slot that will never
+ * arrive.
+ */
+static void test_cleanup_failure_wakes_waiter(void)
+{
+    TEST_BEGIN("cleanup failure wakes waiting session to prevent starvation");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    conn->current_state_hash = 0x9999;
+
+    /* Return dirty — backend enters CLEANING, no idle connections remain. */
+    backend_pool_return(pool, conn, false);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLEANING);
+    TEST_ASSERT_EQ(pool->clean_count, 0U);
+
+    /* Queue a waiter — must block until cleanup finishes. */
+    int session = 77;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &session, pool), 0);
+    TEST_ASSERT_EQ(g_wait_count, 0);
+
+    /* Drain the cleanup command. */
+    uint8_t discard_buf[64];
+    ssize_t nr = -1;
+    for (int i = 0; i < 10 && nr <= 0; i++) {
+        reactor_tick(pool->reactor, 10);
+        nr = recv(be_fds[0], discard_buf, sizeof(discard_buf), MSG_DONTWAIT);
+    }
+    TEST_ASSERT(nr > 0);
+    TEST_ASSERT_EQ(conn->cleanup_state, BACKEND_CLEANUP_DRAIN);
+
+    /* Respond with RFQ('T') — open transaction, not idle.
+     * Cleanup fails; backend is closed without becoming idle.
+     * The waiter must be woken despite no idle slot being available,
+     * preventing permanent starvation. */
+    uint8_t response[] = { 'Z', 0, 0, 0, 5, 'T' };
+    ssize_t sw = send(be_fds[0], response, sizeof(response), MSG_NOSIGNAL);
+    TEST_ASSERT(sw == (ssize_t)sizeof(response));
+
+    for (int i = 0; i < 20 && g_wait_count == 0; i++)
+        reactor_tick(pool->reactor, 10);
+
+    TEST_ASSERT_EQ(g_wait_count, 1);
+    TEST_ASSERT_EQ(g_wait_order[0], 77);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
+    TEST_ASSERT_EQ(pool->cleaning_count, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
     TEST_END();
 }
 
@@ -556,13 +1082,13 @@ static void test_discard_decrements_active_count(void)
     /* Simulate an error: close the fd and discard */
     close(conn->fd);
     conn->fd = -1;
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
 
     TEST_ASSERT_EQ(atomic_load(&conn->state), BACKEND_CONN_CLOSED);
     TEST_ASSERT_EQ(pool->active_count, 0U);
 
     /* Second discard must be a safe no-op (state is already CLOSED) */
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
     TEST_ASSERT_EQ(pool->active_count, 0U);
 
     /* Peer fd still open; fd in slot was already closed above */
@@ -587,6 +1113,10 @@ static void test_get_stats_counts_connections(void)
 
     TEST_ASSERT_EQ(stats.total_connections,  3U);
     TEST_ASSERT_EQ(stats.idle_connections,   3U);
+    TEST_ASSERT_EQ(stats.clean_connections,  3U);
+    TEST_ASSERT_EQ(stats.stateful_connections, 0U);
+    TEST_ASSERT_EQ(stats.dirty_connections,  0U);
+    TEST_ASSERT_EQ(stats.closed_connections, 0U);
     TEST_ASSERT_EQ(stats.active_connections, 0U);
     TEST_ASSERT_EQ(stats.waiting_sessions,   0U);
 
@@ -681,7 +1211,7 @@ static void test_update_state_hash_pins_connection(void)
     /* Discard instead of return because state is no longer ACTIVE */
     close(conn->fd);
     conn->fd = -1;
-    backend_pool_discard(pool, conn);
+    backend_pool_discard(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR);
     destroy_test_pool(pool, be_fds, 1);
     TEST_END();
 }
@@ -724,6 +1254,162 @@ static void test_user_conn_accounting(void)
 }
 
 /* ============================================================================
+ * Test: wait queue backpressure and cancellation
+ * ============================================================================ */
+
+static void test_wait_queue_is_bounded(void)
+{
+    TEST_BEGIN("wait queue is bounded by max_waiting");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 2;
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), -1);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 2U);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s1), 1U);
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s2), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_cancel_removes_dead_session(void)
+{
+    TEST_BEGIN("wait queue cancellation removes disconnected session");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), 0);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s2), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 2U);
+    TEST_ASSERT(pool->wait_queue_head->session == &s1);
+    TEST_ASSERT(pool->wait_queue_tail->session == &s3);
+
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s1), 1U);
+    TEST_ASSERT_EQ(backend_pool_cancel_wait(pool, &s3), 1U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT(pool->wait_queue_head == NULL);
+    TEST_ASSERT(pool->wait_queue_tail == NULL);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_timeout_no_leak(void)
+{
+    TEST_BEGIN("wait queue timeout removes all expired waiters");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+    pool->config.wait_timeout_ms = 1;
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    int s1 = 1, s2 = 2;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    for (pool_waiter_t* w = pool->wait_queue_head; w; w = w->next)
+        w->enqueue_time_ms = 0;
+
+    size_t expired = backend_pool_expire_waiters(pool);
+    TEST_ASSERT_EQ(expired, 2U);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+    TEST_ASSERT_EQ(g_timeout_count, 2);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_wait_queue_fifo_resume_order(void)
+{
+    TEST_BEGIN("wait queue resumes waiters in FIFO order");
+
+    int be_fds[1];
+    backend_pool_t* pool = make_test_pool(1, be_fds);
+    pool->config.max_waiting = 4;
+    backend_pool_set_wait_callback(pool, wait_probe_cb);
+    reset_wait_probe();
+
+    backend_conn_t* conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+
+    int s1 = 1, s2 = 2, s3 = 3;
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s1, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s2, pool), 0);
+    TEST_ASSERT_EQ(backend_pool_queue_wait(pool, &s3, pool), 0);
+
+    backend_pool_return(pool, conn, false);
+    conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    backend_pool_return(pool, conn, false);
+    conn = backend_pool_borrow(pool, 0);
+    TEST_ASSERT_NOT_NULL(conn);
+    backend_pool_return(pool, conn, false);
+
+    TEST_ASSERT_EQ(g_wait_count, 3);
+    TEST_ASSERT_EQ(g_wait_order[0], 1);
+    TEST_ASSERT_EQ(g_wait_order[1], 2);
+    TEST_ASSERT_EQ(g_wait_order[2], 3);
+    TEST_ASSERT_EQ(pool->wait_queue_size, 0U);
+
+    destroy_test_pool(pool, be_fds, 1);
+    TEST_END();
+}
+
+static void test_stmt_semantic_compatibility_predicate(void)
+{
+    TEST_BEGIN("stmt semantic profile compatibility predicate");
+
+    backend_conn_t conn;
+    memset(&conn, 0, sizeof(conn));
+    conn.stmt_set_hash = 0xABCDEFULL;
+    conn.stmt_profile.stmt_set_hash = 0xABCDEFULL;
+    conn.stmt_profile.semantic_profile_hash = 0x1111ULL;
+    conn.stmt_profile.schema_epoch = 3;
+    conn.stmt_profile.role_hash = 0x2222ULL;
+    conn.stmt_profile.search_path_hash = 0x3333ULL;
+    conn.stmt_profile.guc_hash = 0x4444ULL;
+    conn.stmt_profile.semantic_unknown = false;
+
+    keel_stmt_compat_profile_t req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+    TEST_ASSERT(backend_pool_stmt_compatible(&req, &conn));
+
+    req.semantic_profile_hash ^= 0x1ULL;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+    req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+
+    req.role_hash ^= 0x1ULL;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+    req = conn.stmt_profile;
+    req.stmt_set_hash = conn.stmt_set_hash;
+
+    req.semantic_unknown = true;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+
+    conn.stmt_profile.semantic_unknown = true;
+    req.semantic_unknown = false;
+    req.stmt_set_hash = conn.stmt_set_hash;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &conn));
+
+    TEST_END();
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -734,11 +1420,21 @@ int main(void)
     test_cleaning_state_transition();
     test_clean_return_bypasses_discard();
     test_clean_gen_increments();
+    test_backend_can_borrow_predicate_matrix();
+    test_backend_generation_validation();
+    test_close_reason_once();
     test_admission_control_max_pinned();
     test_quarantine_pin_flags();
     test_sticky_primary_fields();
     test_borrow_rejects_cleaning();
     test_drain_cleaning_reclaims();
+    test_cleanup_notification_closes();
+    test_cleanup_timeout_closes_backend();
+    test_backend_eof_during_cleanup_closes();
+    test_waiters_wake_only_when_cleaning_backend_becomes_idle();
+    test_cleanup_rfq_transaction_error_closes();
+    test_cleanup_split_response();
+    test_cleanup_failure_wakes_waiter();
     test_borrow_skips_dead_connection();
     test_borrow_returns_alive_when_one_dead();
     test_drain_idle_closes_all_lists();
@@ -748,6 +1444,11 @@ int main(void)
     test_mark_transaction_transitions_state();
     test_update_state_hash_pins_connection();
     test_user_conn_accounting();
+    test_wait_queue_is_bounded();
+    test_wait_queue_cancel_removes_dead_session();
+    test_wait_queue_timeout_no_leak();
+    test_wait_queue_fifo_resume_order();
+    test_stmt_semantic_compatibility_predicate();
 
     printf("\n");
     return test_summary();

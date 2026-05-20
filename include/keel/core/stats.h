@@ -236,6 +236,15 @@ typedef struct keel_stats_basic {
     keel_counter_t   pool_destroys;      /**< Backend connections closed */
     keel_counter_t   pool_hits;          /**< Pool had a clean conn ready */
     keel_counter_t   pool_misses;        /**< Pool empty, had to create */
+    keel_counter_t   pool_borrow_attempts;            /**< Borrow decisions attempted */
+    keel_counter_t   pool_borrow_exact_state_match;   /**< Borrow selected exact session-state match */
+    keel_counter_t   pool_borrow_exact_stmt_match;    /**< Borrow selected exact prepared-statement match */
+    keel_counter_t   pool_borrow_state_replay;        /**< Borrow selected backend requiring state replay */
+    keel_counter_t   pool_borrow_stmt_replay;         /**< Borrow selected backend requiring statement replay */
+    keel_counter_t   pool_borrow_cleanup_required;    /**< Borrow selected backend requiring cleanup before use */
+    keel_counter_t   backend_borrow_success;          /**< Central borrow predicate accepted and borrow succeeded */
+    keel_counter_t   backend_borrow_failed_incompatible; /**< Borrow rejected by lifecycle incompatibility */
+    keel_counter_t   backend_borrow_failed_quarantined;  /**< Borrow rejected because backend is quarantined */
 
     /* -- Session metrics -- */
     keel_counter_t   sessions_created;   /**< Frontend connections accepted */
@@ -270,6 +279,7 @@ typedef struct keel_stats_basic {
 
     /* -- Multiplexing safety metrics -- */
     keel_counter_t   discard_all_count;       /**< DISCARD ALL commands issued */
+    keel_counter_t   discard_all_failure;     /**< Cleanup/discard failed before reusable boundary */
     keel_counter_t   state_sync_count;        /**< SET/RESET state sync replays issued */
     keel_counter_t   quarantine_count;        /**< Statements held in quarantine */
     keel_counter_t   sticky_primary_hits;     /**< Reads routed to primary due to sticky affinity */
@@ -280,8 +290,43 @@ typedef struct keel_stats_basic {
     keel_counter_t   copy_bytes_total;        /**< Total bytes sent during COPY operations */
     keel_counter_t   notify_relayed;          /**< NotificationResponse ('A') messages relayed to clients */
     keel_counter_t   osc_sessions_detected;   /**< Sessions identified as OSC tool connections (gh-ost/pt-osc) */
+    keel_counter_t   backend_close_dead_idle;       /**< Idle backend closed after failed liveness check */
+    keel_counter_t   backend_close_cleanup_error;   /**< Cleaning backend closed after cleanup/protocol error */
+    keel_counter_t   backend_close_cleanup_timeout; /**< Cleaning backend closed after cleanup timeout */
+    keel_counter_t   backend_close_client_disconnect; /**< Backend closed because owning client disconnected */
+    keel_counter_t   cleaning_timeout_total;        /**< Cleanup state-machine timeout events */
+    keel_counter_t   pin_reason_transaction;        /**< Times transaction pin became active */
+    keel_counter_t   pin_reason_extended_protocol;  /**< Times extended-protocol pin became active */
+    keel_counter_t   pin_reason_prepared_stmt;      /**< Times prepared-statement pin became active */
+    keel_counter_t   pin_reason_other;              /**< Times another hard pin reason became active */
+    keel_counter_t   commit_in_doubt_started;       /**< Commit-in-doubt recovery sessions started */
+    keel_counter_t   commit_in_doubt_resolved;      /**< Commit-in-doubt recovery sessions resolved */
+    keel_counter_t   commit_in_doubt_failed;        /**< Commit-in-doubt recovery sessions could not resolve */
     keel_gauge_t     sessions_pinned;         /**< Currently pinned sessions */
+    keel_gauge_t     sessions_pinned_transaction;       /**< Sessions currently pinned by transaction */
+    keel_gauge_t     sessions_pinned_extended_protocol; /**< Sessions currently pinned by extended protocol */
+    keel_gauge_t     sessions_pinned_prepared_stmt;      /**< Sessions currently pinned by prepared statements */
+    keel_gauge_t     sessions_commit_in_doubt;           /**< Sessions currently resolving commit outcome */
     keel_gauge_t     backends_cleaning;       /**< Backend slots in CLEANING state */
+
+    /* -- Async pre-query replay (deferred BEGIN, PR #4) -- */
+    keel_counter_t   pre_query_replay_count;    /**< Successful BEGIN-then-payload replays */
+    keel_counter_t   pre_query_send_fail;       /**< BEGIN send failed with hard errno */
+    keel_counter_t   pre_query_be_disconnect;   /**< Backend disconnected mid-replay */
+    keel_counter_t   pre_query_proto_violation; /**< Malformed wire frame during absorption */
+    keel_counter_t   pre_query_overflow;        /**< FE payload exceeded KEEL_PRE_QUERY_REPLAY_BUFSZ */
+    keel_counter_t   pre_query_runaway;         /**< Absorbed too many bytes without ReadyForQuery */
+    keel_counter_t   cleanup_result_success;        /**< Cleanup finished at reusable boundary */
+    keel_counter_t   cleanup_result_protocol_error; /**< Cleanup failed due to unsafe response stream */
+    keel_counter_t   cleanup_result_timeout;        /**< Cleanup timed out */
+    keel_counter_t   cleanup_result_backend_eof;    /**< Backend disconnected during cleanup */
+    keel_counter_t   cleanup_result_send_failure;   /**< Cleanup command send failure */
+    keel_counter_t   replay_result_success;         /**< Replay/setup pipeline completed */
+    keel_counter_t   replay_result_parse_error;     /**< Replay failed with protocol parse error */
+    keel_counter_t   replay_result_drain_error;     /**< Replay failed while draining setup responses */
+    keel_counter_t   replay_result_timeout;         /**< Replay/setup timed out */
+    keel_counter_t   replay_result_oom;             /**< Replay/setup failed due to allocation failure */
+    keel_counter_t   replay_result_partial_send_failure; /**< Replay/setup failed after partial send path */
 
     /* -- Connection migration metrics -- */
     keel_counter_t   migrations_sent;         /**< Sessions migrated away to another worker */
@@ -327,6 +372,7 @@ typedef struct keel_stats_basic {
     keel_counter_t   pool_wait_resume_success;      /**< Wait callbacks that successfully borrowed backend */
     keel_counter_t   pool_wait_resume_requeues;     /**< Wait callbacks that had to requeue (no backend yet) */
     keel_counter_t   pool_wait_timeout_events;      /**< Waiters expired by wait_timeout_ms */
+    keel_counter_t   pool_wait_cancelled;           /**< Waiters cancelled because client/session closed */
 
     /* -- Protocol health observability -- */
     keel_counter_t   proxy_state_desync_total;          /**< Protocol/state mismatch events */
@@ -350,6 +396,8 @@ typedef struct keel_stats_extended {
     keel_histogram_t wait_latency_ns;        /**< Time waiting for pool conn */
     keel_histogram_t discard_latency_ns;     /**< DISCARD ALL round-trip latency */
     keel_histogram_t state_sync_latency_ns;  /**< State sync SET/RESET latency */
+    keel_histogram_t cleanup_duration_ns;    /**< Cleanup state-machine duration */
+    keel_histogram_t replay_duration_ns;     /**< Setup replay/state-sync duration */
 } keel_stats_extended_t;
 
 /* ============================================================================

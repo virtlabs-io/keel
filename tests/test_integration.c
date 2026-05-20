@@ -677,7 +677,9 @@ bool integ_pg_query_int(integ_pg_conn_t* conn, const char* query, int64_t* resul
             if (len >= 6) {
                 int16_t ncols = ntohs(*(int16_t*)conn->recv_buf);
                 if (ncols >= 1) {
-                    int32_t col_len = ntohl(*(int32_t*)(conn->recv_buf + 2));
+                    int32_t col_len;
+                    memcpy(&col_len, conn->recv_buf + 2, sizeof(col_len));
+                    col_len = ntohl(col_len);
                     if (col_len > 0 && col_len < 32) {
                         char val[32];
                         memcpy(val, conn->recv_buf + 6, col_len);
@@ -741,7 +743,9 @@ bool integ_pg_query_string(integ_pg_conn_t* conn, const char* query,
             if (len >= 6) {
                 int16_t ncols = ntohs(*(int16_t*)conn->recv_buf);
                 if (ncols >= 1) {
-                    int32_t col_len = ntohl(*(int32_t*)(conn->recv_buf + 2));
+                    int32_t col_len;
+                    memcpy(&col_len, conn->recv_buf + 2, sizeof(col_len));
+                    col_len = ntohl(col_len);
                     if (col_len > 0 && (size_t)col_len < result_size - 1) {
                         memcpy(result, conn->recv_buf + 6, col_len);
                         result[col_len] = '\0';

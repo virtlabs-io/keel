@@ -34,6 +34,7 @@ the deprecation policy, and migration notes for any breaking changes between rel
 | `pid_file` | Stable | none | ❌ restart | Written on startup; removed on clean exit |
 | `shutdown_timeout_ms` | Stable | `30000` | ✅ SIGHUP | Grace period before forced drain |
 | `daemonize` | Stable | `false` | ❌ restart | Double-fork into background |
+| `experimental_features` | Stable | `false` | ❌ restart | Required opt-in gate for experimental features |
 
 ---
 
@@ -45,6 +46,7 @@ the deprecation policy, and migration notes for any breaking changes between rel
 |-----|------|---------|------------|-------|
 | `bind_addr` | Stable | `0.0.0.0` | ❌ restart | Listen address |
 | `bind_port` | Stable | `6432` | ❌ restart | Listen port |
+| `mode` | Stable | `pool` | ❌ restart | Runtime tier: `proxy` `pool` `smart` `full` |
 | `num_workers` | Stable | `0` (= CPU count) | ❌ restart | Worker threads |
 | `listen_backlog` | Stable | `128` | ❌ restart | TCP listen backlog |
 | `protocol` | Stable | `postgres` | ❌ restart | `postgres` or `mysql` |
@@ -116,6 +118,9 @@ the deprecation policy, and migration notes for any breaking changes between rel
 | `transaction_tracking` | Stable | `off` | ❌ restart | XID probe + read-after-write LSN tokens |
 | `fast_network_path` | Experimental | `on` | ❌ restart | MSG_PEEK + splice bypass for DataRow frames |
 | `result_cache` | Stable | `off` | ❌ restart | Query result caching; disables zero-copy splice bypass when `on` |
+| `scatter_merge` | Experimental | `off` | ❌ restart | Enables scatter-merge routing behavior |
+| `wal_lsn_capture` | Experimental | `off` | ❌ restart | Enables WAL LSN capture |
+| `gtid_capture` | Experimental | `off` | ❌ restart | Enables GTID capture |
 
 ### Load Rebalancing
 

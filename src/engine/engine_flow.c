@@ -111,6 +111,50 @@ static inline void sync_session_ssv_state(keel_session_t* session,
     session->pin_reason = (uint32_t)keel_ssv_pin_reason_from_flow_pins(sf->pins);
 }
 
+static inline void observe_pin_transition(struct keel_stats_ctx* stats,
+                                          keel_flow_pin_reason_t prev_pins,
+                                          keel_flow_pin_reason_t next_pins)
+{
+    if (!stats)
+        return;
+
+    if (prev_pins == KEEL_FPIN_NONE && next_pins != KEEL_FPIN_NONE)
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned);
+    else if (prev_pins != KEEL_FPIN_NONE && next_pins == KEEL_FPIN_NONE)
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned);
+
+    keel_flow_pin_reason_t added = next_pins & ~prev_pins;
+    if (added & KEEL_FPIN_TRANSACTION) {
+        KEEL_STAT_INC(stats, pin_reason_transaction);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_transaction);
+    }
+    if ((prev_pins & KEEL_FPIN_TRANSACTION) &&
+        !(next_pins & KEEL_FPIN_TRANSACTION))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_transaction);
+
+    if (added & KEEL_FPIN_EXTENDED_PROTO) {
+        KEEL_STAT_INC(stats, pin_reason_extended_protocol);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_extended_protocol);
+    }
+    if ((prev_pins & KEEL_FPIN_EXTENDED_PROTO) &&
+        !(next_pins & KEEL_FPIN_EXTENDED_PROTO))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_extended_protocol);
+
+    if (added & KEEL_FPIN_PREPARED_STMT) {
+        KEEL_STAT_INC(stats, pin_reason_prepared_stmt);
+        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_prepared_stmt);
+    }
+    if ((prev_pins & KEEL_FPIN_PREPARED_STMT) &&
+        !(next_pins & KEEL_FPIN_PREPARED_STMT))
+        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_prepared_stmt);
+
+    const keel_flow_pin_reason_t tracked =
+        KEEL_FPIN_TRANSACTION | KEEL_FPIN_EXTENDED_PROTO |
+        KEEL_FPIN_PREPARED_STMT;
+    if (added & ~tracked)
+        KEEL_STAT_INC(stats, pin_reason_other);
+}
+
 /**
  * @brief io_uring connect-completion callback that advances the cancel handshake.
  *
@@ -438,7 +482,14 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
     const uint8_t* p = (const uint8_t*)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t s = send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (s < 0 && errno == EPERM) {
+            /* Some sandbox/seccomp environments deny send* while allowing
+             * write() on connected sockets. Preserve non-blocking semantics:
+             * the fd is always O_NONBLOCK so write() will return EAGAIN rather
+             * than blocking if the send buffer is full. */
+            s = write(fd, p + sent, len - sent); /* NOLINT(keel-blocking) */
+        }
         if (s > 0) {
             sent += (size_t)s;
             continue;
@@ -456,28 +507,22 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
  * Heap-copies the remaining bytes and records the target fd + the flow
  * result the worker should act on once the send finishes.
  */
-/* When FE messages are captured into stmt_replay_orig_msg or pending_msg
- * and forwarded directly to the backend (bypassing the normal FE loop),
- * their pin effects never get applied.  Specifically: Sync ('S') clears
- * KEEL_FPIN_EXTENDED_PROTO in the normal loop, but when captured it is
- * just raw bytes.  Without clearing that flag, non_stmt_pins != 0 and
- * can_release stays false forever -- permanent pin, pool exhaustion.
- *
- * Fix: scan the captured buffer for Sync messages and apply the
- * KEEL_FPIN_EXTENDED_PROTO clear here before handing off. */
-static void scan_and_apply_sync_pin(keel_session_flow_t* sf,
-                                    const uint8_t* buf, size_t len)
+/* Captured FE payloads bypass the regular frame-by-frame on_fe_msg path.
+ * Ask the protocol plugin to report any pin transitions hidden in those
+ * deferred bytes, keeping the engine wire-format agnostic. */
+static void apply_captured_fe_pin_effects(keel_session_flow_t* sf,
+                                          const uint8_t* buf,
+                                          size_t len)
 {
-    size_t p = 0;
-    while (p + 5 <= len) {
-        uint8_t  mt = buf[p];
-        uint32_t ml = ((uint32_t)buf[p+1]<<24) | ((uint32_t)buf[p+2]<<16) |
-                      ((uint32_t)buf[p+3]<< 8) |  (uint32_t)buf[p+4];
-        if (ml < 4 || p + 1 + (size_t)ml > len) break;
-        if (mt == 'S')  /* Sync -- clears KEEL_FPIN_EXTENDED_PROTO */
-            sf->pins &= ~(keel_flow_pin_reason_t)KEEL_FPIN_EXTENDED_PROTO;
-        p += 1 + (size_t)ml;
-    }
+    if (!sf || !sf->flow || !sf->flow->captured_fe_pin_effects || !buf || len == 0)
+        return;
+
+    keel_flow_pin_reason_t pin_update = KEEL_FPIN_NONE;
+    keel_flow_pin_reason_t pin_clear = KEEL_FPIN_NONE;
+    sf->flow->captured_fe_pin_effects(sf->ctx, buf, len,
+                                      &pin_update, &pin_clear);
+    sf->pins |= pin_update;
+    sf->pins &= ~pin_clear;
 }
 
 /**
@@ -518,6 +563,448 @@ static keel_flow_result_t defer_send(keel_session_flow_t* sf,
     return KEEL_FLOW_SEND_PENDING;
 }
 
+#define ENGINE_SETUP_CLEANUP_BUFSZ 2048
+/* Keep setup payload queue intentionally small: only the ordered
+ * pre-query chain (BEGIN/state-sync/replay/cleanup) is supported. */
+#define ENGINE_PRE_QUERY_OP_CAP 4
+
+static void pre_query_reset_active(keel_session_flow_t* sf)
+{
+    sf->pending_pre_query = KEEL_PRE_QUERY_NONE;
+    sf->pending_pre_query_absorbed = 0;
+    sf->pending_state_sync_hash = 0;
+    sf->pending_pre_query_resume = KEEL_FLOW_OK;
+}
+
+static void pre_query_free_op(keel_pre_query_op_t* op)
+{
+    if (!op)
+        return;
+    if (op->payload) {
+        keel_free(op->payload);
+        op->payload = NULL;
+    }
+    memset(op, 0, sizeof(*op));
+}
+
+static void pre_query_clear_queue(keel_session_flow_t* sf)
+{
+    if (!sf)
+        return;
+    for (size_t i = 0; i < ENGINE_PRE_QUERY_OP_CAP; i++)
+        pre_query_free_op(&sf->pre_query_ops[i]);
+    sf->pre_query_head = 0;
+    sf->pre_query_tail = 0;
+    sf->pre_query_count = 0;
+}
+
+static void pre_query_fail_clear(keel_session_flow_t* sf)
+{
+    if (!sf)
+        return;
+    pre_query_reset_active(sf);
+    sf->pending_pre_query_len = 0;
+    sf->stmt_replay_needs_cleanup = false;
+    sf->stmt_replay_count = 0;
+    sf->stmt_replay_rfq_pending = false;
+    sf->stmt_replay_hash = 0;
+    pre_query_clear_queue(sf);
+}
+
+static void pre_query_record_result(keel_session_flow_t* sf,
+                                    keel_worker_t* worker,
+                                    keel_replay_result_t result)
+{
+    if (!sf)
+        return;
+
+    uint64_t dur_ns = 0;
+    if (sf->pending_pre_query_started_ns > 0) {
+        int64_t now_ns = keel_stats_now_ns();
+        if (now_ns > 0 &&
+            (uint64_t)now_ns > sf->pending_pre_query_started_ns) {
+            dur_ns = (uint64_t)now_ns - sf->pending_pre_query_started_ns;
+        }
+    }
+
+    sf->replay_last_result = result;
+    sf->replay_last_duration_ns = dur_ns;
+    sf->pending_pre_query_started_ns = 0;
+
+    if (!worker || !worker->stats_ctx)
+        return;
+
+    switch (result) {
+    case KEEL_REPLAY_RESULT_SUCCESS:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_success);
+        break;
+    case KEEL_REPLAY_RESULT_PARSE_ERROR:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_parse_error);
+        break;
+    case KEEL_REPLAY_RESULT_DRAIN_ERROR:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_drain_error);
+        break;
+    case KEEL_REPLAY_RESULT_TIMEOUT:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_timeout);
+        break;
+    case KEEL_REPLAY_RESULT_OOM:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_oom);
+        break;
+    case KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE:
+        KEEL_STAT_INC(worker->stats_ctx, replay_result_partial_send_failure);
+        break;
+    case KEEL_REPLAY_RESULT_NONE:
+        break;
+    }
+
+    if (dur_ns > 0)
+        KEEL_STAT_LATENCY(worker->stats_ctx, replay_duration_ns, dur_ns);
+}
+
+static bool pre_query_has_active_op(const keel_session_flow_t* sf)
+{
+    if (!sf)
+        return false;
+    return sf->pending_pre_query != KEEL_PRE_QUERY_NONE ||
+           sf->stmt_replay_needs_cleanup ||
+           sf->stmt_replay_count > 0 ||
+           sf->stmt_replay_rfq_pending;
+}
+
+static bool pre_query_queue_push(keel_session_flow_t* sf,
+                                 keel_pre_query_op_type_t type,
+                                 const uint8_t* payload,
+                                 size_t payload_len,
+                                 uint64_t state_sync_hash,
+                                 keel_flow_result_t resume,
+                                 uint32_t expected_msgs)
+{
+    if (!sf || !payload || payload_len == 0)
+        return false;
+    if (sf->pre_query_count >= ENGINE_PRE_QUERY_OP_CAP)
+        return false;
+
+    uint8_t idx = sf->pre_query_tail;
+    keel_pre_query_op_t* op = &sf->pre_query_ops[idx];
+    memset(op, 0, sizeof(*op));
+    op->payload = (uint8_t*)keel_malloc(payload_len);
+    if (!op->payload)
+        return false;
+    memcpy(op->payload, payload, payload_len);
+    op->payload_len = payload_len;
+    op->type = type;
+    op->state = KEEL_PQSTATE_IDLE;
+    op->state_sync_hash = state_sync_hash;
+    op->resume = resume;
+    op->expected_msgs = expected_msgs;
+
+    sf->pre_query_tail = (uint8_t)((sf->pre_query_tail + 1u) %
+                                   ENGINE_PRE_QUERY_OP_CAP);
+    sf->pre_query_count++;
+    return true;
+}
+
+static keel_flow_result_t pre_query_start_op(keel_session_flow_t* sf,
+                                             keel_session_t* session,
+                                             keel_pre_query_op_t* op)
+{
+    keel_worker_t* worker = session ? session->worker : NULL;
+    if (!sf || !session || !op || !op->payload || op->payload_len == 0)
+        return KEEL_FLOW_ERROR;
+
+    if (sf->pending_pre_query_started_ns == 0)
+        sf->pending_pre_query_started_ns = (uint64_t)keel_stats_now_ns();
+
+    sf->pending_pre_query_absorbed = 0;
+    sf->pending_pre_query_resume = op->resume;
+    sf->pending_state_sync_hash = op->state_sync_hash;
+    if (op->type == KEEL_PQOP_STATE_SYNC ||
+        op->type == KEEL_PQOP_DEFERRED_BEGIN) {
+        sf->pending_pre_query = (op->type == KEEL_PQOP_STATE_SYNC)
+            ? KEEL_PRE_QUERY_STATE_SYNC
+            : KEEL_PRE_QUERY_BEGIN_REPLAY;
+    } else {
+        sf->pending_pre_query = KEEL_PRE_QUERY_NONE;
+    }
+    if (op->type == KEEL_PQOP_CLEAN_CHECK) {
+        sf->stmt_replay_needs_cleanup = true;
+        memset(&sf->stmt_cleanup_drain_state, 0, sizeof(sf->stmt_cleanup_drain_state));
+    } else if (op->type == KEEL_PQOP_PS_REPLAY) {
+        sf->stmt_replay_count = op->expected_msgs;
+        sf->stmt_replay_rfq_pending = false;
+        sf->stmt_replay_hash = op->state_sync_hash;
+    }
+
+    ssize_t s = keel_try_send_nb(session->server_fd, op->payload, op->payload_len);
+    if (s < 0) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: pre-query op send failed type=%d: %s",
+            worker ? worker->id : 0u, (int)op->type, strerror(errno));
+        if (worker && worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
+            KEEL_STAT_INC(worker->stats_ctx, errors_backend);
+        }
+        pre_query_record_result(sf, worker,
+                                KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+        pre_query_reset_active(sf);
+        return KEEL_FLOW_ERROR;
+    }
+
+    if (op->type == KEEL_PQOP_STATE_SYNC && worker && worker->stats_ctx)
+        KEEL_STAT_INC(worker->stats_ctx, state_sync_count);
+    if (op->type == KEEL_PQOP_CLEAN_CHECK && worker && worker->stats_ctx)
+        KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
+
+    if ((size_t)s < op->payload_len) {
+        keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                           op->payload + s,
+                                           op->payload_len - (size_t)s,
+                                           (op->type == KEEL_PQOP_PS_REPLAY ||
+                                            op->type == KEEL_PQOP_CLEAN_CHECK)
+                                               ? KEEL_FLOW_WAIT_STMT_REPLAY
+                                               : KEEL_FLOW_WAIT_BACKEND);
+        if (dr == KEEL_FLOW_ERROR) {
+            pre_query_record_result(sf, worker,
+                                    KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+        }
+        return dr;
+    }
+
+    if (op->type == KEEL_PQOP_PS_REPLAY || op->type == KEEL_PQOP_CLEAN_CHECK)
+        return KEEL_FLOW_WAIT_STMT_REPLAY;
+    return KEEL_FLOW_WAIT_BACKEND;
+}
+
+static keel_flow_result_t pre_query_start_next_queued(keel_session_flow_t* sf,
+                                                       keel_session_t* session)
+{
+    if (!sf || !session)
+        return KEEL_FLOW_ERROR;
+    if (sf->pre_query_count == 0)
+        return KEEL_FLOW_OK;
+
+    uint8_t idx = sf->pre_query_head;
+    keel_pre_query_op_t op = sf->pre_query_ops[idx];
+    sf->pre_query_ops[idx].payload = NULL;
+    memset(&sf->pre_query_ops[idx], 0, sizeof(sf->pre_query_ops[idx]));
+    sf->pre_query_head = (uint8_t)((sf->pre_query_head + 1u) %
+                                   ENGINE_PRE_QUERY_OP_CAP);
+    sf->pre_query_count--;
+
+    keel_flow_result_t r = pre_query_start_op(sf, session, &op);
+    pre_query_free_op(&op);
+    return r;
+}
+
+static keel_flow_result_t pre_query_enqueue(keel_session_flow_t* sf,
+                                            keel_session_t* session,
+                                            keel_pre_query_op_type_t type,
+                                            const uint8_t* payload,
+                                            size_t payload_len,
+                                            const uint8_t* follow_buf,
+                                            size_t follow_len,
+                                            uint64_t state_sync_hash,
+                                            keel_flow_result_t resume,
+                                            uint32_t expected_msgs)
+{
+    keel_worker_t* worker = session ? session->worker : NULL;
+
+    if (!sf || !session || !payload || payload_len == 0)
+        return KEEL_FLOW_ERROR;
+    if (follow_len > sizeof(sf->pending_pre_query_buf)) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: pre-query follow-up payload %zu B exceeds stash %zu B",
+            worker ? worker->id : 0u, follow_len,
+            sizeof(sf->pending_pre_query_buf));
+        if (worker && worker->stats_ctx)
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_overflow);
+        pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_OOM);
+        return KEEL_FLOW_ERROR;
+    }
+
+    if (follow_len > 0 && follow_buf) {
+        if (sf->pending_pre_query_len == 0) {
+            memcpy(sf->pending_pre_query_buf, follow_buf, follow_len);
+            sf->pending_pre_query_len = follow_len;
+            sf->pending_pre_query_resume = resume;
+        } else if (sf->pending_pre_query_len != follow_len ||
+                   memcmp(sf->pending_pre_query_buf, follow_buf, follow_len) != 0) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: mismatched held payload while enqueuing pre-query op",
+                worker ? worker->id : 0u);
+            if (worker && worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+            return KEEL_FLOW_ERROR;
+        }
+    }
+
+    if (!pre_query_has_active_op(sf) && sf->pre_query_count == 0) {
+        keel_pre_query_op_t tmp = {
+            .type = type,
+            .state = KEEL_PQSTATE_IDLE,
+            .payload = (uint8_t*)payload,
+            .payload_len = payload_len,
+            .state_sync_hash = state_sync_hash,
+            .resume = resume,
+            .expected_msgs = expected_msgs,
+        };
+        return pre_query_start_op(sf, session, &tmp);
+    }
+
+    if (!pre_query_queue_push(sf, type, payload, payload_len,
+                              state_sync_hash, resume, expected_msgs)) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: pre-query op queue full (count=%u)",
+            worker ? worker->id : 0u, (unsigned)sf->pre_query_count);
+        if (worker && worker->stats_ctx)
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_overflow);
+        pre_query_record_result(sf, worker,
+            sf->pre_query_count >= ENGINE_PRE_QUERY_OP_CAP
+                ? KEEL_REPLAY_RESULT_DRAIN_ERROR
+                : KEEL_REPLAY_RESULT_OOM);
+        return KEEL_FLOW_ERROR;
+    }
+
+    return KEEL_FLOW_WAIT_BACKEND;
+}
+
+static keel_flow_result_t pre_query_enqueue_cleanup(keel_session_flow_t* sf,
+                                                    keel_session_t* session,
+                                                    const char* where,
+                                                    const uint8_t* follow_buf,
+                                                    size_t follow_len)
+{
+    if (!sf || !session || !sf->flow || !sf->flow->drain_cleanup_response)
+        return KEEL_FLOW_ERROR;
+
+    uint8_t buf[ENGINE_SETUP_CLEANUP_BUFSZ];
+    keel_cleanup_opts_t opts = {
+        .mode = KEEL_CLEANUP_FULL,
+        .timeout_ms = 0,
+    };
+    ssize_t n = -1;
+    if (sf->flow->cleanup_slot) {
+        n = sf->flow->cleanup_slot(sf->ctx, session->server_fd, NULL,
+                                   opts, buf, sizeof(buf));
+    } else if (sf->flow->build_cleanup) {
+        n = sf->flow->build_cleanup(sf->ctx, KEEL_CLEANUP_UNKNOWN_STATE,
+                                    buf, sizeof(buf));
+    }
+    if (n <= 0) {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+            "W%u: setup cleanup build failed (%s)",
+            session && session->worker ? session->worker->id : 0u,
+            where ? where : "unknown");
+        pre_query_record_result(sf, session ? session->worker : NULL,
+                                KEEL_REPLAY_RESULT_DRAIN_ERROR);
+        return KEEL_FLOW_ERROR;
+    }
+    return pre_query_enqueue(sf, session, KEEL_PQOP_CLEAN_CHECK,
+                             buf, (size_t)n,
+                             follow_buf, follow_len,
+                             0, KEEL_FLOW_WAIT_BACKEND, 0);
+}
+
+static keel_flow_result_t pre_query_enqueue_stmt_replay(keel_session_flow_t* sf,
+                                                         keel_session_t* session,
+                                                         const uint8_t* replay_buf,
+                                                         size_t replay_len,
+                                                         uint32_t replay_count,
+                                                         uint64_t replay_hash,
+                                                         const uint8_t* follow_buf,
+                                                         size_t follow_len)
+{
+    if (!replay_buf || replay_len == 0 || replay_count == 0)
+    {
+        pre_query_record_result(sf, session ? session->worker : NULL,
+                                KEEL_REPLAY_RESULT_PARSE_ERROR);
+        return KEEL_FLOW_ERROR;
+    }
+    return pre_query_enqueue(sf, session, KEEL_PQOP_PS_REPLAY,
+                             replay_buf, replay_len,
+                             follow_buf, follow_len,
+                             replay_hash, KEEL_FLOW_WAIT_BACKEND,
+                             replay_count);
+}
+
+/**
+ * @brief Send the deferred BEGIN asynchronously and stash the follow-up
+ *        FE payload for replay after ReadyForQuery arrives.
+ *
+ * Replaces the old blocking BEGIN+drain inline loops (engine_flow.c spec
+ * §A in docs/REACTOR_BLOCKING_INVENTORY.md, PR #4).  The caller MUST have
+ * already verified that no prepared-statement replay or DISCARD-ALL is
+ * required on this backend (those combos are not yet supported and are
+ * defended against at the call sites).
+ *
+ * On success the caller should return KEEL_FLOW_WAIT_BACKEND; the BE-side
+ * intercept in keel_engine_flow_on_be_data() absorbs the BEGIN response
+ * until 'Z' (ReadyForQuery) arrives, then forwards `follow_buf` to the
+ * backend.
+ *
+ * @param sf         Session-flow state (begin_deferred_payload* must be set).
+ * @param session    Session (server_fd must point at the assigned backend).
+ * @param follow_buf FE payload to forward AFTER the BEGIN's 'Z'.  May be
+ *                   NULL/0 for a degenerate "BEGIN with nothing to follow".
+ * @param follow_len Byte count for follow_buf.  Must be ≤
+ *                   KEEL_PRE_QUERY_REPLAY_BUFSZ or the call hard-errors.
+ *
+ * @return KEEL_FLOW_WAIT_BACKEND on success (BEGIN sent, awaiting Z),
+ *         KEEL_FLOW_SEND_PENDING if the BEGIN partially drained,
+ *         KEEL_FLOW_ERROR on overflow / send failure (counters bumped).
+ */
+static keel_flow_result_t defer_begin_replay(keel_session_flow_t* sf,
+                                             keel_session_t* session,
+                                             const uint8_t* follow_buf,
+                                             size_t follow_len)
+{
+    const uint8_t* bp = sf->begin_deferred_payload;
+    size_t         bl = sf->begin_deferred_payload_len;
+    sf->begin_deferred_payload_len = 0;
+    if (!bp || bl == 0)
+        return KEEL_FLOW_ERROR;
+    return pre_query_enqueue(sf, session, KEEL_PQOP_DEFERRED_BEGIN,
+                             bp, bl, follow_buf, follow_len,
+                             0, KEEL_FLOW_WAIT_BACKEND, 0);
+}
+
+/**
+ * @brief Send session-state sync SQL asynchronously before forwarding a query.
+ *
+ * Transaction pooling correctness requires the sync response stream to be
+ * fully drained before client traffic is forwarded. This arms the existing
+ * pre-query absorber so backend bytes are consumed until ReadyForQuery, then
+ * the backend is stamped with the session profile and the stashed FE payload
+ * is sent.
+ */
+static keel_flow_result_t defer_state_sync_replay(keel_session_flow_t* sf,
+                                                  keel_session_t* session,
+                                                  backend_conn_t* be_conn,
+                                                  const uint8_t* sync_buf,
+                                                  size_t sync_len,
+                                                  const uint8_t* follow_buf,
+                                                  size_t follow_len,
+                                                  keel_flow_result_t resume)
+{
+    if (!be_conn || !sync_buf || sync_len == 0)
+        return KEEL_FLOW_ERROR;
+    return pre_query_enqueue(sf, session, KEEL_PQOP_STATE_SYNC,
+                             sync_buf, sync_len,
+                             follow_buf, follow_len,
+                             session->state_hash, resume, 0);
+}
+
+static bool backend_needs_state_sync(const keel_session_flow_t* sf,
+                                     const keel_session_t* session,
+                                     const backend_conn_t* be_conn)
+{
+    return KEEL_TIER_HAS_STATE_SYNC(sf->mode) &&
+           be_conn && be_conn->profile && session->state_profile &&
+           be_conn->current_state_hash != session->state_hash &&
+           session->state_hash != 0;
+}
+
 /* ============================================================================
  * Session Flow Init/Destroy
  * ============================================================================ */
@@ -533,7 +1020,8 @@ static keel_flow_result_t defer_send(keel_session_flow_t* sf,
  *
  * Inherits configuration from the owning worker:
  *  - ps_mode        — prepared-statement pooling mode (virtualize/pinning/…)
- *  - txn_tracking   — enable XID probe on COMMIT + WAL LSN capture
+ *  - txn_tracking   — enable XID probe on COMMIT; consistency-token capture
+ *                     must be reactor-owned before it is used on the hot path
  *
  * @param sf      Uninitialised flow state struct (will be zero-filled).
  * @param flow    Protocol vtable (postgres, mysql, …).  Must not be NULL.
@@ -558,11 +1046,12 @@ int keel_session_flow_init(keel_session_flow_t* sf,
     else
         sf->ps_mode = KEEL_PS_MODE_VIRTUALIZE;
 
-    /* Inherit runtime mode tier */
+    /* Inherit runtime mode tier.  Fall back to POOL (not FULL) when there is
+     * no worker, so unit tests and standalone tools stay conservative. */
     if (session && session->worker)
         sf->mode = session->worker->runtime_mode;
     else
-        sf->mode = KEEL_TIER_FULL;
+        sf->mode = KEEL_TIER_POOL;
 
     /* Inherit replication uncertainty tracking */
     sf->txn_tracking = (session && session->worker)
@@ -577,6 +1066,12 @@ int keel_session_flow_init(keel_session_flow_t* sf,
     sf->sticky_primary_ttl_ms = (session && session->worker)
                                 ? session->worker->sticky_primary_ttl_ms
                                 : (uint32_t)KEEL_STICKY_PRIMARY_TTL_MS;
+
+    /* Inherit buffer caps (0 = unlimited) */
+    sf->session_max_buffered_bytes = (session && session->worker)
+                                     ? session->worker->session_max_buffered_bytes : 0;
+    sf->backend_max_replay_bytes   = (session && session->worker)
+                                     ? session->worker->backend_max_replay_bytes : 0;
 
     /* PROXY mode: force PS off and disable txn tracking — the session
      * is hard-pinned to one backend, no pooling sophistication needed. */
@@ -608,7 +1103,7 @@ int keel_session_flow_init(keel_session_flow_t* sf,
  *  3. Frees the prepared-statement replay buffer.
  *  4. Returns the commit-in-doubt check connection to the pool if it
  *     was borrowed — prevents silent pool leaks when a session is
- *     destroyed while a txid_status() check is still in flight.
+ *     destroyed while an outcome-check query is still in flight.
  *
  * THREAD SAFETY: Must only be called from the session's owning worker
  * thread.  The pool return is lock-free (CAS on the connection state).
@@ -642,6 +1137,7 @@ void keel_session_flow_destroy(keel_session_flow_t* sf) {
     sf->pending_msg = NULL;
     sf->pending_msg_len = 0;
     sf->queued_for_pool = false;
+    pre_query_clear_queue(sf);
 
     /* Replication tracking: if a commit-in-doubt check connection is still
      * borrowed, return it to the pool so it isn't leaked. */
@@ -668,10 +1164,12 @@ keel_flow_result_t keel_engine_flow_resume_auth(
     keel_session_flow_t* sf,
     keel_session_t* session)
 {
-    /* Drain the eventfd (must read 8 bytes) */
+    /* Drain the eventfd (must read 8 bytes). The fd is set non-blocking at
+     * creation in the auth-pool thread, so this read either returns 8 bytes
+     * (signalled) or fails with EAGAIN — it cannot block the reactor. */
     if (sf->auth_notify_fd >= 0) {
         uint64_t val;
-        ssize_t n = read(sf->auth_notify_fd, &val, sizeof(val));
+        ssize_t n = read(sf->auth_notify_fd, &val, sizeof(val)); /* NOLINT(keel-blocking) */
         (void)n; /* eventfd drain; EAGAIN is harmless if pool thread hasn't written yet */
         close(sf->auth_notify_fd);
         sf->auth_notify_fd = -1;
@@ -704,13 +1202,12 @@ keel_flow_result_t keel_engine_flow_resume_auth(
  *     borrowed backend has a different stmt_set_hash, the Parse wire
  *     messages are sent first.  The original message is held in
  *     `sf->stmt_replay_orig_msg` and forwarded after all ParseCompletes
- *     are acknowledged.  If the backend also has `needs_discard_all` set,
- *     a `DISCARD ALL` is sent first to clear stale session state before
- *     replaying.
+ *     are acknowledged.  If the backend also has `needs_full_cleanup` set,
+ *     plugin cleanup is sent first to clear stale session state before replay.
  *
- *  B. **Needs DISCARD ALL but no stmts**: Backend was borrowed from a
- *     dirty pool slot; DISCARD ALL is sent and the pending message is
- *     deferred until the response is received.
+ *  B. **Needs cleanup but no stmts**: Backend was borrowed from a dirty pool
+ *     slot; plugin cleanup is sent and the pending message is deferred until
+ *     the response is validated.
  *
  * After handling the above, the pending message is forwarded non-blocking.
  * A partial send is deferred via `defer_send()`.
@@ -748,39 +1245,64 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
 
     /* Assign the backend connection */
     session->backend_conn = be_conn;
+    session->backend_generation = be_conn ? be_conn->generation : 0;
     session->server_fd = be_conn->fd;
 
-    /* Deferred-BEGIN replay: if a BEGIN was buffered during shard deferral,
-     * send it to the backend now and drain the response synchronously before
-     * forwarding the actual pending message. */
+    keel_flow_result_t setup_result = KEEL_FLOW_OK;
+    if (backend_needs_state_sync(sf, session, be_conn)) {
+        uint8_t sync_buf[4096];
+        uint64_t _sync_t0 = keel_instr_begin(WORKER_INSTR(worker),
+                                             KEEL_INSTR_STATE_SYNC);
+        ssize_t sync_len = flow->build_state_sync
+            ? flow->build_state_sync(sf->ctx, be_conn->profile,
+                                     session->state_profile,
+                                     sync_buf, sizeof(sync_buf))
+            : -1;
+        keel_instr_end(WORKER_INSTR(worker), KEEL_INSTR_STATE_SYNC, _sync_t0);
+        if (sync_len < 0)
+            return KEEL_FLOW_ERROR;
+        if (sync_len == 0) {
+            be_conn->current_state_hash = session->state_hash;
+            be_conn->needs_sync = false;
+            if (be_conn->profile && session->state_profile)
+                state_profile_copy(be_conn->profile, session->state_profile);
+        } else {
+            setup_result = defer_state_sync_replay(sf, session, be_conn,
+                                                   sync_buf, (size_t)sync_len,
+                                                   pending_data, pending_len,
+                                                   KEEL_FLOW_WAIT_BACKEND);
+            if (setup_result == KEEL_FLOW_ERROR)
+                return KEEL_FLOW_ERROR;
+        }
+    }
+
+    /* Deferred-BEGIN replay (PR #4 — async): if a BEGIN was buffered during
+     * shard deferral, send it to the backend non-blocking and stash the
+     * pending FE message for forwarding once the backend's ReadyForQuery
+     * arrives.  The BE-side intercept in keel_engine_flow_on_be_data()
+     * absorbs the BEGIN response and replays the stashed payload.
+     *
+     * Combination with prepared-statement replay or DISCARD-ALL on the same
+     * borrow is not yet supported: deferred BEGIN happens only on the first
+     * routable query of a sharded session, before the session has pinned
+     * named prepared statements; and the pool borrow paths that set
+     * needs_full_cleanup are mutually exclusive with shard-deferred BEGIN.
+     * Both invariants are asserted below — violation hard-errors the
+     * session rather than silently falling back to the old blocking path. */
     if (sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
         sf->begin_deferred = false;
-        int _bfd    = session->server_fd;
-        int _bflags = fcntl(_bfd, F_GETFL);
-        if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags & ~O_NONBLOCK);
-        send(_bfd, sf->begin_deferred_payload,
-             sf->begin_deferred_payload_len, MSG_NOSIGNAL);
-        uint8_t _bbuf[256];
-        bool    _brfq  = false;
-        int     _btries = 20;
-        while (!_brfq && _btries-- > 0) {
-            ssize_t _brr = recv(_bfd, _bbuf, sizeof(_bbuf), 0);
-            if (_brr <= 0) break;
-            ssize_t _bscan = 0;
-            while (_bscan + 5 <= _brr) {
-                uint8_t  _bmt = _bbuf[_bscan];
-                uint32_t _bml = ((uint32_t)_bbuf[_bscan+1] << 24)
-                              | ((uint32_t)_bbuf[_bscan+2] << 16)
-                              | ((uint32_t)_bbuf[_bscan+3] <<  8)
-                              |  (uint32_t)_bbuf[_bscan+4];
-                if (_bmt == 'Z') { _brfq = true; break; }
-                if (_bml < 4)    break;
-                _bscan += 1 + (ssize_t)_bml;
-            }
-        }
-        sf->begin_deferred_payload_len = 0;
-        if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags);
+
+        /* Query logging happens in the BE-side intercept after setup drain. */
+        keel_flow_result_t br = defer_begin_replay(sf, session,
+                                                   pending_data, pending_len);
+        if (br == KEEL_FLOW_ERROR)
+            return KEEL_FLOW_ERROR;
+        if (setup_result == KEEL_FLOW_OK)
+            setup_result = br;
     }
+
+    if (setup_result != KEEL_FLOW_OK)
+        return setup_result;
 
     KEEL_DEBUG_LOG("W%u: resumed session %lu with BE fd=%d\n",
                 worker->id, (unsigned long)session->id, be_conn->fd);
@@ -797,7 +1319,7 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
             worker->id, be_conn->fd, (unsigned)sf->pins,
             (unsigned long long)stmt_hash,
             (unsigned long long)be_conn->stmt_set_hash,
-            (int)be_conn->needs_discard_all,
+            (int)be_conn->needs_full_cleanup,
             pending_data && pending_len > 0 ? (unsigned)pending_data[0] : 0);
         if (stmt_hash != 0 && be_conn->stmt_set_hash != stmt_hash) {
             /* Backend needs stmts replayed before we send pending_data */
@@ -807,118 +1329,42 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
             uint64_t rhash  = 0;
             if (flow->get_stmt_replay(sf->ctx, &rbuf, &rlen, &rcount, &rhash) == 0 &&
                 rbuf && rlen > 0 && rcount > 0) {
-                sf->stmt_replay_orig_msg     = pending_data;
-                sf->stmt_replay_orig_len     = pending_len;
                 /* Apply pin effects for messages in pending_data that bypass
                  * the FE loop (Sync clears KEEL_FPIN_EXTENDED_PROTO). */
-                scan_and_apply_sync_pin(sf, pending_data, pending_len);
-                sf->stmt_replay_count       = rcount;
-                sf->stmt_replay_rfq_pending = false;  /* cleared at replay start */
-                sf->stmt_replay_hash        = rhash;
-
-                if (be_conn->needs_discard_all) {
-                    /* Backend was borrowed from Step 4 (different stmt hash).
-                     * Save the replay buffer; send DISCARD ALL first so the
-                     * backend is clean before we replay Parse messages.
-                     * The on_be_data handler (WAIT_STMT_REPLAY + needs_discard)
-                     * drains the DISCARD ALL response ('C'+'Z') then sends rbuf. */
-                    be_conn->needs_discard_all     = false;
-                    sf->stmt_replay_buf            = rbuf;   /* saved — sent after 'Z' */
-                    sf->stmt_replay_len            = rlen;
-                    sf->stmt_replay_needs_discard  = true;
-
-                    /* DISCARD ALL (single-statement) clears prepared statements
-                     * and session state.  Backends borrowed from idle_list are
-                     * genuinely idle at the PostgreSQL level; ROLLBACK is not
-                     * needed and must NOT be combined in a multi-statement query
-                     * because PostgreSQL wraps each statement in an implicit
-                     * transaction, making DISCARD ALL fail with
-                     * "cannot run inside a transaction block". */
-                    static const uint8_t discard_q[] = {
-                        'Q', 0, 0, 0, 17,
-                        'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                    };
-                    ssize_t rd = keel_try_send_nb(session->server_fd,
-                                                  discard_q, sizeof(discard_q));
-                    if (rd < 0) {
+                apply_captured_fe_pin_effects(sf, pending_data, pending_len);
+                keel_flow_result_t rr = KEEL_FLOW_WAIT_BACKEND;
+                if (be_conn->needs_full_cleanup) {
+                    be_conn->needs_full_cleanup = false;
+                    rr = pre_query_enqueue_cleanup(sf, session, "resume replay",
+                                                   pending_data, pending_len);
+                    if (rr == KEEL_FLOW_ERROR) {
                         keel_free(rbuf);
-                        sf->stmt_replay_buf   = NULL;
-                        sf->stmt_replay_len   = 0;
-                        sf->stmt_replay_needs_discard = false;
-                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                            "W%u: DISCARD ALL send failed on resume: %s",
-                            worker->id, strerror(errno));
-                        if (worker->stats_ctx)
-                            KEEL_STAT_INC(worker->stats_ctx, errors_backend);
-                        return KEEL_FLOW_ERROR;
+                        return rr;
                     }
-                    if (worker->stats_ctx)
-                        KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
-                    /* Wait for DISCARD ALL response, then replay, then forward */
-                    return KEEL_FLOW_WAIT_STMT_REPLAY;
                 }
-
-                ssize_t rs = keel_try_send_nb(session->server_fd, rbuf, rlen);
-                KEEL_DEBUG_LOG("W%u: replay send no-discard: fd=%d rlen=%zu rs=%zd rcount=%u\n",
-                    worker->id, session->server_fd, rlen, rs, rcount);
+                keel_flow_result_t rqr = pre_query_enqueue_stmt_replay(
+                    sf, session, rbuf, rlen, rcount, rhash,
+                    pending_data, pending_len);
                 keel_free(rbuf);
-                if (rs < 0) {
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                        "W%u: stmt replay send failed on resume: %s",
-                        worker->id, strerror(errno));
-                    if (worker->stats_ctx)
-                        KEEL_STAT_INC(worker->stats_ctx, errors_backend);
-                    return KEEL_FLOW_ERROR;
-                }
-                /* Wait for ParseComplete responses to arrive in on_be_data */
-                return KEEL_FLOW_WAIT_STMT_REPLAY;
+                if (rqr == KEEL_FLOW_ERROR)
+                    return rqr;
+                if (rr == KEEL_FLOW_WAIT_BACKEND || rr == KEEL_FLOW_WAIT_STMT_REPLAY)
+                    return rr;
+                return rqr;
             }
             if (rbuf) keel_free(rbuf);
         }
     }
 
-    /* If the backend was borrowed from Step 4 (different stmt hash reclaimed
-     * for a session with NO prepared stmts yet), we still need to send
-     * DISCARD ALL before forwarding pending_data so the backend is clean.
-     * The KEEL_FPIN_PREPARED_STMT block above handles the case where the
-     * session already HAS stmts; this handles the stmt_hash == 0 case. */
-    if (be_conn->needs_discard_all) {
-        be_conn->needs_discard_all = false;
+    /* If the backend was borrowed with incompatible state for a session with
+     * no prepared state yet, run plugin cleanup before forwarding data. */
+    if (be_conn->needs_full_cleanup) {
+        be_conn->needs_full_cleanup = false;
         KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
-            "W%u: resume no-stmt DISCARD ALL: fd=%d pending_len=%zu pins=0x%x",
+            "W%u: resume no-stmt cleanup: fd=%d pending_len=%zu pins=0x%x",
             worker->id, session->server_fd, pending_len, (unsigned)sf->pins);
-        /* DISCARD ALL (single-statement) — idle backends only; see site-1
-         * comment for why ROLLBACK must not be combined here. */
-        static const uint8_t discard_q0[] = {
-            'Q', 0, 0, 0, 17,
-            'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-        };
-        ssize_t rd = keel_try_send_nb(session->server_fd,
-                                      discard_q0, sizeof(discard_q0));
-        if (rd < 0) {
-            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                "W%u: DISCARD ALL send failed (no-stmt path): %s",
-                worker->id, strerror(errno));
-            return KEEL_FLOW_ERROR;
-        }
-        if ((size_t)rd < sizeof(discard_q0)) {
-            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                "W%u: DISCARD ALL partial send (sent=%zd of %zu) (no-stmt path)",
-                worker->id, rd, sizeof(discard_q0));
-            return KEEL_FLOW_ERROR;
-        }
-        if (worker->stats_ctx)
-            KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
-        /* Save pending_data so on_be_data can forward it after 'Z' */
-        sf->stmt_replay_buf           = NULL;   /* no Parse msgs to replay   */
-        sf->stmt_replay_len           = 0;
-        sf->stmt_replay_orig_msg      = pending_data;
-        sf->stmt_replay_orig_len      = pending_len;
-        sf->stmt_replay_needs_discard = true;
-        sf->discard_skip_bytes        = 0;      /* reset partial-message scanner */
-        sf->stmt_replay_count         = 0;      /* no ParseComplete to count  */
-        /* Wait for DISCARD ALL response ('C'+'Z'), then forward pending_data */
-        return KEEL_FLOW_WAIT_STMT_REPLAY;
+        return pre_query_enqueue_cleanup(sf, session, "resume no-stmt",
+                                         pending_data, pending_len);
     }
 
     /* ----- Query logging (must happen AFTER backend is assigned so that
@@ -1023,10 +1469,11 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
  *  - keel_engine_scatter_execute(): parallel fan-out + merge (scatter path)
  *  - AFTER_SCATTER hook: observational; sees timing, shard counts (scatter path)
  *  - Backend borrow: hard-pin (transactions/COPY) or soft-borrow (stmt replay)
- *  - State sync: if `get_stmt_replay` detects a hash mismatch
+ *  - State sync: if the borrowed backend profile differs from the session
  *  - BEFORE_SEND hook: final mutation of payload before forwarding (single-shard)
  *  - `commit_in_flight` set for COMMIT queries (enables commit-in-doubt)
- *  - `capture_lsn_pending` set for WRITE/DDL queries (triggers deferred LSN capture)
+ *  - WRITE/DDL queries stamp sticky-primary state; token capture is not run
+ *    inline on the worker reactor
  *
  * Non-blocking send: `keel_try_send_nb()` is attempted first; partial
  * sends are handed off to `defer_send()` → `KEEL_FLOW_SEND_PENDING`.
@@ -1359,6 +1806,24 @@ copy_scan_done:
             flen = (ssize_t)available;
         }
 
+        /* Oversized message guard: if session_max_buffered_bytes is set and
+         * the declared frame length (including any jumbo tail) exceeds the
+         * limit, reject the connection rather than buffer an unbounded msg. */
+        if (sf->session_max_buffered_bytes > 0) {
+            size_t total_frame = (size_t)flen + jumbo_remaining;
+            if (total_frame > sf->session_max_buffered_bytes) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "Worker %u: session %lu: message too large "
+                    "(%zu bytes > limit %zu) — closing",
+                    worker ? worker->id : 0u,
+                    session ? (unsigned long)session->id : 0ul,
+                    total_frame, sf->session_max_buffered_bytes);
+                if (worker && worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, errors_proto);
+                return KEEL_FLOW_ERROR;
+            }
+        }
+
         /* Ask protocol what to do */
         keel_fe_action_t act;
         uint64_t _fe_t0 = keel_instr_begin(WORKER_INSTR(worker), KEEL_INSTR_PROTO_FE_MSG);
@@ -1387,12 +1852,7 @@ copy_scan_done:
             sf->pins |= act.pin_update;
             sf->pins &= ~act.pin_clear;
             sync_session_ssv_state(session, sf);
-            if (worker->stats_ctx) {
-                if (prev_pins == KEEL_FPIN_NONE && sf->pins != KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_pinned);
-                else if (prev_pins != KEEL_FPIN_NONE && sf->pins == KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_pinned);
-            }
+            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
         }
 
         /* Dispatch on action type */
@@ -1685,6 +2145,9 @@ copy_scan_done:
                 if (worker->router &&
                     (act.effect & KEEL_QE_BEGINS_TX) &&
                     !(act.effect & KEEL_QE_READONLY) &&
+                    (sf->pins & ~(keel_flow_pin_reason_t)(
+                        KEEL_FPIN_TRANSACTION | KEEL_FPIN_EXTENDED_PROTO)) ==
+                        KEEL_FPIN_NONE &&
                     act.be_payload && act.be_payload_len > 0 &&
                     act.be_payload_len <= sizeof(sf->begin_deferred_payload)) {
                     memcpy(sf->begin_deferred_payload, act.be_payload,
@@ -1719,47 +2182,36 @@ copy_scan_done:
                  * MUST go to a replica pool.  Detect it as a BEGINS_TX action
                  * that classify_sql already routed to FROUTE_REPLICA. */
                 uint8_t route = act.route_hint;
-                bool replica_lsn_check_needed = false;
                 if (KEEL_TIER_HAS_ROUTING(sf->mode)) {
-                bool explicit_read_only_tx =
-                    (act.effect & KEEL_QE_BEGINS_TX) &&
-                    (act.route_hint == KEEL_FROUTE_REPLICA);
-                if (!explicit_read_only_tx &&
-                    route == KEEL_FROUTE_REPLICA &&
-                    sf->sticky_primary_ttl_ms > 0 && sf->last_write_ns != 0) {
-                    uint64_t now = engine_now_ns();
-                    uint64_t ttl_ms = sf->sticky_primary_ttl_ms
-                                        ? sf->sticky_primary_ttl_ms
-                                        : KEEL_STICKY_PRIMARY_TTL_MS;
-                    /* SSV consistency atom carries the same TTL window.
-                     * If the atom says the write is still recent we force
-                     * primary; when the TTL expires we clear both the
-                     * legacy timestamp AND the atom so future reads are
-                     * free to route to replicas. */
-                    if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
-                                                     now, ttl_ms)) {
-                        /* If the protocol supports replica_reached_token and
-                         * we have a captured write LSN, keep the REPLICA route
-                         * and flag a post-borrow position check.  This avoids
-                         * forcing all reads to the primary when the replica has
-                         * already caught up (common case with async replication
-                         * under moderate write load). */
-                        if (flow->replica_reached_token &&
-                            keel_ssv_consistency_has_write_lsn(
-                                sf->consistency_atoms)) {
-                            replica_lsn_check_needed = true;
-                            /* Keep route as REPLICA — borrow from read pool */
-                        } else {
+                    bool explicit_read_only_tx =
+                        (act.effect & KEEL_QE_BEGINS_TX) &&
+                        (act.route_hint == KEEL_FROUTE_REPLICA);
+                    if (!explicit_read_only_tx &&
+                        route == KEEL_FROUTE_REPLICA &&
+                        sf->sticky_primary_ttl_ms > 0 && sf->last_write_ns != 0) {
+                        uint64_t now = engine_now_ns();
+                        uint64_t ttl_ms = sf->sticky_primary_ttl_ms
+                                            ? sf->sticky_primary_ttl_ms
+                                            : KEEL_STICKY_PRIMARY_TTL_MS;
+                        /* SSV consistency atom carries the same TTL window.
+                         * If the atom says the write is still recent we force
+                         * primary; when the TTL expires we clear both the
+                         * legacy timestamp AND the atom so future reads are
+                         * free to route to replicas. */
+                        if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
+                                                         now, ttl_ms)) {
+                            /* Reactor-safe fallback: do not run inline replica
+                             * catch-up probes from the worker. While the sticky
+                             * window is active, route reads to primary. */
                             route = KEEL_FROUTE_PRIMARY;
+                            if (worker->stats_ctx)
+                                KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
+                        } else {
+                            /* TTL expired — clear timestamp and atoms */
+                            sf->last_write_ns = 0;
+                            keel_ssv_consistency_clear(sf->consistency_atoms);
                         }
-                        if (worker->stats_ctx)
-                            KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
-                    } else {
-                        /* TTL expired — clear timestamp and atoms */
-                        sf->last_write_ns = 0;
-                        keel_ssv_consistency_clear(sf->consistency_atoms);
                     }
-                }
                 } /* KEEL_TIER_HAS_ROUTING */
 
                 /* === HOOK: BEFORE_ROUTE ===
@@ -1919,7 +2371,7 @@ copy_scan_done:
                                         reason, errbuf, sizeof(errbuf));
                                     if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                 }
-                                if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                if (flow->generate_ready_for_query) {
                                     uint8_t z[16];
                                     ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                     if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -1969,7 +2421,7 @@ copy_scan_done:
                                                 "shard unavailable", errbuf, sizeof(errbuf));
                                             if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                         }
-                                        if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                        if (flow->generate_ready_for_query) {
                                             uint8_t z[16];
                                             ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                             if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2031,7 +2483,7 @@ copy_scan_done:
                                             reason, errbuf, sizeof(errbuf));
                                         if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                                     }
-                                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                                    if (flow->generate_ready_for_query) {
                                         uint8_t z[16];
                                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                                         if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2213,11 +2665,9 @@ copy_scan_done:
                  * when a specific shard was identified from the SQL's WHERE clause. */
                 if (shard_dispatched_pool) {
                     pool = shard_dispatched_pool;
-                    /* Each shard is an independent PostgreSQL instance with its own
-                     * WAL sequence.  A write LSN captured from one shard is
-                     * meaningless when checking consistency on a different shard,
-                     * so skip the cross-shard replica-reached-token check entirely. */
-                    replica_lsn_check_needed = false;
+                    /* Each shard is an independent PostgreSQL instance with
+                     * its own WAL sequence. Token-based cross-shard replica
+                     * checks remain disabled until they are reactor-owned. */
                 }
 
                 /* Borrow from pool — the ONLY path to a backend connection.
@@ -2234,7 +2684,7 @@ copy_scan_done:
                             "no backend pool configured", errbuf, sizeof(errbuf));
                         if (el > 0) { memcpy(sendbuf, errbuf, (size_t)el); sendlen += (size_t)el; }
                     }
-                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                    if (flow->generate_ready_for_query) {
                         uint8_t z[16];
                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                         if (zlen > 0) { memcpy(sendbuf + sendlen, z, (size_t)zlen); sendlen += (size_t)zlen; }
@@ -2268,6 +2718,15 @@ copy_scan_done:
                 keel_flow_pin_reason_t pins_stable =
                     sf->pins & ~(keel_flow_pin_reason_t)KEEL_FPIN_EXTENDED_PROTO;
 
+                keel_flow_pin_reason_t pins_for_borrow = pins_stable;
+                if ((act.effect & KEEL_QE_BEGINS_TX) &&
+                    keel_ssv_is_stmt_only_pin(
+                        pins_stable & ~(keel_flow_pin_reason_t)KEEL_FPIN_TRANSACTION,
+                        sf->ps_mode)) {
+                    pins_for_borrow =
+                        pins_stable & ~(keel_flow_pin_reason_t)KEEL_FPIN_TRANSACTION;
+                }
+
                 if (pins_stable != KEEL_FPIN_NONE) {
                     /* KEEL_FPIN_PREPARED_STMT alone does NOT require hard-pin (spec §17).
                      * The backend is released at each transaction boundary and re-borrowed
@@ -2281,7 +2740,7 @@ copy_scan_done:
                      *
                      * All other pins (transaction, copy, cursor, etc.) always require
                      * the exact same backend connection. */
-                    bool only_stmt_pin = keel_ssv_is_stmt_only_pin(pins_stable,
+                    bool only_stmt_pin = keel_ssv_is_stmt_only_pin(pins_for_borrow,
                                                                   sf->ps_mode);
                     /* OFF mode: hard-pin like PINNING but with zero tracking overhead.
                      * No stmt_cache on the protocol side means no hash to match and
@@ -2297,17 +2756,28 @@ copy_scan_done:
                             KEEL_STAT_INC(worker->stats_ctx, osc_sessions_detected);
                     } else {
                         /* Stmt-only pin: prefer a backend with matching prepared stmts */
-                        uint64_t stmt_hash = 0;
-                        flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &stmt_hash);
+                        keel_stmt_compat_profile_t stmt_profile;
+                        memset(&stmt_profile, 0, sizeof(stmt_profile));
+                        flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL,
+                                              &stmt_profile.stmt_set_hash);
+                        if (flow->get_stmt_compat_profile) {
+                            if (flow->get_stmt_compat_profile(sf->ctx, &stmt_profile) < 0)
+                                memset(&stmt_profile, 0, sizeof(stmt_profile));
+                        } else if (stmt_profile.stmt_set_hash != 0) {
+                            /* No semantic callback: force conservative replay path. */
+                            stmt_profile.semantic_unknown = true;
+                        }
                         bool needs_replay = false;
                         be_conn = backend_pool_borrow_with_stmts(pool, session->state_hash,
-                                                                  stmt_hash, &needs_replay);
+                                                                  &stmt_profile, &needs_replay);
                         /* Signal the replay path below — non-zero means replay needed */
-                        sf->stmt_replay_hash = (needs_replay && stmt_hash) ? stmt_hash : 0;
+                        sf->stmt_replay_hash = (needs_replay && stmt_profile.stmt_set_hash)
+                            ? stmt_profile.stmt_set_hash : 0;
+                        sf->stmt_replay_profile = stmt_profile;
                         KEEL_DEBUG_LOG("W%u: FE borrow_with_stmts: stmt_hash=0x%016llx"
                             " needs_replay=%d be_fd=%d be_stmt_hash=0x%016llx"
                             " replay_hash=0x%016llx msg[0]=0x%02x\n",
-                            worker->id, (unsigned long long)stmt_hash,
+                            worker->id, (unsigned long long)stmt_profile.stmt_set_hash,
                             (int)needs_replay,
                             be_conn ? be_conn->fd : -1,
                             be_conn ? (unsigned long long)be_conn->stmt_set_hash : 0ULL,
@@ -2318,6 +2788,8 @@ copy_scan_done:
                     /* pins_stable == NONE: no sticky state — free borrow */
                     be_conn = backend_pool_borrow(pool, session->state_hash);
                     sf->stmt_replay_hash = 0;
+                    memset(&sf->stmt_replay_profile, 0,
+                           sizeof(sf->stmt_replay_profile));
                 }
 
                 if (!be_conn) {
@@ -2348,7 +2820,7 @@ copy_scan_done:
                             act.be_payload != (const uint8_t*)(data + pos)) {
                             sf->pending_msg     = act.be_payload;
                             sf->pending_msg_len = act.be_payload_len;
-                            scan_and_apply_sync_pin(sf, act.be_payload, act.be_payload_len);
+                            apply_captured_fe_pin_effects(sf, act.be_payload, act.be_payload_len);
                             /* Save any pipelined bytes that follow in this recv. */
                             if ((size_t)flen < len - pos) {
                                 keel_residual_append(&session->client_residual,
@@ -2358,7 +2830,7 @@ copy_scan_done:
                         } else {
                             sf->pending_msg     = data + pos;
                             sf->pending_msg_len = len - pos;
-                            scan_and_apply_sync_pin(sf, data + pos, len - pos);
+                            apply_captured_fe_pin_effects(sf, data + pos, len - pos);
                         }
                         sf->queued_for_pool = true;
                         KEEL_DEBUG_LOG("W%u: session %lu queued for pool (queue_size=%zu)\n",
@@ -2376,7 +2848,7 @@ copy_scan_done:
                             "connection pool exhausted, retry later", errbuf, sizeof(errbuf));
                         if (el > 0) { memcpy(sendbuf2, errbuf, (size_t)el); sendlen2 += (size_t)el; }
                     }
-                    if (strcmp(flow->name, "postgres") == 0 && flow->generate_ready_for_query) {
+                    if (flow->generate_ready_for_query) {
                         uint8_t z[16];
                         ssize_t zlen = flow->generate_ready_for_query(sf->ctx, z, sizeof(z));
                         if (zlen > 0) { memcpy(sendbuf2 + sendlen2, z, (size_t)zlen); sendlen2 += (size_t)zlen; }
@@ -2395,120 +2867,8 @@ copy_scan_done:
                     continue;
                 }
 
-                /* Replica LSN position check: if the borrow path kept the
-                 * REPLICA route during sticky-primary (because the protocol
-                 * advertises replica_reached_token), verify that the replica
-                 * has caught up to the session's last write LSN before using
-                 * the connection.  This avoids stale reads without forcing
-                 * every post-write SELECT to the primary. */
-                if (replica_lsn_check_needed && be_conn) {
-                    bool reached = false;
-                    keel_consistency_token_t tok;
-                    memset(&tok, 0, sizeof(tok));
-                    memcpy(tok.value,
-                           keel_ssv_consistency_get_lsn(sf->consistency_atoms),
-                           KEEL_CONSISTENCY_TOKEN_MAX);
-                    tok.captured_at_ns =
-                        keel_ssv_consistency_get_ts(sf->consistency_atoms);
-
-                    /* Temporarily set blocking for the position check
-                     * (same pattern used by capture_consistency_token). */
-                    int be_flags = fcntl(be_conn->fd, F_GETFL);
-                    if (be_flags >= 0)
-                        fcntl(be_conn->fd, F_SETFL, be_flags & ~O_NONBLOCK);
-                    int rc = flow->replica_reached_token(
-                        sf->ctx, be_conn->fd, &tok, 0, &reached);
-                    if (be_flags >= 0)
-                        fcntl(be_conn->fd, F_SETFL, be_flags);
-
-                    if (rc == 0 && reached) {
-                        /* Replica is caught up — use it and clear atoms so
-                         * subsequent reads route freely to replicas. */
-                        sf->last_write_ns = 0;
-                        keel_ssv_consistency_clear(sf->consistency_atoms);
-                        KEEL_DEBUG_LOG("W%u: replica LSN check: reached"
-                            " (session %lu)\n", worker->id,
-                            (unsigned long)session->id);
-                    } else {
-                        /* Replica behind or check error — return to pool and
-                         * fall back to a primary connection. */
-                        KEEL_DEBUG_LOG("W%u: replica LSN check: NOT reached"
-                            " (rc=%d, session %lu) — falling back to primary\n",
-                            worker->id, rc, (unsigned long)session->id);
-                        backend_pool_return(pool, be_conn, false);
-                        be_conn = NULL;
-
-                        /* Re-borrow from a primary/RW pool */
-                        backend_pool_t* primary_pool = NULL;
-                        if (worker->server_pool && worker->server_pools) {
-                            for (size_t i = 0; i < worker->server_pool->rw_count; i++) {
-                                size_t srv_idx = worker->server_pool->rw_indices[i];
-                                if (worker->server_pool->servers[srv_idx].healthy &&
-                                    srv_idx < worker->server_pool_count &&
-                                    worker->server_pools[srv_idx]) {
-                                    primary_pool = worker->server_pools[srv_idx];
-                                    break;
-                                }
-                            }
-                        }
-                        if (!primary_pool) {
-                            for (size_t i = 0; i < worker->server_pool_count; i++) {
-                                if (worker->server_pools[i]) {
-                                    primary_pool = worker->server_pools[i];
-                                    break;
-                                }
-                            }
-                        }
-                        if (primary_pool) {
-                            be_conn = backend_pool_borrow(primary_pool,
-                                                          session->state_hash);
-                            pool = primary_pool;
-                        }
-                        if (!be_conn) {
-                            /* Primary pool exhausted — send error to client */
-                            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                                "W%u: primary pool exhausted after replica LSN miss",
-                                worker->id);
-                            uint8_t sendbuf3[512];
-                            size_t sendlen3 = 0;
-                            {
-                                uint8_t errbuf[256];
-                                ssize_t el = flow->generate_error(sf->ctx, "53300",
-                                    "connection pool exhausted, retry later",
-                                    errbuf, sizeof(errbuf));
-                                if (el > 0) {
-                                    memcpy(sendbuf3, errbuf, (size_t)el);
-                                    sendlen3 += (size_t)el;
-                                }
-                            }
-                            if (strcmp(flow->name, "postgres") == 0 &&
-                                flow->generate_ready_for_query) {
-                                uint8_t z[16];
-                                ssize_t zlen = flow->generate_ready_for_query(
-                                    sf->ctx, z, sizeof(z));
-                                if (zlen > 0) {
-                                    memcpy(sendbuf3 + sendlen3, z, (size_t)zlen);
-                                    sendlen3 += (size_t)zlen;
-                                }
-                            }
-                            if (sendlen3 > 0) {
-                                ssize_t s = keel_try_send_nb(session->client_fd,
-                                    sendbuf3, sendlen3);
-                                if (s > 0 && (size_t)s < sendlen3) {
-                                    sf->phase = KEEL_PHASE_READY;
-                                    return defer_send(sf, session->client_fd,
-                                        sendbuf3 + s, sendlen3 - (size_t)s,
-                                        KEEL_FLOW_OK);
-                                }
-                            }
-                            pos += (size_t)flen;
-                            sf->phase = KEEL_PHASE_READY;
-                            continue;
-                        }
-                    }
-                }
-
                 session->backend_conn = be_conn;
+                session->backend_generation = be_conn ? be_conn->generation : 0;
                 session->server_fd = be_conn->fd;
                 keel_instr_end(WORKER_INSTR(worker), KEEL_INSTR_ROUTE_DECISION, _route_t0);
 
@@ -2530,106 +2890,116 @@ copy_scan_done:
                 /* Trace event: pool borrow + route decision */
                 KEEL_TRACE_EVENT(session, "pool.borrow");
                 KEEL_TRACE_ATTR_INT(session, "pool.server_fd", be_conn->fd);
+                KEEL_TRACE_ATTR_INT(session, "pool.route", route);
+                KEEL_TRACE_ATTR_INT(session, "pool.pin_reason", session->pin_reason);
+                KEEL_TRACE_ATTR_INT(session, "pool.session_state_hash",
+                                    (int64_t)session->state_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.backend_state_hash",
+                                    (int64_t)be_conn->current_state_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.backend_stmt_hash",
+                                    (int64_t)be_conn->stmt_set_hash);
+                KEEL_TRACE_ATTR_INT(session, "pool.needs_state_sync",
+                                    be_conn->needs_sync ? 1 : 0);
+                KEEL_TRACE_ATTR_INT(session, "pool.needs_cleanup",
+                                    be_conn->needs_full_cleanup ? 1 : 0);
+                KEEL_TRACE_ATTR_INT(session, "pool.stmt_replay_hash",
+                                    (int64_t)sf->stmt_replay_hash);
 
-                /* State sync check (Spec §5): sync backend state to session state.
-                 *
-                 * IMPORTANT: This must NOT block the worker thread.  We use
-                 * non-blocking recv (MSG_DONTWAIT) with a short iteration
-                 * limit.  If the backend hasn't replied within the non-blocking
-                 * window, we skip sync and accept a potential state mismatch
-                 * rather than stalling all connections on this worker. */
-                {
-                uint64_t _sync_t0 = keel_instr_begin(WORKER_INSTR(worker), KEEL_INSTR_STATE_SYNC);
-                if (KEEL_TIER_HAS_STATE_SYNC(sf->mode) &&
-                    be_conn->profile && session->state_profile &&
-                    be_conn->current_state_hash != session->state_hash &&
-                    session->state_hash != 0) {
-                    /* State mismatch — generate and send sync SQL */
-                    uint8_t sync_buf[4096];
-                    ssize_t sync_len = flow->build_state_sync(sf->ctx,
-                        be_conn->profile, session->state_profile,
-                        sync_buf, sizeof(sync_buf));
+                /* State sync is performed later, immediately before the
+                 * final client payload is forwarded, so hooks and batching
+                 * still see the original query. */
+            }
 
-                    if (sync_len > 0) {
-                        /* Send sync commands to backend (non-blocking) */
-                        ssize_t ss = send(session->server_fd, sync_buf, (size_t)sync_len, MSG_NOSIGNAL);
-                        if (ss > 0) {
-                            if (worker->stats_ctx)
-                                KEEL_STAT_INC(worker->stats_ctx, state_sync_count);
-                            /* Non-blocking drain of sync responses.
-                             * Try up to 10 immediate reads — if the backend
-                             * hasn't responded yet, skip sync to avoid blocking. */
-                            uint8_t resp_buf[1024];
-                            int max_iters = 10;
-                            bool got_rfq = false;
+            keel_flow_result_t setup_result = KEEL_FLOW_OK;
+            bool queue_begin_after_state_sync = false;
+            bool needs_state_sync =
+                backend_needs_state_sync(sf, session, session->backend_conn);
 
-                            while (!got_rfq && max_iters-- > 0) {
-                                ssize_t rr = recv(session->server_fd, resp_buf,
-                                                  sizeof(resp_buf), MSG_DONTWAIT);
-                                if (rr <= 0) break;  /* EAGAIN or error — stop */
+            const uint8_t* setup_follow_buf = NULL;
+            size_t setup_follow_len = 0;
+            if (act.be_payload != NULL &&
+                act.be_payload != (const uint8_t*)(data + pos)) {
+                setup_follow_buf = act.be_payload;
+                setup_follow_len = act.be_payload_len;
+            } else {
+                setup_follow_buf = data + pos;
+                setup_follow_len = len - pos;
+            }
 
-                                /* Look for ReadyForQuery ('Z') */
-                                for (ssize_t i = 0; i < rr; i++) {
-                                    if (resp_buf[i] == 'Z' && i + 5 <= rr) {
-                                        got_rfq = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (got_rfq) {
-                                be_conn->current_state_hash = session->state_hash;
-                                if (be_conn->profile && session->state_profile) {
-                                    state_profile_copy(be_conn->profile, session->state_profile);
-                                }
-                                KEEL_DEBUG_LOG("W%u: state sync completed\n", worker->id);
-                            } else {
-                                /* Sync incomplete — just proceed with mismatched state.
-                                 * The worst case is a SET value being stale, which is
-                                 * far better than blocking the entire worker. */
-                                KEEL_DEBUG_LOG("W%u: state sync skipped (non-blocking)\n",
-                                            worker->id);
-                            }
-                        }
-                    }
-                }
-                keel_instr_end(WORKER_INSTR(worker), KEEL_INSTR_STATE_SYNC, _sync_t0);
+            /* Deferred-BEGIN replay (PR #4 — async): a BEGIN was buffered
+             * earlier to avoid binding the session to a random shard before
+             * the shard key was known.  Now that we have the correct shard
+             * backend, send the BEGIN non-blocking and stash the upcoming
+             * client query (or full pipelined remainder) for forwarding
+             * after the BEGIN's ReadyForQuery arrives.  The BE-side
+             * intercept in keel_engine_flow_on_be_data() handles the rest.
+             *
+             * This is now part of the generic pre-query queue and can compose
+             * with state sync, cleanup, and stmt replay on the same borrow. */
+            if (sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
+                if (needs_state_sync) {
+                    queue_begin_after_state_sync = true;
+                } else {
+                    sf->begin_deferred = false;
+                    keel_flow_result_t br =
+                        defer_begin_replay(sf, session, setup_follow_buf, setup_follow_len);
+                    if (br == KEEL_FLOW_ERROR)
+                        return KEEL_FLOW_ERROR;
+                    if (setup_result == KEEL_FLOW_OK)
+                        setup_result = br;
                 }
             }
 
-            /* Deferred-BEGIN replay: a BEGIN was buffered earlier to avoid
-             * assigning the session to a random shard before the shard key
-             * was known.  Now that we have the correct shard backend, send
-             * the BEGIN and drain its response synchronously (blocking
-             * briefly) before forwarding the actual client query. */
-            if (sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
-                sf->begin_deferred = false;
-                int _bfd    = session->server_fd;
-                int _bflags = fcntl(_bfd, F_GETFL);
-                if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags & ~O_NONBLOCK);
-                send(_bfd, sf->begin_deferred_payload,
-                     sf->begin_deferred_payload_len, MSG_NOSIGNAL);
-                /* Drain backend response until ReadyForQuery */
-                uint8_t _bbuf[256];
-                bool    _brfq  = false;
-                int     _btries = 20;
-                while (!_brfq && _btries-- > 0) {
-                    ssize_t _brr = recv(_bfd, _bbuf, sizeof(_bbuf), 0);
-                    if (_brr <= 0) break;
-                    ssize_t _bscan = 0;
-                    while (_bscan + 5 <= _brr) {
-                        uint8_t  _bmt = _bbuf[_bscan];
-                        uint32_t _bml = ((uint32_t)_bbuf[_bscan+1] << 24)
-                                      | ((uint32_t)_bbuf[_bscan+2] << 16)
-                                      | ((uint32_t)_bbuf[_bscan+3] <<  8)
-                                      |  (uint32_t)_bbuf[_bscan+4];
-                        if (_bmt == 'Z') { _brfq = true; break; }
-                        if (_bml < 4)    break;
-                        _bscan += 1 + (ssize_t)_bml;
+            if (act.be_payload && act.be_payload_len > 0 &&
+                needs_state_sync) {
+                uint8_t sync_buf[4096];
+                uint64_t _sync_t0 = keel_instr_begin(WORKER_INSTR(worker),
+                                                     KEEL_INSTR_STATE_SYNC);
+                ssize_t sync_len = flow->build_state_sync
+                    ? flow->build_state_sync(sf->ctx,
+                                             session->backend_conn->profile,
+                                             session->state_profile,
+                                             sync_buf, sizeof(sync_buf))
+                    : -1;
+                keel_instr_end(WORKER_INSTR(worker), KEEL_INSTR_STATE_SYNC,
+                               _sync_t0);
+                if (sync_len < 0)
+                    return KEEL_FLOW_ERROR;
+                if (sync_len == 0) {
+                    session->backend_conn->current_state_hash = session->state_hash;
+                    session->backend_conn->needs_sync = false;
+                    if (session->backend_conn->profile && session->state_profile)
+                        state_profile_copy(session->backend_conn->profile,
+                                           session->state_profile);
+                } else {
+                    keel_flow_result_t resume = KEEL_FLOW_WAIT_BACKEND;
+                    if (act.no_response ||
+                        (act.msg_kind == KEEL_MSG_KIND_COPY &&
+                         act.be_payload_len > 0 && act.be_payload[0] == 'd') ||
+                        (act.msg_kind == KEEL_MSG_KIND_EXTENDED &&
+                         !(act.pin_clear & KEEL_FPIN_EXTENDED_PROTO))) {
+                        resume = KEEL_FLOW_OK;
                     }
+                    keel_flow_result_t sr = defer_state_sync_replay(
+                        sf, session, session->backend_conn,
+                        sync_buf, (size_t)sync_len,
+                        setup_follow_buf, setup_follow_len,
+                        resume);
+                    if (sr == KEEL_FLOW_ERROR)
+                        return KEEL_FLOW_ERROR;
+                    if (setup_result == KEEL_FLOW_OK)
+                        setup_result = sr;
                 }
-                sf->begin_deferred_payload_len = 0;
-                if (_bflags >= 0) fcntl(_bfd, F_SETFL, _bflags);
+            }
+            if (queue_begin_after_state_sync &&
+                sf->begin_deferred && sf->begin_deferred_payload_len > 0) {
+                sf->begin_deferred = false;
+                keel_flow_result_t br =
+                    defer_begin_replay(sf, session, setup_follow_buf, setup_follow_len);
+                if (br == KEEL_FLOW_ERROR)
+                    return KEEL_FLOW_ERROR;
+                if (setup_result == KEEL_FLOW_OK)
+                    setup_result = br;
             }
 
             /* ----- Query logging (after backend is connected) ----- */
@@ -2655,7 +3025,6 @@ copy_scan_done:
              * We wait for ParseComplete responses in on_be_data. */
             if (sf->stmt_replay_hash != 0 && flow->get_stmt_replay &&
                 act.be_payload && act.be_payload_len > 0) {
-
                 uint8_t* rbuf   = NULL;
                 size_t   rlen   = 0;
                 uint32_t rcount = 0;
@@ -2663,6 +3032,20 @@ copy_scan_done:
 
                 int gr = flow->get_stmt_replay(sf->ctx, &rbuf, &rlen, &rcount, &rhash);
                 if (gr == 0 && rbuf && rlen > 0 && rcount > 0) {
+                    /* Replay buffer size guard */
+                    if (sf->backend_max_replay_bytes > 0 &&
+                        rlen > sf->backend_max_replay_bytes) {
+                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                            "Worker %u: session %lu: PS replay buffer too large "
+                            "(%zu bytes > limit %zu) — closing",
+                            worker ? worker->id : 0u,
+                            session ? (unsigned long)session->id : 0ul,
+                            rlen, sf->backend_max_replay_bytes);
+                        keel_free(rbuf);
+                        if (worker && worker->stats_ctx)
+                            KEEL_STAT_INC(worker->stats_ctx, errors_proto);
+                        return KEEL_FLOW_ERROR;
+                    }
                     /* Determine what to send to the backend after replay.
                      *
                      * Normal case (no payload rewrite): capture the whole
@@ -2681,133 +3064,83 @@ copy_scan_done:
                     if (act.be_payload != NULL &&
                         act.be_payload != (const uint8_t*)(data + pos)) {
                         /* Rewritten payload — use it verbatim */
-                        sf->stmt_replay_orig_msg = act.be_payload;
-                        sf->stmt_replay_orig_len = act.be_payload_len;
-                        scan_and_apply_sync_pin(sf,
+                        apply_captured_fe_pin_effects(sf,
                                                 act.be_payload,
                                                 act.be_payload_len);
                     } else {
                         /* Un-rewritten — capture full pipeline */
-                        sf->stmt_replay_orig_msg = data + pos;
-                        sf->stmt_replay_orig_len = len - pos;
-                        scan_and_apply_sync_pin(sf, data + pos, len - pos);
+                        apply_captured_fe_pin_effects(sf, data + pos, len - pos);
                     }
-                    sf->stmt_replay_count       = rcount;
-                    sf->stmt_replay_rfq_pending = false;  /* cleared at replay start */
-                    sf->stmt_replay_hash        = rhash;
 
-                    /* needs_discard_all: backend was borrowed with a DIFFERENT
-                     * stmt hash (Step 4 of borrow_with_stmts).  DISCARD ALL
-                     * (single-statement) clears the old statements so the
-                     * new session's Parse replay can proceed cleanly. */
+                    const uint8_t* follow_buf = NULL;
+                    size_t follow_len = 0;
+                    if (act.be_payload != NULL &&
+                        act.be_payload != (const uint8_t*)(data + pos)) {
+                        follow_buf = act.be_payload;
+                        follow_len = act.be_payload_len;
+                    } else {
+                        follow_buf = data + pos;
+                        follow_len = len - pos;
+                    }
+
+                    /* needs_full_cleanup: backend was borrowed with a different
+                     * statement hash. Plugin cleanup clears old state before
+                     * this session's replay can proceed. */
+                    keel_flow_result_t qr = KEEL_FLOW_WAIT_BACKEND;
                     if (session->backend_conn &&
-                        session->backend_conn->needs_discard_all) {
-                        session->backend_conn->needs_discard_all = false;
-                        sf->stmt_replay_buf           = rbuf;  /* sent after 'Z' */
-                        sf->stmt_replay_len           = rlen;
-                        sf->stmt_replay_needs_discard = true;
-                        sf->discard_skip_bytes        = 0;  /* reset partial-message scanner */
-
-                        static const uint8_t discard_q[] = {
-                            'Q', 0, 0, 0, 17,
-                            'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                        };
-                        ssize_t rd = keel_try_send_nb(session->server_fd,
-                                                      discard_q, sizeof(discard_q));
-                        if (rd < 0) {
+                        session->backend_conn->needs_full_cleanup) {
+                        session->backend_conn->needs_full_cleanup = false;
+                        qr = pre_query_enqueue_cleanup(sf, session, "FE replay",
+                                                       follow_buf, follow_len);
+                        if (qr == KEEL_FLOW_ERROR) {
                             keel_free(rbuf);
-                            sf->stmt_replay_buf           = NULL;
-                            sf->stmt_replay_len           = 0;
-                            sf->stmt_replay_needs_discard = false;
-                            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                                "W%u: DISCARD ALL send failed on FE replay: %s",
-                                worker->id, strerror(errno));
-                            return KEEL_FLOW_ERROR;
+                            return qr;
                         }
-                        if (worker->stats_ctx)
-                            KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
-                        return KEEL_FLOW_WAIT_STMT_REPLAY;
                     }
 
-                    ssize_t rs = keel_try_send_nb(session->server_fd, rbuf, rlen);
-                    if (rs < 0) {
-                        keel_free(rbuf);
-                        KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                            "W%u: stmt replay send failed: %s",
-                            worker->id, strerror(errno));
-                        return KEEL_FLOW_ERROR;
-                    }
-                    if ((size_t)rs < rlen) {
-                        /* Partial send — defer remainder via pending_send */
-                        sf->stmt_replay_buf = keel_malloc(rlen - (size_t)rs);
-                        if (sf->stmt_replay_buf) {
-                            memcpy(sf->stmt_replay_buf, rbuf + rs, rlen - (size_t)rs);
-                            sf->stmt_replay_len = rlen - (size_t)rs;
-                        }
-                        keel_free(rbuf);
-                        if (!sf->stmt_replay_buf) return KEEL_FLOW_ERROR;
-                        /* Use defer_send mechanism to flush; resume enters replay wait */
-                        return defer_send(sf, session->server_fd,
-                                          sf->stmt_replay_buf, sf->stmt_replay_len,
-                                          KEEL_FLOW_WAIT_STMT_REPLAY);
-                    }
+                    keel_flow_result_t rr = pre_query_enqueue_stmt_replay(
+                        sf, session, rbuf, rlen, rcount, rhash,
+                        follow_buf, follow_len);
                     keel_free(rbuf);
-                    /* Full replay buf sent — wait for ParseComplete responses */
-                    return KEEL_FLOW_WAIT_STMT_REPLAY;
+                    if (rr == KEEL_FLOW_ERROR)
+                        return rr;
+                    if (qr == KEEL_FLOW_WAIT_BACKEND || qr == KEEL_FLOW_WAIT_STMT_REPLAY)
+                        return qr;
+                    return rr;
                 }
                 if (rbuf) keel_free(rbuf);
                 sf->stmt_replay_hash = 0;  /* fallback: send original msg as-is */
             }
 
-            /* needs_discard_all for stmt_hash=0 (FE path): backend was
-             * reclaimed from idle_list for a session with no prepared stmts.
-             * Send DISCARD ALL now, wait for 'Z', then forward payload. */
+            /* needs_full_cleanup for stmt_hash=0 (FE path): backend was
+             * reclaimed with incompatible state. Run plugin cleanup, then
+             * forward the payload after the cleanup response is drained. */
             if (session->backend_conn &&
-                session->backend_conn->needs_discard_all &&
+                session->backend_conn->needs_full_cleanup &&
                 act.be_payload && act.be_payload_len > 0) {
-                session->backend_conn->needs_discard_all = false;
+                session->backend_conn->needs_full_cleanup = false;
                 KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
-                    "W%u: FE no-stmt DISCARD ALL: fd=%d pos=%zu len=%zu pins=0x%x",
+                    "W%u: FE no-stmt cleanup: fd=%d pos=%zu len=%zu pins=0x%x",
                     worker->id, session->server_fd, pos, len, (unsigned)sf->pins);
-                /* DISCARD ALL (single-statement) — idle backend only. */
-                static const uint8_t discard_q_fe[] = {
-                    'Q', 0, 0, 0, 17,
-                    'D','I','S','C','A','R','D',' ','A','L','L',';', 0
-                };
-                ssize_t rd = keel_try_send_nb(session->server_fd,
-                                              discard_q_fe, sizeof(discard_q_fe));
-                if (rd < 0) {
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                        "W%u: DISCARD ALL send failed (FE no-stmt): %s",
-                        worker->id, strerror(errno));
-                    return KEEL_FLOW_ERROR;
-                }
-                if ((size_t)rd < sizeof(discard_q_fe)) {
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                        "W%u: DISCARD ALL partial send (sent=%zd of %zu) (FE no-stmt)",
-                        worker->id, rd, sizeof(discard_q_fe));
-                    return KEEL_FLOW_ERROR;
-                }
-                if (worker->stats_ctx)
-                    KEEL_STAT_INC(worker->stats_ctx, discard_all_count);
-                sf->stmt_replay_buf           = NULL;
-                sf->stmt_replay_len           = 0;
                 /* Use the rewritten payload (e.g. kPgXidCommitMsg) when the
                  * protocol plugin rewrote the FE message; otherwise fall back
                  * to the raw client bytes as-is. */
+                const uint8_t* follow_buf = NULL;
+                size_t follow_len = 0;
                 if (act.be_payload != NULL &&
                     act.be_payload != (const uint8_t*)(data + pos)) {
-                    sf->stmt_replay_orig_msg = act.be_payload;
-                    sf->stmt_replay_orig_len = act.be_payload_len;
+                    follow_buf = act.be_payload;
+                    follow_len = act.be_payload_len;
                 } else {
-                    sf->stmt_replay_orig_msg = data + pos;
-                    sf->stmt_replay_orig_len = len - pos;
+                    follow_buf = data + pos;
+                    follow_len = len - pos;
                 }
-                sf->stmt_replay_needs_discard = true;
-                sf->discard_skip_bytes        = 0;  /* reset partial-message scanner */
-                sf->stmt_replay_count         = 0;
-                return KEEL_FLOW_WAIT_STMT_REPLAY;
+                return pre_query_enqueue_cleanup(sf, session, "FE no-stmt",
+                                                 follow_buf, follow_len);
             }
+
+            if (setup_result != KEEL_FLOW_OK)
+                return setup_result;
 
             /* Forward payload to backend */
             KEEL_DEBUG_LOG("W%u: fwd to BE fd=%d payload=%p len=%zu splice=%d\n",
@@ -3002,10 +3335,11 @@ be_forward_done:
                         (int)act.msg_kind, sf->ctx);
             }
 
-            /* Deferred LSN capture: if writes occurred inside an explicit
-             * BEGIN…COMMIT, schedule capture now (at COMMIT time) so the
-             * captured WAL position reflects committed, not in-flight, data.
-             * The capture runs after COMMIT's ReadyForQuery in the BE path. */
+            /* Deferred consistency-token capture marker: if writes occurred
+             * inside an explicit BEGIN…COMMIT, remember that COMMIT reached
+             * the point where an async token-capture state machine could run.
+             * The worker does not perform inline token capture because that
+             * legacy path blocked the reactor. */
             if (KEEL_TIER_HAS_LSN_CAPTURE(sf->mode) &&
                 sf->txn_had_writes &&
                 (act.effect & KEEL_QE_ENDS_TX) &&
@@ -3038,29 +3372,23 @@ be_forward_done:
                     }
                 }
 
-                /* Phase 5: schedule WAL LSN / GTID capture after the backend
-                 * responds.  We MUST NOT call capture_consistency_token() here
-                 * because the pool socket is non-blocking: recv() returns EAGAIN
-                 * and the SELECT response leaks into the client's next response.
-                 *
-                 * For autocommit writes the backend is idle after ReadyForQuery,
-                 * so capture immediately.  For writes inside an explicit
-                 * BEGIN…COMMIT transaction the data is uncommitted at this point;
-                 * defer capture to the COMMIT's query_complete (see ENDS_TX block
-                 * above) so the captured LSN reflects committed, not in-flight,
-                 * data — and avoids a blocking round-trip per intra-txn statement. */
+                /* Mark that WAL LSN / GTID capture would be useful once the
+                 * backend reaches ReadyForQuery.  Actual capture is disabled
+                 * until it is implemented as a reactor-owned state machine;
+                 * sticky-primary routing above provides the stable safety
+                 * boundary in the meantime. */
                 if (KEEL_TIER_HAS_LSN_CAPTURE(sf->mode) &&
                     keel_plugin_has_cap(flow, KEEL_PCAP_CONSISTENCY_TOKEN) &&
                     session->server_fd >= 0) {
                     if (!session->in_transaction) {
-                        /* Autocommit write: capture after this statement's
-                         * ReadyForQuery('I'). */
+                        /* Autocommit write: eligible after this statement's
+                         * ReadyForQuery('I') once async capture exists. */
                         sf->capture_lsn_pending = true;
                     } else {
                         /* Inside explicit BEGIN…COMMIT: remember that writes
                          * occurred.  capture_lsn_pending is set at COMMIT
-                         * (ENDS_TX block above) to avoid mid-transaction captures
-                         * that are both logically wrong and performance-killing. */
+                         * (ENDS_TX block above) so a future async capture does
+                         * not observe an uncommitted mid-transaction position. */
                         sf->txn_had_writes = true;
                     }
                 }
@@ -3362,62 +3690,41 @@ be_forward_done:
  * Replication Tracking: Commit-in-Doubt Resolution (spec §TXN-TRACK)
  * ============================================================================ */
 
-/* Synthetic PostgreSQL wire messages for commit_in_doubt responses. */
-static const uint8_t kPgCommitOK[] = {
-    /* CommandComplete("COMMIT") */
-    'C', 0x00, 0x00, 0x00, 0x0b, 'C','O','M','M','I','T','\0',   /* 12 bytes */
-    /* ReadyForQuery('I') */
-    'Z', 0x00, 0x00, 0x00, 0x05, 'I'                              /*  6 bytes */
-};  /* total 18 bytes */
-
-static const uint8_t kPgRFQIdle[] = {
-    'Z', 0x00, 0x00, 0x00, 0x05, 'I'
-};
-
-/** Build a minimal PostgreSQL ErrorResponse + ReadyForQuery('I') into buf.
- *  @return total bytes written, or -1 if buf too small */
-/**
- * @brief Build a PostgreSQL wire-protocol ErrorResponse + ReadyForQuery('I').
- *
- * Serialises a minimal ErrorResponse message with fields:
- *   'S' SEVERITY     = "ERROR"
- *   'V' SEVERITY_NP  = "ERROR"
- *   'C' SQLSTATE     = sqlstate (must be exactly 5 characters)
- *   'M' MESSAGE      = msg
- * followed immediately by a `ReadyForQuery('I')` (idle status).
- *
- * The combined buffer is used both for commit-in-doubt error synthesis
- * and for abort responses where the engine must reset the session to idle
- * state without a round-trip to the backend.
- *
- * @param buf       Output buffer.
- * @param cap       Capacity of output buffer.
- * @param sqlstate  5-character PostgreSQL SQLSTATE code (e.g. "08006").
- * @param msg       Human-readable error message.
- * @return Total bytes written, or -1 if the buffer is too small.
- */
-static ssize_t pg_build_error_resp(uint8_t* buf, size_t cap,
-                                   const char* sqlstate, const char* msg)
+static void send_commit_doubt_response(const keel_proto_flow_vtable_t* flow,
+                                       void* flow_ctx,
+                                       int client_fd,
+                                       keel_commit_doubt_reason_t reason,
+                                       uint64_t xid)
 {
-    /* ErrorResponse body: 'S' "ERROR\0" + 'V' "ERROR\0" + 'C' sqlstate + '\0' +
-     *                     'M' msg + '\0' + '\0' (terminator) */
-    size_t ml      = strlen(msg);
-    size_t bodylen = 1+6 + 1+6 + 1+5+1 + 1+ml+1 + 1;
-    size_t totlen  = 1 + 4 + bodylen + sizeof(kPgRFQIdle);
-    if (totlen > cap) return -1;
+    if (!flow || client_fd < 0)
+        return;
 
-    uint8_t* p = buf;
-    *p++ = 'E';
-    uint32_t ll = (uint32_t)(4 + bodylen);
-    *p++ = (ll >> 24) & 0xff; *p++ = (ll >> 16) & 0xff;
-    *p++ = (ll >>  8) & 0xff; *p++ = (ll      ) & 0xff;
-    *p++ = 'S'; memcpy(p, "ERROR",  5); p += 5; *p++ = '\0';
-    *p++ = 'V'; memcpy(p, "ERROR",  5); p += 5; *p++ = '\0';
-    *p++ = 'C'; memcpy(p, sqlstate, 5); p += 5; *p++ = '\0';
-    *p++ = 'M'; memcpy(p, msg, ml);     p += ml; *p++ = '\0';
-    *p++ = '\0';
-    memcpy(p, kPgRFQIdle, sizeof(kPgRFQIdle));
-    return (ssize_t)totlen;
+    uint8_t out[512];
+    ssize_t n = -1;
+    if (flow->generate_commit_doubt_response) {
+        n = flow->generate_commit_doubt_response(flow_ctx, reason, xid,
+                                                 out, sizeof(out));
+    } else if (flow->generate_error) {
+        const char* code = (reason == KEEL_CIDR_RESOLVED_ABORTED) ? "40000" : "08006";
+        const char* msg = (reason == KEEL_CIDR_RESOLVED_ABORTED)
+            ? "connection lost before COMMIT confirmation: transaction failed"
+            : "connection lost before COMMIT confirmation";
+        ssize_t el = flow->generate_error(flow_ctx, code, msg, out, sizeof(out));
+        if (el > 0) {
+            size_t total = (size_t)el;
+            if (flow->generate_ready_for_query) {
+                ssize_t zl = flow->generate_ready_for_query(flow_ctx,
+                                                            out + total,
+                                                            sizeof(out) - total);
+                if (zl > 0)
+                    total += (size_t)zl;
+            }
+            n = (ssize_t)total;
+        }
+    }
+
+    if (n > 0)
+        (void)keel_try_send_nb(client_fd, out, (size_t)n);
 }
 
 /**
@@ -3433,18 +3740,16 @@ static ssize_t pg_build_error_resp(uint8_t* buf, size_t cap,
  *    Outcome is completely unknown.  Synthesise ErrorResponse(08006),
  *    send it to the client, return KEEL_FLOW_CLOSED.
  *
- *  Case 2 — XID captured but no RW pool:
- *    Synthesise ErrorResponse(08006) with the XID in the message so the
- *    operator can manually verify via `txid_status(XID)`.
+ *  Case 2 — token captured but no RW pool:
+ *    Ask the protocol plugin to synthesize an operator-facing uncertain result.
  *
- *  Case 3 — XID captured, RW pool available:
+ *  Case 3 — token captured, RW pool available:
  *    Borrow a new connection from the first RW server pool.
- *    Send `SELECT txid_status(XID)` to the borrowed connection.
+ *    Build and send a protocol-owned outcome-check query to that connection.
  *    Store the connection in `sf->xid_check_conn`.
  *    Return KEEL_FLOW_WAIT_COMMIT_CHECK — the worker arms recv on the
  *    check connection and routes responses back through on_be_data where
- *    the commit_in_doubt handler parses `T/D/C/Z` and synthesises the
- *    appropriate committed/aborted/uncertain response.
+ *    plugin callbacks determine committed/aborted/uncertain outcomes.
  *
  * IMPORTANT: This function sets `session->server_fd = check_conn->fd`
  * and clears `session->backend_conn` so the worker's recv arming targets
@@ -3460,6 +3765,7 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     keel_session_t* session,
     keel_worker_t* worker)
 {
+    const keel_proto_flow_vtable_t* flow = sf ? sf->flow : NULL;
     sf->commit_in_doubt      = true;
     sf->indoubt_xid          = sf->pending_commit_xid;
     sf->commit_in_flight     = false;
@@ -3467,17 +3773,21 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
 
     /* Mirror to session so engine drain can avoid force-closing this session */
     session->commit_in_doubt = true;
+    session->indoubt_xid     = sf->indoubt_xid;
+    if (worker->stats_ctx) {
+        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_started);
+        KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_commit_in_doubt);
+    }
 
     if (sf->indoubt_xid == 0) {
-        /* No XID captured — outcome truly unknown */
-        uint8_t errbuf[384];
-        ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-            "08006",
-            "connection lost before COMMIT confirmation: "
-            "transaction outcome unknown (no XID captured)");
-        if (elen > 0)
-            keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_XID, 0);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
@@ -3490,72 +3800,72 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         }
     }
     if (!pool) {
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "no RW pool — check txid_status(%llu) to resolve",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_RW_POOL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
     backend_conn_t* check_conn = backend_pool_borrow(pool, 0);
     if (!check_conn) {
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "pool unavailable — check txid_status(%llu) to resolve",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_NO_CHECK_CONN, sf->indoubt_xid);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
-    /* Build and send: SELECT txid_status(XID) */
-    char sql[80];
-    int  sql_len = snprintf(sql, sizeof(sql),
-                            "SELECT txid_status(%llu)",
-                            (unsigned long long)sf->indoubt_xid);
-    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
+    uint8_t qbuf[256];
+    ssize_t qmsglen = 0;
+    if (flow && flow->build_commit_doubt_check) {
+        qmsglen = flow->build_commit_doubt_check(sf->ctx, sf->indoubt_xid,
+                                                 qbuf, sizeof(qbuf));
+    }
+    if (qmsglen <= 0) {
         backend_pool_return(pool, check_conn, false);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_CHECK_BUILD_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
-        return KEEL_FLOW_ERROR;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
+        return KEEL_FLOW_CLOSED;
     }
 
-    uint8_t  qbuf[128];
-    uint32_t qlen = (uint32_t)(4 + (size_t)sql_len + 1);
-    qbuf[0] = 'Q';
-    qbuf[1] = (qlen >> 24) & 0xff; qbuf[2] = (qlen >> 16) & 0xff;
-    qbuf[3] = (qlen >>  8) & 0xff; qbuf[4] = (qlen      ) & 0xff;
-    memcpy(qbuf + 5, sql, (size_t)sql_len);
-    qbuf[5 + (size_t)sql_len] = '\0';
-    size_t qmsglen = 5 + (size_t)sql_len + 1;
-
-    ssize_t s = keel_try_send_nb(check_conn->fd, qbuf, qmsglen);
-    if (s < 0 || (size_t)s < qmsglen) {
+    ssize_t s = keel_try_send_nb(check_conn->fd, qbuf, (size_t)qmsglen);
+    if (s < 0 || (size_t)s < (size_t)qmsglen) {
         backend_pool_return(pool, check_conn, false);
-        char umsg[256];
-        snprintf(umsg, sizeof(umsg),
-            "connection lost before COMMIT confirmation: "
-            "XID-check send failed — verify txid_status(%llu) manually",
-            (unsigned long long)sf->indoubt_xid);
-        uint8_t errbuf[384]; ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf), "08006", umsg);
-        if (elen > 0) keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+        send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                   KEEL_CIDR_CHECK_SEND_FAIL, sf->indoubt_xid);
         sf->commit_in_doubt = false;
+        session->commit_in_doubt = false; session->indoubt_xid = 0;
+        if (worker->stats_ctx) {
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+        }
         return KEEL_FLOW_CLOSED;
     }
 
     KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-        "W%u: session %lu: commit-in-doubt — checking txid_status(%llu) on fd=%d",
+        "W%u: session %lu: commit-in-doubt — checking outcome for token=%llu on fd=%d",
         worker->id, (unsigned long)session->id,
         (unsigned long long)sf->indoubt_xid, check_conn->fd);
 
     sf->xid_check_conn  = check_conn;
     session->server_fd  = check_conn->fd;
     session->backend_conn = NULL;  /* already cleared by worker before calling us */
+    session->backend_generation = 0;
     return KEEL_FLOW_WAIT_COMMIT_CHECK;
 }
 
@@ -3570,10 +3880,9 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
  * Handles several distinct states:
  *
  *  **commit_in_doubt** — If `sf->commit_in_doubt` is set, the session is
- *    waiting for the result of a `SELECT txid_status()` check on the
- *    borrowed check connection.  Messages are absorbed (T/D/C) or used
- *    to synthesise a success/failure response (C+Z).  On completion the
- *    check connection is returned to the pool.
+ *    waiting for protocol-owned outcome-check messages on a borrowed
+ *    check connection. On completion the check connection is returned
+ *    to the pool.
  *
  *  **WAIT_STMT_REPLAY** — When performing prepared-statement replay after
  *    pool-wait resume, responses to Parse messages are counted.  Each
@@ -3604,8 +3913,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
  *    `act.query_complete`, the engine:
  *    - Updates `session->in_transaction` from tx status.
  *    - Applies `commit_in_flight` → `pending_commit_xid` from `act.commit_xid`.
- *    - If `capture_lsn_pending`: temporarily sets backend fd to blocking,
- *      calls `flow->capture_consistency_token()`, restores non-blocking.
+ *    - Clears `capture_lsn_pending`; inline token capture is intentionally
+ *      disabled on the reactor thread.
  *    - Returns backend to pool if no active pins, otherwise keeps it.
  *    - Re-arms frontend recv.
  *
@@ -3680,383 +3989,413 @@ keel_flow_result_t keel_engine_flow_on_be_data(
     /* ------------------------------------------------------------------ *
      * Replication tracking: commit_in_doubt response handler.            *
      * After keel_engine_flow_handle_commit_doubt() borrows a check conn  *
-     * and sends SELECT txid_status(), the response comes through here.   *
-     * Absorb T/D/C, synthesize the appropriate response on Z.           *
+     * and sends a protocol-owned outcome-check query, responses flow      *
+     * through here and are interpreted by plugin callbacks.              *
      * ------------------------------------------------------------------ */
     if (sf->commit_in_doubt) {
+        if (!flow->frame_len || !flow->on_be_msg)
+            return KEEL_FLOW_ERROR;
         size_t cid_pos = 0;
         while (cid_pos < len) {
-            if (len - cid_pos < 5) break;  /* incomplete header */
-            uint8_t  ct  = data[cid_pos];
-            uint32_t cl  = ((uint32_t)data[cid_pos+1] << 24)
-                         | ((uint32_t)data[cid_pos+2] << 16)
-                         | ((uint32_t)data[cid_pos+3] <<  8)
-                         |  (uint32_t)data[cid_pos+4];
-            if (cl < 4) break;
-            size_t cm = 1u + (size_t)cl;
-            if (cid_pos + cm > len) break;  /* partial message — wait for more */
+            ssize_t fl = flow->frame_len(sf->ctx, data + cid_pos, len - cid_pos, 1);
+            if (fl < 0)
+                return KEEL_FLOW_ERROR;
+            if (fl == 0 || (size_t)fl > (len - cid_pos))
+                break;
 
-            if (ct == 'D' && cm >= 11) {
-                /* DataRow: extract text value of txid_status() */
-                uint16_t ncols = (uint16_t)(((uint16_t)data[cid_pos+5] << 8)
-                                           | data[cid_pos+6]);
-                if (ncols >= 1) {
-                    int32_t vcl = (int32_t)(((uint32_t)data[cid_pos+7]  << 24)
-                                          | ((uint32_t)data[cid_pos+8]  << 16)
-                                          | ((uint32_t)data[cid_pos+9]  <<  8)
-                                          |  (uint32_t)data[cid_pos+10]);
-                    if (vcl > 0 && cm >= (size_t)(11 + vcl)) {
-                        const char* val = (const char*)(data + cid_pos + 11);
-                        if (strncmp(val, "committed",  9) == 0)
-                            sf->indoubt_check_result = 1;
-                        else if (strncmp(val, "aborted", 7) == 0)
-                            sf->indoubt_check_result = 2;
-                        /* in progress or NULL → result stays 0 (uncertain) */
-                    }
-                    /* NULL column (vcl < 0) → txid too old → result stays 0 */
-                }
-            } else if (ct == 'Z') {
-                /* ReadyForQuery — return check conn and synthesize client response */
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + cid_pos, (size_t)fl, &act) < 0)
+                return KEEL_FLOW_ERROR;
+
+            if (act.commit_doubt_outcome_changed) {
+                sf->indoubt_check_result = act.commit_doubt_outcome;
+            }
+
+            if (act.query_complete) {
                 if (sf->xid_check_conn) {
                     backend_pool_return(sf->xid_check_conn->pool,
-                                       sf->xid_check_conn, false);
+                                        sf->xid_check_conn, false);
                     sf->xid_check_conn = NULL;
                     session->server_fd = -1;
                 }
                 sf->commit_in_doubt = false;
-                session->commit_in_doubt = false;
+                session->commit_in_doubt = false; session->indoubt_xid = 0;
+                if (worker->stats_ctx) {
+                    if (sf->indoubt_check_result == 1 || sf->indoubt_check_result == 2)
+                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_resolved);
+                    else
+                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+                }
 
                 if (sf->indoubt_check_result == 1) {
-                    /* Transaction committed — send synthetic success */
-                    keel_try_send_nb(session->client_fd,
-                                     kPgCommitOK, sizeof(kPgCommitOK));
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_COMMITTED,
+                                               sf->indoubt_xid);
                 } else if (sf->indoubt_check_result == 2) {
-                    /* Transaction aborted — send error */
-                    uint8_t errbuf[384];
-                    ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-                        "40000",
-                        "connection lost before COMMIT confirmation: "
-                        "transaction was rolled back");
-                    if (elen > 0)
-                        keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_ABORTED,
+                                               sf->indoubt_xid);
                 } else {
-                    /* Unknown / in-progress / NULL */
-                    char umsg[256];
-                    snprintf(umsg, sizeof(umsg),
-                        "connection lost before COMMIT confirmation: "
-                        "outcome uncertain for XID %llu — check txid_status() manually",
-                        (unsigned long long)sf->indoubt_xid);
-                    uint8_t errbuf[384];
-                    ssize_t elen = pg_build_error_resp(errbuf, sizeof(errbuf),
-                                                       "08006", umsg);
-                    if (elen > 0)
-                        keel_try_send_nb(session->client_fd, errbuf, (size_t)elen);
+                    send_commit_doubt_response(flow, sf->ctx, session->client_fd,
+                                               KEEL_CIDR_RESOLVED_UNKNOWN,
+                                               sf->indoubt_xid);
                 }
                 return KEEL_FLOW_CLOSED;
             }
-            /* T (RowDescription) and C (CommandComplete SELECT) → absorbed silently */
-            cid_pos += cm;
+            cid_pos += (size_t)fl;
         }
         return KEEL_FLOW_WAIT_BACKEND;  /* wait for the rest of the response */
     }
 
     /* ------------------------------------------------------------------ *
-     * DISCARD ALL drain (spec §17, Step 4 borrow):                       *
-     * When borrow_with_stmts grabbed a backend with a DIFFERENT stmt     *
-     * hash, it set needs_discard_all and the resume path sent            *
-     * "DISCARD ALL;" before saving the replay buffer.  We wait here for  *
-     * the backend's CommandComplete('C') + ReadyForQuery('Z').  Once 'Z' *
-     * is seen the backend is clean; we send the saved replay buffer and  *
-     * fall through to normal ParseComplete counting.                      *
+     * Async pre-query replay.  Deferred BEGIN and state sync both have to *
+     * finish, including their ReadyForQuery, before the client's payload  *
+     * can be forwarded.  The backend response bytes are absorbed here so  *
+     * CommandComplete/ReadyForQuery frames from setup work never leak into *
+     * the client query response stream.                                  *
      * ------------------------------------------------------------------ */
-    if (sf->stmt_replay_needs_discard) {
-        size_t scan_pos = 0;
-
-        /* If a previous recv ended mid-message, skip the remaining bytes of
-         * that partial message before resuming header-based parsing. */
-        if (sf->discard_skip_bytes > 0) {
-            if ((uint32_t)(len - scan_pos) <= sf->discard_skip_bytes) {
-                /* Entire buffer is still inside the partial message body. */
-                sf->discard_skip_bytes -= (uint32_t)(len - scan_pos);
-                return KEEL_FLOW_WAIT_STMT_REPLAY;
-            }
-            scan_pos += sf->discard_skip_bytes;
-            sf->discard_skip_bytes = 0;
+    if (sf->pending_pre_query == KEEL_PRE_QUERY_BEGIN_REPLAY ||
+        sf->pending_pre_query == KEEL_PRE_QUERY_STATE_SYNC) {
+        bool is_state_sync = (sf->pending_pre_query == KEEL_PRE_QUERY_STATE_SYNC);
+        keel_tx_status_t expected_tx =
+            is_state_sync ? KEEL_TX_IDLE : KEEL_TX_ACTIVE;
+        if (len == 0) {
+            /* recv()==0 on backend → connection lost mid-replay. */
+            KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                "W%u: backend disconnect during %s",
+                worker->id, is_state_sync ? "state sync" : "deferred BEGIN replay");
+            if (worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_be_disconnect);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
         }
 
-        while (scan_pos < len) {
-            /* Need type byte + 4-byte length field */
-            if (len - scan_pos < 5) {
-                /* Less than a full header remains.  
-                 * We cannot determine the message type/length, so just wait for
-                 * more data.  The remaining 1-4 bytes will be prepended to the
-                 * next recv by the kernel (TCP stream), but our buffer does NOT
-                 * accumulate across calls — we simply mark skip=0 and wait.
-                 * Practically this is harmless: the tiny tail will arrive with
-                 * the next network segment, well within the same syscall burst. */
-                break;
+        /* Runaway guard: a misbehaving / wedged backend that never sends 'Z'
+         * could pin this session indefinitely.  Cap absorption at 64 KiB. */
+        enum { KEEL_PRE_QUERY_RUNAWAY_MAX = 64u * 1024u };
+        sf->pending_pre_query_absorbed += len;
+        if (sf->pending_pre_query_absorbed > KEEL_PRE_QUERY_RUNAWAY_MAX) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: %s absorbed %zu B without "
+                "ReadyForQuery; aborting session",
+                worker->id,
+                is_state_sync ? "state sync" : "deferred BEGIN replay",
+                sf->pending_pre_query_absorbed);
+            if (worker->stats_ctx)
+                KEEL_STAT_INC(worker->stats_ctx, pre_query_runaway);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_TIMEOUT);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
+        }
+
+        if (!flow->frame_len || !flow->on_be_msg) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: protocol handler missing frame_len/on_be_msg during %s",
+                worker->id, is_state_sync ? "state sync" : "deferred begin");
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
+        }
+
+        size_t pp = 0;
+        bool saw_complete = false;
+        bool saw_tx_state = false;
+        keel_tx_status_t observed_tx = KEEL_TX_IDLE;
+        while (pp < len) {
+            ssize_t fl = flow->frame_len(sf->ctx, data + pp, len - pp, 1);
+            if (fl < 0) {
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                pre_query_fail_clear(sf);
+                return KEEL_FLOW_ERROR;
             }
-            uint8_t  msg_type = data[scan_pos];
-            uint32_t msg_len  = ((uint32_t)data[scan_pos+1] << 24)
-                              | ((uint32_t)data[scan_pos+2] << 16)
-                              | ((uint32_t)data[scan_pos+3] <<  8)
-                              |  (uint32_t)data[scan_pos+4];
-
-            if (msg_len < 4) {
-                /* Corrupt / unexpected — bail to avoid infinite loop */
+            if (fl == 0 || (size_t)fl > (len - pp))
                 break;
-            }
 
-            /* Total message size = 1 (type) + msg_len */
-            size_t full_msg_size = 1u + (size_t)msg_len;
-
-            if (scan_pos + full_msg_size > len) {
-                /* Message extends past the current buffer — note how many bytes
-                 * of the body still need to be consumed in future recvs. */
-                size_t bytes_consumed_so_far = len - scan_pos;   /* includes header */
-                sf->discard_skip_bytes = (uint32_t)(full_msg_size - bytes_consumed_so_far);
-                scan_pos = len;   /* consumed entire buffer */
-                break;
-            }
-
-            if (msg_type == 'E') {
-                /* ErrorResponse during DISCARD ALL — backend must be in a
-                 * transaction, which should not happen for idle_list backends.
-                 * Close the backend to avoid state corruption (un-discarded
-                 * prepared statements would cause "already exists" errors). */
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                    "W%u: DISCARD-drain ErrorResponse fd=%d msg_len=%u"
-                    " (DISCARD ALL rejected by backend — closing)",
-                    worker->id, session->server_fd, msg_len);
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + pp, (size_t)fl, &act) < 0) {
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                pre_query_fail_clear(sf);
                 return KEEL_FLOW_ERROR;
             }
 
-            if (msg_type == 'Z') {
-                /* ReadyForQuery — DISCARD ALL complete. */
-                char tx_status = (scan_pos + 5 < len) ? (char)data[scan_pos + 5] : '?';
-                scan_pos += full_msg_size;
-                sf->stmt_replay_needs_discard = false;
-                sf->discard_skip_bytes = 0;
+            /* A backend ErrorResponse during state sync or deferred BEGIN means
+             * the operation failed (e.g. a SET command was rejected).  The sync
+             * hash must NOT be stamped; close the backend immediately. */
+            if (act.is_error_response) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: ErrorResponse from backend during %s; aborting session",
+                    worker->id, is_state_sync ? "state sync" : "deferred BEGIN");
+                if (worker->stats_ctx)
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_proto_violation);
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+                pre_query_fail_clear(sf);
+                return KEEL_FLOW_ERROR;
+            }
 
-                KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
-                    "W%u: DISCARD-drain 'Z'[%c] fd=%d scan_pos=%zu len=%zu"
-                    " replay_buf=%p replay_len=%zu replay_count=%u"
-                    " orig_msg=%p orig_len=%zu",
-                    worker->id, tx_status, session->server_fd,
-                    scan_pos, len,
-                    (void*)sf->stmt_replay_buf, sf->stmt_replay_len,
-                    sf->stmt_replay_count,
-                    (void*)sf->stmt_replay_orig_msg, sf->stmt_replay_orig_len);
+            if (act.tx_state_changed) {
+                saw_tx_state = true;
+                observed_tx = act.tx_status;
+                sf->tx = act.tx_status;
+                session->in_transaction = (act.tx_status != KEEL_TX_IDLE);
+                if (session->backend_conn)
+                    session->backend_conn->in_transaction = session->in_transaction;
+            }
 
-                if (tx_status != 'I') {
-                    /* Backend returned 'T' or 'E' after ROLLBACK+DISCARD —
-                     * something is very wrong; close to avoid state corruption. */
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                        "W%u: DISCARD-drain bad tx_status='%c' fd=%d — closing backend",
-                        worker->id, tx_status, session->server_fd);
-                    return KEEL_FLOW_ERROR;
-                }
-
-                /* Send the saved replay Parse buffer (may be NULL when the
-                 * session had no prepared stmts; we only needed the DISCARD). */
-                if (sf->stmt_replay_buf && sf->stmt_replay_len > 0) {
-                    ssize_t rs = keel_try_send_nb(session->server_fd,
-                                                  sf->stmt_replay_buf,
-                                                  sf->stmt_replay_len);
-                    keel_free(sf->stmt_replay_buf);
-                    sf->stmt_replay_buf = NULL;
-                    sf->stmt_replay_len = 0;
-                    if (rs < 0) {
-                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                            "W%u: replay send after DISCARD ALL failed: %s",
-                            worker->id, strerror(errno));
-                        return KEEL_FLOW_ERROR;
-                    }
-                    /* Fall through to ParseComplete counting */
-                } else if (sf->stmt_replay_count == 0 && sf->stmt_replay_orig_msg) {
-                    /* No Parse replay needed (session had no stmts).
-                     * Forward the original client Parse+Sync directly. */
-                    const uint8_t* orig     = sf->stmt_replay_orig_msg;
-                    size_t         orig_len = sf->stmt_replay_orig_len;
-                    KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
-                        "W%u: DISCARD ALL done (no-stmt), forwarding %zu bytes orig[0]=0x%02x to BE fd=%d",
-                        worker->id, orig_len, orig ? orig[0] : 0, session->server_fd);
-                    sf->stmt_replay_orig_msg = NULL;
-                    sf->stmt_replay_orig_len = 0;
-                    ssize_t rs = keel_try_send_nb(session->server_fd,
-                                                  orig, orig_len);
-                    if (rs < 0) {
-                        KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
-                            "W%u: pending send after DISCARD ALL failed: %s",
-                            worker->id, strerror(errno));
-                        return KEEL_FLOW_ERROR;
-                    }
-                    if ((size_t)rs < orig_len) {
-                        KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                            "W%u: pending send after DISCARD ALL partial: %zd of %zu",
-                            worker->id, rs, orig_len);
-                        return defer_send(sf, session->server_fd,
-                                          orig + rs, orig_len - (size_t)rs,
-                                          KEEL_FLOW_WAIT_BACKEND);
-                    }
-                    return KEEL_FLOW_WAIT_BACKEND;
-                }
-                /* Fall through: any remaining bytes in this buffer may be
-                 * ParseComplete responses if the backend is very fast. */
-                data += scan_pos;
-                len  -= scan_pos;
+            if (act.query_complete) {
+                saw_complete = true;
+                pp += (size_t)fl;
                 break;
             }
 
-            /* Skip 'C' CommandComplete, 'N' NoticeResponse, 'S' ParameterStatus,
-             * and any other messages that come before ReadyForQuery. */
-            scan_pos += full_msg_size;
+            pp += (size_t)fl;
         }
-        if (sf->stmt_replay_needs_discard) {
-            /* Haven't seen 'Z' yet — wait for more backend data */
-            return KEEL_FLOW_WAIT_STMT_REPLAY;
+
+        if (!saw_complete) {
+            if (pp < len)
+                keel_residual_append(&session->server_residual,
+                                     data + pp, len - pp);
+            /* Still draining BEGIN response — wait for more BE data. */
+            return KEEL_FLOW_WAIT_BACKEND;
         }
-        if (len == 0) {
-            /* No more data — wait for ParseComplete responses */
-            return KEEL_FLOW_WAIT_STMT_REPLAY;
+
+        if (!saw_tx_state || observed_tx != expected_tx) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: %s completed with unexpected tx state (seen=%d expected=%d)",
+                worker->id,
+                is_state_sync ? "state sync" : "deferred begin",
+                (int)observed_tx, (int)expected_tx);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
         }
+
+        if (is_state_sync) {
+            if (session->backend_conn) {
+                session->backend_conn->current_state_hash =
+                    sf->pending_state_sync_hash;
+                session->backend_conn->needs_sync = false;
+                if (session->backend_conn->profile && session->state_profile)
+                    state_profile_copy(session->backend_conn->profile,
+                                       session->state_profile);
+            }
+        }
+
+        /* 'Z' received — complete this setup op. If additional pre-query ops
+         * are queued, start the next one first; held FE bytes are forwarded
+         * only after the entire queue has drained successfully. */
+        size_t forward_len = sf->pending_pre_query_len;
+        keel_flow_result_t forward_resume = sf->pending_pre_query_resume;
+        pre_query_reset_active(sf);
+
+        if (worker->stats_ctx)
+            KEEL_STAT_INC(worker->stats_ctx, pre_query_replay_count);
+
+        if (sf->pre_query_count > 0) {
+            if (pp < len)
+                keel_residual_append(&session->server_residual,
+                                     data + pp, len - pp);
+            return pre_query_start_next_queued(sf, session);
+        }
+
+        if (forward_len > 0) {
+            ssize_t fs = keel_try_send_nb(session->server_fd,
+                                          sf->pending_pre_query_buf,
+                                          forward_len);
+            if (fs < 0) {
+                KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                    "W%u: post-%s payload send failed fd=%d len=%zu: %s",
+                    worker->id,
+                    is_state_sync ? "state-sync" : "BEGIN",
+                    session->server_fd, forward_len,
+                    strerror(errno));
+                if (worker->stats_ctx) {
+                    KEEL_STAT_INC(worker->stats_ctx, pre_query_send_fail);
+                    KEEL_STAT_INC(worker->stats_ctx, errors_backend);
+                }
+                pre_query_record_result(sf, worker,
+                                        KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                sf->pending_pre_query_len = 0;
+                return KEEL_FLOW_ERROR;
+            }
+            if (worker->stats_ctx)
+                KEEL_STAT_ADD(worker->stats_ctx, bytes_backend_sent,
+                              (uint64_t)fs);
+            if ((size_t)fs < forward_len) {
+                /* Partial send — io_uring path will complete the rest, then
+                 * resume into KEEL_FLOW_WAIT_BACKEND so we can pick up the
+                 * real query response. */
+                keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                   sf->pending_pre_query_buf + fs,
+                                                   forward_len - (size_t)fs,
+                                                   forward_resume);
+                if (dr == KEEL_FLOW_ERROR) {
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                }
+                return dr;
+            }
+        }
+        sf->pending_pre_query_len = 0;
+        pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
+
+        /* Any trailing bytes after 'Z' are part of the real query stream;
+         * re-enter this function on that slice rather than duplicating the
+         * downstream handling here. */
+        if (pp < len)
+            return keel_engine_flow_on_be_data(sf, session,
+                                               data + pp, len - pp);
+        return forward_resume;
     }
 
     /* ------------------------------------------------------------------ *
-     * Prepared-statement replay (spec §17):                               *
-     * When the engine sent Parse wire messages to restore the session's   *
-     * named prepared statements on a freshly borrowed backend,            *
-     * stmt_replay_count holds the number of ParseComplete ('1') responses *
-     * still expected.  Count them here; when all are received, forward   *
-     * the original client message to the backend.                        *
+     * Setup cleanup drain (prepared-state replay borrow path):           *
+     * Core owns sequencing only. The protocol plugin parses/validates the *
+     * cleanup response stream and tells us when the backend is reusable.  *
+     * ------------------------------------------------------------------ */
+    if (sf->stmt_replay_needs_cleanup) {
+        if (!flow->drain_cleanup_response) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: setup cleanup drain requested without protocol handler fd=%d",
+                worker->id, session->server_fd);
+            return KEEL_FLOW_ERROR;
+        }
+
+        size_t consumed = 0;
+        keel_proto_drain_result_t gate = flow->drain_cleanup_response(
+            sf->ctx, &sf->stmt_cleanup_drain_state, data, len, &consumed);
+        if (gate == KEEL_PROTO_DRAIN_ERROR || consumed > len) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
+                "W%u: setup cleanup drain failed fd=%d consumed=%zu len=%zu",
+                worker->id, session->server_fd, consumed, len);
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            return KEEL_FLOW_ERROR;
+        }
+        if (gate == KEEL_PROTO_DRAIN_MORE)
+            return KEEL_FLOW_WAIT_STMT_REPLAY;
+
+        sf->stmt_replay_needs_cleanup = false;
+        memset(&sf->stmt_cleanup_drain_state, 0,
+               sizeof(sf->stmt_cleanup_drain_state));
+        data += consumed;
+        len  -= consumed;
+
+        if (sf->pre_query_count > 0) {
+            if (len > 0)
+                keel_residual_append(&session->server_residual, data, len);
+            return pre_query_start_next_queued(sf, session);
+        }
+
+        if (sf->pending_pre_query_len > 0 && sf->stmt_replay_count == 0 &&
+            !sf->stmt_replay_rfq_pending) {
+            size_t forward_len = sf->pending_pre_query_len;
+            keel_flow_result_t forward_resume = sf->pending_pre_query_resume;
+            ssize_t rs = keel_try_send_nb(session->server_fd,
+                                          sf->pending_pre_query_buf,
+                                          forward_len);
+            sf->pending_pre_query_len = 0;
+            if (rs < 0)
+            {
+                pre_query_record_result(sf, worker,
+                                        KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                return KEEL_FLOW_ERROR;
+            }
+            if ((size_t)rs < forward_len) {
+                keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                   sf->pending_pre_query_buf + rs,
+                                                   forward_len - (size_t)rs,
+                                                   forward_resume);
+                if (dr == KEEL_FLOW_ERROR) {
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                }
+                return dr;
+            }
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
+            if (len > 0)
+                return keel_engine_flow_on_be_data(sf, session, data, len);
+            return forward_resume;
+        }
+
+        if (len == 0)
+            return KEEL_FLOW_WAIT_STMT_REPLAY;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Prepared-statement replay (spec §17):
+     * Core drains replay responses using protocol frame parsing and
+     * semantic backend actions only (no protocol tag checks in core).
      * ------------------------------------------------------------------ */
     if (sf->stmt_replay_count > 0 || sf->stmt_replay_rfq_pending) {
-        size_t scan_pos = 0;
-        while (scan_pos < len && sf->stmt_replay_count > 0) {
-            /* Each Parse reply frame: '1' + int32(4) = 5 bytes */
-            if (len - scan_pos < 5) break;
-            uint8_t msg_type = data[scan_pos];
-            uint32_t msg_len = ((uint32_t)data[scan_pos+1] << 24)
-                             | ((uint32_t)data[scan_pos+2] << 16)
-                             | ((uint32_t)data[scan_pos+3] <<  8)
-                             |  (uint32_t)data[scan_pos+4];
-            if (msg_len < 4 || 1 + msg_len > len - scan_pos) break;
+        if (len == 0) {
+            /* Backend closed socket during stmt replay — clear all pre-query state
+             * before returning, consistent with all other error paths. */
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_DRAIN_ERROR);
+            pre_query_fail_clear(sf);
+            return KEEL_FLOW_ERROR;
+        }
+        if (!flow->frame_len || !flow->on_be_msg) {
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+            return KEEL_FLOW_ERROR;
+        }
 
-            if (msg_type == '1') {
-                /* ParseComplete — one stmt has been accepted */
-                sf->stmt_replay_count--;
-                scan_pos += 1 + msg_len;
-                if (sf->stmt_replay_count == 0) {
-                    /* All ParseCompletes in; now wait for the ReadyForQuery
-                     * generated by the Sync we appended to the replay buffer.
-                     * We MUST drain it before sending orig_msg so it doesn't
-                     * contaminate the WAIT_BACKEND response stream. */
-                    sf->stmt_replay_rfq_pending = true;
-                    /* Fall through to the rfq_pending scan below. */
-                    break;
-                }
-                continue;
-            } else if (msg_type == 'E') {
-                /* ErrorResponse during replay — a Parse message was rejected.
-                 *
-                 * CRITICAL: the replay buffer contains only Parse messages
-                 * (no Sync).  The backend accepted each ParseComplete and
-                 * sent it immediately — but on a Parse failure it enters
-                 * "error recovery" mode and discards ALL subsequent messages
-                 * until a Sync is received.  Without an explicit Sync the
-                 * backend stays frozen in error recovery, never sends RFQ,
-                 * and keel waits for WAIT_BACKEND indefinitely → deadlock.
-                 *
-                 * Fix: send a Sync immediately so the backend exits error
-                 * recovery and sends RFQ(E).  We then fall through to the
-                 * normal WAIT_BACKEND path which forwards the RFQ to the
-                 * client and releases the backend.
-                 *
-                 * Root cause: replay landed on a backend that already had
-                 * stmts with the same names from a previous session.  This
-                 * is now prevented by borrow_with_stmts only falling back
-                 * to stmt-clean backends (stmt_set_hash==0), but we keep
-                 * this Sync as a safety net. */
-                {
-                    /* Log the error message for debugging */
-                    const uint8_t* emsg = data + scan_pos + 5;  /* skip type+len */
-                    size_t ebody = (size_t)msg_len - 4;
-                    char errbuf[256] = {0};
-                    size_t ei = 0, oi = 0;
-                    while (ei < ebody && oi < sizeof(errbuf)-1) {
-                        uint8_t field = emsg[ei++];
-                        if (!field) break;
-                        const char* fval = (const char*)(emsg + ei);
-                        size_t flen = strnlen(fval, ebody - ei);
-                        if (field == 'M') {  /* Message field */
-                            size_t copy = flen < sizeof(errbuf)-oi-1 ? flen : sizeof(errbuf)-oi-1;
-                            memcpy(errbuf + oi, fval, copy);
-                            oi += copy;
-                            break;
-                        }
-                        ei += flen + 1;
-                    }
-                    KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                        "W%u: REPLAY ErrorResponse: fd=%d replay_count_left=%u msg='%s'"
-                        " stmt_hash=0x%016llx be_stmt_hash=0x%016llx",
-                        worker->id, session->server_fd,
-                        sf->stmt_replay_count, errbuf,
-                        (unsigned long long)sf->stmt_replay_hash,
-                        session->backend_conn
-                            ? (unsigned long long)session->backend_conn->stmt_set_hash : 0ULL);
-                }
-                static const uint8_t pg_sync[] = { 'S', 0, 0, 0, 4 };
-                keel_try_send_nb(session->server_fd,
-                                 pg_sync, sizeof(pg_sync));
-                /* Forward the error to the client so its protocol state
-                 * machine gets the ErrorResponse it expects. */
-                if (session->client_fd >= 0) {
-                    keel_try_send_nb(session->client_fd,
-                                    data + scan_pos, 1 + msg_len);
-                }
+        size_t scan_pos = 0;
+        while (scan_pos < len) {
+            ssize_t fl = flow->frame_len(sf->ctx, data + scan_pos, len - scan_pos, 1);
+            if (fl < 0) {
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
+            }
+            if (fl == 0 || (size_t)fl > (len - scan_pos))
+                break;
+
+            keel_be_action_t act;
+            if (flow->on_be_msg(sf->ctx, data + scan_pos, (size_t)fl, &act) < 0) {
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
+            }
+
+                if (act.is_error_response) {
+                if (act.fe_payload && act.fe_payload_len > 0 && session->client_fd >= 0)
+                    keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)
+                {
                     session->backend_conn->stmt_set_hash = 0;
+                    memset(&session->backend_conn->stmt_profile, 0,
+                           sizeof(session->backend_conn->stmt_profile));
+                }
                 sf->stmt_replay_count       = 0;
                 sf->stmt_replay_rfq_pending = false;
                 sf->stmt_replay_orig_msg    = NULL;
                 sf->stmt_replay_orig_len    = 0;
                 sf->stmt_replay_hash        = 0;
-                /* RFQ(E) will arrive shortly (response to the Sync we just
-                 * sent); handle it via the normal WAIT_BACKEND path. */
-                return KEEL_FLOW_WAIT_BACKEND;
+                sf->pending_pre_query_len   = 0;
+                pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_PARSE_ERROR);
+                return KEEL_FLOW_ERROR;
             }
-            scan_pos += 1 + msg_len;
-        }
 
-        /* ---------------------------------------------------------------
-         * If all ParseCompletes have been counted, drain the ReadyForQuery
-         * (type 'Z') that the Sync appended to the replay buffer generates.
-         * We MUST consume it here; if we let it linger in the socket buffer
-         * it will be the first byte the WAIT_BACKEND handler sees, which
-         * would misinterpret it as an end-of-transaction signal, returning
-         * the backend to the pool prematurely before the actual response to
-         * orig_msg ever arrives.
-         * --------------------------------------------------------------- */
-        if (sf->stmt_replay_rfq_pending) {
-            /* Scan forward from scan_pos for the 'Z' message */
-            while (scan_pos < len) {
-                if (len - scan_pos < 5) break;  /* partial message header */
-                uint8_t  mtype = data[scan_pos];
-                uint32_t mlen  = ((uint32_t)data[scan_pos+1] << 24)
-                               | ((uint32_t)data[scan_pos+2] << 16)
-                               | ((uint32_t)data[scan_pos+3] <<  8)
-                               |  (uint32_t)data[scan_pos+4];
-                if (mlen < 4 || 1 + mlen > len - scan_pos) break;  /* partial body */
-                scan_pos += 1 + mlen;
-                if (mtype == 'Z') {
-                    /* Found the replay Sync's ReadyForQuery — drain it */
-                    sf->stmt_replay_rfq_pending = false;
-                    break;
-                }
-                /* Any other messages (NoticeResponse, ParameterStatus, etc.)
-                 * before the RFQ are silently discarded — they're artifacts
-                 * of the replay Sync and should not reach the client. */
+            if (act.tx_state_changed) {
+                sf->tx = act.tx_status;
+                session->in_transaction = (act.tx_status != KEEL_TX_IDLE);
+                if (session->backend_conn)
+                    session->backend_conn->in_transaction = session->in_transaction;
             }
+
+            if (sf->stmt_replay_count > 0 && act.stmt_replay_accepted) {
+                sf->stmt_replay_count--;
+                if (sf->stmt_replay_count == 0)
+                    sf->stmt_replay_rfq_pending = true;
+            }
+
+            if (sf->stmt_replay_rfq_pending && act.query_complete)
+                sf->stmt_replay_rfq_pending = false;
+
+            scan_pos += (size_t)fl;
         }
 
         if (sf->stmt_replay_count == 0 && !sf->stmt_replay_rfq_pending) {
@@ -4064,13 +4403,29 @@ keel_flow_result_t keel_engine_flow_on_be_data(
              * Stamp the backend with the session's stmt_set_hash. */
             if (session->backend_conn && sf->stmt_replay_hash) {
                 session->backend_conn->stmt_set_hash = sf->stmt_replay_hash;
+                session->backend_conn->stmt_profile = sf->stmt_replay_profile;
+                session->backend_conn->stmt_profile.stmt_set_hash = sf->stmt_replay_hash;
             }
             sf->stmt_replay_hash = 0;
 
-            /* Forward original client message to backend */
-            if (sf->stmt_replay_orig_msg && sf->stmt_replay_orig_len > 0) {
-                const uint8_t* orig     = sf->stmt_replay_orig_msg;
-                size_t         orig_len = sf->stmt_replay_orig_len;
+            if (sf->pre_query_count > 0) {
+                if (scan_pos < len)
+                    keel_residual_append(&session->server_residual,
+                                         data + scan_pos, len - scan_pos);
+                return pre_query_start_next_queued(sf, session);
+            }
+
+            /* Forward held client payload to backend */
+            if (sf->pending_pre_query_len > 0 ||
+                (sf->stmt_replay_orig_msg && sf->stmt_replay_orig_len > 0)) {
+                const uint8_t* orig = sf->pending_pre_query_len > 0
+                    ? sf->pending_pre_query_buf
+                    : sf->stmt_replay_orig_msg;
+                size_t orig_len = sf->pending_pre_query_len > 0
+                    ? sf->pending_pre_query_len
+                    : sf->stmt_replay_orig_len;
+                keel_flow_result_t forward_resume = sf->pending_pre_query_resume;
+                sf->pending_pre_query_len = 0;
                 sf->stmt_replay_orig_msg = NULL;
                 sf->stmt_replay_orig_len = 0;
 
@@ -4100,17 +4455,31 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
                         "W%u: orig msg send after replay failed: %s",
                         worker->id, strerror(errno));
+                    pre_query_record_result(sf, worker,
+                                            KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
                     return KEEL_FLOW_ERROR;
                 }
                 if ((size_t)s < orig_len) {
-                    return defer_send(sf, session->server_fd,
-                                      orig + s, orig_len - (size_t)s,
-                                      KEEL_FLOW_WAIT_BACKEND);
+                    keel_flow_result_t dr = defer_send(sf, session->server_fd,
+                                                       orig + s, orig_len - (size_t)s,
+                                                       forward_resume);
+                    if (dr == KEEL_FLOW_ERROR) {
+                        pre_query_record_result(sf, worker,
+                                                KEEL_REPLAY_RESULT_PARTIAL_SEND_FAILURE);
+                    }
+                    return dr;
                 }
             }
+            pre_query_record_result(sf, worker, KEEL_REPLAY_RESULT_SUCCESS);
+            if (scan_pos < len)
+                return keel_engine_flow_on_be_data(sf, session,
+                                                   data + scan_pos, len - scan_pos);
             return KEEL_FLOW_WAIT_BACKEND;
         }
         /* Still waiting for more ParseComplete responses or the replay RFQ */
+        if (scan_pos < len)
+            keel_residual_append(&session->server_residual,
+                                 data + scan_pos, len - scan_pos);
         return KEEL_FLOW_WAIT_STMT_REPLAY;
     }
 
@@ -4258,83 +4627,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             continue;
         }
 
-        /* ---- NotificationResponse relay (LISTEN/NOTIFY transparent proxy) --
-         * PostgreSQL sends 'A' (NotificationResponse) asynchronously on any
-         * connection that has issued LISTEN.  These messages arrive interspersed
-         * with regular query responses and must be forwarded to the client
-         * immediately without affecting query state, transaction tracking, or
-         * the query-complete signal.
-         *
-         * Wire format:
-         *   'A'  1 byte  — message type
-         *   len  4 bytes — message length (includes itself, excludes type byte)
-         *   pid  4 bytes — notifying backend PID
-         *   channel NUL-terminated string
-         *   payload NUL-terminated string (empty string = no payload)
-         */
-        if (data[pos] == 'A' && (sf->pins & KEEL_FPIN_LISTEN)) {
-            /* Flush any pending batch before this out-of-band relay. */
-            if (batch_active) {
-                size_t batch_len = pos - batch_unsent_start;
-                ssize_t bs = keel_try_send_nb(session->client_fd,
-                                              data + batch_unsent_start,
-                                              batch_len);
-                if (bs < 0) {
-                    KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                        "W%u: notify pre-flush failed: %s",
-                        worker->id, strerror(errno));
-                    return KEEL_FLOW_ERROR;
-                }
-                if ((size_t)bs < batch_len) {
-                    /* Partial batch — save remainder + notify + rest of buffer */
-                    size_t relay_start = pos;
-                    size_t rest_start  = pos + (size_t)flen;
-                    if (rest_start < len)
-                        keel_residual_append(&session->server_residual,
-                                            data + rest_start, len - rest_start);
-                    keel_residual_append(&session->server_residual,
-                                        data + relay_start, (size_t)flen);
-                    return defer_send(sf, session->client_fd,
-                                      data + batch_unsent_start + (size_t)bs,
-                                      batch_len - (size_t)bs,
-                                      KEEL_FLOW_WAIT_BACKEND);
-                }
-                batch_active = false;
-            }
-            /* Relay the 'A' frame directly to the client. */
-            ssize_t ns = keel_try_send_nb(session->client_fd,
-                                          data + pos, (size_t)flen);
-            if (ns < 0) {
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                    "W%u: notify relay send failed: %s",
-                    worker->id, strerror(errno));
-                return KEEL_FLOW_ERROR;
-            }
-            worker->stats.bytes_sent += (uint64_t)flen;
-            if (worker->stats_ctx)
-                KEEL_STAT_ADD(worker->stats_ctx, bytes_sent, flen);
-            if (worker->stats_ctx)
-                KEEL_STAT_INC(worker->stats_ctx, notify_relayed);
-            if ((size_t)ns < (size_t)flen) {
-                size_t rest_start = pos + (size_t)flen;
-                if (rest_start < len)
-                    keel_residual_append(&session->server_residual,
-                                        data + rest_start, len - rest_start);
-                return defer_send(sf, session->client_fd,
-                                  data + pos + (size_t)ns,
-                                  (size_t)flen - (size_t)ns,
-                                  KEEL_FLOW_WAIT_BACKEND);
-            }
-            KEEL_LOG_DEBUG(KEEL_LOG_CAT_CONN,
-                "W%u: relayed NotificationResponse (%zu bytes) fd=%d → fd=%d",
-                worker->id, (size_t)flen,
-                session->server_fd, session->client_fd);
-            /* Reset batch start to skip past the relayed 'A' frame */
-            batch_unsent_start = pos + (size_t)flen;
-            pos += (size_t)flen;
-            continue;
-        }
-
         keel_be_action_t act;
         uint64_t _be_t0 = keel_instr_begin(WORKER_INSTR(worker), KEEL_INSTR_PROTO_BE_MSG);
         int rc = flow->on_be_msg(sf->ctx, data+pos, (size_t)flen, &act);
@@ -4345,39 +4637,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             if (worker->stats_ctx)
                 KEEL_STAT_INC(worker->stats_ctx, proxy_state_desync_total);
             return KEEL_FLOW_ERROR;
-        }
-
-        /* Log ErrorResponse messages to help diagnose "already exists" */
-        if (act.type == KEEL_BE_ACT_ERROR && (size_t)flen >= 5 &&
-            data[pos] == 'E') {
-            const uint8_t* emsg = data + pos + 5;
-            size_t ebody = (size_t)flen - 5;
-            char errbuf2[256] = {0};
-            char sqlstate2[8] = {0};
-            size_t ei = 0, oi = 0, si = 0;
-            while (ei < ebody) {
-                uint8_t field = emsg[ei++];
-                if (!field) break;
-                const char* fval = (const char*)(emsg + ei);
-                size_t flen2 = strnlen(fval, ebody - ei);
-                if (field == 'M' && oi < sizeof(errbuf2)-1) {
-                    size_t cp = flen2 < sizeof(errbuf2)-oi-1 ? flen2 : sizeof(errbuf2)-oi-1;
-                    memcpy(errbuf2+oi, fval, cp); oi += cp;
-                }
-                if (field == 'C' && si < sizeof(sqlstate2)-1) {
-                    size_t cp = flen2 < sizeof(sqlstate2)-si-1 ? flen2 : sizeof(sqlstate2)-si-1;
-                    memcpy(sqlstate2+si, fval, cp); si += cp;
-                }
-                ei += flen2 + 1;
-            }
-            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-                "W%u: BE ErrorResponse: fd=%d sqlstate='%s' msg='%s'"
-                " be_stmt_hash=0x%016llx session_pins=0x%x",
-                worker->id, session->server_fd,
-                sqlstate2, errbuf2,
-                session->backend_conn
-                    ? (unsigned long long)session->backend_conn->stmt_set_hash : 0ULL,
-                (unsigned)sf->pins);
         }
 
         /* ---- Plugin error classification (Phase 5) ----
@@ -4391,14 +4650,23 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                           (size_t)flen, &einfo) == 0) {
                 if (!einfo.connection_ok) {
                     /* Backend connection is dead — mark unusable */
-                    if (session->backend_conn)
-                        session->backend_conn->state = 5; /* BACKEND_DEAD */
+                    if (session->backend_conn) {
+                        session->backend_conn->protocol_desync = true;
+                        backend_pool_set_quarantine(session->backend_conn,
+                                                    BACKEND_QUARANTINE_PROTOCOL_DESYNC);
+                    }
                     if (worker->stats_ctx)
                         KEEL_STAT_INC(worker->stats_ctx, errors_backend);
                     KEEL_DEBUG_LOG("W%u: classify_error → FATAL (%s)\n",
                                   worker->id,
                                   einfo.sqlstate ? einfo.sqlstate : "?");
                 }
+                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                    "W%u: backend error class=%d sqlstate=%s msg=%s",
+                    worker->id,
+                    (int)einfo.error_class,
+                    einfo.sqlstate ? einfo.sqlstate : "?",
+                    einfo.message ? einfo.message : "?");
             }
             /* Error response — do not cache this result */
             if (sf->cache_pending) {
@@ -4416,12 +4684,7 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             sf->pins |= act.pin_update;
             sf->pins &= ~act.pin_clear;
             sync_session_ssv_state(session, sf);
-            if (worker->stats_ctx) {
-                if (prev_pins == KEEL_FPIN_NONE && sf->pins != KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_pinned);
-                else if (prev_pins != KEEL_FPIN_NONE && sf->pins == KEEL_FPIN_NONE)
-                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_pinned);
-            }
+            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
         }
         if (act.pin_clear & KEEL_FPIN_COPY) {
             sf->copy_skip = 0;      /* Reset COPY scanner state */
@@ -4476,39 +4739,6 @@ keel_flow_result_t keel_engine_flow_on_be_data(
          * Flush happens at the end of the loop or on non-contiguous payload. */
         if ((act.type == KEEL_BE_ACT_FORWARD_FE || act.type == KEEL_BE_ACT_ERROR) &&
             act.fe_payload && act.fe_payload_len > 0) {
-            /* Log backend FATAL/ERROR messages (severity + SQLSTATE + text)
-             * before forwarding so they appear in Keel logs with the server
-             * that sent them — critical for diagnosing replica kill events. */
-            if (act.type == KEEL_BE_ACT_ERROR &&
-                act.fe_payload_len > 5 && act.fe_payload[0] == 'E') {
-                const uint8_t* ep   = act.fe_payload + 5;
-                const uint8_t* eend = act.fe_payload + act.fe_payload_len;
-                const char* sev      = NULL;
-                const char* msg      = NULL;
-                const char* sqlstate = NULL;
-                while (ep < eend && *ep != '\0') {
-                    uint8_t ftype = *ep++;
-                    const char* fval = (const char*)ep;
-                    size_t fvl = strnlen(fval, (size_t)(eend - ep));
-                    ep += fvl + 1;
-                    if      (ftype == 'S') sev      = fval;
-                    else if (ftype == 'M') msg      = fval;
-                    else if (ftype == 'C') sqlstate = fval;
-                }
-                const char* be_host = "?";
-                uint16_t    be_port = 0;
-                if (session->backend_conn && session->backend_conn->pool) {
-                    be_host = session->backend_conn->pool->config.host;
-                    be_port = session->backend_conn->pool->config.port;
-                }
-                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
-                    "W%u: backend error [%s:%u] %s %s: %s",
-                    worker->id, be_host, (unsigned)be_port,
-                    sev      ? sev      : "?",
-                    sqlstate ? sqlstate : "?",
-                    msg      ? msg      : "(no message)");
-            }
-
             /* Check if this is a raw passthrough (payload is contiguous
              * in the original data buffer at the current position) */
             if (act.fe_payload == (const uint8_t*)(data + pos) &&
@@ -4808,35 +5038,12 @@ fe_forward_done: ;
          * Core returns to L7 mode for the next query. */
         session->fast_forward_mode = 0;
 
-        /* Phase 5: capture WAL LSN / GTID now that the backend has responded
-         * and the connection is idle.
-         *
-         * The deferred pattern: capture_lsn_pending was set by the FE path
-         * when a write/DDL was detected.  Now that the backend has sent
-         * ReadyForQuery we temporarily switch the fd to blocking, call the
-         * protocol adapter's capture_consistency_token(), and restore
-         * non-blocking.  The captured token is stored both in the legacy
-         * last_write_token field AND in the SSV consistency atoms so that
-         * the replica borrow path can use either. */
-        if (sf->capture_lsn_pending && session->backend_conn &&
-            flow->capture_consistency_token) {
-            int be_fd = session->backend_conn->fd;
-            int flags = fcntl(be_fd, F_GETFL);
-            if (flags >= 0) {
-                fcntl(be_fd, F_SETFL, flags & ~O_NONBLOCK);
-                int cap_rc = flow->capture_consistency_token(
-                    sf->ctx, be_fd, &sf->last_write_token);
-                fcntl(be_fd, F_SETFL, flags);
-                if (cap_rc == 0 && sf->last_write_token.value[0] != '\0') {
-                    keel_ssv_consistency_set_token(
-                        sf->consistency_atoms, &sf->last_write_token);
-                    /* Notify the protocol context so SHOW keel.write_lsn works */
-                    if (flow->notify_write_lsn)
-                        flow->notify_write_lsn(sf->ctx,
-                                               sf->last_write_token.value);
-                }
-            }
-        }
+        /* Phase 5 consistency token capture is intentionally not performed
+         * inline here. The old path temporarily cleared O_NONBLOCK and ran a
+         * protocol query on the worker reactor, which can stall unrelated
+         * sessions. Correctness is preserved by sticky-primary routing during
+         * the TTL window; async token capture can be reintroduced as its own
+         * reactor-owned pre-query state machine. */
         sf->capture_lsn_pending = false;
 
         /*
@@ -4924,7 +5131,7 @@ fe_forward_done: ;
              *
              *  PINNING  — the backend was hard-pinned for the lifetime of the
              *      PS set.  On release we must clean the backend so it doesn't
-             *      carry stale named statements.  Set needs_discard_all so the
+             *      carry stale named statements.  Set needs_full_cleanup so the
              *      pool sends DEALLOCATE ALL before returning the connection to
              *      the clean list.  Clear stmt_set_hash to 0 so it goes to the
              *      dirty list until the cleanup is confirmed.
@@ -4935,6 +5142,8 @@ fe_forward_done: ;
              */
             backend_conn_t* be = session->backend_conn;
             if (be->pool) {
+                keel_stmt_compat_profile_t stmt_profile;
+                memset(&stmt_profile, 0, sizeof(stmt_profile));
                 /* Unknown-state rule: if the protocol adapter flagged a
                  * command it could not semantically model, any cached
                  * backend state (SET variables, prepared stmts) may be
@@ -4943,30 +5152,34 @@ fe_forward_done: ;
                 if (keel_ssv_opaque_has_unknown(sf->opaque_atoms)) {
                     be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     be->stmt_set_hash      = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }
 
                 if ((sf->pins & KEEL_FPIN_PREPARED_STMT) && flow->get_stmt_replay
                     && sf->ps_mode != KEEL_PS_MODE_PINNING
                     && sf->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
-                    /* VIRTUALIZE / TRACKING: only preserve stmt_set_hash when the
-                     * backend's existing prepared statements are still semantically
-                     * aligned with the session's current stmt hash.
-                     *
-                     * If the session changed a replay-sensitive semantic context
-                     * (for example DateStyle or TimeZone) after preparing named
-                     * statements, the backend still physically holds the OLD parse
-                     * semantics.  Blindly restamping it to the NEW session hash
-                     * would create a false exact-match backend and skip replay on
-                     * the next borrow.  Force DISCARD ALL in that case so reuse
-                     * always goes through clean borrow + replay under the current
-                     * context. */
-                    uint64_t stmt_hash = 0;
-                    flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL, &stmt_hash);
-                    if (be->stmt_set_hash != 0 && be->stmt_set_hash != stmt_hash) {
+                    bool have_stmt_profile = false;
+                    if (flow->get_stmt_compat_profile &&
+                        flow->get_stmt_compat_profile(sf->ctx, &stmt_profile) == 0) {
+                        have_stmt_profile = true;
+                    }
+                    flow->get_stmt_replay(sf->ctx, NULL, NULL, NULL,
+                                          &stmt_profile.stmt_set_hash);
+                    if (!have_stmt_profile && stmt_profile.stmt_set_hash != 0)
+                        stmt_profile.semantic_unknown = true;
+
+                    if (stmt_profile.semantic_unknown) {
                         be->stmt_set_hash = 0;
+                        memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
+                        be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                    } else if (be->stmt_set_hash != 0 &&
+                               !backend_pool_stmt_compatible(&stmt_profile, be)) {
+                        be->stmt_set_hash = 0;
+                        memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                         be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     } else {
-                        be->stmt_set_hash = stmt_hash;
+                        be->stmt_set_hash = stmt_profile.stmt_set_hash;
+                        be->stmt_profile = stmt_profile;
                     }
                 } else if (sf->ps_mode == KEEL_PS_MODE_PINNING
                            && (sf->pins & KEEL_FPIN_PREPARED_STMT)) {
@@ -4976,17 +5189,20 @@ fe_forward_done: ;
                      * CLEANING path (DISCARD ALL), clearing all named
                      * prepared statements from the backend. */
                     be->stmt_set_hash       = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                     be->current_state_hash  = 0xFFFFFFFFFFFFFFFFULL;  /* sentinel → DISCARD ALL */
                 } else {
                     /* No prepared stmts (or ANONYMOUS) — clear hash so backend
                      * can go to clean_list (or get DISCARD ALL if SET vars exist) */
                     be->stmt_set_hash = 0;
+                    memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }
                 backend_pool_return(be->pool, be, false);
                 if (worker->stats_ctx)
                     KEEL_STAT_INC(worker->stats_ctx, pool_returns);
             }
             session->backend_conn = NULL;
+            session->backend_generation = 0;
             session->server_fd = -1;
         } else if (can_release && session->server_fd >= 0 && !session->backend_conn) {
             /* Non-pooled connection that's reusable — close it since we can't pool */

@@ -185,6 +185,22 @@ void keel_admin_set_throttle_rules(keel_admin_t *admin,
 void keel_admin_set_discovery(keel_admin_t *admin,
                               keel_discovery_t *discovery);
 
+/**
+ * @brief Return the TCP port the admin console is actually listening on.
+ *
+ * Useful when `admin_port = 0` was specified and the OS assigned an
+ * ephemeral port.  Returns 0 if the admin listener is not open.
+ */
+uint16_t keel_admin_get_port(const keel_admin_t *admin);
+
+/**
+ * @brief Return the TCP port the Prometheus exporter is actually listening on.
+ *
+ * Useful when `prom_port = 0` was specified and the OS assigned an
+ * ephemeral port.  Returns 0 if the Prometheus listener is not open.
+ */
+uint16_t keel_admin_get_prom_port(const keel_admin_t *admin);
+
 #ifdef __cplusplus
 }
 #endif

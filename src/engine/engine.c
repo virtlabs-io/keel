@@ -500,7 +500,7 @@ int keel_engine_drain(keel_engine_t* engine) {
 
         /* Sleep briefly to avoid busy-waiting */
         struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-        nanosleep(&sleep_ts, NULL);
+        nanosleep(&sleep_ts, NULL); /* NOLINT(keel-blocking): lifecycle drain loop, not worker reactor */
     }
 
     uint64_t final_active = __atomic_load_n(&engine->active_connections, __ATOMIC_RELAXED);
@@ -735,7 +735,7 @@ int keel_engine_restart_workers(keel_engine_t* engine, uint32_t drain_timeout_ms
         if (still_active == 0) break;
 
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-        nanosleep(&ts, NULL);
+        nanosleep(&ts, NULL); /* NOLINT(keel-blocking): graceful restart control loop, not worker reactor */
     } while (engine_get_time_ns() < deadline_ns);
 
     /* Phase 5 — force-stop any stragglers. */
@@ -802,6 +802,20 @@ void keel_engine_destroy(keel_engine_t* engine) {
     KEEL_LOG_DEBUG(KEEL_LOG_CAT_CORE, "engine: destroyed (total connections: %llu)", 
               (unsigned long long)engine->total_connections);
     
+    /* Free heap-allocated strings for any dynamically-added servers
+     * (servers with dynamic=true were added via ADD SERVER at runtime). */
+    for (size_t i = 0; i < engine->config.server_pool.count; i++) {
+        keel_backend_server_t *srv = &engine->config.server_pool.servers[i];
+        if (!srv->dynamic) continue;
+        keel_free((void*)srv->host);
+        keel_free((void*)srv->user);
+        keel_free((void*)srv->password);
+        keel_free((void*)srv->database);
+        keel_free((void*)srv->probe_user);
+        keel_free((void*)srv->probe_password);
+        keel_free((void*)srv->probe_auth);
+    }
+
     keel_free(engine);
 }
 
@@ -1051,6 +1065,7 @@ uint32_t keel_engine_get_num_workers(keel_engine_t* engine) {
  */
 const keel_worker_t* keel_engine_get_worker(keel_engine_t* engine, uint32_t idx) {
     if (!engine || idx >= engine->num_workers) return NULL;
+    if (!engine->worker_pool.workers) return NULL;
     return &engine->worker_pool.workers[idx];
 }
 
@@ -1063,6 +1078,7 @@ const keel_worker_t* keel_engine_get_worker(keel_engine_t* engine, uint32_t idx)
  */
 keel_worker_t* keel_engine_get_worker_mut(keel_engine_t* engine, uint32_t idx) {
     if (!engine || idx >= engine->num_workers) return NULL;
+    if (!engine->worker_pool.workers) return NULL;
     return &engine->worker_pool.workers[idx];
 }
 

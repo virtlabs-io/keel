@@ -67,13 +67,13 @@ Set the tier per worker group in your INI file:
 
 ```ini
 [worker-group:main]
-mode = smart            # proxy | pool | smart | full (default: full)
+mode = smart            # proxy | pool | smart | full (default: pool)
 workers = 4
 listen_port = 7432
 ```
 
-The default is `full` — all features enabled.  Explicitly set a lower tier only when you know
-you don't need the higher-tier features and want to minimize per-query overhead.
+The default is `pool` for production-safe startup behavior. Raise the tier only
+when your deployment explicitly needs routing (`smart`) or hook/LSN features (`full`).
 
 ### Example Configurations
 
@@ -87,14 +87,14 @@ prepared_statement = virtualize
 **Intelligent routing with observability:**
 ```ini
 [worker-group:main]
-mode = smart
+mode = smart   # hardening tier for v0.2-alpha
 query_log = all
 ```
 
 **Full programmability with hooks and safety:**
 ```ini
 [worker-group:main]
-mode = full
+mode = full    # explicit opt-in; not the default production profile
 transaction_tracking = on
 hook_script_lua = /etc/keel/hooks/audit.lua
 ```
@@ -201,9 +201,9 @@ backend with zero pooling sophistication.
                                        SMART               FULL
 ```
 
-**When in doubt, use `full`.**  The overhead of unused features at the `full` tier is modest
-(~3-5% over `smart`), and you retain access to all safety guarantees and extensibility.  Only
-drop to a lower tier when profiling shows the overhead matters for your workload.
+**When in doubt, start with `pool`.** For `v0.2-alpha`, that is the recommended
+production tier. Move to `smart` or `full` only after you have validated the
+higher-tier behavior you need in your environment.
 
 ---
 

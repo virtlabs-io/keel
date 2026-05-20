@@ -36,6 +36,23 @@
 #include <time.h>
 #include <liburing.h>
 
+/* MemorySanitizer: mark kernel-filled receive buffers as initialised.
+ * io_uring asks the kernel to write received bytes into a user-supplied buffer
+ * but MSan does not observe kernel writes, so every downstream read triggers
+ * a false-positive "use-of-uninitialized-value" report.  The macro is placed
+ * just before the completion callback so all receive paths (buf-ring and
+ * direct) are covered.  On non-MSan builds the macro compiles to nothing. */
+#if defined(__has_feature)
+#  if __has_feature(memory_sanitizer)
+#    include <sanitizer/msan_interface.h>
+#    define KEEL_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
+#  else
+#    define KEEL_MSAN_UNPOISON(ptr, size) ((void)0)
+#  endif
+#else
+#  define KEEL_MSAN_UNPOISON(ptr, size) ((void)0)
+#endif
+
 /* ============================================================================
  * Internal Structures
  * ============================================================================ */
@@ -777,11 +794,11 @@ static int iouring_recv(
 #endif /* KEEL_HAS_URING_RECV_MULTISHOT */
 
     } else {
-        op->orig_buf = NULL;
+        op->orig_buf = buf;
         io_uring_prep_recv(sqe, fd, buf, len, flags);
     }
 #else  /* !KEEL_HAS_URING_BUF_RING */
-    op->orig_buf = NULL;
+    op->orig_buf = buf;
     io_uring_prep_recv(sqe, fd, buf, len, flags);
 #endif /* KEEL_HAS_URING_BUF_RING */
 
@@ -1093,7 +1110,7 @@ static int iouring_chain_send_recv(
     recv_op->callback  = on_recv_done;
     recv_op->type      = KEEL_OP_RECV;
     recv_op->multishot = false;
-    recv_op->orig_buf  = NULL;
+    recv_op->orig_buf  = recv_buf;
     recv_op->fd        = -1;
 
     io_uring_prep_recv(sqe_recv, recv_fd, recv_buf, recv_len, recv_flags);
@@ -1324,6 +1341,11 @@ static void iouring_handle_completion(keel_reactor_t* reactor,
     keel_reactor_set_completion_batch_size(batch_size);
     keel_reactor_set_completion_batch_index(batch_index);
     keel_reactor_set_completion_seen_ns(iouring_time_ns());
+    /* Unpoison the receive buffer: the kernel fills it via io_uring but MSan
+     * does not observe the kernel write.  Mark the received bytes as
+     * initialised to prevent cascading false-positive reports downstream. */
+    if (op->type == KEEL_OP_RECV && res > 0 && op->orig_buf != NULL)
+        KEEL_MSAN_UNPOISON(op->orig_buf, (size_t)res);
     op->callback(op->userdata, res);
     keel_reactor_set_completion_seen_ns(0);
     keel_reactor_set_completion_wakeup_ns(0);

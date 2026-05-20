@@ -1379,6 +1379,7 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
     /* -------- ERR Packet (0xFF) — always checked, can abort any state -------- */
     if (marker == MY_ERR) {
         act->type = KEEL_BE_ACT_ERROR;
+        act->is_error_response = true;
         act->query_complete = true;
         ctx->result_state = MY_RS_IDLE;
 
@@ -2079,6 +2080,95 @@ static ssize_t myf_cleanup_slot(void* vctx, int be_fd,
     }
 }
 
+typedef struct my_cleanup_drain_state {
+    uint8_t  hdr[MY_HDR];
+    uint8_t  hdr_len;
+    uint32_t payload_len;
+    uint32_t payload_seen;
+    uint8_t  marker;
+    bool     marker_seen;
+} my_cleanup_drain_state_t;
+
+static void my_cleanup_reset_packet(my_cleanup_drain_state_t* st)
+{
+    memset(st->hdr, 0, sizeof(st->hdr));
+    st->hdr_len = 0;
+    st->payload_len = 0;
+    st->payload_seen = 0;
+    st->marker = 0;
+    st->marker_seen = false;
+}
+
+static keel_proto_drain_result_t myf_drain_cleanup_response(
+    void* vctx,
+    keel_proto_drain_state_t* state,
+    const uint8_t* data,
+    size_t len,
+    size_t* consumed_out)
+{
+    (void)vctx;
+    if (consumed_out)
+        *consumed_out = 0;
+    if (!state || (!data && len > 0))
+        return KEEL_PROTO_DRAIN_ERROR;
+
+    my_cleanup_drain_state_t* st = (my_cleanup_drain_state_t*)state->opaque;
+    size_t pos = 0;
+
+    while (pos < len) {
+        if (st->hdr_len < MY_HDR) {
+            size_t need = MY_HDR - st->hdr_len;
+            size_t take = (len - pos < need) ? (len - pos) : need;
+            memcpy(st->hdr + st->hdr_len, data + pos, take);
+            st->hdr_len += (uint8_t)take;
+            pos += take;
+
+            if (st->hdr_len < MY_HDR) {
+                if (consumed_out)
+                    *consumed_out = pos;
+                return KEEL_PROTO_DRAIN_MORE;
+            }
+
+            st->payload_len = rdle24(st->hdr);
+            st->payload_seen = 0;
+            st->marker_seen = false;
+            if (st->payload_len == 0 || st->payload_len > MY_MAX_PKT) {
+                if (consumed_out)
+                    *consumed_out = pos;
+                return KEEL_PROTO_DRAIN_ERROR;
+            }
+        }
+
+        uint32_t remaining = st->payload_len - st->payload_seen;
+        size_t take = (len - pos < remaining) ? (len - pos) : remaining;
+        if (!st->marker_seen && take > 0) {
+            st->marker = data[pos];
+            st->marker_seen = true;
+        }
+
+        pos += take;
+        st->payload_seen += (uint32_t)take;
+
+        if (st->payload_seen < st->payload_len) {
+            if (consumed_out)
+                *consumed_out = pos;
+            return KEEL_PROTO_DRAIN_MORE;
+        }
+
+        bool ok = st->marker_seen && st->marker == MY_OK;
+        my_cleanup_reset_packet(st);
+        if (consumed_out)
+            *consumed_out = pos;
+        if (!ok)
+            return KEEL_PROTO_DRAIN_ERROR;
+        return KEEL_PROTO_DRAIN_COMPLETE;
+    }
+
+    if (consumed_out)
+        *consumed_out = pos;
+    return KEEL_PROTO_DRAIN_MORE;
+}
+
 /**
  * @brief Vtable hook: verify backend liveness by exchanging a `COM_PING` packet.
  *
@@ -2671,6 +2761,7 @@ const keel_proto_flow_vtable_t keel_proto_flow_mysql = {
     .stream_write          = NULL,
     .end_stream            = NULL,
     .cleanup_slot          = myf_cleanup_slot,
+    .drain_cleanup_response = myf_drain_cleanup_response,
     .probe_backend         = myf_probe_backend,
     .get_backend_metadata  = myf_get_backend_metadata,
     .get_metrics           = myf_get_metrics,

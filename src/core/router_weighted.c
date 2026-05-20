@@ -52,6 +52,34 @@
 #define KEEL_DEFAULT_QUERY_TIMEOUT_MS         30000U
 
 /* ============================================================================
+ * Route-reason name table
+ * ============================================================================ */
+
+const char* keel_route_reason_name(keel_route_reason_t r)
+{
+    switch (r) {
+    case KEEL_ROUTE_REASON_NORMAL:            return "NORMAL";
+    case KEEL_ROUTE_REASON_IN_TRANSACTION:    return "IN_TRANSACTION";
+    case KEEL_ROUTE_REASON_PINNED_SESSION:    return "PINNED_SESSION";
+    case KEEL_ROUTE_REASON_PINNED_PS:         return "PINNED_PS";
+    case KEEL_ROUTE_REASON_HARD_PINNED:       return "HARD_PINNED";
+    case KEEL_ROUTE_REASON_WRITE_REQUIRED:    return "WRITE_REQUIRED";
+    case KEEL_ROUTE_REASON_READ_SPLIT:        return "READ_SPLIT";
+    case KEEL_ROUTE_REASON_FAILOVER_PRIMARY:  return "FAILOVER_PRIMARY";
+    case KEEL_ROUTE_REASON_LAG_EXCEEDED:      return "LAG_EXCEEDED";
+    case KEEL_ROUTE_REASON_HEALTH_DEGRADED:   return "HEALTH_DEGRADED";
+    case KEEL_ROUTE_REASON_NO_PRIMARY:        return "NO_PRIMARY";
+    case KEEL_ROUTE_REASON_CID_BLOCKED:       return "CID_BLOCKED";
+    case KEEL_ROUTE_REASON_TIMELINE_STALE:    return "TIMELINE_STALE";
+    case KEEL_ROUTE_REASON_PATRONI_UNAVAIL:   return "PATRONI_UNAVAIL";
+    case KEEL_ROUTE_REASON_ROLE_FLAPPING:     return "ROLE_FLAPPING";
+    case KEEL_ROUTE_REASON_DDL:               return "DDL";
+    case KEEL_ROUTE_REASON_TRANSACTION_CTRL:  return "TRANSACTION_CTRL";
+    default:                                  return "UNKNOWN";
+    }
+}
+
+/* ============================================================================
  * Internal Types
  * ============================================================================ */
 
@@ -857,9 +885,10 @@ static keel_error_t route_internal(keel_router_t* router,
     router->stats.total_routes++;
 
     if (session && session->pinned_server) {
-        decision->server = session->pinned_server;
-        decision->was_pinned = true;
-        decision->reason = "session pinned";
+        decision->server      = session->pinned_server;
+        decision->was_pinned  = true;
+        decision->reason      = "session pinned";
+        decision->reason_code = KEEL_ROUTE_REASON_PINNED_SESSION;
         router->stats.pinned_routes++;
         return KEEL_OK;
     }
@@ -907,14 +936,16 @@ static keel_error_t route_internal(keel_router_t* router,
             }
             if (selected) {
                 router->stats.failover_routes++;
-                decision->reason = use_shard_filter ? "single-shard failover to RW" : "failover to RW";
+                decision->reason      = use_shard_filter ? "single-shard failover to RW" : "failover to RW";
+                decision->reason_code = KEEL_ROUTE_REASON_FAILOVER_PRIMARY;
             }
         }
 
         if (selected) {
             router->stats.read_routes++;
             if (!decision->reason) {
-                decision->reason = use_shard_filter ? "single-shard read query" : "read query";
+                decision->reason      = use_shard_filter ? "single-shard read query" : "read query";
+                decision->reason_code = KEEL_ROUTE_REASON_READ_SPLIT;
             }
         }
     } else {
@@ -930,15 +961,20 @@ static keel_error_t route_internal(keel_router_t* router,
         if (selected) {
             router->stats.write_routes++;
             if (session && session->in_transaction) {
-                decision->reason = use_shard_filter ? "single-shard transaction" : "in transaction";
+                decision->reason      = use_shard_filter ? "single-shard transaction" : "in transaction";
+                decision->reason_code = KEEL_ROUTE_REASON_IN_TRANSACTION;
             } else if (qt && qt->operation == KEEL_QT_OP_TRANSACTION) {
-                decision->reason = "transaction control";
+                decision->reason      = "transaction control";
+                decision->reason_code = KEEL_ROUTE_REASON_TRANSACTION_CTRL;
             } else if (qt && qt->operation == KEEL_QT_OP_DDL) {
-                decision->reason = "DDL statement";
+                decision->reason      = "DDL statement";
+                decision->reason_code = KEEL_ROUTE_REASON_DDL;
             } else if (qt && qt->operation == KEEL_QT_OP_WRITE) {
-                decision->reason = use_shard_filter ? "single-shard write query" : "write query";
+                decision->reason      = use_shard_filter ? "single-shard write query" : "write query";
+                decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
             } else {
-                decision->reason = use_shard_filter ? "single-shard RW required" : "RW required";
+                decision->reason      = use_shard_filter ? "single-shard RW required" : "RW required";
+                decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
             }
         }
     }
@@ -1510,9 +1546,10 @@ static keel_error_t route_shard_for_scatter(keel_router_t*              router,
     router->stats.total_routes++;
 
     if (session && session->pinned_server) {
-        decision->server     = session->pinned_server;
-        decision->was_pinned = true;
-        decision->reason     = "session pinned";
+        decision->server      = session->pinned_server;
+        decision->was_pinned  = true;
+        decision->reason      = "session pinned";
+        decision->reason_code = KEEL_ROUTE_REASON_PINNED_SESSION;
         router->stats.pinned_routes++;
         return KEEL_OK;
     }
@@ -1542,15 +1579,17 @@ static keel_error_t route_shard_for_scatter(keel_router_t*              router,
             }
             if (selected) {
                 router->stats.failover_routes++;
-                decision->reason = "scatter read failover to RW";
+                decision->reason      = "scatter read failover to RW";
+                decision->reason_code = KEEL_ROUTE_REASON_FAILOVER_PRIMARY;
             }
         }
 
         if (selected) {
-            decision->is_read = true;
+            decision->is_read    = true;
             router->stats.read_routes++;
             if (!decision->reason) {
-                decision->reason = "scatter read";
+                decision->reason      = "scatter read";
+                decision->reason_code = KEEL_ROUTE_REASON_READ_SPLIT;
             }
         }
     } else {
@@ -1564,7 +1603,8 @@ static keel_error_t route_shard_for_scatter(keel_router_t*              router,
 
         if (selected) {
             router->stats.write_routes++;
-            decision->reason = "scatter write";
+            decision->reason      = "scatter write";
+            decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
         }
     }
 

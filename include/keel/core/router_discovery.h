@@ -188,6 +188,10 @@ typedef struct keel_discovery_config {
     const char*              patroni_url;    /**< Patroni REST API base URL */
     const char*              cluster_name;   /**< Cluster to discover */
 
+    /* Role-flap dampening */
+    uint32_t                 flap_dampening_window_s;   /**< Window for counting role flips (0=disabled) */
+    uint32_t                 flap_dampening_threshold;  /**< Max flips in window before dampening kicks in */
+
     /* pg_auto_failover settings */
     const char*              monitor_connstr; /**< Monitor connection string */
     const char*              formation;       /**< Formation name */
@@ -218,6 +222,8 @@ typedef struct keel_failover_event {
     const char*             new_primary;    /**< New primary name */
     keel_time_t              detected_at;    /**< When detected */
     const char*             reason;         /**< Failover reason (if known) */
+    int                     old_timeline;   /**< WAL timeline before promotion */
+    int                     new_timeline;   /**< WAL timeline after promotion */
 } keel_failover_event_t;
 
 /**
@@ -226,6 +232,33 @@ typedef struct keel_failover_event {
 typedef void (*keel_failover_callback_fn)(
     void* user_data,
     const keel_failover_event_t* event
+);
+
+/**
+ * @brief Structured record for a single server role change.
+ *
+ * Emitted via @c keel_role_change_callback_fn whenever a server's role
+ * transitions between primary and replica (or to unknown).  The @c flap_count
+ * field accumulates over the lifetime of the discovery instance so a steadily
+ * growing value indicates persistent instability.
+ */
+typedef struct keel_role_change_event {
+    char                    server_name[64]; /**< Server identifier */
+    keel_server_role_t       old_role;        /**< Previous role */
+    keel_server_role_t       new_role;        /**< New role */
+    int                     old_timeline;    /**< WAL timeline before change */
+    int                     new_timeline;    /**< WAL timeline after change */
+    keel_time_t              changed_at;      /**< Monotonic timestamp of detection */
+    uint32_t                flap_count;      /**< Total role flips seen for this server */
+    bool                    dampened;        /**< True: change suppressed by dampening */
+} keel_role_change_event_t;
+
+/**
+ * @brief Callback invoked on every (undampened) server role change.
+ */
+typedef void (*keel_role_change_callback_fn)(
+    void* user_data,
+    const keel_role_change_event_t* event
 );
 
 /* ============================================================================
@@ -398,6 +431,25 @@ void keel_discovery_on_failover(
     keel_discovery_t* disc,
     keel_failover_callback_fn callback,
     void* user_data
+);
+
+/**
+ * @brief Register a role-change callback.
+ *
+ * The callback fires on every role transition observed during topology
+ * refresh.  Dampened transitions (within the flap window) still fire but
+ * have @c event->dampened set to @c true so the caller can choose to ignore
+ * them or count them separately.
+ *
+ * @param disc      Discovery instance.
+ * @param callback  Callback function, or @c NULL to deregister.
+ * @param user_data Opaque value forwarded to the callback.
+ * @return
+ */
+void keel_discovery_on_role_change(
+    keel_discovery_t*            disc,
+    keel_role_change_callback_fn callback,
+    void*                        user_data
 );
 
 #ifdef __cplusplus

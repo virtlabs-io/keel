@@ -22,6 +22,7 @@
 #include "test_utils.h"
 #include "keel/probe/probe.h"
 #include "keel/probe/probe_common.h"
+#include "keel/engine/engine.h"
 #include "keel/mem/mem.h"
 #include "keel_types.h"
 #include "keel_error.h"
@@ -31,7 +32,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 /* ============================================================================
  * §1  Probe Registry Tests
@@ -519,6 +525,770 @@ static void test_probe_result_error_field(void) {
 }
 
 /* ============================================================================
+ * §16  Real PostgreSQL probe vtable — mock TCP server
+ *
+ * We spawn a minimal PG-wire server in a background thread.  The server:
+ *   1. Accepts one connection
+ *   2. Reads (and discards) the startup message
+ *   3. Sends AuthenticationOK + ParameterStatus + BackendKeyData + ReadyForQuery
+ *   4. Reads the role-detection query ('Q' message)
+ *   5. Sends RowDescription + DataRow("t") + CommandComplete + ReadyForQuery
+ *   6. Closes the connection
+ *
+ * The main thread calls keel_probe_postgres_ops.create() + check() and verifies
+ * the probe reaches KEEL_HEALTH_UP and detects the primary role.
+ * ============================================================================ */
+
+/* Wire helpers used by the mock server */
+static void mock_wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >>  8); p[3] = (uint8_t)v;
+}
+
+static ssize_t mock_recv_all(int fd, uint8_t *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, buf + got, n - got, 0);
+        if (r <= 0) return (ssize_t)got;
+        got += (size_t)r;
+    }
+    return (ssize_t)got;
+}
+
+static int mock_send_all(int fd, const uint8_t *buf, size_t n) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t s = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (s <= 0) return -1;
+        sent += (size_t)s;
+    }
+    return 0;
+}
+
+/** Write a PG message: tag + int32(4+bodylen) + body */
+static int mock_pg_msg(int fd, uint8_t tag, const uint8_t *body, size_t blen) {
+    uint8_t hdr[5];
+    hdr[0] = tag;
+    mock_wr32(hdr + 1, (uint32_t)(4 + blen));
+    if (mock_send_all(fd, hdr, 5) < 0) return -1;
+    if (blen > 0 && mock_send_all(fd, body, blen) < 0) return -1;
+    return 0;
+}
+
+/** Serve a minimal AuthOK + ParameterStatus + BackendKeyData + ReadyForQuery */
+static void mock_pg_send_startup_ok(int fd) {
+    /* AuthenticationOK: 'R' + int32(8) + int32(0) */
+    uint8_t auth_ok[8]; mock_wr32(auth_ok, 0);
+    mock_pg_msg(fd, 'R', auth_ok, 4);
+
+    /* ParameterStatus: 'S' + int32(len) + "server_version\0" + "14\0" */
+    uint8_t ps[32];
+    memcpy(ps, "server_version", 15);
+    memcpy(ps + 15, "14", 3);
+    mock_pg_msg(fd, 'S', ps, 18);
+
+    /* BackendKeyData: 'K' + int32(12) + int32(pid) + int32(key) */
+    uint8_t bkd[8]; mock_wr32(bkd, 12345); mock_wr32(bkd + 4, 0);
+    mock_pg_msg(fd, 'K', bkd, 8);
+
+    /* ReadyForQuery: 'Z' + int32(5) + 'I' */
+    uint8_t rfq[1] = { 'I' };
+    mock_pg_msg(fd, 'Z', rfq, 1);
+}
+
+/** Serve a result for SELECT NOT pg_is_in_recovery() AS is_primary → 't' */
+static void mock_pg_send_role_result(int fd, bool is_primary) {
+    /* RowDescription: 'T' + ... + 1 col "is_primary" */
+    uint8_t rd[64];
+    size_t off = 0;
+    mock_wr32(rd + off, 0); off += 2; /* ncols = 1 (int16 BE) */
+    /* Fix: ncols is 2 bytes */
+    rd[0] = 0; rd[1] = 1; off = 2;
+    /* col name: "is_primary\0" */
+    memcpy(rd + off, "is_primary", 11); off += 11;
+    /* tableoid(4) colno(2) typeoid(4) typlen(2) typmod(4) fmt(2) */
+    memset(rd + off, 0, 18); off += 18;
+    mock_pg_msg(fd, 'T', rd, off);
+
+    /* DataRow: 'D' + ... ncols(2) + col_len(4) + value */
+    const char *val = is_primary ? "t" : "f";
+    uint8_t dr[32];
+    off = 0;
+    dr[off++] = 0; dr[off++] = 1;  /* ncols = 1 */
+    mock_wr32(dr + off, 1); off += 4;  /* col length = 1 */
+    dr[off++] = (uint8_t)val[0];
+    mock_pg_msg(fd, 'D', dr, off);
+
+    /* CommandComplete */
+    mock_pg_msg(fd, 'C', (const uint8_t *)"SELECT 1\0", 9);
+
+    /* ReadyForQuery */
+    uint8_t rfq[1] = { 'I' };
+    mock_pg_msg(fd, 'Z', rfq, 1);
+}
+
+typedef struct mock_pg_server_args {
+    int     listen_fd;
+    bool    send_auth_error;   /* if true: send ErrorResponse instead of AuthOK */
+    bool    is_primary;        /* role to report in row result */
+} mock_pg_server_args_t;
+
+static void *mock_pg_server_thread(void *arg) {
+    mock_pg_server_args_t *a = (mock_pg_server_args_t *)arg;
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    int cfd = accept(a->listen_fd, NULL, NULL);
+    if (cfd < 0) return NULL;
+
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* Drain the startup message (first 4 bytes = total length) */
+    uint8_t hdr[8];
+    if (mock_recv_all(cfd, hdr, 8) < 8) { close(cfd); return NULL; }
+    uint32_t msglen = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16)
+                    | ((uint32_t)hdr[2] << 8)  |  (uint32_t)hdr[3];
+    if (msglen > 8) {
+        size_t rem = msglen - 8;
+        uint8_t discard[512];
+        while (rem > 0) {
+            size_t chunk = rem < sizeof(discard) ? rem : sizeof(discard);
+            mock_recv_all(cfd, discard, chunk);
+            rem -= chunk;
+        }
+    }
+
+    if (a->send_auth_error) {
+        /* Send an ErrorResponse instead of AuthOK */
+        const char *emsg = "EFATAL\0VFATAL\0C28000\0MAuthentication failed\0\0";
+        mock_pg_msg(cfd, 'E', (const uint8_t *)emsg, 44);
+        close(cfd);
+        return NULL;
+    }
+
+    /* Send auth OK + params + ready */
+    mock_pg_send_startup_ok(cfd);
+
+    /* Drain the role-detection query ('Q' message) */
+    uint8_t qhdr[5];
+    if (mock_recv_all(cfd, qhdr, 5) >= 5) {
+        uint32_t qlen = ((uint32_t)qhdr[1] << 24) | ((uint32_t)qhdr[2] << 16)
+                      | ((uint32_t)qhdr[3] << 8)  |  (uint32_t)qhdr[4];
+        if (qlen > 4) {
+            size_t rem = qlen - 4;
+            uint8_t qbody[512];
+            while (rem > 0) {
+                size_t chunk = rem < sizeof(qbody) ? rem : sizeof(qbody);
+                mock_recv_all(cfd, qbody, chunk);
+                rem -= chunk;
+            }
+        }
+        /* Send role result */
+        mock_pg_send_role_result(cfd, a->is_primary);
+    }
+
+    /* Drain Terminate ('X') if sent */
+    uint8_t term[5];
+    mock_recv_all(cfd, term, 5);
+
+    close(cfd);
+    return NULL;
+}
+
+/** Create a loopback listener, return fd and port. */
+static int make_probe_listen_socket(uint16_t *out_port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in sa = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = 0,
+    };
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
+    if (listen(fd, 8) < 0) { close(fd); return -1; }
+    socklen_t slen = sizeof(sa);
+    getsockname(fd, (struct sockaddr *)&sa, &slen);
+    *out_port = ntohs(sa.sin_port);
+    return fd;
+}
+
+static void test_probe_postgres_trust_auth(void) {
+    TEST_BEGIN("probe postgres: trust auth → HEALTH_UP + primary role");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("postgres");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    /* Start mock server thread */
+    mock_pg_server_args_t args = { .listen_fd = lfd, .send_auth_error = false, .is_primary = true };
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_pg_server_thread, &args);
+
+    /* Build server descriptor pointing to our mock */
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    keel_backend_server_t srv = {
+        .host          = "127.0.0.1",
+        .port          = port,
+        .user          = "probe",
+        .password      = NULL,
+        .database      = "postgres",
+        .probe_auth    = "trust",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    keel_error_t err = ops->check(ctx, &srv, &result);
+
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_UP);
+
+    if (ctx) ops->destroy(ctx);
+
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_postgres_auth_error(void) {
+    TEST_BEGIN("probe postgres: auth error → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("postgres");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_pg_server_args_t args = { .listen_fd = lfd, .send_auth_error = true, .is_primary = false };
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_pg_server_thread, &args);
+
+    keel_backend_server_t srv = {
+        .host       = "127.0.0.1",
+        .port       = port,
+        .user       = "probe",
+        .password   = "wrong",
+        .database   = "postgres",
+        .probe_auth = "password",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+    /* Auth error → health is DOWN */
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_DOWN);
+
+    if (ctx) ops->destroy(ctx);
+
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_postgres_connection_refused(void) {
+    TEST_BEGIN("probe postgres: refused connection → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("postgres");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    /* Use port 1 — always refused */
+    keel_backend_server_t srv = {
+        .host     = "127.0.0.1",
+        .port     = 1,
+        .user     = "probe",
+        .database = "postgres",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_DOWN);
+
+    if (ctx) ops->destroy(ctx);
+
+    TEST_END();
+}
+
+static void test_probe_postgres_create_destroy_null(void) {
+    TEST_BEGIN("probe postgres: create/destroy NULL-safety");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("postgres");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    /* destroy(NULL) must not crash */
+    if (ops->destroy) ops->destroy(NULL);
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * §17  Patroni probe vtable — mock HTTP server
+ * ============================================================================ */
+
+typedef struct mock_http_server_args {
+    int     listen_fd;
+    int     status_code;     /* HTTP status code to return */
+    char    role_body[64];   /* JSON body snippet */
+} mock_http_server_args_t;
+
+static void *mock_http_server_thread(void *arg) {
+    mock_http_server_args_t *a = (mock_http_server_args_t *)arg;
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    int cfd = accept(a->listen_fd, NULL, NULL);
+    if (cfd < 0) return NULL;
+
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* Drain HTTP request */
+    uint8_t rbuf[4096];
+    recv(cfd, rbuf, sizeof(rbuf) - 1, 0);
+
+    /* Send HTTP response */
+    char resp[512];
+    const char *body = a->role_body[0] ? a->role_body : "{}";
+    int n = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 %d OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        a->status_code, strlen(body), body);
+    if (n > 0) send(cfd, resp, (size_t)n, MSG_NOSIGNAL);
+
+    close(cfd);
+    return NULL;
+}
+
+static void test_probe_patroni_primary(void) {
+    TEST_BEGIN("probe patroni: HTTP 200 primary → HEALTH_UP");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("patroni");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_http_server_args_t args = {
+        .listen_fd   = lfd,
+        .status_code = 200,
+    };
+    snprintf(args.role_body, sizeof(args.role_body), "{\"role\":\"master\"}");
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_http_server_thread, &args);
+
+    /* Patroni probe uses extra param as the HTTP port string */
+    char port_str[12];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    keel_backend_server_t srv = {
+        .host     = "127.0.0.1",
+        .port     = 5432,   /* PG port (unused by patroni probe) */
+        .user     = "probe",
+        .database = "postgres",
+    };
+
+    void *ctx = ops->create(&srv, port_str);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    keel_error_t err = ops->check(ctx, &srv, &result);
+
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_UP);
+
+    if (ctx) ops->destroy(ctx);
+
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_patroni_replica(void) {
+    TEST_BEGIN("probe patroni: HTTP 200 replica → HEALTH_UP");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("patroni");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_http_server_args_t args = {
+        .listen_fd   = lfd,
+        .status_code = 200,
+    };
+    snprintf(args.role_body, sizeof(args.role_body), "{\"role\":\"replica\"}");
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_http_server_thread, &args);
+
+    char port_str[12];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    keel_backend_server_t srv = {
+        .host = "127.0.0.1", .port = 5432,
+        .user = "probe", .database = "postgres",
+    };
+
+    void *ctx = ops->create(&srv, port_str);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_UP);
+
+    if (ctx) ops->destroy(ctx);
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_patroni_503(void) {
+    TEST_BEGIN("probe patroni: HTTP 503 → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("patroni");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_http_server_args_t args = {
+        .listen_fd   = lfd,
+        .status_code = 503,
+    };
+    snprintf(args.role_body, sizeof(args.role_body), "{\"state\":\"stopped\"}");
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_http_server_thread, &args);
+
+    char port_str[12];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    keel_backend_server_t srv = {
+        .host = "127.0.0.1", .port = 5432,
+        .user = "probe", .database = "postgres",
+    };
+
+    void *ctx = ops->create(&srv, port_str);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+
+    if (ctx) ops->destroy(ctx);
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_patroni_connection_refused(void) {
+    TEST_BEGIN("probe patroni: refused HTTP port → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("patroni");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    keel_backend_server_t srv = {
+        .host = "127.0.0.1", .port = 5432,
+        .user = "probe", .database = "postgres",
+    };
+
+    void *ctx = ops->create(&srv, "1");  /* port 1 = always refused */
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_DOWN);
+
+    if (ctx) ops->destroy(ctx);
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * §18  MySQL probe vtable — mock MySQL handshake server
+ * ============================================================================ */
+
+/** Build a minimal MySQL v10 Initial Handshake packet into buf, return length. */
+static size_t build_mysql_greeting(uint8_t *buf, size_t cap) {
+    if (cap < 64) return 0;
+    memset(buf, 0, cap);
+    size_t off = 0;
+
+    /* 4-byte header: length(3) + seq_id(1) = placeholder, fix later */
+    off += 4;
+
+    buf[off++] = 10;  /* protocol version */
+
+    /* server version "8.0.30\0" */
+    memcpy(buf + off, "8.0.30", 7); off += 7;
+
+    /* connection_id */
+    buf[off++] = 1; buf[off++] = 0; buf[off++] = 0; buf[off++] = 0;
+
+    /* auth scramble part 1 (8 bytes) */
+    for (int i = 0; i < 8; i++) buf[off++] = (uint8_t)(i + 1);
+    buf[off++] = 0;  /* filler */
+
+    /* capability flags low: PROTOCOL_41 | PLUGIN_AUTH | SECURE_CONNECTION */
+    uint32_t caps = (1U << 9) | (1U << 19) | (1U << 15);
+    buf[off++] = (uint8_t)(caps & 0xFF);
+    buf[off++] = (uint8_t)((caps >> 8) & 0xFF);
+
+    buf[off++] = 0x21;  /* charset */
+    buf[off++] = 2; buf[off++] = 0;  /* status flags */
+
+    /* capability flags high */
+    buf[off++] = (uint8_t)((caps >> 16) & 0xFF);
+    buf[off++] = (uint8_t)((caps >> 24) & 0xFF);
+
+    /* auth_plugin_data_len = 21 */
+    buf[off++] = 21;
+
+    /* reserved 10 bytes */
+    for (int i = 0; i < 10; i++) buf[off++] = 0;
+
+    /* auth scramble part 2 (13 bytes) */
+    for (int i = 0; i < 13; i++) buf[off++] = (uint8_t)(0x10 + i);
+
+    /* plugin name */
+    memcpy(buf + off, "mysql_native_password", 22); off += 22;
+
+    /* Fix header length */
+    uint32_t body = (uint32_t)(off - 4);
+    buf[0] = (uint8_t)(body & 0xFF);
+    buf[1] = (uint8_t)((body >> 8) & 0xFF);
+    buf[2] = (uint8_t)((body >> 16) & 0xFF);
+    buf[3] = 0;  /* seq_id */
+
+    return off;
+}
+
+/** Build a MySQL OK packet (seq_id=2). */
+static size_t build_mysql_ok(uint8_t *buf) {
+    buf[0] = 7; buf[1] = 0; buf[2] = 0; /* length = 7 */
+    buf[3] = 2;  /* seq_id */
+    buf[4] = 0;  /* OK marker */
+    buf[5] = 0;  /* affected_rows */
+    buf[6] = 0;  /* last_insert_id */
+    buf[7] = 2; buf[8] = 0;  /* status */
+    buf[9] = 0; buf[10] = 0; /* warnings */
+    return 11;
+}
+
+typedef struct mock_mysql_server_args {
+    int  listen_fd;
+    bool send_error;  /* send ERR instead of OK */
+} mock_mysql_server_args_t;
+
+static void *mock_mysql_server_thread(void *arg) {
+    mock_mysql_server_args_t *a = (mock_mysql_server_args_t *)arg;
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    int cfd = accept(a->listen_fd, NULL, NULL);
+    if (cfd < 0) return NULL;
+
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* 1. Send greeting */
+    uint8_t greet[128];
+    size_t glen = build_mysql_greeting(greet, sizeof(greet));
+    mock_send_all(cfd, greet, glen);
+
+    /* 2. Drain handshake response */
+    uint8_t rbuf[1024];
+    mock_recv_all(cfd, rbuf, 4);
+    uint32_t rlen = (uint32_t)rbuf[0] | ((uint32_t)rbuf[1] << 8) | ((uint32_t)rbuf[2] << 16);
+    if (rlen > 0 && rlen < sizeof(rbuf)) mock_recv_all(cfd, rbuf + 4, rlen);
+
+    /* 3. Send OK or ERR */
+    uint8_t resp[64];
+    if (a->send_error) {
+        /* ERR packet */
+        const char *errmsg = "Access denied";
+        uint32_t elen = (uint32_t)(1 + 2 + 1 + 5 + strlen(errmsg));
+        resp[0] = (uint8_t)(elen & 0xFF); resp[1] = 0; resp[2] = 0; resp[3] = 2;
+        resp[4] = 0xFF;
+        resp[5] = 0x15; resp[6] = 0x04; /* error code 1045 */
+        resp[7] = '#';
+        memcpy(resp + 8, "28000", 5);
+        memcpy(resp + 13, errmsg, strlen(errmsg));
+        mock_send_all(cfd, resp, 4 + elen);
+    } else {
+        size_t olen = build_mysql_ok(resp);
+        mock_send_all(cfd, resp, olen);
+    }
+
+    close(cfd);
+    return NULL;
+}
+
+static void test_probe_mysql_trust_auth(void) {
+    TEST_BEGIN("probe mysql: trust auth → HEALTH_UP");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("mysql");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_mysql_server_args_t args = { .listen_fd = lfd, .send_error = false };
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_mysql_server_thread, &args);
+
+    keel_backend_server_t srv = {
+        .host       = "127.0.0.1",
+        .port       = port,
+        .user       = "probe",
+        .password   = NULL,
+        .database   = "test",
+        .probe_auth = "trust",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    keel_error_t err = ops->check(ctx, &srv, &result);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_UP);
+
+    if (ctx) ops->destroy(ctx);
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_mysql_auth_error(void) {
+    TEST_BEGIN("probe mysql: auth error → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("mysql");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    uint16_t port = 0;
+    int lfd = make_probe_listen_socket(&port);
+    TEST_ASSERT(lfd >= 0);
+    if (lfd < 0) { TEST_END(); return; }
+
+    mock_mysql_server_args_t args = { .listen_fd = lfd, .send_error = true };
+    pthread_t tid;
+    pthread_create(&tid, NULL, mock_mysql_server_thread, &args);
+
+    keel_backend_server_t srv = {
+        .host     = "127.0.0.1",
+        .port     = port,
+        .user     = "probe",
+        .password = "wrongpassword",
+        .database = "test",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+
+    if (ctx) ops->destroy(ctx);
+    pthread_join(tid, NULL);
+    close(lfd);
+
+    TEST_END();
+}
+
+static void test_probe_mysql_connection_refused(void) {
+    TEST_BEGIN("probe mysql: refused connection → HEALTH_DOWN");
+
+    keel_probe_register_builtins();
+
+    const keel_probe_ops_t *ops = keel_probe_lookup("mysql");
+    TEST_ASSERT_NOT_NULL(ops);
+    if (!ops) { TEST_END(); return; }
+
+    keel_backend_server_t srv = {
+        .host = "127.0.0.1", .port = 1,
+        .user = "probe", .database = "test",
+    };
+
+    void *ctx = ops->create(&srv, NULL);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    keel_probe_check_t result;
+    memset(&result, 0, sizeof(result));
+    ops->check(ctx, &srv, &result);
+    TEST_ASSERT_EQ((int)result.health, (int)KEEL_HEALTH_DOWN);
+
+    if (ctx) ops->destroy(ctx);
+
+    TEST_END();
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -567,6 +1337,23 @@ int main(void) {
 
     /* Fuzz */
     test_probe_fuzz_lookup();
+
+    /* §16  Real postgres probe vtable */
+    test_probe_postgres_trust_auth();
+    test_probe_postgres_auth_error();
+    test_probe_postgres_connection_refused();
+    test_probe_postgres_create_destroy_null();
+
+    /* §17  Real patroni probe vtable */
+    test_probe_patroni_primary();
+    test_probe_patroni_replica();
+    test_probe_patroni_503();
+    test_probe_patroni_connection_refused();
+
+    /* §18  Real mysql probe vtable */
+    test_probe_mysql_trust_auth();
+    test_probe_mysql_auth_error();
+    test_probe_mysql_connection_refused();
 
     keel_mem_shutdown();
 

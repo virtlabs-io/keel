@@ -22,8 +22,12 @@
 #include "keel/plugin/plugin_types.h"
 #include "keel/session/state_profile.h"
 #include "keel/protocol/postgres/postgres_flow_internal.h"
+#include "keel/protocol/pg_backend_auth.h"
+#include "keel/protocol/mysql_backend_auth.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
 
 /* The tests exercise the built-in PostgreSQL flow vtable directly so failures
  * stay localized to the plugin contract instead of the surrounding worker
@@ -1877,6 +1881,209 @@ static void test_ps_tracking_reset_role_rehashes_stmt_set(void) {
     TEST_END();
 }
 
+static void test_ps_tracking_stmt_compat_profile_hashes_update(void) {
+    TEST_BEGIN("ps_mode/tracking: stmt compat profile hashes update on semantic changes");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pcompat AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t p0;
+    memset(&p0, 0, sizeof(p0));
+    rc = VT->get_stmt_compat_profile(ctx, &p0);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p0.stmt_set_hash != 0);
+    TEST_ASSERT(!p0.semantic_unknown);
+
+    len = build_query(buf, "SET search_path TO tenant_sem, public");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    keel_stmt_compat_profile_t p1;
+    memset(&p1, 0, sizeof(p1));
+    rc = VT->get_stmt_compat_profile(ctx, &p1);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p1.semantic_profile_hash != p0.semantic_profile_hash);
+    TEST_ASSERT(p1.search_path_hash != p0.search_path_hash);
+    TEST_ASSERT(p1.role_hash == p0.role_hash);
+
+    len = build_query(buf, "SET ROLE app_reader");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    keel_stmt_compat_profile_t p2;
+    memset(&p2, 0, sizeof(p2));
+    rc = VT->get_stmt_compat_profile(ctx, &p2);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p2.semantic_profile_hash != p1.semantic_profile_hash);
+    TEST_ASSERT(p2.role_hash != p1.role_hash);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: DDL invalidates stmt set and bumps schema epoch");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pddl AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    len = build_query(buf, "ALTER TABLE t ADD COLUMN c int");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+    TEST_ASSERT(!after.semantic_unknown);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_discard_plans_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: DISCARD PLANS invalidates stmt set");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE pdisc AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    len = build_query(buf, "DISCARD PLANS");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_discard_all_resets_guc_context(void) {
+    TEST_BEGIN("ps_mode/tracking: DISCARD ALL resets GUC and role context");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+
+    /* Prepare a statement so the stmt set is non-empty */
+    size_t len = build_query(buf, "PREPARE pdatest AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    /* Apply GUC and role changes */
+    rc = VT->on_fe_msg(ctx, buf,
+                       build_query(buf, "SET search_path TO tenant_a, public"),
+                       &act);
+    TEST_ASSERT_EQ(rc, 0);
+    rc = VT->on_fe_msg(ctx, buf, build_query(buf, "SET ROLE app_reader"), &act);
+    TEST_ASSERT_EQ(rc, 0);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(strcmp(c->stmt_search_path, "") != 0);
+    TEST_ASSERT(strcmp(c->stmt_role, "") != 0);
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+
+    /* DISCARD ALL must clear stmts, reset GUCs and role */
+    len = build_query(buf, "DISCARD ALL");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    /* Stmts cleared */
+    TEST_ASSERT_EQ(c->session_stmt_hash, 0ULL);
+    /* GUC and role fields reset to empty (session defaults) */
+    TEST_ASSERT_STR_EQ(c->stmt_search_path, "");
+    TEST_ASSERT_STR_EQ(c->stmt_role, "");
+    TEST_ASSERT_STR_EQ(c->stmt_session_auth, "");
+
+    /* Compatibility profile hashes must match a fresh context */
+    void* fresh = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(fresh);
+    pg_flow_ctx_t* fc = (pg_flow_ctx_t*)fresh;
+    TEST_ASSERT_EQ(c->stmt_search_path_hash, fc->stmt_search_path_hash);
+    TEST_ASSERT_EQ(c->stmt_role_hash, fc->stmt_role_hash);
+    TEST_ASSERT_EQ(c->stmt_guc_hash, fc->stmt_guc_hash);
+    VT->destroy_context(fresh);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_unknown_semantic_marks_incompatible(void) {
+    TEST_BEGIN("ps_mode/tracking: unknown utility marks semantic_unknown");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+    size_t len = build_query(buf, "PREPARE punk AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    len = build_query(buf, "CALL do_work()");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+
+    keel_stmt_compat_profile_t p;
+    memset(&p, 0, sizeof(p));
+    rc = VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p.semantic_unknown);
+    TEST_ASSERT_EQ(p.stmt_set_hash, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
 static void test_ps_tracking_set_session_auth_rehashes_stmt_set(void) {
     TEST_BEGIN("ps_mode/tracking: SET SESSION AUTHORIZATION rehashes stmt set");
 
@@ -2350,6 +2557,62 @@ static void test_ps_tracking_temp_table_bumps_temp_epoch(void) {
     TEST_END();
 }
 
+static void test_ps_tracking_temp_shadow_execute_discards_plans(void) {
+    TEST_BEGIN("ps_mode/tracking: temp shadow rewrites next EXECUTE with DISCARD PLANS");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t fact;
+    keel_be_action_t bact;
+
+    size_t len = build_query(buf, "PREPARE pshadow AS SELECT COUNT(*) FROM shadow_target");
+    int rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    len = build_query(buf, "BEGIN");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    len = build_ready_for_query(buf, 'T');
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(c->in_transaction);
+
+    len = build_query(buf, "CREATE TEMP TABLE shadow_target (id int)");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(c->stmt_discard_plans_before_execute);
+
+    len = build_query(buf, "EXECUTE pshadow");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(fact.be_payload != buf);
+    TEST_ASSERT_EQ(fact.be_payload[0], 'Q');
+    TEST_ASSERT(strstr((const char*)fact.be_payload + 5,
+                       "DISCARD PLANS;EXECUTE pshadow") != NULL);
+    TEST_ASSERT(!c->stmt_discard_plans_before_execute);
+    TEST_ASSERT(c->stmt_discard_plans_absorb_pending);
+
+    len = build_command_complete(buf, "DISCARD PLANS");
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(bact.type, KEEL_BE_ACT_ABSORB);
+    TEST_ASSERT(!c->stmt_discard_plans_absorb_pending);
+
+    len = build_command_complete(buf, "SELECT 1");
+    rc = VT->on_be_msg(ctx, buf, len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(bact.type != KEEL_BE_ACT_ABSORB);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
 static void test_ps_tracking_extended_temp_table_bumps_temp_epoch(void) {
     TEST_BEGIN("ps_mode/tracking: extended Execute temp DDL bumps temp stmt epoch");
 
@@ -2659,6 +2922,147 @@ static void test_ps_tracking_extended_discard_temp_rehashes_temp_context(void) {
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_EQ(c->stmt_temp_epoch, before_discard_epoch + 1);
     TEST_ASSERT(c->session_stmt_hash != before_discard_hash);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_extended_discard_plans_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: extended Execute DISCARD PLANS invalidates stmt set");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t fact;
+
+    size_t len = build_query(buf, "PREPARE epdisc AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    /* Send DISCARD PLANS via extended protocol */
+    len = build_named_parse(buf, "", "DISCARD PLANS");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    len = build_extended_msg(buf, 'E');
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_extended_discard_all_resets_guc_context(void) {
+    TEST_BEGIN("ps_mode/tracking: extended Execute DISCARD ALL resets GUC and role context");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t fact;
+
+    /* Prepare a statement */
+    size_t len = build_query(buf, "PREPARE epdatest AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    /* Apply GUC and role changes via Simple Query */
+    rc = VT->on_fe_msg(ctx, buf,
+                       build_query(buf, "SET search_path TO ext_schema, public"),
+                       &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    rc = VT->on_fe_msg(ctx, buf, build_query(buf, "SET ROLE ext_reader"), &fact);
+    TEST_ASSERT_EQ(rc, 0);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(strcmp(c->stmt_search_path, "") != 0);
+    TEST_ASSERT(strcmp(c->stmt_role, "") != 0);
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    /* Send DISCARD ALL via extended protocol */
+    len = build_named_parse(buf, "", "DISCARD ALL");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    len = build_extended_msg(buf, 'E');
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+
+    /* Stmts cleared */
+    TEST_ASSERT_EQ(c->session_stmt_hash, 0ULL);
+    /* GUC and role fields reset to empty */
+    TEST_ASSERT_STR_EQ(c->stmt_search_path, "");
+    TEST_ASSERT_STR_EQ(c->stmt_role, "");
+    TEST_ASSERT_STR_EQ(c->stmt_session_auth, "");
+
+    /* Hashes must match a fresh context */
+    void* fresh = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(fresh);
+    pg_flow_ctx_t* fc = (pg_flow_ctx_t*)fresh;
+    TEST_ASSERT_EQ(c->stmt_search_path_hash, fc->stmt_search_path_hash);
+    TEST_ASSERT_EQ(c->stmt_role_hash, fc->stmt_role_hash);
+    TEST_ASSERT_EQ(c->stmt_guc_hash, fc->stmt_guc_hash);
+    VT->destroy_context(fresh);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_ps_tracking_extended_ddl_invalidates_stmt_set(void) {
+    TEST_BEGIN("ps_mode/tracking: extended Execute DDL invalidates stmt set");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t fact;
+
+    size_t len = build_query(buf, "PREPARE epddl AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    /* Send ALTER TABLE via extended protocol */
+    len = build_named_parse(buf, "", "ALTER TABLE t ADD COLUMN x int");
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+    len = build_extended_msg(buf, 'E');
+    rc = VT->on_fe_msg(ctx, buf, len, &fact);
+    TEST_ASSERT_EQ(rc, 0);
+
+    keel_stmt_compat_profile_t after;
+    memset(&after, 0, sizeof(after));
+    rc = VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.schema_epoch > before.schema_epoch);
+    TEST_ASSERT(!after.semantic_unknown);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -4086,6 +4490,397 @@ static void test_vacuum_is_write_not_unknown(void) {
 }
 
 /* ============================================================================
+ * §15 — PG backend auth pure functions (pg_backend_auth.c)
+ * ============================================================================
+ */
+
+static void test_pg_b64_roundtrip(void) {
+    TEST_BEGIN("pg_b64: encode/decode roundtrip");
+
+    const uint8_t input[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE };
+    char encoded[64];
+    uint8_t decoded[64];
+
+    size_t enc_len = pg_b64_encode(input, sizeof(input), encoded, sizeof(encoded));
+    TEST_ASSERT(enc_len > 0);
+    encoded[enc_len] = '\0';
+
+    size_t dec_len = pg_b64_decode(encoded, enc_len, decoded, sizeof(decoded));
+    TEST_ASSERT_EQ(dec_len, sizeof(input));
+    TEST_ASSERT(memcmp(decoded, input, sizeof(input)) == 0);
+
+    /* Empty input */
+    TEST_ASSERT_EQ(pg_b64_encode(NULL, 0, encoded, sizeof(encoded)), (size_t)0);
+    TEST_ASSERT_EQ(pg_b64_decode("", 0, decoded, sizeof(decoded)), (size_t)0);
+
+    /* Buffer too small */
+    TEST_ASSERT_EQ(pg_b64_encode(input, sizeof(input), encoded, 1), (size_t)0);
+
+    TEST_END();
+}
+
+static void test_pg_build_startup_message(void) {
+    TEST_BEGIN("pg_build_startup_message: valid and edge cases");
+
+    uint8_t buf[256];
+    ssize_t n;
+
+    n = pg_build_startup_message("postgres", "mydb", buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+
+    /* First 4 bytes = total length, next 4 = protocol 196608 */
+    uint32_t total = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16)
+                   | ((uint32_t)buf[2] << 8)  |  (uint32_t)buf[3];
+    TEST_ASSERT_EQ(total, (uint32_t)n);
+
+    uint32_t proto = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
+                   | ((uint32_t)buf[6] << 8)  |  (uint32_t)buf[7];
+    TEST_ASSERT_EQ(proto, 196608U);
+
+    /* Buffer too small */
+    n = pg_build_startup_message("postgres", "mydb", buf, 4);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_pg_build_password_message(void) {
+    TEST_BEGIN("pg_build_password_message: valid and edge cases");
+
+    uint8_t buf[128];
+    ssize_t n = pg_build_password_message("mypassword", buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+    /* Tag should be 'p' */
+    TEST_ASSERT_EQ(buf[0], (uint8_t)'p');
+
+    /* Buffer too small */
+    n = pg_build_password_message("mypassword", buf, 2);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_pg_sasl_initial_response(void) {
+    TEST_BEGIN("pg_sasl_initial_response: SCRAM-SHA-256");
+
+    uint8_t buf[256];
+    const char *data = "n,,n=user,r=raNdOmNoNcE";
+    ssize_t n = pg_sasl_initial_response("SCRAM-SHA-256",
+                                          data, strlen(data),
+                                          buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT_EQ(buf[0], (uint8_t)'p');
+
+    /* Buffer too small */
+    n = pg_sasl_initial_response("SCRAM-SHA-256", data, strlen(data), buf, 2);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_pg_sasl_response(void) {
+    TEST_BEGIN("pg_sasl_response: client-final-message");
+
+    uint8_t buf[256];
+    const uint8_t data[] = "c=biws,r=serverNonce,p=AAAA";
+    ssize_t n = pg_sasl_response(data, sizeof(data) - 1, buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT_EQ(buf[0], (uint8_t)'p');
+
+    /* Buffer too small */
+    n = pg_sasl_response(data, sizeof(data) - 1, buf, 2);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_pg_scram_client_first(void) {
+    TEST_BEGIN("pg_scram_build_client_first: generates valid packet");
+
+    uint8_t buf[512];
+    pg_scram_ctx_t scram;
+    memset(&scram, 0, sizeof(scram));
+
+    ssize_t n = pg_scram_build_client_first("testuser", &scram, buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+    /* Tag should be 'p' (SASLInitialResponse) */
+    TEST_ASSERT_EQ(buf[0], (uint8_t)'p');
+    /* Client nonce should be populated */
+    TEST_ASSERT(scram.client_nonce_b64[0] != '\0');
+    /* client_first_bare should contain "n=testuser" */
+    TEST_ASSERT(strstr(scram.client_first_bare, "testuser") != NULL);
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * §16 — MySQL backend auth pure functions (mysql_backend_auth.c)
+ * ============================================================================
+ */
+
+static void test_my_scramble_native(void) {
+    TEST_BEGIN("my_scramble_native: produces 20-byte hash");
+
+    /* Minimal smoke test: deterministic for known inputs */
+    uint8_t scramble[20] = { 0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+                              0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+                              0x11,0x12,0x13,0x14 };
+    uint8_t out1[20] = {0};
+    uint8_t out2[20] = {0};
+
+    my_scramble_native("password", scramble, sizeof(scramble), out1);
+    my_scramble_native("password", scramble, sizeof(scramble), out2);
+
+    /* Same inputs → same output (deterministic) */
+    TEST_ASSERT(memcmp(out1, out2, 20) == 0);
+
+    /* Different password → different output */
+    uint8_t out3[20] = {0};
+    my_scramble_native("different", scramble, sizeof(scramble), out3);
+    TEST_ASSERT(memcmp(out1, out3, 20) != 0);
+
+    /* Empty password */
+    uint8_t out4[20] = {0};
+    my_scramble_native("", scramble, sizeof(scramble), out4);
+    (void)out4;  /* just check it doesn't crash */
+
+    TEST_END();
+}
+
+static void test_my_scramble_caching_sha2(void) {
+    TEST_BEGIN("my_scramble_caching_sha2: produces 32-byte hash");
+
+    uint8_t scramble[20] = { 0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+                              0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+                              0x11,0x12,0x13,0x14 };
+    uint8_t out1[32] = {0};
+    uint8_t out2[32] = {0};
+
+    my_scramble_caching_sha2("password", scramble, sizeof(scramble), out1);
+    my_scramble_caching_sha2("password", scramble, sizeof(scramble), out2);
+
+    TEST_ASSERT(memcmp(out1, out2, 32) == 0);
+
+    uint8_t out3[32] = {0};
+    my_scramble_caching_sha2("different", scramble, sizeof(scramble), out3);
+    TEST_ASSERT(memcmp(out1, out3, 32) != 0);
+
+    TEST_END();
+}
+
+static void test_my_parse_greeting_valid(void) {
+    TEST_BEGIN("my_parse_greeting: valid v10 handshake");
+
+    /* Minimal MySQL v10 Initial Handshake Packet:
+     * 4-byte header + protocol_version(1) + server_version\0(varies) +
+     * connection_id(4) + auth_data_1(8) + filler(1) +
+     * capability_flags_1(2) + character_set(1) + status_flags(2) +
+     * capability_flags_2(2) + auth_plugin_data_len(1) + reserved(10) +
+     * auth_data_2(max(13,len-8)) + auth_plugin_name\0
+     */
+    uint8_t pkt[128];
+    memset(pkt, 0, sizeof(pkt));
+
+    size_t off = 0;
+
+    /* MySQL 4-byte header: length(3) + seq_id(1) */
+    pkt[off++] = 0x4a;  /* length low byte — will fix later */
+    pkt[off++] = 0x00;
+    pkt[off++] = 0x00;
+    pkt[off++] = 0x00;  /* seq_id = 0 */
+
+    /* Protocol version */
+    pkt[off++] = 10;
+
+    /* Server version "8.0.30\0" */
+    const char *ver = "8.0.30";
+    memcpy(pkt + off, ver, strlen(ver) + 1);
+    off += strlen(ver) + 1;
+
+    /* Connection ID (4 bytes LE) */
+    pkt[off++] = 0x01; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00;
+
+    /* Auth plugin data part 1 (8 bytes) */
+    for (int i = 0; i < 8; i++) pkt[off++] = (uint8_t)(i + 1);
+
+    /* Filler */
+    pkt[off++] = 0x00;
+
+    /* Capability flags low 2 bytes: set PROTOCOL_41 + PLUGIN_AUTH + SECURE_CONN */
+    uint32_t caps = MY_CAP_PROTOCOL_41 | MY_CAP_PLUGIN_AUTH | MY_CAP_SECURE_CONNECTION;
+    pkt[off++] = (uint8_t)(caps & 0xFF);
+    pkt[off++] = (uint8_t)((caps >> 8) & 0xFF);
+
+    /* Character set */
+    pkt[off++] = 0x21;  /* utf8_general_ci */
+
+    /* Status flags */
+    pkt[off++] = 0x02; pkt[off++] = 0x00;
+
+    /* Capability flags high 2 bytes */
+    pkt[off++] = (uint8_t)((caps >> 16) & 0xFF);
+    pkt[off++] = (uint8_t)((caps >> 24) & 0xFF);
+
+    /* Auth plugin data length (total = 8+13 = 21) */
+    pkt[off++] = 21;
+
+    /* Reserved 10 bytes */
+    for (int i = 0; i < 10; i++) pkt[off++] = 0x00;
+
+    /* Auth plugin data part 2 (13 bytes = max(13, 21-8) = 13) */
+    for (int i = 0; i < 13; i++) pkt[off++] = (uint8_t)(0x10 + i);
+
+    /* Auth plugin name "mysql_native_password\0" */
+    const char *plugin = "mysql_native_password";
+    memcpy(pkt + off, plugin, strlen(plugin) + 1);
+    off += strlen(plugin) + 1;
+
+    /* Fix header length */
+    uint32_t body_len = (uint32_t)(off - 4);
+    pkt[0] = (uint8_t)(body_len & 0xFF);
+    pkt[1] = (uint8_t)((body_len >> 8) & 0xFF);
+    pkt[2] = (uint8_t)((body_len >> 16) & 0xFF);
+
+    my_handshake_info_t info;
+    memset(&info, 0, sizeof(info));
+    int rc = my_parse_greeting(pkt, off, &info);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(info.scramble_len > 0);
+    TEST_ASSERT(strcmp(info.plugin, "mysql_native_password") == 0);
+
+    TEST_END();
+}
+
+static void test_my_parse_greeting_invalid(void) {
+    TEST_BEGIN("my_parse_greeting: invalid packets return -1");
+
+    my_handshake_info_t info;
+    memset(&info, 0, sizeof(info));
+
+    /* Too short */
+    uint8_t short_pkt[3] = {0};
+    TEST_ASSERT(my_parse_greeting(short_pkt, 3, &info) < 0);
+
+    /* NULL data */
+    TEST_ASSERT(my_parse_greeting(NULL, 0, &info) < 0);
+
+    TEST_END();
+}
+
+static void test_my_parse_auth_result_ok(void) {
+    TEST_BEGIN("my_parse_auth_result: OK packet");
+
+    /* Minimal OK packet: 4-byte header + 0x00 + affected_rows(var) + ... */
+    uint8_t pkt[16];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x07;  /* length */
+    pkt[1] = 0x00;
+    pkt[2] = 0x00;
+    pkt[3] = 0x02;  /* seq_id */
+    pkt[4] = MY_OK_MARKER;
+    /* affected_rows = 0, last_insert_id = 0, status = 0, warnings = 0 */
+
+    my_auth_result_t result;
+    memset(&result, 0, sizeof(result));
+    int rc = my_parse_auth_result(pkt, sizeof(pkt), &result);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ((int)result.type, (int)MY_AUTH_OK);
+
+    TEST_END();
+}
+
+static void test_my_parse_auth_result_err(void) {
+    TEST_BEGIN("my_parse_auth_result: ERR packet");
+
+    /* ERR packet: 4-byte header + 0xFF + error_code(2) + '#' + sqlstate(5) + msg */
+    uint8_t pkt[32];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x17;  /* length low byte */
+    pkt[1] = 0x00;
+    pkt[2] = 0x00;
+    pkt[3] = 0x02;  /* seq_id */
+    pkt[4] = MY_ERR_MARKER;
+    pkt[5] = 0x15;  /* error code low */
+    pkt[6] = 0x04;  /* error code high = 0x0415 = 1045 Access denied */
+    pkt[7] = '#';
+    memcpy(pkt + 8, "28000", 5);
+    memcpy(pkt + 13, "Access denied", 14);
+
+    my_auth_result_t result;
+    memset(&result, 0, sizeof(result));
+    int rc = my_parse_auth_result(pkt, 4 + 1 + 2 + 1 + 5 + 13, &result);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ((int)result.type, (int)MY_AUTH_ERR);
+    TEST_ASSERT_EQ((int)result.err_code, 1045);
+
+    TEST_END();
+}
+
+static void test_my_build_handshake_response(void) {
+    TEST_BEGIN("my_build_handshake_response: valid output");
+
+    my_handshake_info_t hs;
+    memset(&hs, 0, sizeof(hs));
+    hs.server_caps = MY_CAP_PROTOCOL_41 | MY_CAP_SECURE_CONNECTION
+                   | MY_CAP_PLUGIN_AUTH;
+    hs.scramble_len = 20;
+    for (int i = 0; i < 20; i++) hs.scramble[i] = (uint8_t)(i + 1);
+    hs.seq_id = 1;
+    memcpy(hs.plugin, "mysql_native_password", 22);
+
+    uint8_t buf[512];
+    ssize_t n = my_build_handshake_response(&hs, "testuser", "testdb",
+                                            "password", buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+
+    /* Buffer too small */
+    n = my_build_handshake_response(&hs, "testuser", "testdb",
+                                    "password", buf, 4);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_my_build_auth_switch_response(void) {
+    TEST_BEGIN("my_build_auth_switch_response: valid output");
+
+    uint8_t scramble[20];
+    for (int i = 0; i < 20; i++) scramble[i] = (uint8_t)(i + 1);
+
+    uint8_t buf[256];
+    ssize_t n = my_build_auth_switch_response("mysql_native_password",
+                                               scramble, 20,
+                                               "password", 3,
+                                               buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+
+    /* Buffer too small */
+    n = my_build_auth_switch_response("mysql_native_password",
+                                      scramble, 20,
+                                      "password", 3,
+                                      buf, 4);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+static void test_my_build_rsa_key_request(void) {
+    TEST_BEGIN("my_build_rsa_key_request: valid output");
+
+    uint8_t buf[64];
+    ssize_t n = my_build_rsa_key_request(4, buf, sizeof(buf));
+    TEST_ASSERT(n > 0);
+    /* Packet body should be 0x02 (RSA key request marker) */
+    TEST_ASSERT_EQ(buf[4], 0x02);
+
+    /* Buffer too small */
+    n = my_build_rsa_key_request(4, buf, 4);
+    TEST_ASSERT(n < 0);
+
+    TEST_END();
+}
+
+/* ============================================================================
  * MAIN
  * ============================================================================ */
 int main(void) {
@@ -4184,6 +4979,11 @@ int main(void) {
     test_ps_tracking_search_path_rehashes_stmt_set();
     test_ps_tracking_set_role_rehashes_stmt_set();
     test_ps_tracking_reset_role_rehashes_stmt_set();
+    test_ps_tracking_stmt_compat_profile_hashes_update();
+    test_ps_tracking_ddl_invalidates_stmt_set();
+    test_ps_tracking_discard_plans_invalidates_stmt_set();
+    test_ps_tracking_discard_all_resets_guc_context();
+    test_ps_tracking_unknown_semantic_marks_incompatible();
     test_ps_tracking_set_session_auth_rehashes_stmt_set();
     test_ps_tracking_reset_session_auth_rehashes_stmt_set();
     test_ps_tracking_set_timezone_rehashes_stmt_set();
@@ -4204,6 +5004,7 @@ int main(void) {
     test_ps_tracking_extended_set_local_search_path_rehashes_and_reverts();
     test_ps_tracking_local_overlay_and_temp_shadow_rehash_order_on_rollback();
     test_ps_tracking_temp_table_bumps_temp_epoch();
+    test_ps_tracking_temp_shadow_execute_discards_plans();
     test_ps_tracking_extended_temp_table_bumps_temp_epoch();
     test_ps_tracking_temp_on_commit_drop_rehashes_at_tx_end();
     test_ps_tracking_extended_temp_on_commit_drop_rehashes_at_tx_end();
@@ -4213,6 +5014,9 @@ int main(void) {
     test_ps_tracking_extended_drop_table_rehashes_temp_context();
     test_ps_tracking_discard_temp_rehashes_temp_context();
     test_ps_tracking_extended_discard_temp_rehashes_temp_context();
+    test_ps_tracking_extended_discard_plans_invalidates_stmt_set();
+    test_ps_tracking_extended_discard_all_resets_guc_context();
+    test_ps_tracking_extended_ddl_invalidates_stmt_set();
     test_ps_tracking_temp_create_rehashes_again_on_rollback();
     test_ps_tracking_extended_temp_create_rehashes_again_on_rollback();
     test_ps_anon_named_parse_intercepted();
@@ -4274,6 +5078,25 @@ int main(void) {
     test_call_marks_unknown_state();
     test_merge_is_write_not_unknown();
     test_vacuum_is_write_not_unknown();
+
+    /* 15) PG backend auth pure functions */
+    test_pg_b64_roundtrip();
+    test_pg_build_startup_message();
+    test_pg_build_password_message();
+    test_pg_sasl_initial_response();
+    test_pg_sasl_response();
+    test_pg_scram_client_first();
+
+    /* 16) MySQL backend auth pure functions */
+    test_my_scramble_native();
+    test_my_scramble_caching_sha2();
+    test_my_parse_greeting_valid();
+    test_my_parse_greeting_invalid();
+    test_my_parse_auth_result_ok();
+    test_my_parse_auth_result_err();
+    test_my_build_handshake_response();
+    test_my_build_auth_switch_response();
+    test_my_build_rsa_key_request();
 
     printf("\n");
     return test_summary();

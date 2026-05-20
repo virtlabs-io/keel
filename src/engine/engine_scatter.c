@@ -584,7 +584,7 @@ static int sc_read_full(int fd, void* buf, size_t len) {
     uint8_t* p = (uint8_t*)buf;
     size_t done = 0;
     while (done < len) {
-        ssize_t n = recv(fd, p + done, len - done, 0);
+        ssize_t n = recv(fd, p + done, len - done, 0); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) return -1;
         done += (size_t)n;
     }
@@ -595,7 +595,7 @@ static int sc_write_full(int fd, const void* buf, size_t len) {
     const uint8_t* p = (const uint8_t*)buf;
     size_t done = 0;
     while (done < len) {
-        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL);
+        ssize_t n = send(fd, p + done, len - done, MSG_NOSIGNAL); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) return -1;
         done += (size_t)n;
     }
@@ -674,7 +674,7 @@ static int sc_exec_shard_pooled(
      * error, making every shard fail.  Temporarily clear O_NONBLOCK so that
      * recv() blocks until data arrives; restored at the 'done:' label below. */
     int orig_flags = fcntl(fd, F_GETFL);
-    if (orig_flags < 0 || fcntl(fd, F_SETFL, orig_flags & ~O_NONBLOCK) < 0) {
+    if (orig_flags < 0 || fcntl(fd, F_SETFL, orig_flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking): dedicated scatter worker thread */
         snprintf(errbuf, errlen, "scatter: fcntl(O_NONBLOCK) failed: %s",
                  strerror(errno));
         conn_broken = true;
@@ -853,11 +853,9 @@ done:
         /* Response not fully consumed — connection is in an unknown protocol
          * state.  Close the fd and mark the pool slot CLOSED so the pool's
          * background refill timer can reconnect it. */
-        close(be->fd);
-        be->fd = -1;
-        atomic_store(&be->state, BACKEND_CONN_CLOSED);
+        backend_pool_close_connection(pool, be, BACKEND_CLOSE_REASON_IO_ERROR);
+        return rc;
     }
-    /* backend_pool_return is a no-op when state == BACKEND_CONN_CLOSED */
     backend_pool_return(pool, be, false);
     return rc;
 }
@@ -888,7 +886,7 @@ static int sc_flush(sendbuf_t* sb, int fd) {
     int rc = 0;
     size_t done = 0;
     while (done < sb->len) {
-        ssize_t n = send(fd, sb->data + done, sb->len - done, MSG_NOSIGNAL);
+        ssize_t n = send(fd, sb->data + done, sb->len - done, MSG_NOSIGNAL); /* NOLINT(keel-blocking): dedicated scatter worker thread */
         if (n <= 0) { rc = -1; break; }
         done += (size_t)n;
     }
@@ -2178,12 +2176,12 @@ int keel_engine_scatter_write(
         /* Backend connections are O_NONBLOCK; sc_exec_cmd uses blocking I/O.
          * Temporarily clear O_NONBLOCK — restored before pool return in Phase 2. */
         sh->orig_flags = fcntl(fd, F_GETFL);
-        if (sh->orig_flags < 0 || fcntl(fd, F_SETFL, sh->orig_flags & ~O_NONBLOCK) < 0) {
+        if (sh->orig_flags < 0 || fcntl(fd, F_SETFL, sh->orig_flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking): dedicated scatter worker thread */
             snprintf(sh->errbuf, sizeof sh->errbuf,
                      "scatter-write: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             continue;
         }
 
@@ -2193,7 +2191,7 @@ int keel_engine_scatter_write(
              * active_count is decremented and the slot can be refilled. */
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             continue;
         }
         sh->active = true;
@@ -2205,7 +2203,7 @@ int keel_engine_scatter_write(
              * pool can refill the slot and avoid stale-transaction cascades. */
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[si], sh->be);
+            backend_pool_discard(server_pools[si], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
             sh->active = false;
             continue;
         }
@@ -2280,7 +2278,7 @@ int keel_engine_scatter_write(
         if (conn_broken) {
             close(sh->be->fd);
             sh->be->fd = -1;
-            backend_pool_discard(server_pools[sh->shard_idx], sh->be);
+            backend_pool_discard(server_pools[sh->shard_idx], sh->be, BACKEND_CLOSE_REASON_IO_ERROR);
         }
         /* Restore O_NONBLOCK before returning to pool. */
         if (!conn_broken && sh->be->fd >= 0 && sh->orig_flags >= 0)

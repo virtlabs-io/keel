@@ -28,6 +28,14 @@
 # Default: info
 log_level = info
 
+# Production posture for v0.2-alpha:
+#   0 = keep experimental features disabled (recommended default)
+#   1 = allow experimental feature keys such as scatter-merge, result cache,
+#       WAL/GTID capture, sharding-adjacent features, and cluster compression
+# Enable only after targeted validation in your own environment.
+# Default: 0
+experimental_features = 0
+
 # Maximum time (ms) to wait for active connections to drain during graceful
 # shutdown (SIGTERM / SIGQUIT).  After this timeout, remaining connections are
 # forcibly closed.
@@ -511,14 +519,16 @@ prepared_statement = virtualize
 #     no LSN capture.
 #     Use for: production read/write splitting, observability, multi-replica.
 #
-#   full  (default)
+#   full
 #     Everything enabled: hooks, transaction tracking, LSN/GTID capture,
 #     commit-in-doubt recovery.  Maximum safety and programmability.
 #     Use for: applications needing maximum consistency guarantees,
 #     custom hook pipelines, programmable proxy logic.
 #
-# Default: full
-mode = full
+# For v0.2-alpha, the recommended production default is `pool`.
+# `smart` is a hardening tier. `full` is an explicit opt-in tier.
+# Default: pool
+mode = pool
 
 # -- Transaction tracking (replication consistency) --------------------------
 #
@@ -1546,6 +1556,10 @@ no_new_privs = 0
 # ============================================================================
 # Example G: Horizontal Sharding — 4 PostgreSQL shards
 #
+# Experimental for v0.2-alpha. Requires:
+#   [keel]
+#   experimental_features = 1
+#
 # The application issues queries like:
 #   SELECT * FROM users WHERE user_id = 12345
 # KEEL extracts user_id, computes 12345 % 4 = 1, routes to shard1.
@@ -1557,6 +1571,7 @@ no_new_privs = 0
 # bind_addr     = 0.0.0.0
 # bind_port     = 5432
 # num_workers   = 4
+# mode          = smart        # hardening tier
 # protocol      = postgresql
 # server_user   = app
 # server_password = secret
@@ -1577,6 +1592,10 @@ no_new_privs = 0
 
 # ============================================================================
 # Example H: Multi-Proxy HA Cluster (3 nodes)
+#
+# Experimental for v0.2-alpha. Requires:
+#   [keel]
+#   experimental_features = 1
 #
 # Deploy three KEEL instances behind a load balancer (e.g. AWS NLB, HAProxy).
 # Each node forms a peer group: heartbeats keep roles in sync; if one node

@@ -657,6 +657,77 @@ static void test_pool_inv_valid_clean_list(void) {
     TEST_END();
 }
 
+static void test_pool_inv_clean_list_rejects_dirty(void) {
+    TEST_BEGIN("inv_pool: clean_list rejects dirty state");
+    backend_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.total_count = 10;
+    pool.clean_count = 1;
+    backend_conn_t conn = make_be_conn(BACKEND_CONN_IDLE);
+    conn.current_state_hash = 0xdeadbeefULL;
+    pool.clean_list = &conn;
+    uint32_t v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT(v != 0);
+    TEST_END();
+}
+
+static void test_pool_inv_borrowable_rejects_pinned(void) {
+    TEST_BEGIN("inv_pool: borrowable lists reject pinned owner");
+    backend_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.total_count = 10;
+    backend_conn_t conn = make_be_conn(BACKEND_CONN_IDLE);
+    int owner = 42;
+    conn.pinned_session = &owner;
+    pool.idle_list = &conn;
+    uint32_t v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT(v != 0);
+    TEST_END();
+}
+
+static void test_pool_inv_cleaning_not_borrowable(void) {
+    TEST_BEGIN("inv_pool: CLEANING conn not borrowable");
+    backend_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.total_count = 10;
+    backend_conn_t conn = make_be_conn(BACKEND_CONN_CLEANING);
+    conn.current_state_hash = 0xfeedULL;
+    pool.dirty_list = &conn;
+    pool.dirty_count = 1;
+    uint32_t v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT(v != 0);
+    TEST_END();
+}
+
+static void test_pool_inv_closed_not_borrowable(void) {
+    TEST_BEGIN("inv_pool: CLOSED conn not borrowable");
+    backend_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.total_count = 10;
+    backend_conn_t conn = make_be_conn(BACKEND_CONN_CLOSED);
+    pool.idle_list = &conn;
+    uint32_t v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT(v != 0);
+    TEST_END();
+}
+
+static void test_pool_inv_dirty_list_requires_dirty(void) {
+    TEST_BEGIN("inv_pool: dirty_list requires cleanup work");
+    backend_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.total_count = 10;
+    backend_conn_t conn = make_be_conn(BACKEND_CONN_IDLE);
+    pool.dirty_list = &conn;
+    pool.dirty_count = 1;
+    uint32_t v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT(v != 0);
+
+    conn.current_state_hash = 0xbeefULL;
+    v = keel_invariant_check_pool(&pool);
+    TEST_ASSERT_EQ(v, (uint32_t)0);
+    TEST_END();
+}
+
 /* ============================================================================
  * §5 — Live Protocol Flow Invariant Integration
  *
@@ -856,6 +927,11 @@ int main(void) {
     test_pool_inv_active_overflow();
     test_pool_inv_wrong_list_state();
     test_pool_inv_valid_clean_list();
+    test_pool_inv_clean_list_rejects_dirty();
+    test_pool_inv_borrowable_rejects_pinned();
+    test_pool_inv_cleaning_not_borrowable();
+    test_pool_inv_closed_not_borrowable();
+    test_pool_inv_dirty_list_requires_dirty();
 
     /* §5 — Live protocol flow */
     test_live_query_lifecycle_invariants();

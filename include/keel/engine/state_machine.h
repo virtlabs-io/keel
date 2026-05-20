@@ -74,8 +74,8 @@ typedef enum keel_backend_binding {
  */
 typedef enum keel_replay_state {
     KEEL_REPLAY_NONE = 0,        /**< No replay needed */
-    KEEL_REPLAY_DISCARD_PENDING, /**< Backend needs DISCARD ALL first */
-    KEEL_REPLAY_DISCARD_SENT,    /**< DISCARD ALL sent, awaiting ReadyForQuery */
+    KEEL_REPLAY_CLEANUP_PENDING, /**< Backend needs plugin cleanup first */
+    KEEL_REPLAY_CLEANUP_SENT,    /**< Cleanup sent, awaiting validated completion */
     KEEL_REPLAY_SENDING,         /**< Parse messages being written to backend */
     KEEL_REPLAY_WAITING,         /**< Waiting for ParseComplete responses */
     KEEL_REPLAY_RFQ_PENDING,     /**< All ParseComplete received, draining Sync RFQ */
@@ -116,7 +116,7 @@ typedef enum keel_quarantine_reason {
     KEEL_QUARANTINE_REPLAY_MISMATCH, /**< PS replay hash mismatch */
     KEEL_QUARANTINE_PROTOCOL_DESYNC, /**< Unexpected message sequence */
     KEEL_QUARANTINE_TLS_MISMATCH,    /**< TLS state inconsistency */
-    KEEL_QUARANTINE_FAILED_DISCARD,  /**< DISCARD ALL failed or timed out */
+    KEEL_QUARANTINE_FAILED_CLEANUP,  /**< Cleanup failed or timed out */
     KEEL_QUARANTINE_FAILED_SYNC,     /**< State sync failed */
     KEEL_QUARANTINE_COUNT,
 } keel_quarantine_reason_t;

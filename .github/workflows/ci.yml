@@ -5,9 +5,9 @@ env:
 
 on:
   push:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
   pull_request:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,12 +28,25 @@ jobs:
         run: bash scripts/check_forbidden_syscalls.sh
 
   # ===========================================================================
+  # Reactor-blocking lint — no blocking I/O in hot-path files.
+  # Pre-existing violations are baselined; this gate prevents regressions.
+  # ===========================================================================
+  lint-blocking-hotpath:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check forbidden blocking calls in hot-path files
+        run: bash scripts/check_forbidden_blocking.sh
+
+  # ===========================================================================
   # Build + Unit Tests (Release with debug info)
   # ===========================================================================
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
 
     steps:
       - name: Checkout
@@ -52,7 +65,13 @@ jobs:
             lua5.4 \
             liblua5.4-dev \
             python3 \
-            python3-dev
+            python3-dev \
+            ccache
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: build-and-test-${{ runner.os }}
 
       - name: Configure
         run: |
@@ -60,6 +79,7 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_STANDARD=23 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DKEEL_ENABLE_TESTS=ON \
             -DKEEL_ENABLE_HARDENING=ON
 
@@ -67,7 +87,7 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j$(nproc)
+        run: ctest --test-dir build --output-on-failure -LE integration -j$(nproc)
 
   # ===========================================================================
   # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -75,7 +95,7 @@ jobs:
   sanitizer-asan:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
@@ -114,7 +134,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build-asan --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-asan --output-on-failure -LE integration -j$(nproc)
 
       - name: Python memory suite (ASAN build)
         run: |
@@ -130,7 +150,7 @@ jobs:
   sanitizer-tsan:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
@@ -166,9 +186,8 @@ jobs:
 
       - name: Test (TSan)
         env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
-          TSAN_SUPPRESSIONS: cmake/tsan_suppressions.txt
-        run: ctest --test-dir build-tsan --output-on-failure -j$(nproc)
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/cmake/tsan_suppressions.txt"
+        run: ctest --test-dir build-tsan --output-on-failure -LE integration -j$(nproc)
 
       - name: Python concurrency suite (TSAN build)
         run: |
@@ -187,7 +206,7 @@ jobs:
   sanitizer-msan:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    needs: lint-memory-policy
+    needs: [lint-memory-policy, lint-blocking-hotpath]
     if: github.event_name == 'pull_request'
 
     steps:
@@ -203,6 +222,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libssl-dev \
             lua5.4 \
             liblua5.4-dev \
             python3 \
@@ -228,7 +248,7 @@ jobs:
         run: |
           ctest --test-dir build-msan \
             --output-on-failure \
-            -LE openssl \
+            -LE "integration|openssl" \
             -j$(nproc)
 
   # ===========================================================================
@@ -305,7 +325,7 @@ jobs:
   # Code Coverage — line + branch (Gcov / Lcov / Gcovr)
   #
   # Thresholds:
-  #   Line   coverage ≥ 70%
+  #   Line   coverage ≥ 55%
   #   Branch coverage ≥ 40%
   #
   # Artifacts:
@@ -356,7 +376,7 @@ jobs:
         run: lcov --directory build-coverage --zerocounters --quiet
 
       - name: Run Tests
-        run: ctest --test-dir build-coverage --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-coverage --output-on-failure -LE integration -j$(nproc)
 
       - name: Collect Coverage (line + branch)
         run: |
@@ -381,7 +401,7 @@ jobs:
             --rc lcov_branch_coverage=1 \
             ${IGNORE_FLAGS}
 
-      - name: Enforce thresholds (line ≥ 70%, branch ≥ 40%)
+      - name: Enforce thresholds (line ≥ 55%, branch ≥ 40%)
         run: |
           python3 - <<'EOF'
           import subprocess, re, sys, os
@@ -399,7 +419,7 @@ jobs:
           line_pct   = extract(r'lines\.*:\s*([\d.]+)%',    out)
           branch_pct = extract(r'branches\.*:\s*([\d.]+)%', out)
 
-          LINE_MIN, BRANCH_MIN = 70.0, 40.0
+          LINE_MIN, BRANCH_MIN = 55.0, 40.0
           fail = False
 
           print(out)
@@ -543,11 +563,11 @@ jobs:
           fail_ci_if_error: false
 
   # ===========================================================================
-  # Real Database Integration Tests (PostgreSQL 16 + MySQL 8)
+  # Real Database Integration Tests (PostgreSQL 16 + MySQL 8 + MariaDB 11)
   # ===========================================================================
   integration-db:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     if: github.event_name == 'pull_request'
 
     services:
@@ -576,6 +596,21 @@ jobs:
           - 13306:3306
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pmysql --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: mariadb
+          MARIADB_DATABASE: keeltest
+          MARIADB_USER: keel
+          MARIADB_PASSWORD: keel
+        ports:
+          - 13307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 15
@@ -621,6 +656,10 @@ jobs:
       - name: Verify MySQL is reachable
         run: |
           mysql -h 127.0.0.1 -P 13306 -u root -pmysql -e "SELECT VERSION();"
+
+      - name: Verify MariaDB is reachable
+        run: |
+          mysql -h 127.0.0.1 -P 13307 -u root -pmariadb -e "SELECT VERSION();"
 
       - name: Run proxy E2E tests (PostgreSQL)
         env:

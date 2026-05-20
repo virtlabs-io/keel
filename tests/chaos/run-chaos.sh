@@ -93,6 +93,11 @@ stop_stack() {
     docker compose -f "$CHAOS_COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
 }
 
+restart_stack() {
+    stop_stack
+    start_stack
+}
+
 # Verify keel and PostgreSQL primary are reachable
 check_stack() {
     log "Checking stack availability..."
@@ -190,6 +195,16 @@ run_scenario() {
         FAILED_SCENARIOS+=("${name}:rc=${rc}")
     fi
 
+    if [[ "$MANAGE_STACK" == "1" && "$SKIP_CLEANUP" != "1" ]]; then
+        case "$name" in
+            flip-primary|timeline-invalidation)
+                log "Resetting chaos stack after topology-mutating scenario: ${name}"
+                restart_stack
+                init_pgbench
+                ;;
+        esac
+    fi
+
     # Brief pause between scenarios to let the stack settle
     sleep 3
 }
@@ -219,6 +234,13 @@ ALL_SCENARIOS=(
     "partition-replica"
     "sigkill-during-drain"
     "flip-primary"
+    # Issue 8 — Failover Gate scenarios
+    "primary-dies-idle"
+    "primary-dies-during-txn"
+    "commit-in-doubt"
+    "role-flapping"
+    "replica-lag-threshold"
+    "timeline-invalidation"
 )
 
 if [[ $# -gt 0 ]]; then

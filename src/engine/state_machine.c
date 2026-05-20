@@ -34,8 +34,8 @@ static const char* const s_binding_names[] = {
 
 static const char* const s_replay_names[] = {
     [KEEL_REPLAY_NONE]            = "NONE",
-    [KEEL_REPLAY_DISCARD_PENDING] = "DISCARD_PENDING",
-    [KEEL_REPLAY_DISCARD_SENT]    = "DISCARD_SENT",
+    [KEEL_REPLAY_CLEANUP_PENDING] = "CLEANUP_PENDING",
+    [KEEL_REPLAY_CLEANUP_SENT]    = "CLEANUP_SENT",
     [KEEL_REPLAY_SENDING]         = "SENDING",
     [KEEL_REPLAY_WAITING]         = "WAITING",
     [KEEL_REPLAY_RFQ_PENDING]     = "RFQ_PENDING",
@@ -61,7 +61,7 @@ static const char* const s_quarantine_names[] = {
     [KEEL_QUARANTINE_REPLAY_MISMATCH] = "REPLAY_MISMATCH",
     [KEEL_QUARANTINE_PROTOCOL_DESYNC] = "PROTOCOL_DESYNC",
     [KEEL_QUARANTINE_TLS_MISMATCH]    = "TLS_MISMATCH",
-    [KEEL_QUARANTINE_FAILED_DISCARD]  = "FAILED_DISCARD",
+    [KEEL_QUARANTINE_FAILED_CLEANUP]  = "FAILED_CLEANUP",
     [KEEL_QUARANTINE_FAILED_SYNC]     = "FAILED_SYNC",
 };
 
@@ -279,7 +279,7 @@ keel_backend_binding_t keel_derive_binding(
  * @brief Derive the prepared-statement replay lifecycle state.
  *
  * Replay state is inferred from buffered replay payload, remaining expected
- * responses, DISCARD-ALL sequencing, and pending ReadyForQuery drainage.
+ * responses, setup-cleanup sequencing, and pending terminal drainage.
  *
  * @param sf Session flow state.
  * @return Derived replay state.
@@ -289,11 +289,11 @@ keel_replay_state_t keel_derive_replay_state(const keel_session_flow_t* sf)
     if (sf->stmt_replay_len == 0)
         return KEEL_REPLAY_NONE;
 
-    if (sf->stmt_replay_needs_discard) {
-        /* Waiting for DISCARD ALL to complete before replay */
+    if (sf->stmt_replay_needs_cleanup) {
+        /* Waiting for plugin cleanup to complete before replay */
         if (sf->stmt_replay_count == 0 && sf->stmt_replay_rfq_pending)
-            return KEEL_REPLAY_DISCARD_SENT;
-        return KEEL_REPLAY_DISCARD_PENDING;
+            return KEEL_REPLAY_CLEANUP_SENT;
+        return KEEL_REPLAY_CLEANUP_PENDING;
     }
 
     if (sf->stmt_replay_rfq_pending)
@@ -389,6 +389,7 @@ keel_session_contract_t keel_session_contract_sync(
  */
 keel_backend_contract_t keel_backend_contract_sync(const backend_conn_t* conn)
 {
+    keel_quarantine_reason_t q = KEEL_QUARANTINE_NONE;
     if (!conn) {
         return (keel_backend_contract_t){
             .conn_state    = BACKEND_CONN_CLOSED,
@@ -399,10 +400,20 @@ keel_backend_contract_t keel_backend_contract_sync(const backend_conn_t* conn)
             .in_transaction = false,
         };
     }
+
+    switch (conn->quarantine) {
+    case BACKEND_QUARANTINE_NONE: q = KEEL_QUARANTINE_NONE; break;
+    case BACKEND_QUARANTINE_DIRTY: q = KEEL_QUARANTINE_DIRTY_STATE; break;
+    case BACKEND_QUARANTINE_SYNCING: q = KEEL_QUARANTINE_FAILED_SYNC; break;
+    case BACKEND_QUARANTINE_REPLAYING: q = KEEL_QUARANTINE_REPLAY_MISMATCH; break;
+    case BACKEND_QUARANTINE_PROTOCOL_DESYNC: q = KEEL_QUARANTINE_PROTOCOL_DESYNC; break;
+    case BACKEND_QUARANTINE_CLEANUP_FAILED: q = KEEL_QUARANTINE_FAILED_CLEANUP; break;
+    }
+
     return (keel_backend_contract_t){
         .conn_state    = atomic_load_explicit(&conn->state, memory_order_relaxed),
-        .quarantine    = KEEL_QUARANTINE_NONE, /* quarantine tracked externally for now */
-        .has_owner     = conn->pinned_session != NULL,
+        .quarantine    = q,
+        .has_owner     = (conn->active_owner != NULL) || (conn->pinned_session != NULL),
         .has_stmts     = conn->stmt_set_hash != 0,
         .needs_sync    = conn->needs_sync,
         .in_transaction = conn->in_transaction,
@@ -526,6 +537,7 @@ int keel_session_transition_bind(
 
     /* Perform the bind */
     session->backend_conn = conn;
+    session->backend_generation = conn ? conn->generation : 0;
     session->server_fd = conn->fd;
     conn->pinned_session = session;
     atomic_store_explicit(&conn->state, BACKEND_CONN_ACTIVE, memory_order_release);
@@ -581,6 +593,7 @@ int keel_session_transition_unbind(
     }
 
     session->backend_conn = NULL;
+    session->backend_generation = 0;
     session->server_fd = -1;
     session->in_transaction = false;
     session->hard_pinned = false;
@@ -689,14 +702,14 @@ int keel_session_transition_end_txn(
 /* Replay transition validation. */
 static const bool replay_transitions[KEEL_REPLAY_COUNT][KEEL_REPLAY_COUNT] = {
     [KEEL_REPLAY_NONE] = {
-        [KEEL_REPLAY_DISCARD_PENDING] = true,
+        [KEEL_REPLAY_CLEANUP_PENDING] = true,
         [KEEL_REPLAY_SENDING] = true,
     },
-    [KEEL_REPLAY_DISCARD_PENDING] = {
-        [KEEL_REPLAY_DISCARD_SENT] = true,
+    [KEEL_REPLAY_CLEANUP_PENDING] = {
+        [KEEL_REPLAY_CLEANUP_SENT] = true,
         [KEEL_REPLAY_NONE] = true,  /* abort */
     },
-    [KEEL_REPLAY_DISCARD_SENT] = {
+    [KEEL_REPLAY_CLEANUP_SENT] = {
         [KEEL_REPLAY_SENDING] = true,
         [KEEL_REPLAY_NONE] = true,  /* abort */
     },

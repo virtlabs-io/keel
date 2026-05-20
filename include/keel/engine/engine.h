@@ -279,6 +279,21 @@ typedef struct keel_engine_config {
     uint32_t            pool_refill_backoff_ms;   /* Slower poll period when pool is full (default 5 000) */
     uint32_t            pool_max_waiting;         /* Max queued sessions per worker (0 = auto) */
 
+    /** Maximum time a session may wait in the pool queue before being rejected.
+     *  0 = fall back to connect_timeout_ms (existing behaviour).
+     *  pool_wait_timeout_ms = on */
+    uint64_t            pool_wait_timeout_ms;
+
+    /** Per-session maximum bytes that may be buffered for an in-flight
+     *  client message.  0 = unlimited.  Oversized messages trigger
+     *  KEEL_ERR_MSG_TOO_LARGE and the session is closed deterministically. */
+    size_t              session_max_buffered_bytes;
+
+    /** Per-backend maximum bytes that may be used for prepared-statement
+     *  replay.  0 = unlimited.  Exceeding this limit returns
+     *  KEEL_ERR_REPLAY_TOO_LARGE and the backend is quarantined. */
+    size_t              backend_max_replay_bytes;
+
     /* TCP accept settings */
     uint32_t            listen_backlog;           /* listen() queue depth (0 = use OS default 4096) */
 
@@ -309,7 +324,7 @@ typedef struct keel_engine_config {
 
     /** Runtime mode tier — controls which hot-path features are active.
      *  proxy=minimal pass-through, pool=pooling+PS, smart=+routing+logging,
-     *  full=+hooks+txn_tracking+LSN.  Default: full (all features). */
+     *  full=+hooks+txn_tracking+LSN.  Default: pool. */
     keel_tier_t          runtime_mode;
 
     /** Replication uncertainty tracking (transaction_tracking = on).
@@ -434,6 +449,9 @@ typedef struct keel_engine_config {
     .pool_refill_interval_ms = 100, \
     .pool_refill_backoff_ms = 5000, \
     .pool_max_waiting = 0, \
+    .pool_wait_timeout_ms = 0, \
+    .session_max_buffered_bytes = 0, \
+    .backend_max_replay_bytes = 0, \
     .rebalance_enabled = true, \
     .rebalance_interval_ms = 5000, \
     .rebalance_threshold_pct = 125, \
@@ -451,7 +469,7 @@ typedef struct keel_engine_config {
     .instr_mask = 0, \
     .hook_registry = NULL, \
     .ps_mode = KEEL_PS_MODE_VIRTUALIZE, \
-    .runtime_mode = KEEL_TIER_FULL, \
+    .runtime_mode = KEEL_TIER_POOL, \
     .txn_tracking = false, \
     .fast_network_path = true, \
     .result_cache = false, \

@@ -73,7 +73,7 @@ static int migration_send_fd(int dst_sock, int fd)
         .msg_controllen = sizeof(ctrl.buf),
     };
 
-    ssize_t rc = sendmsg(dst_sock, &msg, MSG_NOSIGNAL);
+    ssize_t rc = sendmsg(dst_sock, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (rc < 0) {
         KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN,
             "migration: sendmsg FD failed: %s", strerror(errno));
@@ -329,11 +329,12 @@ int keel_migration_send(keel_session_t*          session,
         return -1;
     }
 
-    /* Step 3: Wake the destination worker via its eventfd */
+    /* Step 3: Wake the destination worker via its eventfd.
+     * 8-byte eventfd add never blocks (kernel always accepts it). */
 #ifdef __linux__
     if (dst->eventfd >= 0) {
         uint64_t val = 1;
-        ssize_t r = write(dst->eventfd, &val, sizeof(val));
+        ssize_t r = write(dst->eventfd, &val, sizeof(val)); /* NOLINT(keel-blocking) */
         (void)r;  /* Best-effort; worker will drain on next reactor_wait() */
     }
 #endif

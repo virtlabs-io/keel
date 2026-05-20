@@ -384,10 +384,10 @@ static void test_replay_hash_probe_only(void) {
 }
 
 /* ============================================================================
- * Test 9: Every frame in replay buf starts with 'P' (Parse)
+ * Test 9: Replay buffer contains one replay frame per statement.
  * ============================================================================ */
 static void test_replay_each_msg_is_parse(void) {
-    TEST_BEGIN("ps_failover: every message in replay buf starts with 'P'");
+    TEST_BEGIN("ps_failover: replay buf contains statement replay messages");
 
     void *ctx = create_ctx_with_n_stmts(4);
     TEST_ASSERT_NOT_NULL(ctx);
@@ -399,12 +399,9 @@ static void test_replay_each_msg_is_parse(void) {
     VT->get_stmt_replay(ctx, &rbuf, &rlen, &rcnt, &hash);
     TEST_ASSERT_NOT_NULL(rbuf);
 
-    /* Walk the replay buffer skipping any leading SET Q messages
-     * (they have type 'Q') — the parse messages themselves must be 'P'.
-     * We cannot assume the very first byte is 'P' because the context-sync
-     * prefix (GUC SET commands) may prepend 'Q' frames.
-     * Instead verify that at least rcnt 'P' messages exist. */
-    uint32_t parse_count = 0;
+    /* Tracking-mode SQL PREPARE replays as 'Q' PREPARE; extended Parse
+     * replays as 'P'.  Ignore Sync and any non-PREPARE SET prefix. */
+    uint32_t replay_count = 0;
     size_t pos = 0;
     while (pos + 5 <= rlen) {
         uint8_t msg_type = rbuf[pos];
@@ -413,10 +410,16 @@ static void test_replay_each_msg_is_parse(void) {
                            ((uint32_t)rbuf[pos+3] << 8)  |
                             (uint32_t)rbuf[pos+4];
         if (msg_len < 4 || pos + 1 + msg_len > rlen) break;
-        if (msg_type == 'P') parse_count++;
+        if (msg_type == 'P') {
+            replay_count++;
+        } else if (msg_type == 'Q' && msg_len > 12 &&
+                   strncasecmp((const char*)rbuf + pos + 5,
+                               "PREPARE", 7) == 0) {
+            replay_count++;
+        }
         pos += 1 + msg_len;
     }
-    TEST_ASSERT_EQ((int)parse_count, (int)rcnt);
+    TEST_ASSERT_EQ((int)replay_count, (int)rcnt);
 
     keel_free(rbuf);
     VT->destroy_context(ctx);
@@ -424,10 +427,10 @@ static void test_replay_each_msg_is_parse(void) {
 }
 
 /* ============================================================================
- * Test 10: Replay-buffer round-trip — inject replayed Parses into fresh context
+ * Test 10: Replay-buffer round-trip — inject replayed statements into fresh context
  * ============================================================================ */
 static void test_failover_stmt_replay_roundtrip(void) {
-    TEST_BEGIN("ps_failover: replayed Parse msgs produce matching hash on fresh ctx");
+    TEST_BEGIN("ps_failover: replayed stmt msgs produce matching hash on fresh ctx");
 
     /* Create original context with stmts */
     void *orig = create_ctx_with_n_stmts(2);
@@ -441,7 +444,7 @@ static void test_failover_stmt_replay_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(rbuf);
     TEST_ASSERT(((int)rcnt) > (0));
 
-    /* Create fresh context and inject only the 'P' messages from rbuf */
+    /* Create fresh context and inject statement replay messages from rbuf. */
     void *fresh = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
     TEST_ASSERT_NOT_NULL(fresh);
 
@@ -466,6 +469,18 @@ static void test_failover_stmt_replay_roundtrip(void) {
             pc[1] = 0; pc[2] = 0; pc[3] = 0; pc[4] = 4;
             keel_be_action_t bact;
             VT->on_be_msg(fresh, pc, sizeof(pc), &bact);
+        } else if (msg_type == 'Q' && msg_len > 12 &&
+                   strncasecmp((const char*)rbuf + pos + 5,
+                               "PREPARE", 7) == 0) {
+            keel_fe_action_t act;
+            VT->on_fe_msg(fresh, rbuf + pos, 1 + msg_len, &act);
+
+            uint8_t cc[16];
+            cc[0] = 'C';
+            cc[1] = 0; cc[2] = 0; cc[3] = 0; cc[4] = 12;
+            memcpy(cc + 5, "PREPARE", 8);
+            keel_be_action_t bact;
+            VT->on_be_msg(fresh, cc, 13, &bact);
         }
         pos += 1 + msg_len;
     }

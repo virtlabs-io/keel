@@ -88,9 +88,7 @@ services:
     <<: *keel-base
     container_name: auth-test-keel-trust
     hostname: keel-trust
-    environment:
-      KEEL_CONFIG: /etc/keel/keel-trust.ini
-    command: ["keel"]
+    command: ["-c", "/etc/keel/keel-trust.ini"]
     volumes:
       - ../../tests/e2e/auth/configs/keel-trust.ini:/etc/keel/keel-trust.ini:ro
     ports:
@@ -103,9 +101,7 @@ services:
     <<: *keel-base
     container_name: auth-test-keel-scram
     hostname: keel-scram
-    environment:
-      KEEL_CONFIG: /etc/keel/keel-scram.ini
-    command: ["keel"]
+    command: ["-c", "/etc/keel/keel-scram.ini"]
     volumes:
       - ../../tests/e2e/auth/configs/keel-scram.ini:/etc/keel/keel-scram.ini:ro
       - ../../tests/e2e/auth/configs/userlist.txt:/etc/keel/userlist.txt:ro
@@ -124,9 +120,7 @@ services:
         condition: service_healthy
       openldap:
         condition: service_healthy
-    environment:
-      KEEL_CONFIG: /etc/keel/keel-ldap.ini
-    command: ["keel"]
+    command: ["-c", "/etc/keel/keel-ldap.ini"]
     volumes:
       - ../../tests/e2e/auth/configs/keel-ldap.ini:/etc/keel/keel-ldap.ini:ro
     ports:
@@ -139,9 +133,7 @@ services:
     <<: *keel-base
     container_name: auth-test-keel-md5
     hostname: keel-md5
-    environment:
-      KEEL_CONFIG: /etc/keel/keel-md5.ini
-    command: ["keel"]
+    command: ["-c", "/etc/keel/keel-md5.ini"]
     volumes:
       - ../../tests/e2e/auth/configs/keel-md5.ini:/etc/keel/keel-md5.ini:ro
       - ../../tests/e2e/auth/configs/userlist.txt:/etc/keel/userlist.txt:ro
