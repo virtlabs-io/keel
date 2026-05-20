@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# KEEL — Production Image (Debian Bookworm Slim)
+# KEEL — Production Image (Debian Trixie Slim)
 # =============================================================================
 # Multi-stage build that compiles KEEL in Release mode and produces a minimal
-# runtime image based on debian:bookworm-slim.
+# runtime image based on debian:trixie-slim.
 #
 # Docker Hub:  vlbsio/keel:debian   vlbsio/keel:latest   vlbsio/keel:X.Y.Z
 #
@@ -18,7 +18,7 @@
 # Stage 1 — builder
 # Compiles KEEL with full optimisations; artefacts are copied out in stage 2.
 # =============================================================================
-FROM debian:bookworm AS builder
+FROM debian:trixie AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -73,9 +73,9 @@ RUN cmake -B build -G Ninja \
 
 # =============================================================================
 # Stage 2 — runner
-# Minimal debian:bookworm-slim image containing only the runtime libraries.
+# Minimal debian:trixie-slim image containing only the runtime libraries.
 # =============================================================================
-FROM debian:bookworm-slim AS runner
+FROM debian:trixie-slim AS runner
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -108,8 +108,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libzstd1 \
         # Lua 5.4 hook runtime
         liblua5.4-0 \
-        # Python 3.11 hook runtime (Bookworm default)
-        libpython3.11 \
+        # Python 3.13 hook runtime (Trixie default)
+        libpython3.13 \
         # Minimal network utility for HEALTHCHECK
         netcat-openbsd \
     && groupadd -r keel \
