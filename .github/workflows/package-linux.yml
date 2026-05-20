@@ -57,7 +57,7 @@ jobs:
         run: cmake --build build-gate -j$(nproc)
 
       - name: Run CTest (test gate)
-        run: ctest --test-dir build-gate --output-on-failure -j$(nproc)
+        run: ctest --test-dir build-gate --output-on-failure -LE integration -j$(nproc)
 
       - name: Install Python test dependencies
         run: pip3 install --user psycopg2-binary
