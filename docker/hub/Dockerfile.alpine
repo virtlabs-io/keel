@@ -67,9 +67,14 @@ COPY docker/keel/ docker/keel/
 # with -Werror.  Passing -U_FORTIFY_SOURCE in CMAKE_C_FLAGS (which is
 # injected before the per-target compile options) cleanly undefines the
 # spec-injected value so the CMakeLists.txt definition wins without warning.
+# Alpine installs Lua 5.4 headers under /usr/include/lua5.4/ rather than the
+# generic /usr/include/ path that CMake's FindLua expects.  Provide explicit
+# paths so Lua scripting is actually compiled in.
 RUN cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE" \
+        -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
+        -DLUA_LIBRARY=/usr/lib/liblua5.4.so \
         -DKEEL_USE_IOURING=ON \
         -DKEEL_USE_EPOLL=ON \
         -DKEEL_ENABLE_TESTS=OFF \
@@ -92,10 +97,12 @@ LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.vendor="Virt Labs"
 
 # Runtime libraries only — no headers, no build tools.
-# Combined with user creation in a single layer to minimise layer count.
+# apk upgrade keeps all base OS packages at their latest patched version,
+# reducing CVEs reported by Docker Hub / Snyk scanning.
 # Busybox (included in Alpine base) provides nc for the HEALTHCHECK.
 RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
-    apk add --no-cache \
+    apk upgrade \
+    && apk add --no-cache \
         # io_uring runtime
         liburing \
         # TLS

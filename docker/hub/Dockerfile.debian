@@ -87,10 +87,14 @@ LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.vendor="Virt Labs"
 
 # Runtime libraries only — no headers, no build tools.
+# apt-get upgrade applies Debian security backports to the slim base, which
+# significantly reduces the CVE count reported by Docker Hub / Snyk scanning.
 # Combined with user creation in a single layer to minimise layer count.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
         # io_uring runtime
         liburing2 \
         # TLS
