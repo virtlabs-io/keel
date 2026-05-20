@@ -224,5 +224,5 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKERHUB_REPO }}
-          readme-filepath: ./README.md
+          readme-filepath: ./docker/hub/DOCKERHUB.md
           short-description: "KEEL — High-performance PostgreSQL/MySQL connection pooler and proxy"
