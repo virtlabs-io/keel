@@ -33,19 +33,21 @@ target_link_libraries(keel_hook
 if(KEEL_ENABLE_LUA)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
-        # Try LuaJIT first, then Lua 5.4
-        pkg_check_modules(LUAJIT QUIET luajit)
+        # Try LuaJIT first, then Lua 5.4.
+        # IMPORTED_TARGET creates PkgConfig::<name> which carries include dirs,
+        # library dirs (-L), and link libraries (-l) as a single target — this
+        # correctly handles distros that install Lua in non-standard paths
+        # (e.g. Alpine puts liblua.so in /usr/lib/lua5.4/).
+        pkg_search_module(LUAJIT QUIET IMPORTED_TARGET luajit)
         if(LUAJIT_FOUND)
             target_compile_definitions(keel_hook PRIVATE KEEL_ENABLE_LUA)
-            target_include_directories(keel_hook PRIVATE ${LUAJIT_INCLUDE_DIRS})
-            target_link_libraries(keel_hook PRIVATE ${LUAJIT_LIBRARIES})
+            target_link_libraries(keel_hook PRIVATE PkgConfig::LUAJIT)
             message(STATUS "Lua hooks: enabled (LuaJIT ${LUAJIT_VERSION})")
         else()
-            pkg_search_module(LUA54 QUIET lua5.4 lua-5.4 lua54 lua)
+            pkg_search_module(LUA54 QUIET IMPORTED_TARGET lua5.4 lua-5.4 lua54 lua)
             if(LUA54_FOUND)
                 target_compile_definitions(keel_hook PRIVATE KEEL_ENABLE_LUA)
-                target_include_directories(keel_hook PRIVATE ${LUA54_INCLUDE_DIRS})
-                target_link_libraries(keel_hook PRIVATE ${LUA54_LIBRARIES})
+                target_link_libraries(keel_hook PRIVATE PkgConfig::LUA54)
                 message(STATUS "Lua hooks: enabled (Lua ${LUA54_VERSION})")
             else()
                 message(WARNING "KEEL_ENABLE_LUA=ON but Lua not found — disabling")
