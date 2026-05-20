@@ -202,6 +202,63 @@ jobs:
             keel --help 2>&1 | head -5
 
   # ===========================================================================
+  # Security scan — Trivy CVE scan of every published image
+  # Runs in parallel with update-description; never blocks releases.
+  # Results appear in the job log and in the GitHub Security tab (SARIF).
+  # ===========================================================================
+  security-scan:
+    name: "trivy (${{ matrix.distro }})"
+    needs: smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+
+    permissions:
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, ubuntu, alpine]
+
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}"
+
+      # Table output goes directly to the job log / step summary
+      - name: Trivy scan — table
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}"
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      # SARIF output → GitHub Security tab (Code scanning alerts)
+      - name: Trivy scan — SARIF
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: "${{ env.DOCKERHUB_REPO }}:${{ matrix.distro }}"
+          format: sarif
+          output: "trivy-${{ matrix.distro }}.sarif"
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-${{ matrix.distro }}.sarif"
+          category: "trivy-${{ matrix.distro }}"
+
+  # ===========================================================================
   # Update the Docker Hub repository description from README.md
   # Only runs on version tags or manual dispatch (not on every push).
   # ===========================================================================
@@ -219,9 +276,10 @@ jobs:
 
       - name: Push README to Docker Hub
         uses: peter-evans/dockerhub-description@v4
+        continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKERHUB_REPO }}
-          readme-filepath: ./README.md
+          readme-filepath: ./docker/hub/DOCKERHUB.md
           short-description: "KEEL — High-performance PostgreSQL/MySQL connection pooler and proxy"

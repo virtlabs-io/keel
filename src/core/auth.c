@@ -29,6 +29,7 @@
 #include <sys/eventfd.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <sys/time.h>     /* struct timeval — needed explicitly on musl libc */
 #include <unistd.h>
 
 #ifdef KEEL_HAS_OPENSSL

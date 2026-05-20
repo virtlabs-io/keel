@@ -49,6 +49,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>     /* struct timeval — needed explicitly on musl libc */
 #include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/epoll.h>

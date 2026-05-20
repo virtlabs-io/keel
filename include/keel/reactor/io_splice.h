@@ -32,8 +32,10 @@ extern "C" {
  * Platform Detection
  * ============================================================================ */
 
-/* Check for splice() availability */
-#if defined(__linux__) && defined(__GLIBC__)
+/* Check for splice() availability.
+ * splice(2) is a Linux syscall available via both glibc and musl libc.
+ * The original __GLIBC__ guard incorrectly disabled it on Alpine/musl. */
+#if defined(__linux__)
     #define KEEL_HAVE_SPLICE 1
 #else
     #define KEEL_HAVE_SPLICE 0

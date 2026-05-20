@@ -82,15 +82,14 @@ keel_error_t keel_splice_pipe_create(keel_splice_pipe_t* pipe, size_t size)
     pipe->valid = true;
     return KEEL_OK;
 #else
-    /* Fallback: use regular pipe */
+    /* Fallback when splice is unavailable: use pipe2() instead of pipe().
+     * pipe() cannot be called here because the parameter is also named 'pipe',
+     * and the C standard requires the identifier to resolve to the local before
+     * the extern function.  pipe2(fds, 0) is equivalent and avoids the conflict. */
     int fds[2];
-    if (pipe(fds) < 0) {
+    if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) < 0) {
         return KEEL_ERR_IO;
     }
-
-    /* Set non-blocking */
-    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
-    fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK);
 
     pipe->pipe_fds[0] = fds[0];
     pipe->pipe_fds[1] = fds[1];

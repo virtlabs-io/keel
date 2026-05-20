@@ -67,6 +67,8 @@ COPY docker/keel/ docker/keel/
 # with -Werror.  Passing -U_FORTIFY_SOURCE in CMAKE_C_FLAGS (which is
 # injected before the per-target compile options) cleanly undefines the
 # spec-injected value so the CMakeLists.txt definition wins without warning.
+# pkg_search_module (OR semantics) picks up the first matching name from
+# "lua5.4 lua-5.4 lua54 lua", so no extra cmake hints are needed.
 RUN cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE" \
@@ -92,10 +94,12 @@ LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.vendor="Virt Labs"
 
 # Runtime libraries only — no headers, no build tools.
-# Combined with user creation in a single layer to minimise layer count.
+# apk upgrade keeps all base OS packages at their latest patched version,
+# reducing CVEs reported by Docker Hub / Snyk scanning.
 # Busybox (included in Alpine base) provides nc for the HEALTHCHECK.
 RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
-    apk add --no-cache \
+    apk upgrade \
+    && apk add --no-cache \
         # io_uring runtime
         liburing \
         # TLS

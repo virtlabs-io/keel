@@ -33,6 +33,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/time.h>     /* struct timeval — needed explicitly on musl libc */
 #include "keel/util/platform_compat.h"
 
 /* ============================================================================

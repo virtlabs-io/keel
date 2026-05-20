@@ -23,6 +23,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>     /* struct timeval — needed explicitly on musl libc */
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <errno.h>
