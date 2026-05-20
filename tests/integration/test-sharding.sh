@@ -64,9 +64,6 @@ echo -e "\n${BOLD}${CYAN}=== KEEL Sharding Integration Test ===${NC}\n"
 info "Starting compose stack..."
 docker compose -f "$COMPOSE_FILE" up -d --build --wait 2>&1 | tail -5
 
-# Give keel a moment after the health-check passes
-sleep 2
-
 KEEL_HOST="127.0.0.1"
 KEEL_PORT="16432"
 PROM_PORT="19101"
@@ -79,6 +76,21 @@ export PGPASSWORD="${PGPASSWORD:-postgres}"
 PG0="docker compose -f $COMPOSE_FILE exec -T pg-shard0 psql -U postgres -d testdb -v ON_ERROR_STOP=1"
 PG1="docker compose -f $COMPOSE_FILE exec -T pg-shard1 psql -U postgres -d testdb -v ON_ERROR_STOP=1"
 KEEL_PSQL="psql -h $KEEL_HOST -p $KEEL_PORT -U postgres -d testdb -v ON_ERROR_STOP=1"
+
+# The Docker health check passes when KEEL's Prometheus port (9101) binds,
+# which happens *before* worker threads have established backend pool
+# connections to the shards.  Poll until KEEL can actually execute a query
+# so subsequent tests don't race the async pool-connect phase.
+info "Waiting for KEEL to be query-ready..."
+READY=0
+for _i in $(seq 1 30); do
+    if $KEEL_PSQL -c "SELECT 1" >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 1
+done
+[[ $READY -eq 1 ]] || fail "KEEL did not become query-ready after 30 seconds"
 
 # =============================================================================
 # Test 1: Schema setup
@@ -141,7 +153,14 @@ pass "Single-shard SELECT returned correct row"
 # =============================================================================
 info "Test 5: Prometheus /metrics endpoint..."
 
-METRICS=$(curl -sf "http://$KEEL_HOST:$PROM_PORT/metrics" 2>/dev/null) || fail "Could not fetch /metrics"
+# Retry the metrics fetch briefly — the HTTP listener comes up with the pool
+# but may need a moment to fully initialise on the first scrape.
+METRICS=""
+for _i in $(seq 1 10); do
+    METRICS=$(curl -sf "http://$KEEL_HOST:$PROM_PORT/metrics" 2>/dev/null) && break
+    sleep 1
+done
+[[ -n "$METRICS" ]] || fail "Could not fetch /metrics after 10 attempts"
 
 echo "$METRICS" | grep -q "keel_queries_total" \
     || fail "/metrics missing keel_queries_total"
