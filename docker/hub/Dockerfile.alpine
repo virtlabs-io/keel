@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# KEEL — Production Image (Alpine 3.20)
+# =============================================================================
+# Multi-stage build that compiles KEEL against musl libc and produces the
+# smallest possible runtime image based on alpine:3.20.
+#
+# Docker Hub:  vlbsio/keel:alpine   vlbsio/keel:X.Y.Z-alpine
+#
+# NOTE: Alpine uses musl libc.  io_uring requires Linux kernel ≥ 5.6.
+#
+# Build:
+#   docker build -f docker/hub/Dockerfile.alpine -t vlbsio/keel:alpine .
+#
+# Run:
+#   docker run -v /path/to/keel.ini:/etc/keel/keel.ini vlbsio/keel:alpine
+# =============================================================================
+
+# =============================================================================
+# Stage 1 — builder
+# Compiles KEEL against musl with full optimisations.
+# =============================================================================
+FROM alpine:3.20 AS builder
+
+# Build-time dependencies; apk cache is mounted externally by BuildKit
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    apk add --no-cache \
+        # Toolchain
+        build-base \
+        cmake \
+        ninja \
+        pkgconf \
+        git \
+        # io_uring (Linux 5.6+)
+        liburing-dev \
+        # TLS / authentication
+        openssl-dev \
+        openldap-dev \
+        # Wire-protocol compression
+        zlib-dev \
+        zstd-dev \
+        # Lua 5.4 hook scripting
+        lua5.4-dev \
+        # Python 3 hook scripting
+        python3-dev \
+        musl-dev
+
+WORKDIR /keel
+
+# Copy source tree (only what is needed for the build)
+COPY CMakeLists.txt README.md LICENSE ./
+COPY cmake/      cmake/
+COPY include/    include/
+COPY src/        src/
+COPY tests/      tests/
+COPY scripts/    scripts/
+COPY etc/        etc/
+COPY docker/keel/ docker/keel/
+
+# Configure and compile with Release optimisations; strip debug info.
+# Disable epoll — Alpine kernel headers may differ; io_uring is the primary backend.
+RUN cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DKEEL_USE_IOURING=ON \
+        -DKEEL_USE_EPOLL=OFF \
+        -DKEEL_ENABLE_TESTS=OFF \
+        -DKEEL_ENABLE_LUA=ON \
+        -DKEEL_ENABLE_PYTHON=ON \
+    && cmake --build build \
+    && strip --strip-unneeded build/src/main/keel
+
+# =============================================================================
+# Stage 2 — runner
+# Minimal alpine:3.20 image (~10 MB base + runtime libs).
+# =============================================================================
+FROM alpine:3.20 AS runner
+
+LABEL org.opencontainers.image.title="keel" \
+      org.opencontainers.image.description="KEEL high-performance database connection pooler (Alpine)" \
+      org.opencontainers.image.url="https://hub.docker.com/r/vlbsio/keel" \
+      org.opencontainers.image.documentation="https://github.com/virtlabs-io/keel/tree/main/docs" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.vendor="Virt Labs"
+
+# Runtime libraries only — no headers, no build tools.
+# Combined with user creation in a single layer to minimise layer count.
+# Busybox (included in Alpine base) provides nc for the HEALTHCHECK.
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    apk add --no-cache \
+        # io_uring runtime
+        liburing \
+        # TLS
+        libssl3 \
+        # LDAP authentication runtime
+        openldap \
+        # TLS certificate bundle
+        ca-certificates \
+        # Wire-protocol compression
+        zlib \
+        zstd-libs \
+        # Lua 5.4 hook runtime
+        lua5.4 \
+        # Python 3 hook runtime
+        python3 \
+    && addgroup -S keel \
+    && adduser -S -G keel -H -s /sbin/nologin keel
+
+# Binary from builder
+COPY --from=builder --chmod=755 /keel/build/src/main/keel /usr/local/bin/keel
+
+# Config and runtime directories
+RUN mkdir -p /etc/keel /var/log/keel /run/keel \
+    && chown keel:keel /etc/keel /var/log/keel /run/keel
+
+# Ship the example configs; users mount or override with KEEL_* env vars
+COPY --from=builder /keel/etc/keel.ini.example        /etc/keel/keel.ini.example
+COPY docker/keel/keel-cluster.ini                     /etc/keel/keel-cluster.ini.example
+
+COPY --chmod=755 docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+USER keel
+
+# PostgreSQL proxy  MySQL proxy  admin console  cluster peer  Prometheus
+EXPOSE 7432 7306 6433 9100 9101
+
+# Busybox nc is available in the Alpine base image
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD nc -z 127.0.0.1 6433 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["keel"]
