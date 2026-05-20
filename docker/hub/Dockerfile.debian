@@ -98,9 +98,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         # io_uring runtime
         liburing2 \
         # TLS
-        libssl3 \
+        libssl3t64 \
         # LDAP authentication
-        libldap-2.5-0 \
+        libldap2 \
         # TLS certificate bundle
         ca-certificates \
         # Wire-protocol compression

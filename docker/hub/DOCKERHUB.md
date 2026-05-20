@@ -5,7 +5,7 @@
 **KEEL** is a high-performance connection pooler and intelligent proxy for **PostgreSQL** and **MySQL**. It sits between your application and your databases, multiplexing thousands of app connections over a small pool of real backend connections — reducing database load, improving tail latency, and adding routing intelligence with zero application changes.
 
 > **v0.3.0** · [GitHub](https://github.com/virtlabs-io/keel) · [Documentation](https://github.com/virtlabs-io/keel/tree/main/docs) · [Changelog](https://github.com/virtlabs-io/keel/blob/main/CHANGELOG.md) · [License: AGPL-3.0](https://github.com/virtlabs-io/keel/blob/main/LICENSE)
-
+ 
 ---
 
 ## Why KEEL?
@@ -26,7 +26,7 @@
 
 | Tag | Base | Size | Use when |
 |-----|------|------|---------|
-| `latest`, `X.Y.Z`, `debian` | Debian Bookworm Slim | ~120 MB | Default — best library compatibility |
+| `latest`, `X.Y.Z`, `debian` | Debian Trixie Slim | ~120 MB | Default — best library compatibility |
 | `ubuntu`, `X.Y.Z-ubuntu` | Ubuntu 24.04 LTS | ~140 MB | Ubuntu-centric environments |
 | `alpine`, `X.Y.Z-alpine` | Alpine 3.20 | ~40 MB | Minimal footprint, musl libc |
 
