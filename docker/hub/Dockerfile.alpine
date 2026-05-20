@@ -67,14 +67,11 @@ COPY docker/keel/ docker/keel/
 # with -Werror.  Passing -U_FORTIFY_SOURCE in CMAKE_C_FLAGS (which is
 # injected before the per-target compile options) cleanly undefines the
 # spec-injected value so the CMakeLists.txt definition wins without warning.
-# Alpine installs Lua 5.4 headers under /usr/include/lua5.4/ rather than the
-# generic /usr/include/ path that CMake's FindLua expects.  Provide explicit
-# paths so Lua scripting is actually compiled in.
+# pkg_search_module (OR semantics) picks up the first matching name from
+# "lua5.4 lua-5.4 lua54 lua", so no extra cmake hints are needed.
 RUN cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE" \
-        -DLUA_INCLUDE_DIR=/usr/include/lua5.4 \
-        -DLUA_LIBRARY=/usr/lib/liblua5.4.so \
         -DKEEL_USE_IOURING=ON \
         -DKEEL_USE_EPOLL=ON \
         -DKEEL_ENABLE_TESTS=OFF \

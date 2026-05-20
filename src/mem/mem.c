@@ -20,7 +20,12 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <unistd.h>
-#include <execinfo.h>
+#if __has_include(<execinfo.h>)
+#  include <execinfo.h>
+#  define KEEL_HAVE_EXECINFO 1
+#else
+#  define KEEL_HAVE_EXECINFO 0
+#endif
 
 /* ----------------------------------------------------------------------
  * Diagnostic backtrace helper used by allocator corruption logging.
@@ -35,6 +40,7 @@
  * paths in keel_free / keel_realloc.
  * ---------------------------------------------------------------------- */
 static void keel_mem_log_backtrace(keel_log_category_t cat, const char* label) {
+#if KEEL_HAVE_EXECINFO
     void* frames[32];
     int   n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
     char** syms = backtrace_symbols(frames, n);
@@ -47,6 +53,9 @@ static void keel_mem_log_backtrace(keel_log_category_t cat, const char* label) {
         KEEL_LOG_ERROR(cat, "[%s]   #%-2d %s", label, i - 1, syms[i]);
     }
     free(syms);  /* allocated by libc, not us */
+#else
+    KEEL_LOG_ERROR(cat, "[%s] backtrace: <not available on this platform>", label);
+#endif
 }
 
 /* ============================================================================
