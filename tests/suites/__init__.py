@@ -48,6 +48,7 @@ class SuiteResult:
     detail:     str   = ""
     returncode: int   = 0
     cases:      list[CaseResult] = field(default_factory=list)
+    metrics:    dict  = field(default_factory=dict)
 
     # --- coordinator-compatible properties --------------------------------
 
@@ -88,6 +89,7 @@ class SuiteResult:
             "failed":     self.failed,
             "skipped":    self.skipped,
             "cases":      [c.as_dict() for c in self.cases],
+            "metrics":    self.metrics,
         }
 
 
@@ -232,6 +234,8 @@ def standalone_main(
                         help="Only run test methods whose names contain SUBSTR")
     parser.add_argument("--list", action="store_true",
                         help="List all test method names and exit")
+    parser.add_argument("--json-out", metavar="PATH",
+                        help="Write JSON report to PATH (in addition to normal output)")
 
     if extra_args_fn:
         extra_args_fn(parser)
@@ -269,6 +273,12 @@ def standalone_main(
     runner.run_all()
     result.duration = time.monotonic() - t0
 
+    if getattr(args, "json_out", None):
+        import pathlib
+        p = pathlib.Path(args.json_out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(result.as_dict(), indent=2))
+
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
@@ -278,16 +288,36 @@ def standalone_main(
 
 
 def _print_text_summary(result: SuiteResult) -> None:
-    width = 60
+    width = 72
+    sym_map = {"passed": "✓", "failed": "✗", "skipped": "~", "error": "!"}
     print(f"\n{'='*width}")
     status_str = result.status.upper()
     print(f"Suite: {result.name}  [{status_str}]  ({result.duration:.2f}s)")
     print(f"  {result.passed} passed  {result.failed} failed  {result.skipped} skipped")
+
+    if result.cases:
+        print(f"\n  {'Test':<56} {'Status':>7}  {'ms':>7}")
+        print(f"  {'-'*56} {'-'*7}  {'-'*7}")
+        for c in result.cases:
+            sym = sym_map.get(c.status, "?")
+            dur = f"{c.duration*1000:.0f}"
+            print(f"  [{sym}] {c.name:<56} {c.status:>7}  {dur:>7}")
+
+    if result.metrics:
+        print("\n  --- Metrics ---")
+        for key, val in sorted(result.metrics.items()):
+            if isinstance(val, dict):
+                print(f"  {key}:")
+                for k, v in sorted(val.items()):
+                    print(f"    {k}: {v}")
+            else:
+                print(f"  {key}: {val}")
+
     if result.failed:
-        print("\nFailed cases:")
+        print("\n  Failed:")
         for c in result.cases:
             if c.status in ("failed", "error"):
                 print(f"  ✗ {c.name}")
-                for line in (c.detail or "").splitlines()[:4]:
-                    print(f"    {line}")
+                for line in (c.detail or "").splitlines()[:8]:
+                    print(f"      {line}")
     print()

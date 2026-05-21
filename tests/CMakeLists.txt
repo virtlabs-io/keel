@@ -2378,6 +2378,23 @@ set_tests_properties(check_result_cache_gate PROPERTIES
 )
 
 # =============================================================================
+# Auth-log safety gate — no authentication material in log calls.
+# Scans source for KEEL_LOG_* calls whose format strings embed sensitive
+# labels (data=, proof=, nonce=, auth_msg=, …) with a %s specifier, or
+# that pass raw SCRAM wire-message variables to %s inside AUTH-category
+# log calls.  Must pass on every branch before merging to main.
+# =============================================================================
+add_test(
+    NAME  check_auth_log_safety
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_auth_log_safety.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_auth_log_safety PROPERTIES
+    LABELS "gate;security"
+    TIMEOUT 30
+)
+
+# =============================================================================
 # PostgreSQL Parse/Execute integration test
 # Connects to a live PostgreSQL to verify extended-protocol Parse ('P' message)
 # vs simple-query PREPARE handling, specifically the plan-invalidation behaviour
