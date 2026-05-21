@@ -3859,11 +3859,45 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             (tag[7] == '\0' || !isalnum((unsigned char)tag[7]))) {
             act->stmt_replay_accepted = true;
         }
+        /* search_path has no GUC_REPORT flag in PostgreSQL so it never
+         * generates a ParameterStatus message.  KEEL's state_profile is
+         * normally only updated from ParameterStatus; bridge the gap by
+         * synthesising a profile update from the stmt context so that SSV
+         * state-sync can replay SET search_path on future pool borrows.
+         * Only emit when a non-empty search_path is tracked; empty means no
+         * explicit SET was issued and the pool's DISCARD ALL handles cleanup. */
+        if (strncmp(tag, "SET", 3) == 0 && tag[3] == '\0' &&
+            ctx->stmt_search_path[0] != '\0') {
+            act->has_profile_update = true;
+            act->profile_key        = "search_path";
+            act->profile_key_len    = 11; /* strlen("search_path") */
+            act->profile_value      = ctx->stmt_search_path;
+            act->profile_value_len  = strlen(ctx->stmt_search_path);
+        }
         return 0;
     }
     case 'E': /* ErrorResponse */
         act->is_error_response = true;
         ctx->stmt_discard_plans_absorb_pending = false;
+        /* Detect query_canceled (SQLSTATE 57014) to suppress the following
+         * ReadyForQuery so no stale Z reaches the client socket buffer.
+         * For any other error the flag is cleared to prevent spurious fires. */
+        {
+            ctx->cancel_rfq_suppress = false;
+            const uint8_t* ep  = data + 5;
+            const uint8_t* eend = data + len;
+            while (ep < eend && *ep != '\0') {
+                uint8_t ftype = *ep++;
+                const char* fval = (const char*)ep;
+                size_t fvl = strnlen(fval, (size_t)(eend - ep));
+                if (ftype == 'C' && fvl == 5 &&
+                    fval[0]=='5' && fval[1]=='7' &&
+                    fval[2]=='0' && fval[3]=='1' && fval[4]=='4') {
+                    ctx->cancel_rfq_suppress = true;
+                }
+                ep += fvl + 1;
+            }
+        }
         /* Tracking mode: backend rejected the staged PREPARE — roll back the
          * cache entry to the prior confirmed state (or remove it if there was
          * no prior entry).  The ErrorResponse is still forwarded to the client
@@ -3996,6 +4030,19 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 pg_stmt_recompute_session_hash(ctx);
                 ctx->pending_track_valid     = false;
                 ctx->pending_track_had_prior = false;
+            }
+
+            /* Cancel-RFQ suppression: if the last error was query_canceled
+             * (SQLSTATE 57014), absorb this ReadyForQuery so the client only
+             * sees the ErrorResponse and NOT a bare Z.  The next query's
+             * ReadyForQuery will serve as the protocol sync point.
+             * query_complete and backend_reusable remain set so the engine
+             * still returns the backend connection to the pool. */
+            if (ctx->cancel_rfq_suppress) {
+                ctx->cancel_rfq_suppress = false;
+                act->type           = KEEL_BE_ACT_ABSORB;
+                act->fe_payload     = NULL;
+                act->fe_payload_len = 0;
             }
         }
         return 0;

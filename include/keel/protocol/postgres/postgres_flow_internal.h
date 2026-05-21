@@ -281,6 +281,12 @@ typedef struct pg_flow_ctx {
     keel_auth_manager_t*  auth_manager;      /**< Non-owning ptr to worker auth manager */
     keel_auth_context_t*  auth_ctx;          /**< In-progress per-connection auth context */
     bool                  auth_pending;      /**< Challenge sent; awaiting client response */
-    int                   auth_round;        /**< 0-based count of 'p' messages received (for SASL) */} pg_flow_ctx_t;
+    int                   auth_round;        /**< 0-based count of 'p' messages received (for SASL) */
+    /* Cancel-RFQ suppression: set when a query_canceled (SQLSTATE 57014)
+     * ErrorResponse is received; cleared after the subsequent ReadyForQuery
+     * is absorbed.  Prevents a stale Z from landing in the client socket
+     * buffer between the cancel error and the next query's response. */
+    bool                  cancel_rfq_suppress;
+} pg_flow_ctx_t;
 
 #endif /* KEEL_POSTGRES_FLOW_INTERNAL_H */

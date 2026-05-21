@@ -73,6 +73,7 @@ from tests.suites.common import (
     proxy_env,
     wait_for_port,
     pg_query,
+    pg_cancel_request,
     pg_startup_msg,
     pg_terminate,
     pg_parse,
@@ -2315,6 +2316,354 @@ class TortureSuite(SuiteRunner):
                     f"query {i} failed after idle-backend kill — "
                     "KEEL did not transparently reconnect"
                 )
+
+
+    # =======================================================================
+    # I29 — Live config reload under concurrent load
+    # =======================================================================
+
+    def test_i29_live_reload_under_load(self) -> None:
+        """Issue admin RELOAD while 30 workers run concurrent queries.
+
+        The admin RELOAD command is the equivalent of SIGHUP — KEEL re-reads
+        its configuration and applies changes without dropping existing
+        connections.  All in-flight queries must complete without error.
+
+        Steps:
+        1. Spin up 30 threads, each running 10 quick queries via the proxy.
+        2. After 100 ms (while load is still in flight), issue RELOAD via the
+           admin SQL console (psql -p 6433).
+        3. Wait for all threads to finish.
+        4. Assert zero query errors and that a post-reload query succeeds.
+        """
+        if not check_command("psql"):
+            self.skip("psql not available")
+        e = self._env
+
+        CONCURRENCY = 30
+        errors: list[str] = []
+        reload_done = threading.Event()
+
+        def _worker(tid: int) -> None:
+            try:
+                for i in range(10):
+                    with ProxyConn(e["host"], int(e["port"])) as conn:
+                        if not conn.startup(e["user"], e["database"], e["password"]):
+                            errors.append(f"tid={tid} iter={i}: startup failed")
+                            return
+                        conn.set_timeout(10.0)
+                        conn.send(pg_query(f"SELECT {tid} * 1000 + {i}"))
+                        msgs = conn.recv_until({ord("Z")})
+                        if not any(t == ord("D") for t, _ in msgs):
+                            errors.append(f"tid={tid} iter={i}: no DataRow")
+                    # Give the reload a window to interleave
+                    if not reload_done.is_set():
+                        time.sleep(0.01)
+            except Exception as ex:
+                errors.append(f"tid={tid}: {ex}")
+
+        threads = [threading.Thread(target=_worker, args=(i,), daemon=True)
+                   for i in range(CONCURRENCY)]
+        for t in threads:
+            t.start()
+
+        # Issue RELOAD while load is in flight
+        time.sleep(0.1)
+        rc, out, err = _run(
+            ["psql", f"--host={e['host']}", "--port=6433",
+             "--username=postgres", "--dbname=postgres",
+             "--no-password", "--command=RELOAD"],
+            env={"PGPASSWORD": "postgres"},
+            timeout=8,
+        )
+        reload_done.set()
+
+        for t in threads:
+            t.join(timeout=30)
+
+        if rc != 0:
+            self.skip(f"admin RELOAD failed (admin unavailable?): {(err or out)[:200]}")
+
+        assert not errors, \
+            f"queries failed during live RELOAD ({len(errors)} errors): {errors[:5]}"
+
+        # Post-reload sanity query
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(5.0)
+            conn.send(pg_query("SELECT 'reload_ok'"))
+            msgs = conn.recv_until({ord("Z")})
+            assert any(t == ord("D") for t, _ in msgs), \
+                "pool unhealthy immediately after config RELOAD"
+
+    # =======================================================================
+    # I34 — SET/GUC tracking across pool cycles (SSV)
+    # =======================================================================
+
+    def test_i34_set_tracking_across_pool_cycles(self) -> None:
+        """SET parameters must be preserved across pool boundaries (SSV).
+
+        In transaction pooling mode KEEL returns the backend to the pool after
+        each transaction.  The next transaction from the same client may land
+        on a *different* backend.  KEEL's Semantic State Virtualisation (SSV)
+        layer must replay the session's GUC changes (SET search_path, SET
+        timezone, …) on that fresh backend before forwarding the query.
+
+        Test sequence (repeated 8 times to exercise different backends):
+        1. SET search_path = pg_catalog, public
+        2. SET timezone = 'America/New_York'
+        3. SHOW search_path  →  must contain 'pg_catalog'
+        4. SHOW timezone     →  must contain 'America/New_York'
+
+        Each SHOW runs in a *separate* transaction (autocommit=True), so KEEL
+        MUST replay the SET on whatever backend it picks.
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e = self._env
+
+        for i in range(8):
+            with pg.connect(
+                host=e["host"], port=int(e["port"]),
+                user=e["user"], password=e["password"],
+                dbname=e["database"],
+                connect_timeout=10, autocommit=True,
+            ) as conn:
+                conn.execute("SET search_path = pg_catalog, public")
+                conn.execute("SET timezone = 'America/New_York'")
+
+                row = conn.execute("SHOW search_path").fetchone()
+                sp = row[0] if row else ""
+                assert "pg_catalog" in sp, (
+                    f"iteration {i}: SET search_path not preserved across pool cycle: "
+                    f"got {sp!r}"
+                )
+
+                row = conn.execute("SHOW timezone").fetchone()
+                tz = row[0] if row else ""
+                assert "America/New_York" in tz, (
+                    f"iteration {i}: SET timezone not preserved across pool cycle: "
+                    f"got {tz!r}"
+                )
+
+    # =======================================================================
+    # I35 — Temp table session pinning
+    # =======================================================================
+
+    def test_i35_temp_table_session_pin(self) -> None:
+        """Creating a temporary table must pin the session to its backend.
+
+        PostgreSQL temporary tables are session-scoped: they live in the
+        pg_temp_N namespace of the backend that created them.  In transaction
+        pooling mode, KEEL must detect CREATE TEMP TABLE and hard-pin the
+        client connection to the creating backend for the lifetime of that
+        client connection.
+
+        Steps:
+        1. CREATE TEMP TABLE _i35 (v int) — triggers FPIN_TEMP_TABLE in KEEL.
+        2. INSERT a row and COMMIT.
+        3. In a *new* transaction on the same client: SELECT from _i35 — must
+           see the row (proves the same backend was used).
+        4. Repeat INSERTs across multiple transactions to confirm continued
+           pinning.
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e = self._env
+
+        with pg.connect(
+            host=e["host"], port=int(e["port"]),
+            user=e["user"], password=e["password"],
+            dbname=e["database"],
+            connect_timeout=10, autocommit=False,
+        ) as conn:
+            conn.execute("CREATE TEMP TABLE _i35_pin (v int)")
+            conn.execute("INSERT INTO _i35_pin VALUES (42)")
+            conn.commit()
+
+            # New transaction — must still see the temp table
+            row = conn.execute("SELECT v FROM _i35_pin").fetchone()
+            conn.commit()
+            assert row is not None and row[0] == 42, (
+                "temp table invisible after pool cycle — "
+                "session was NOT pinned to the creating backend"
+            )
+
+            # Additional transactions — confirmed continued pinning
+            for k in range(5):
+                conn.execute(f"INSERT INTO _i35_pin VALUES ({k})")
+                conn.commit()
+
+            count = conn.execute("SELECT COUNT(*) FROM _i35_pin").fetchone()[0]
+            conn.commit()
+            assert count == 6, (
+                f"expected 6 rows in temp table, got {count} — "
+                "pin broke across transactions"
+            )
+
+    # =======================================================================
+    # I36 — WITH HOLD cursor survives COMMIT
+    # =======================================================================
+
+    def test_i36_with_hold_cursor_across_commit(self) -> None:
+        """DECLARE … WITH HOLD cursor must survive transaction COMMIT.
+
+        A WITH HOLD cursor lives on the backend (in its portal cache) past
+        the COMMIT that closes the declaring transaction.  KEEL must:
+        a) Pin the session to the cursor-owning backend (FPIN_CURSOR), and
+        b) Keep it pinned until the client CLOSEs the cursor.
+
+        Steps:
+        1. Create a table with 10 rows.
+        2. DECLARE c1 CURSOR WITH HOLD FOR SELECT …
+        3. COMMIT — cursor must survive (WITH HOLD).
+        4. FETCH 5 from c1 — must return 5 rows (proves same backend).
+        5. CLOSE c1 — KEEL must release the CURSOR pin.
+        6. A fresh query on a *different* connection must succeed (pool health).
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e = self._env
+
+        # Seed table (separate connection so it doesn't interfere)
+        with pg.connect(
+            host=e["host"], port=int(e["port"]),
+            user=e["user"], password=e["password"],
+            dbname=e["database"],
+            connect_timeout=10, autocommit=True,
+        ) as seed:
+            seed.execute(
+                "CREATE TABLE IF NOT EXISTS _i36_cursor_tbl "
+                "AS SELECT generate_series(1, 10) AS n"
+            )
+
+        with pg.connect(
+            host=e["host"], port=int(e["port"]),
+            user=e["user"], password=e["password"],
+            dbname=e["database"],
+            connect_timeout=10, autocommit=False,
+        ) as conn:
+            conn.execute(
+                "DECLARE c1 CURSOR WITH HOLD FOR "
+                "SELECT n FROM _i36_cursor_tbl ORDER BY n"
+            )
+            conn.commit()  # Close declaring transaction; WITH HOLD keeps cursor alive
+
+            rows = conn.execute("FETCH 5 FROM c1").fetchall()
+            conn.commit()
+            assert len(rows) == 5, (
+                f"expected 5 rows from WITH HOLD cursor after COMMIT, got {len(rows)} — "
+                "KEEL did not keep session pinned to cursor-owning backend"
+            )
+            assert [r[0] for r in rows] == list(range(1, 6)), (
+                f"wrong rows from cursor: {rows}"
+            )
+
+            conn.execute("CLOSE c1")
+            conn.commit()  # Cursor closed — KEEL should release CURSOR pin
+
+        # Pool health: unrelated query must work after cursor is closed
+        with ProxyConn(e["host"], int(e["port"])) as health:
+            assert health.startup(e["user"], e["database"], e["password"])
+            health.set_timeout(5.0)
+            health.send(pg_query("SELECT 'pool_ok_after_cursor'"))
+            msgs = health.recv_until({ord("Z")})
+            assert any(t == ord("D") for t, _ in msgs), \
+                "pool unhealthy after WITH HOLD cursor lifecycle"
+
+        # Cleanup
+        with pg.connect(
+            host=e["host"], port=int(e["port"]),
+            user=e["user"], password=e["password"],
+            dbname=e["database"],
+            connect_timeout=10, autocommit=True,
+        ) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS _i36_cursor_tbl")
+
+    # =======================================================================
+    # I40 — CancelRequest storm
+    # =======================================================================
+
+    def test_i40_cancel_request_storm(self) -> None:
+        """10 concurrent long queries each receive a CancelRequest; all must cancel.
+
+        CancelRequest is a special out-of-band TCP connection (not within the
+        normal protocol stream).  KEEL must forward the cancel token to the
+        correct backend and the query must receive SQLSTATE 57014 (QueryCanceled).
+
+        Steps:
+        1. Open 10 connections, each starting 'SELECT pg_sleep(30)'.
+        2. Immediately send a CancelRequest on a separate socket.
+        3. Collect the response — must be ErrorResponse with SQLSTATE 57014.
+        4. Each connection must then accept a normal query (pool is healthy).
+        """
+        e = self._env
+        WORKERS = 10
+        results: list[str] = []  # "" = ok, else error description
+        lock = threading.Lock()
+
+        def _cancel_one(tid: int) -> None:
+            try:
+                with ProxyConn(e["host"], int(e["port"])) as conn:
+                    if not conn.startup(e["user"], e["database"], e["password"]):
+                        with lock:
+                            results.append(f"tid={tid}: startup failed")
+                        return
+                    conn.set_timeout(15.0)
+
+                    # Send a long-running query
+                    conn.send(pg_query("SELECT pg_sleep(30)"))
+
+                    # Cancel it immediately on a separate socket
+                    cancel_host = e["host"]
+                    cancel_port = int(e["port"])
+                    with socket.create_connection((cancel_host, cancel_port), timeout=5) as csock:
+                        csock.sendall(pg_cancel_request(conn.backend_pid, conn.backend_secret))
+
+                    # The pending query must return ErrorResponse (57014)
+                    msgs = conn.recv_until({ord("Z"), ord("E")})
+                    sqlstate = ""
+                    for t, body in msgs:
+                        if t == ord("E"):
+                            sqlstate = _parse_pg_error_field(body, "C")
+                            break
+
+                    if sqlstate != "57014":
+                        with lock:
+                            results.append(
+                                f"tid={tid}: expected SQLSTATE 57014, got {sqlstate!r}"
+                            )
+                        return
+
+                    # Recovery: a normal query must succeed
+                    conn.send(pg_query(f"SELECT {tid} + 0"))
+                    msgs2 = conn.recv_until({ord("Z")})
+                    if not any(t == ord("D") for t, _ in msgs2):
+                        with lock:
+                            results.append(f"tid={tid}: recovery query failed after cancel")
+                        return
+
+                with lock:
+                    results.append("")  # success
+            except Exception as ex:
+                with lock:
+                    results.append(f"tid={tid}: {ex}")
+
+        threads = [threading.Thread(target=_cancel_one, args=(i,), daemon=True)
+                   for i in range(WORKERS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        failures = [r for r in results if r]
+        assert len(results) == WORKERS, \
+            f"only {len(results)}/{WORKERS} cancel threads completed"
+        assert not failures, \
+            f"{len(failures)}/{WORKERS} cancel workers failed: {failures[:5]}"
 
 
 # ---------------------------------------------------------------------------

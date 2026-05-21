@@ -194,10 +194,10 @@ static void cancel_on_connected(void* userdata, int result)
  * Never blocks the reactor thread.  Silently drops the cancel on any failure.
  */
 static void cancel_request_async(keel_reactor_t* reactor,
-                                 const char* host, uint16_t port,
+                                 const struct sockaddr_in* addr,
                                  const uint8_t* payload, size_t payload_len)
 {
-    if (!reactor || !payload || payload_len == 0 || payload_len > 64) return;
+    if (!reactor || !addr || !payload || payload_len == 0 || payload_len > 64) return;
 
     int fd = keel_socket_nonblock(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return;
@@ -213,15 +213,7 @@ static void cancel_request_async(keel_reactor_t* reactor,
     memcpy(ctx->payload, payload, payload_len);
     ctx->payload_len = payload_len;
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        close(fd); keel_free(ctx); return;
-    }
-
-    if (keel_reactor_connect(reactor, fd, (struct sockaddr*)&addr, sizeof(addr),
+    if (keel_reactor_connect(reactor, fd, (const struct sockaddr*)addr, sizeof(*addr),
                             ctx, cancel_on_connected) < 0) {
         close(fd); keel_free(ctx);
     }
@@ -1004,8 +996,12 @@ static bool backend_needs_state_sync(const keel_session_flow_t* sf,
                                      const keel_session_t* session,
                                      const backend_conn_t* be_conn)
 {
+    /* be_conn->profile is not required: generate_sync_sql() treats a NULL
+     * backend profile as the clean baseline (empty), which is correct for
+     * any backend whose profile was never explicitly recorded.  The hash
+     * comparison alone is sufficient to detect whether sync is needed. */
     return KEEL_TIER_HAS_STATE_SYNC(sf->mode) &&
-           be_conn && be_conn->profile && session->state_profile &&
+           be_conn && session->state_profile &&
            be_conn->current_state_hash != session->state_hash &&
            session->state_hash != 0;
 }
@@ -1250,6 +1246,26 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
     if (!pending_data || pending_len == 0) {
         KEEL_LOG_ERROR(KEEL_LOG_CAT_CONN, "W%u: resume_from_pool with no pending msg", worker->id);
         return KEEL_FLOW_ERROR;
+    }
+
+    /* Early cancel: a CancelRequest arrived while the session was queued
+     * waiting for a pool slot.  Return the just-borrowed connection and
+     * synthesise E(57014) — identical to the on_fe_data fast-path above.
+     * KEEL_FLOW_OK re-arms the FE recv for the client's recovery query. */
+    if (atomic_load_explicit(&session->cancel_pending, memory_order_acquire)) {
+        atomic_store_explicit(&session->cancel_pending, false, memory_order_relaxed);
+        if (be_conn && be_conn->pool)
+            backend_pool_return(be_conn->pool, be_conn, false);
+        if (flow->generate_error) {
+            uint8_t ebuf[256];
+            ssize_t elen = flow->generate_error(sf->ctx, "57014",
+                "canceling statement due to user request",
+                ebuf, sizeof(ebuf));
+            if (elen > 0)
+                keel_try_send_nb(session->client_fd, ebuf, (size_t)elen);
+        }
+        sf->phase = KEEL_PHASE_READY;
+        return KEEL_FLOW_OK;
     }
 
     /* Assign the backend connection */
@@ -2036,6 +2052,28 @@ copy_scan_done:
                             KEEL_STAT_INC(worker->stats_ctx, queries_tx);
                     }
                 }
+            }
+
+            /* === EARLY CANCEL: CancelRequest arrived before backend was borrowed ===
+             * A cancel handler running cross-worker may have set cancel_pending
+             * atomically when it found backend_conn == NULL.  Synthesise
+             * E(57014) to the client and skip backend borrow entirely.  The
+             * next ReadyForQuery will come from the recovery query's response,
+             * which is the correct protocol sync point. */
+            if (act.type == KEEL_FE_ACT_QUERY &&
+                atomic_load_explicit(&session->cancel_pending, memory_order_acquire)) {
+                atomic_store_explicit(&session->cancel_pending, false, memory_order_relaxed);
+                if (flow->generate_error) {
+                    uint8_t ebuf[256];
+                    ssize_t elen = flow->generate_error(sf->ctx, "57014",
+                        "canceling statement due to user request",
+                        ebuf, sizeof(ebuf));
+                    if (elen > 0)
+                        keel_try_send_nb(session->client_fd, ebuf, (size_t)elen);
+                }
+                sf->phase = KEEL_PHASE_READY;
+                pos += (size_t)flen;
+                continue;
             }
 
             /* === HOOK: AFTER_QUERY_READ ===
@@ -3040,6 +3078,23 @@ copy_scan_done:
                          !(act.pin_clear & KEEL_FPIN_EXTENDED_PROTO))) {
                         resume = KEEL_FLOW_OK;
                     }
+                    /* When the stashed follow-up buffer contains a Sync ('S')
+                     * message, the entire Extended Protocol pipeline is being
+                     * forwarded after state_sync.  The backend will send a
+                     * final Z('I'), so we must wait for it (WAIT_BACKEND),
+                     * not re-arm FE recv (FLOW_OK). */
+                    if (resume == KEEL_FLOW_OK &&
+                        flow->captured_fe_pin_effects &&
+                        setup_follow_len > 0) {
+                        keel_flow_pin_reason_t _fpu = KEEL_FPIN_NONE;
+                        keel_flow_pin_reason_t _fpc = KEEL_FPIN_NONE;
+                        flow->captured_fe_pin_effects(sf->ctx,
+                                                      setup_follow_buf,
+                                                      setup_follow_len,
+                                                      &_fpu, &_fpc);
+                        if (_fpc & KEEL_FPIN_EXTENDED_PROTO)
+                            resume = KEEL_FLOW_WAIT_BACKEND;
+                    }
                     keel_flow_result_t sr = defer_state_sync_replay(
                         sf, session, session->backend_conn,
                         sync_buf, (size_t)sync_len,
@@ -3597,9 +3652,8 @@ be_forward_done:
              * MySQL: COM_PROCESS_KILL packet (4-byte hdr + 1 cmd + 4 conn_id)
              *        Synthetic conn_id encodes (worker_id << 16 | slab_index).
              */
-            if (!act.be_payload || act.be_payload_len < 9) {
+            if (!act.be_payload || act.be_payload_len < 9)
                 return KEEL_FLOW_CLOSED;
-            }
             const uint8_t* cp = act.be_payload;
 
             uint32_t tgt_wid = 0, tgt_idx = 0;
@@ -3622,30 +3676,45 @@ be_forward_done:
                     if (tw && tgt_idx < tw->sessions.capacity) {
                         keel_session_t* ts = &tw->sessions.sessions[tgt_idx];
                         if (ts->cancel_pid == syn_pid &&
-                            ts->cancel_secret == syn_sec &&
-                            ts->backend_conn &&
-                            ts->backend_conn->backend_pid != 0) {
-                            uint8_t real_cancel[16];
-                            uint32_t rpid = ts->backend_conn->backend_pid;
-                            uint32_t rsec = ts->backend_conn->cancel_secret;
-                            real_cancel[0]=0; real_cancel[1]=0;
-                            real_cancel[2]=0; real_cancel[3]=16;
-                            real_cancel[4]=0x04; real_cancel[5]=0xD2;
-                            real_cancel[6]=0x16; real_cancel[7]=0x2E;
-                            real_cancel[8]=(uint8_t)(rpid>>24);
-                            real_cancel[9]=(uint8_t)(rpid>>16);
-                            real_cancel[10]=(uint8_t)(rpid>>8);
-                            real_cancel[11]=(uint8_t)rpid;
-                            real_cancel[12]=(uint8_t)(rsec>>24);
-                            real_cancel[13]=(uint8_t)(rsec>>16);
-                            real_cancel[14]=(uint8_t)(rsec>>8);
-                            real_cancel[15]=(uint8_t)rsec;
+                            ts->cancel_secret == syn_sec) {
+                            if (ts->backend_conn &&
+                                ts->backend_conn->backend_pid != 0) {
+                                uint8_t real_cancel[16];
+                                uint32_t rpid = ts->backend_conn->backend_pid;
+                                uint32_t rsec = ts->backend_conn->cancel_secret;
+                                real_cancel[0]=0; real_cancel[1]=0;
+                                real_cancel[2]=0; real_cancel[3]=16;
+                                real_cancel[4]=0x04; real_cancel[5]=0xD2;
+                                real_cancel[6]=0x16; real_cancel[7]=0x2E;
+                                real_cancel[8]=(uint8_t)(rpid>>24);
+                                real_cancel[9]=(uint8_t)(rpid>>16);
+                                real_cancel[10]=(uint8_t)(rpid>>8);
+                                real_cancel[11]=(uint8_t)rpid;
+                                real_cancel[12]=(uint8_t)(rsec>>24);
+                                real_cancel[13]=(uint8_t)(rsec>>16);
+                                real_cancel[14]=(uint8_t)(rsec>>8);
+                                real_cancel[15]=(uint8_t)rsec;
 
-                            cancel_request_async(worker->reactor,
-                                                 tw->backend_host, tw->backend_port,
-                                                 real_cancel, 16);
+                                backend_pool_t* bpool = ts->backend_conn->pool;
+                                if (bpool && bpool->addr_resolved) {
+                                    cancel_request_async(worker->reactor,
+                                                         &bpool->resolved_addr,
+                                                         real_cancel, 16);
+                                }
+                            } else {
+                                /* Backend not yet borrowed — store a pending
+                                 * cancel flag.  The FE query handler will
+                                 * synthesise E(57014) before borrowing. */
+                                atomic_store_explicit(&ts->cancel_pending,
+                                                      true,
+                                                      memory_order_release);
+                            }
                         }
+                    } else {
+                        /* tgt_idx out of bounds or tw == NULL — silently skip */
                     }
+                } else {
+                    /* tgt_wid >= nw — silently skip */
                 }
             } else if (act.be_payload_len >= 9 && cp[4] == 0x0c) {
                 /* MySQL COM_PROCESS_KILL: look up the target session's real
@@ -4999,6 +5068,39 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                   KEEL_FLOW_WAIT_BACKEND);
             }
 fe_forward_done: ;
+        } else if (act.type == KEEL_BE_ACT_ABSORB && batch_active) {
+            /* Flush the pending batch NOW, before pos advances past the
+             * absorbed message.  If we skip this flush, the end-of-loop
+             * batch send will compute batch_len = pos_after_absorb -
+             * batch_unsent_start, which spans the absorbed bytes too —
+             * silently forwarding them to the client and defeating the
+             * absorb intent (e.g. the cancel ReadyForQuery reaches the
+             * client socket buffer even though cancel_rfq_suppress was set). */
+            size_t batch_len = pos - batch_unsent_start;
+            if (batch_len > 0) {
+                ssize_t bs = keel_try_send_nb(session->client_fd,
+                                              data + batch_unsent_start,
+                                              batch_len);
+                if (bs < 0) {
+                    KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
+                        "Worker %u: FE batch flush (pre-absorb) failed: %s",
+                        worker->id, strerror(errno));
+                    return KEEL_FLOW_ERROR;
+                }
+                if ((size_t)bs < batch_len) {
+                    /* Partial send (extremely unlikely on localhost).
+                     * Defer batch remainder; skip absorbed msg; save tail. */
+                    size_t after_abs = pos + (size_t)flen;
+                    if (after_abs < len)
+                        keel_residual_append(&session->server_residual,
+                                            data + after_abs, len - after_abs);
+                    return defer_send(sf, session->client_fd,
+                                      data + batch_unsent_start + (size_t)bs,
+                                      batch_len - (size_t)bs,
+                                      KEEL_FLOW_WAIT_BACKEND);
+                }
+            }
+            batch_active = false;
         }
 
         if (act.query_complete) query_complete = true;

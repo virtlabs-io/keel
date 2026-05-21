@@ -1138,6 +1138,13 @@ static void on_scram_final_recv(void* userdata, int result)
             }
             break;
         }
+        case 'K':
+            /* BackendKeyData — capture PID + secret for cancel forwarding */
+            if (body_len >= 12) {
+                ctx->pg_backend_pid   = be32(ctx->recv_buf + p + 5);
+                ctx->pg_cancel_secret = be32(ctx->recv_buf + p + 9);
+            }
+            break;
         case 'E': {
             char errmsg[256] = "unknown";
             size_t ep = p + 5;
@@ -1210,6 +1217,13 @@ static void on_drain_recv(void* userdata, int result)
         case 'R':
             if (body_len >= 8 && be32(ctx->recv_buf + p + 5) == 0)
                 ctx->authed = true;
+            break;
+        case 'K':
+            /* BackendKeyData — capture PID + secret for cancel forwarding */
+            if (body_len >= 12) {
+                ctx->pg_backend_pid   = be32(ctx->recv_buf + p + 5);
+                ctx->pg_cancel_secret = be32(ctx->recv_buf + p + 9);
+            }
             break;
         case 'E':
             async_fail(ctx);
