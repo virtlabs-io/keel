@@ -135,6 +135,8 @@ wait "$BENCH_PID" || true
 
 WRITER_TXN_COUNT=$(sentinel_stop_background_writer "$_WRITER_PID_FILE" "$_WRITER_COUNT_FILE")
 log "Background writer ran ${WRITER_TXN_COUNT} transactions during kill window"
+[[ "$WRITER_TXN_COUNT" -gt 0 ]] \
+    || die "background writer completed zero transactions; chaos coverage invalid"
 
 if [[ $recovered -eq 0 ]]; then
     log "BENCH_LOG:"; cat "$_BENCH_LOG" >&2

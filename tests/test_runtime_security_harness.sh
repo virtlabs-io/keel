@@ -41,6 +41,17 @@ cleanup() {
 trap cleanup EXIT
 
 cfg="$tmpdir/security.ini"
+listen_port="${KEEL_TEST_SECURITY_PORT:-}"
+if [[ -z "$listen_port" ]]; then
+  listen_port="$(
+    python3 -c 'import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+  )"
+fi
+
 cat > "$cfg" <<EOF
 [keel]
 log_level = 0
@@ -48,7 +59,7 @@ log_level = 0
 [worker_group.smoke]
 name = smoke
 bind_addr = 127.0.0.1
-bind_port = 27432
+bind_port = $listen_port
 num_workers = 1
 protocol = postgres
 

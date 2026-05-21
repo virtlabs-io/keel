@@ -117,6 +117,8 @@ log "keel SIGKILLed at $(date -d @${KILL_TIME} '+%H:%M:%S')"
 # Stop the background writer
 WRITER_TXN_COUNT=$(sentinel_stop_background_writer "$_WRITER_PID_FILE" "$_WRITER_COUNT_FILE")
 log "Background writer ran ${WRITER_TXN_COUNT} transactions during drain window"
+[[ "$WRITER_TXN_COUNT" -gt 0 ]] \
+    || die "background writer completed zero transactions; chaos coverage invalid"
 
 # Restart keel
 log "Starting keel container..."
