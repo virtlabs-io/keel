@@ -446,6 +446,7 @@ class TortureSuite(SuiteRunner):
                 ["go", "mod", "init", "keel_torture_pgx"],
                 timeout=10,
                 env={"GOPATH": str(tdp / "gopath"), "HOME": str(tdp)},
+                cwd=str(tdp),
             )
             if rc != 0:
                 self.skip(f"go mod init failed: {err[:200]}")
@@ -453,6 +454,7 @@ class TortureSuite(SuiteRunner):
                 ["go", "get", "github.com/jackc/pgx/v5"],
                 timeout=60,
                 env={"GOPATH": str(tdp / "gopath"), "HOME": str(tdp)},
+                cwd=str(tdp),
             )
             if rc != 0:
                 self.skip(f"go get pgx failed (no network?): {err[:200]}")
@@ -460,6 +462,7 @@ class TortureSuite(SuiteRunner):
                 ["go", "run", "."],
                 timeout=30,
                 env={"GOPATH": str(tdp / "gopath"), "HOME": str(tdp)},
+                cwd=str(tdp),
             )
         assert rc == 0, f"pgx test failed: {err}"
         assert "pgx OK" in out, f"unexpected output: {out!r}"
@@ -711,6 +714,11 @@ class TortureSuite(SuiteRunner):
                   provider = "postgresql"
                   url      = env("DATABASE_URL")
                 }}
+                // Prisma requires at least one model to generate a working client
+                // even when only raw queries ($queryRawUnsafe) are used.
+                model KeelTest {{
+                  id Int @id @default(autoincrement())
+                }}
             """))
             (tdp / "test.js").write_text(script)
 
@@ -719,6 +727,7 @@ class TortureSuite(SuiteRunner):
             rc, out, err = _run(
                 ["npm", "install", "--quiet"],
                 timeout=120, env=env_extra,
+                cwd=str(tdp),
             )
             if rc != 0:
                 self.skip(f"npm install failed: {err[:200]}")
@@ -726,6 +735,7 @@ class TortureSuite(SuiteRunner):
             rc, out, err = _run(
                 ["npx", "prisma", "generate"],
                 timeout=60, env=env_extra,
+                cwd=str(tdp),
             )
             if rc != 0:
                 self.skip(f"prisma generate failed: {err[:200]}")
@@ -733,6 +743,7 @@ class TortureSuite(SuiteRunner):
             rc, out, err = _run(
                 ["node", "test.js"],
                 timeout=30, env=env_extra,
+                cwd=str(tdp),
             )
         assert rc == 0, f"Prisma test failed: {err}"
         assert "Prisma OK" in out, f"unexpected output: {out!r}"
