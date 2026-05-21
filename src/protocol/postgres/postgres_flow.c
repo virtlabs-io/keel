@@ -126,6 +126,7 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
     ctx->pending_parse_name[0] = '\0';
     ctx->pending_deallocate_valid = false;
     ctx->pending_deallocate_absorbed_error = false;
+    ctx->pending_deallocate_complete = false;
     ctx->stmt_discard_plans_before_execute = false;
     ctx->stmt_discard_plans_absorb_pending = false;
     ctx->named_stmt_count = 0;
@@ -2842,12 +2843,19 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                                          dentry->valid &&
                                          dentry->confirmed);
                     pg_stmt_remove(ctx, dealloc_name);
-                    /* Re-evaluate pin_clear: if no confirmed stmts remain, clear pin */
-                    if (ctx->session_stmt_hash == 0)
+                    /* Re-evaluate pin_clear: a by-name DEALLOCATE only
+                     * releases the virtual prepared-stmt pin when it removed
+                     * the last confirmed statement.  Classification marks all
+                     * DEALLOCATE as pin_clear up front, so explicitly preserve
+                     * the pin while other tracked statements remain. */
+                    if (pg_stmt_has_confirmed_entries(ctx))
+                        act->pin_clear &= ~(keel_flow_pin_reason_t)KEEL_FPIN_PREPARED_STMT;
+                    else
                         act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
                     if (was_confirmed) {
                         ctx->pending_deallocate_valid = true;
                         ctx->pending_deallocate_absorbed_error = false;
+                        ctx->pending_deallocate_complete = false;
                     }
                     handled_by_name = true;
                 }
@@ -3859,6 +3867,11 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             (tag[7] == '\0' || !isalnum((unsigned char)tag[7]))) {
             act->stmt_replay_accepted = true;
         }
+        if (ctx->pending_deallocate_valid &&
+            strncmp(tag, "DEALLOCATE", 10) == 0 &&
+            (tag[10] == '\0' || !isalnum((unsigned char)tag[10]))) {
+            ctx->pending_deallocate_complete = true;
+        }
         /* search_path has no GUC_REPORT flag in PostgreSQL so it never
          * generates a ParameterStatus message.  KEEL's state_profile is
          * normally only updated from ParameterStatus; bridge the gap by
@@ -3936,6 +3949,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             act->fe_payload     = NULL;
             act->fe_payload_len = 0;
             ctx->pending_deallocate_absorbed_error = true;
+            ctx->pending_deallocate_complete = true;
         }
         return 0;
     case 'Z': /* ReadyForQuery */
@@ -3987,7 +4001,8 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
              * (absorbed in the 'E' handler above), inject a synthetic
              * CommandComplete("DEALLOCATE") before this ReadyForQuery so the
              * client receives a well-formed success response. */
-            if (ctx->pending_deallocate_valid) {
+            if (ctx->pending_deallocate_valid &&
+                ctx->pending_deallocate_complete) {
                 if (ctx->pending_deallocate_absorbed_error) {
                     uint8_t* p = ctx->ryw_resp_buf;
                     /* CommandComplete("DEALLOCATE") */
@@ -4006,6 +4021,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 }
                 ctx->pending_deallocate_valid          = false;
                 ctx->pending_deallocate_absorbed_error = false;
+                ctx->pending_deallocate_complete       = false;
             }
 
             /* Safety guard: clear any stale pending tracking PREPARE state.

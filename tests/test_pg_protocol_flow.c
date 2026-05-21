@@ -1926,6 +1926,74 @@ static void test_ps_tracking_stmt_compat_profile_hashes_update(void) {
     TEST_END();
 }
 
+static void test_ps_tracking_deallocate_keeps_pin_with_remaining_stmt(void) {
+    TEST_BEGIN("ps_mode/tracking: DEALLOCATE by name keeps pin while stmts remain");
+
+    void* ctx = create_with_ps_mode(KEEL_PS_MODE_TRACKING);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+
+    size_t len = build_query(buf, "PREPARE pdel1 AS SELECT 1");
+    int rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    len = build_query(buf, "PREPARE pdel2 AS SELECT 2");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    sim_track_prepare_confirm(ctx);
+
+    keel_stmt_compat_profile_t before;
+    memset(&before, 0, sizeof(before));
+    rc = VT->get_stmt_compat_profile(ctx, &before);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(before.stmt_set_hash != 0);
+
+    len = build_query(buf, "DEALLOCATE pdel1");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(!(act.pin_clear & KEEL_FPIN_PREPARED_STMT));
+
+    keel_be_action_t bact;
+    rc = VT->on_be_msg(ctx, buf, build_ready_for_query(buf, 'I'), &bact);
+    TEST_ASSERT_EQ(rc, 0);
+
+    ssize_t err_len = VT->generate_error(ctx, "26000",
+        "prepared statement \"pdel1\" does not exist", buf, sizeof(buf));
+    TEST_ASSERT(err_len > 0);
+    rc = VT->on_be_msg(ctx, buf, (size_t)err_len, &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(bact.type, KEEL_BE_ACT_ABSORB);
+
+    rc = VT->on_be_msg(ctx, buf, build_ready_for_query(buf, 'I'), &bact);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_NOT_NULL(bact.fe_payload);
+    TEST_ASSERT_EQ(bact.fe_payload[0], 'C');
+
+    keel_stmt_compat_profile_t after_first;
+    memset(&after_first, 0, sizeof(after_first));
+    rc = VT->get_stmt_compat_profile(ctx, &after_first);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(after_first.stmt_set_hash != 0);
+    TEST_ASSERT(after_first.stmt_set_hash != before.stmt_set_hash);
+
+    len = build_query(buf, "DEALLOCATE pdel2");
+    rc = VT->on_fe_msg(ctx, buf, len, &act);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    keel_stmt_compat_profile_t after_second;
+    memset(&after_second, 0, sizeof(after_second));
+    rc = VT->get_stmt_compat_profile(ctx, &after_second);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(after_second.stmt_set_hash, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
 static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
     TEST_BEGIN("ps_mode/tracking: DDL invalidates stmt set and bumps schema epoch");
 
@@ -4980,6 +5048,7 @@ int main(void) {
     test_ps_tracking_set_role_rehashes_stmt_set();
     test_ps_tracking_reset_role_rehashes_stmt_set();
     test_ps_tracking_stmt_compat_profile_hashes_update();
+    test_ps_tracking_deallocate_keeps_pin_with_remaining_stmt();
     test_ps_tracking_ddl_invalidates_stmt_set();
     test_ps_tracking_discard_plans_invalidates_stmt_set();
     test_ps_tracking_discard_all_resets_guc_context();

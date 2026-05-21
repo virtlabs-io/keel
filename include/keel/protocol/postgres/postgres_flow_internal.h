@@ -190,6 +190,7 @@ typedef struct pg_flow_ctx {
      * client sees session-level success. */
     bool            pending_deallocate_valid;
     bool            pending_deallocate_absorbed_error;
+    bool            pending_deallocate_complete;
 
     /* Active classification for the next Execute message.
      * Set by Parse (unnamed stmt) or by Bind (looks up named stmt). */
