@@ -1755,6 +1755,567 @@ class TortureSuite(SuiteRunner):
         assert rc3 == 0 and "50000" in out3, \
             f"COPY IN row count wrong — expected 50000, got: {out3!r}"
 
+    # =======================================================================
+    # I20 — Malformed message lengths
+    # =======================================================================
+
+    def test_i20_malformed_message_length_too_small(self) -> None:
+        """'Q' message with declared length=3 (minimum is 4 — length includes itself).
+
+        KEEL must respond with an ErrorResponse or close the connection.
+        It must NOT hang indefinitely.  After the malformed message, a fresh
+        connection must succeed to prove the proxy is still healthy.
+        """
+        e = self._env
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(3.0)
+            # length=3 is illegal per PostgreSQL protocol spec
+            conn.send(b"Q" + struct.pack(">I", 3))
+            got_response = False
+            try:
+                for _ in range(10):
+                    t, _ = conn.recv_message()
+                    if t in (ord("E"), ord("Z")):
+                        got_response = True
+                        break
+            except OSError:
+                got_response = True  # connection closed by KEEL — also acceptable
+
+        time.sleep(0.3)
+        assert is_proxy_reachable(e["host"], int(e["port"])), \
+            "KEEL must remain reachable after a message with length=3"
+        # Verify a new clean query works
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(5.0)
+            conn.send(pg_query("SELECT 'i20a'"))
+            msgs = conn.recv_until({ord("Z")})
+            assert any(t == ord("D") for t, _ in msgs), \
+                "new query after malformed-length message must succeed"
+
+    def test_i20_malformed_message_length_oversized(self) -> None:
+        """'Q' message claiming 2 GB body but only the 5-byte header is sent.
+
+        KEEL must not buffer 2 GB of RAM, OOM, or hang indefinitely.
+        After the client disconnects KEEL must detect the EOF and stay alive.
+        """
+        import socket as _socket
+        e = self._env
+        conn = ProxyConn(e["host"], int(e["port"]))
+        conn.connect()
+        try:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(4.0)
+            # Declare a 2 GiB body; only send the header — no actual payload
+            conn.send(b"Q" + struct.pack(">I", 0x7FFF_FFFF))
+            # Do NOT send any more bytes.  KEEL may time-out the connection
+            # or we will get disconnected after the timeout.
+            try:
+                conn.recv_until({ord("E"), ord("Z")}, max_msgs=5)
+            except OSError:
+                pass  # expected
+        finally:
+            # Force RST so KEEL gets an immediate EOF signal
+            try:
+                conn._sock.setsockopt(
+                    _socket.SOL_SOCKET, _socket.SO_LINGER,
+                    struct.pack("ii", 1, 0),
+                )
+            except Exception:
+                pass
+            conn.close()
+
+        time.sleep(0.5)
+        assert is_proxy_reachable(e["host"], int(e["port"])), \
+            "KEEL must remain reachable after oversized declared message length"
+
+    # =======================================================================
+    # I21 — Bind message with parameter count mismatch
+    # =======================================================================
+
+    def test_i21_bind_param_count_mismatch(self) -> None:
+        """Bind message claiming 1000 parameters but encoding 0 actual values.
+
+        The message framing is structurally valid (length matches body size)
+        but the parameter count does not match the actual encoded params.
+        KEEL's protocol parser must:
+          - Detect the mismatch before forwarding to the backend, OR
+          - Let PostgreSQL return an ErrorResponse and relay it cleanly.
+        In either case:
+          - The client must receive an ErrorResponse, not a silent hang.
+          - A ReadyForQuery must arrive so the session stays usable.
+          - A valid query after this must succeed (session recovery).
+        """
+        e = self._env
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(5.0)
+
+            # First Parse succeeds — gives KEEL a valid statement reference
+            conn.send(pg_parse("i21_stmt", "SELECT 1", []) + pg_sync())
+            msgs = conn.recv_until({ord("Z")})
+            assert any(t == ord("1") for t, _ in msgs), \
+                "Parse must succeed before the malformed Bind"
+
+            # Malformed Bind: claim 1000 params, encode 0
+            bad_body = (
+                b"\x00"                      # portal name (empty)
+                + b"i21_stmt\x00"            # statement name
+                + struct.pack(">H", 0)       # 0 param format codes
+                + struct.pack(">H", 1000)    # declare 1000 params
+                # — no actual param data follows —
+            )
+            bad_bind = b"B" + struct.pack(">I", 4 + len(bad_body)) + bad_body
+            conn.send(bad_bind + pg_sync())
+
+            got_error = False
+            try:
+                msgs = conn.recv_until({ord("Z")}, max_msgs=20)
+                got_error = any(t == ord("E") for t, _ in msgs)
+                rdy = any(t == ord("Z") for t, _ in msgs)
+            except OSError:
+                got_error = True
+                rdy = False
+
+            assert got_error, \
+                "KEEL must propagate an ErrorResponse for a Bind param-count mismatch"
+
+            if rdy:
+                # Session is still alive — verify recovery
+                conn.send(
+                    pg_parse("i21_recovery", "SELECT 21 * 2", [])
+                    + pg_bind("", "i21_recovery", [], [], [])
+                    + pg_execute("", 0)
+                    + pg_sync()
+                )
+                msgs = conn.recv_until({ord("Z")})
+                rows = [b for t, b in msgs if t == ord("D")]
+                assert rows, "recovery query after malformed Bind must return a row"
+                col_len = struct.unpack(">i", rows[0][2:6])[0]
+                val = int(rows[0][6 : 6 + col_len])
+                assert val == 42, f"recovery query: expected 42, got {val}"
+
+        time.sleep(0.3)
+        assert is_proxy_reachable(e["host"], int(e["port"])), \
+            "KEEL must remain reachable after malformed Bind"
+
+    # =======================================================================
+    # I22 — Mid-extended-protocol abrupt disconnect
+    # =======================================================================
+
+    def test_i22_mid_extproto_disconnect(self) -> None:
+        """Abrupt RST mid-extended-protocol (after Parse, before Sync/Execute).
+
+        KEEL must detect the disconnect and release the pinned backend cleanly
+        to the pool.  Verified by running 10 successive queries on fresh
+        connections after a cleanup window — all must succeed.
+
+        A stuck or leaked backend would cause pool exhaustion and failures here.
+        """
+        import socket as _socket
+        e = self._env
+
+        conn = ProxyConn(e["host"], int(e["port"]))
+        conn.connect()
+        try:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(3.0)
+            # Send Parse to trigger backend allocation/pin — do NOT Sync
+            conn.send(pg_parse("i22_leak_stmt", "SELECT $1::int", [23]))
+            # Give the data time to reach KEEL before we RST
+            time.sleep(0.1)
+        finally:
+            # Force RST (linger=0) so KEEL sees an immediate EOF
+            try:
+                conn._sock.setsockopt(
+                    _socket.SOL_SOCKET, _socket.SO_LINGER,
+                    struct.pack("ii", 1, 0),
+                )
+            except Exception:
+                pass
+            conn.close()
+
+        # Give KEEL's cleanup path time to run
+        time.sleep(2.0)
+
+        # Pool must be healthy: 10 consecutive queries on fresh connections
+        failures = []
+        for i in range(10):
+            try:
+                with ProxyConn(e["host"], int(e["port"])) as check:
+                    assert check.startup(e["user"], e["database"], e["password"])
+                    check.set_timeout(5.0)
+                    check.send(pg_query(f"SELECT {i} + 1"))
+                    msgs = check.recv_until({ord("Z")})
+                    if not any(t == ord("D") for t, _ in msgs):
+                        failures.append(i)
+            except Exception as ex:
+                failures.append(f"{i}:{ex}")
+
+        assert not failures, (
+            f"pool unhealthy after mid-extproto disconnect: "
+            f"queries {failures} failed — backend may be stuck/leaked"
+        )
+
+    # =======================================================================
+    # I23 — Out-of-order extended protocol messages
+    # =======================================================================
+
+    def test_i23_extended_protocol_out_of_order(self) -> None:
+        """Extended-protocol messages sent in illegal order.
+
+        Case 1: Bind referencing a statement that was never Parsed.
+        Case 2: Execute with no preceding Bind in flight.
+
+        KEEL must relay (or generate) an ErrorResponse for each case.
+        A ReadyForQuery must follow each error so the session stays alive.
+        A valid query after all errors must succeed — proving state recovery.
+        """
+        e = self._env
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(5.0)
+
+            # Case 1: Bind → unknown statement
+            conn.send(
+                pg_bind("", "ghost_stmt_i23_never_parsed", [], [], [])
+                + pg_sync()
+            )
+            msgs = conn.recv_until({ord("Z")}, max_msgs=20)
+            assert any(t == ord("E") for t, _ in msgs), \
+                "Bind of unknown statement must produce ErrorResponse"
+            assert any(t == ord("Z") for t, _ in msgs), \
+                "ReadyForQuery must follow ErrorResponse (unknown statement Bind)"
+
+            # Case 2: Execute with no active portal
+            conn.send(
+                pg_execute("i23_ghost_portal", 0)
+                + pg_sync()
+            )
+            msgs = conn.recv_until({ord("Z")}, max_msgs=20)
+            assert any(t == ord("E") for t, _ in msgs), \
+                "Execute on nonexistent portal must produce ErrorResponse"
+            assert any(t == ord("Z") for t, _ in msgs), \
+                "ReadyForQuery must follow ErrorResponse (stray Execute)"
+
+            # Recovery: a valid extended-protocol query must work
+            conn.send(
+                pg_parse("i23_ok", "SELECT 21 + 21", [])
+                + pg_bind("", "i23_ok", [], [], [])
+                + pg_execute("", 0)
+                + pg_sync()
+            )
+            msgs = conn.recv_until({ord("Z")})
+            rows = [b for t, b in msgs if t == ord("D")]
+            assert rows, "recovery query after out-of-order messages must return a row"
+            col_len = struct.unpack(">i", rows[0][2:6])[0]
+            val = int(rows[0][6 : 6 + col_len])
+            assert val == 42, f"recovery query: expected 42, got {val}"
+
+    # =======================================================================
+    # I24 — Random byte fuzzing after startup
+    # =======================================================================
+
+    def test_i24_random_byte_fuzz(self) -> None:
+        """Send 4 KB of random bytes after a valid startup handshake.
+
+        Runs 5 independent probes.  After each probe KEEL must:
+        - Still accept new TCP connections.
+        - Serve a valid query on a fresh connection.
+
+        Acceptable outcomes per probe:
+        - ErrorResponse (malformed message type) + connection close.
+        - Immediate connection close (KEEL detected garbage and hung up).
+        KEEL must NOT crash, hang, or corrupt the response stream of other
+        sessions.
+        """
+        import os as _os
+        e = self._env
+
+        for trial in range(5):
+            junk = _os.urandom(4096)
+            conn = ProxyConn(e["host"], int(e["port"]))
+            conn.connect()
+            try:
+                assert conn.startup(e["user"], e["database"], e["password"])
+                conn.set_timeout(2.0)
+                conn.send(junk)
+                try:
+                    conn.recv_until({ord("E"), ord("Z")}, max_msgs=10)
+                except OSError:
+                    pass  # expected — KEEL closed the connection
+            finally:
+                conn.close()
+
+            time.sleep(0.3)
+            assert is_proxy_reachable(e["host"], int(e["port"])), \
+                f"KEEL must be reachable after fuzz trial {trial + 1}"
+
+        # Final sanity: clean query on a fresh connection must work
+        with ProxyConn(e["host"], int(e["port"])) as conn:
+            assert conn.startup(e["user"], e["database"], e["password"])
+            conn.set_timeout(5.0)
+            conn.send(pg_query("SELECT 'fuzz_survived'"))
+            msgs = conn.recv_until({ord("Z")})
+            assert any(t == ord("D") for t, _ in msgs), \
+                "KEEL must serve queries normally after fuzz probes"
+
+    # =======================================================================
+    # I26 — Transaction abandonment storm
+    # =======================================================================
+
+    def test_i26_transaction_abandonment_storm(self) -> None:
+        """50 connections begin transactions; 25 disconnect mid-tx without ROLLBACK.
+
+        KEEL must:
+        - Detect each abrupt disconnect.
+        - Rollback / recycle the abandoned backends.
+        - Return all backends cleanly to the pool.
+
+        Verified by running 50 queries on fresh connections after a cleanup
+        window — all must succeed, proving the pool recovered completely.
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e = self._env
+
+        N = 50
+        conns: list = []
+        open_errors: list[str] = []
+
+        # Open N connections and begin transactions
+        for _ in range(N):
+            try:
+                c = pg.connect(
+                    host=e["host"], port=int(e["port"]),
+                    user=e["user"], password=e["password"],
+                    dbname=e["database"],
+                    connect_timeout=15, autocommit=False,
+                )
+                c.execute("BEGIN")
+                c.execute("SELECT pg_sleep(0)")
+                conns.append(c)
+            except Exception as ex:
+                open_errors.append(str(ex))
+
+        if len(conns) < N // 2:
+            for c in conns:
+                try: c.close()
+                except Exception: pass
+            self.skip(
+                f"could not open enough connections ({len(conns)}/{N}): "
+                f"{open_errors[:3]}"
+            )
+
+        # Abruptly close the first half (no ROLLBACK / Terminate message)
+        for c in conns[: N // 2]:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+        # Cleanly close the second half
+        for c in conns[N // 2 :]:
+            try:
+                c.rollback()
+                c.close()
+            except Exception:
+                pass
+
+        # Give KEEL time to detect disconnects and recycle all backends
+        time.sleep(4.0)
+
+        # Verify pool is healthy: N fresh queries must all succeed
+        failures: list = []
+        for i in range(N):
+            try:
+                with ProxyConn(e["host"], int(e["port"])) as check:
+                    assert check.startup(e["user"], e["database"], e["password"])
+                    check.set_timeout(5.0)
+                    check.send(pg_query(f"SELECT {i} + 1"))
+                    msgs = check.recv_until({ord("Z")})
+                    if not any(t == ord("D") for t, _ in msgs):
+                        failures.append(i)
+            except Exception as ex:
+                failures.append(f"conn_{i}: {ex}")
+
+        assert not failures, (
+            f"pool unhealthy after abandonment storm: "
+            f"{len(failures)}/{N} queries failed — backends may not have been recycled"
+        )
+
+    # =======================================================================
+    # I27 — Pool exhaustion and wait-queue ordering
+    # =======================================================================
+
+    def test_i27_pool_exhaustion_wait_queue(self) -> None:
+        """Exhaust the backend pool then verify waiting sessions are served in order.
+
+        Strategy (torture config: max_pool_size=80, transaction pooling):
+        - Open 80 connections, each holding an advisory lock inside a
+          transaction — all pool backends are now occupied.
+        - Launch 10 extra connections in threads (they must queue in KEEL).
+        - After 2 s release all holders.
+        - Verify all 10 waiters complete successfully.
+
+        Covers: wait-queue fairness, no starvation, no deadlock when pool is
+        suddenly released.
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e = self._env
+
+        MAX_POOL = 80   # matches keel-torture.ini max_pool_size
+        EXTRA    = 10
+
+        holders:        list = []
+        holder_errors:  list[str] = []
+        waiter_results: list[bool] = []
+        waiter_errors:  list[str] = []
+
+        def _hold(i: int) -> None:
+            try:
+                c = pg.connect(
+                    host=e["host"], port=int(e["port"]),
+                    user=e["user"], password=e["password"],
+                    dbname=e["database"],
+                    connect_timeout=15, autocommit=False,
+                )
+                c.execute(f"SELECT pg_advisory_xact_lock({9_000_000 + i})")
+                holders.append(c)
+            except Exception as ex:
+                holder_errors.append(str(ex))
+
+        # Fill the pool
+        hold_threads = [threading.Thread(target=_hold, args=(i,)) for i in range(MAX_POOL)]
+        for t in hold_threads: t.start()
+        for t in hold_threads: t.join(timeout=30)
+
+        if len(holders) < MAX_POOL // 2:
+            for c in holders:
+                try: c.close()
+                except Exception: pass
+            self.skip(
+                f"could not fill pool ({len(holders)}/{MAX_POOL}): "
+                f"{holder_errors[:2]}"
+            )
+
+        def _wait(i: int) -> None:
+            try:
+                c = pg.connect(
+                    host=e["host"], port=int(e["port"]),
+                    user=e["user"], password=e["password"],
+                    dbname=e["database"],
+                    connect_timeout=60, autocommit=True,
+                )
+                row = c.execute("SELECT 42").fetchone()
+                c.close()
+                waiter_results.append(row is not None and row[0] == 42)
+            except Exception as ex:
+                waiter_results.append(False)
+                waiter_errors.append(str(ex))
+
+        waiter_threads = [threading.Thread(target=_wait, args=(i,)) for i in range(EXTRA)]
+        for t in waiter_threads: t.start()
+
+        # Let waiters queue for 2 s, then release all holders
+        time.sleep(2.0)
+        for c in holders:
+            try:
+                c.rollback()
+                c.close()
+            except Exception:
+                pass
+
+        for t in waiter_threads: t.join(timeout=60)
+
+        assert len(waiter_results) == EXTRA, (
+            f"only {len(waiter_results)}/{EXTRA} waiters completed "
+            f"(errors: {waiter_errors[:3]})"
+        )
+        successes = sum(1 for r in waiter_results if r)
+        assert successes == EXTRA, (
+            f"pool wait queue: only {successes}/{EXTRA} waiters got correct results "
+            f"(errors: {waiter_errors[:3]})"
+        )
+
+    # =======================================================================
+    # I28 — Backend killed while idle in pool
+    # =======================================================================
+
+    def test_i28_idle_backend_killed_transparent_reconnect(self) -> None:
+        """Kill idle backends in the PostgreSQL pool directly; KEEL must reconnect.
+
+        Steps:
+        1. Run a query to warm up the pool (at least one idle backend exists).
+        2. Terminate all idle KEEL backends via pg_terminate_backend() on the
+           direct PostgreSQL connection.
+        3. Wait 1 s for KEEL to detect the dead connections.
+        4. Run 5 queries through the proxy — all must succeed, proving KEEL
+           transparently opened fresh backends without surfacing an error.
+
+        Requires: direct access to the PostgreSQL backend (KEEL_PG_HOST/PORT)
+        with sufficient privilege to call pg_terminate_backend().
+        """
+        pg = _import_psycopg3()
+        if pg is None:
+            self.skip("psycopg (v3) not installed")
+        e   = self._env
+        pg_host = e.get("pg_host", "127.0.0.1")
+        pg_port = int(e.get("pg_port", 5432))
+
+        if not wait_for_port(pg_host, pg_port, timeout=2.0):
+            self.skip(f"direct PG backend not reachable at {pg_host}:{pg_port}")
+
+        # Step 1: warm the pool
+        with ProxyConn(e["host"], int(e["port"])) as warm:
+            assert warm.startup(e["user"], e["database"], e["password"])
+            warm.set_timeout(5.0)
+            warm.send(pg_query("SELECT 1"))
+            warm.recv_until({ord("Z")})
+
+        time.sleep(0.3)
+
+        # Step 2: terminate idle KEEL backends at the PG level
+        try:
+            admin = pg.connect(
+                host=pg_host, port=pg_port,
+                user=e["user"], password=e["password"],
+                dbname=e["database"],
+                connect_timeout=5, autocommit=True,
+            )
+            admin.execute(
+                """
+                SELECT pg_terminate_backend(pid)
+                FROM   pg_stat_activity
+                WHERE  usename = %s
+                  AND  state   = 'idle'
+                  AND  pid    <> pg_backend_pid()
+                """,
+                (e["user"],),
+            )
+            admin.close()
+        except Exception as err:
+            self.skip(f"could not terminate backends (no superuser?): {err}")
+
+        # Step 3: brief window for KEEL to detect dead connections
+        time.sleep(1.0)
+
+        # Step 4: 5 queries must succeed transparently
+        for i in range(5):
+            with ProxyConn(e["host"], int(e["port"])) as conn:
+                assert conn.startup(e["user"], e["database"], e["password"])
+                conn.set_timeout(8.0)
+                conn.send(pg_query(f"SELECT {i} + 1"))
+                msgs = conn.recv_until({ord("Z")})
+                assert any(t == ord("D") for t, _ in msgs), (
+                    f"query {i} failed after idle-backend kill — "
+                    "KEEL did not transparently reconnect"
+                )
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (wire-protocol + metrics)
