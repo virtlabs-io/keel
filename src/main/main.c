@@ -2307,6 +2307,77 @@ static keel_logging_config_t g_log_cfg = {
 static keel_log_plugin_t* g_log_plugin = NULL;
 static keel_query_log_t   g_query_log  = {0};
 
+static void cleanup_startup_failure(keel_config_t* config, bool tls_initialized) {
+    keel_admin_stop(g_admin);
+    g_admin = NULL;
+
+    if (g_cluster) {
+        keel_cluster_destroy(g_cluster);
+        g_cluster = NULL;
+    }
+
+    for (size_t gi = 0; gi < g_num_groups; gi++) {
+        worker_group_t* wg = &g_groups[gi];
+
+        if (wg->probe_mgr) {
+            keel_probe_manager_destroy(wg->probe_mgr);
+            wg->probe_mgr = NULL;
+        }
+        if (wg->discovery) {
+            keel_discovery_stop(wg->discovery);
+            keel_discovery_destroy(wg->discovery);
+            wg->discovery = NULL;
+        }
+        if (wg->throttle_rules) {
+            keel_throttle_rules_replace(&wg->throttle_rules, NULL);
+        }
+        if (wg->router_mgr) {
+            keel_router_mgr_destroy(wg->router_mgr);
+            wg->router_mgr = NULL;
+        }
+        if (wg->engine) {
+            keel_engine_destroy(wg->engine);
+            wg->engine = NULL;
+        }
+        if (wg->listen_fd >= 0) {
+            close(wg->listen_fd);
+            wg->listen_fd = -1;
+        }
+        if (wg->hook_registry) {
+            keel_hook_registry_destroy(wg->hook_registry);
+            wg->hook_registry = NULL;
+        }
+    }
+    g_engine = NULL;
+
+    if (g_tracer) {
+        keel_tracer_destroy(g_tracer);
+        g_tracer = NULL;
+    }
+    if (g_audit_log_initialized) {
+        keel_audit_log_close(&g_audit_log);
+        g_audit_log_initialized = false;
+    }
+
+    keel_config_free(config);
+
+    keel_lua_shutdown();
+    keel_python_shutdown();
+
+    keel_query_log_shutdown(&g_query_log);
+    if (g_log_plugin) {
+        g_log_plugin->flush(g_log_plugin);
+        g_log_plugin->close(g_log_plugin);
+        g_log_plugin->destroy(g_log_plugin);
+        g_log_plugin = NULL;
+    }
+
+    if (tls_initialized)
+        keel_tls_cleanup();
+
+    keel_mem_shutdown();
+}
+
 /* ============================================================================
  * Security Hardening Configuration
  * ============================================================================ */
@@ -4616,6 +4687,7 @@ int main(int argc, char** argv) {
             KEEL_LOG_FATAL(KEEL_LOG_CAT_CONFIG,
                 "Configuration rejected: experimental features are disabled. "
                 "Set [keel] experimental_features=true to opt in.");
+            cleanup_startup_failure(config, false);
             return 1;
         }
     }
@@ -4816,6 +4888,7 @@ int main(int argc, char** argv) {
         printf("Daemonizing...\n");
         if (daemonize_process() < 0) {
             KEEL_LOG_FATAL(KEEL_LOG_CAT_CORE, "Failed to daemonize");
+            cleanup_startup_failure(config, false);
             return 1;
         }
     }
@@ -4835,10 +4908,13 @@ int main(int argc, char** argv) {
      * cannot interleave with the banner.
      * ==================================================================== */
     /* Initialize TLS subsystem (OpenSSL + kTLS detection) */
+    bool tls_initialized = false;
     if (keel_tls_init() != KEEL_OK) {
         KEEL_LOG_FATAL(KEEL_LOG_CAT_TLS, "Failed to initialize TLS subsystem");
+        cleanup_startup_failure(config, false);
         return 1;
     }
+    tls_initialized = true;
     KEEL_LOG_INFO(KEEL_LOG_CAT_TLS, "TLS subsystem initialized");
 
     uint32_t sys_instr_mask = build_system_instr_mask_from_env();
@@ -4851,6 +4927,7 @@ int main(int argc, char** argv) {
         if (wg->listen_fd < 0) {
             KEEL_LOG_FATAL(KEEL_LOG_CAT_CORE, "[%s] Failed to create listen socket on %s:%d",
                           wg->name, wg->listen_addr, wg->listen_port);
+            cleanup_startup_failure(config, tls_initialized);
             return 1;
         }
         printf("  [%s] Socket: fd=%d (listening on %s:%d)\n",
@@ -5009,7 +5086,7 @@ int main(int argc, char** argv) {
                 KEEL_LOG_FATAL(KEEL_LOG_CAT_TLS,
                     "[%s] Failed to auto-generate TLS certificates in %s",
                     wg->name, wg->tls_auto_dir_buf);
-                close(wg->listen_fd);
+                cleanup_startup_failure(config, tls_initialized);
                 return 1;
             }
             KEEL_LOG_INFO(KEEL_LOG_CAT_TLS,
@@ -5104,7 +5181,7 @@ int main(int argc, char** argv) {
         wg->engine = keel_engine_create(&engine_cfg);
         if (!wg->engine) {
             KEEL_LOG_FATAL(KEEL_LOG_CAT_CORE, "[%s] Failed to create engine", wg->name);
-            close(wg->listen_fd);
+            cleanup_startup_failure(config, tls_initialized);
             return 1;
         }
 
@@ -5312,6 +5389,7 @@ int main(int argc, char** argv) {
     if (apply_runtime_security_policy() < 0) {
         KEEL_LOG_FATAL(KEEL_LOG_CAT_CORE,
                        "security: failed to apply runtime security policy");
+        cleanup_startup_failure(config, tls_initialized);
         return 1;
     }
 
@@ -5326,6 +5404,8 @@ int main(int argc, char** argv) {
             keel_engine_destroy(wg->engine);
             wg->engine = NULL;
             close(wg->listen_fd);
+            wg->listen_fd = -1;
+            cleanup_startup_failure(config, tls_initialized);
             return 1;
         }
     }
