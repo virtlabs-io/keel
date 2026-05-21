@@ -3106,6 +3106,8 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->route_hint = KEEL_FROUTE_PRIMARY;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* ParseComplete */
+
         /* Parse: 'P' + int32 len + string stmt_name + string query + ...
          * If stmt_name is non-empty, this creates a named prepared statement
          * that persists across transactions → pin to backend.
@@ -3247,6 +3249,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* BindComplete */
         /* Bind: 'B' + int32 len + string portal_name + string stmt_name + ...
          * Look up stmt_name in the cache and activate it for the next Execute. */
         if (len > 5) {
@@ -3344,12 +3347,18 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        /* Describe('S') emits ParameterDescription+RowDescription/NoData;
+         * Describe('P') emits RowDescription/NoData.  We count only the
+         * terminal (RowDescription or NoData) — ParameterDescription is not
+         * a flush_pending_count terminal. */
+        act->ext_response_count = 1;
         return 0;
     case 'E': { /* Execute — replay cached Parse classification for hooks */
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* CommandComplete (DataRows don't count) */
         if (ctx->cached_valid) {
             act->sql_view = ctx->cached_sql;
             act->sql_view_len = ctx->cached_sql_len;
@@ -3472,12 +3481,20 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
     case 'H': /* Flush */
         act->type = KEEL_FE_ACT_FORWARD_TO_BACKEND;
         act->be_payload = data; act->be_payload_len = len;
+        /* Flush never produces a backend response on its own.  The engine sets
+         * no_response so the FE handler does not arm backend recv after sending.
+         * When Flush terminates an extended-query batch (Parse+Describe+Flush),
+         * engine_flow.c overrides no_response=false and sets flush_in_flight so
+         * the BE handler knows to re-arm FE recv once all expected responses
+         * (ParseComplete, RowDescription, …) have been forwarded. */
+        act->no_response = true;
         return 0;
     case 'C': { /* Close — may destroy a named prepared statement */
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* CloseComplete */
         /* Close: 'C' + int32 len + byte type ('S'=stmt/'P'=portal) + string name
          * If closing a named statement, decrement count; unpin when zero.
          * Also remove from the prepared statement classification cache. */
@@ -4846,10 +4863,6 @@ static int pgf_get_stmt_replay(void* vctx,
     if (replay_len_out) *replay_len_out = 0;
     if (stmt_count_out) *stmt_count_out = 0;
     if (hash_out)       *hash_out       = ctx->session_stmt_hash;
-
-    fprintf(stderr, "[DBG-GETSRP] session_stmt_hash=%016llx full=%d semantic_unknown=%d datestyle='%s'\n",
-        (unsigned long long)ctx->session_stmt_hash, (int)(replay_buf_out != NULL),
-        (int)ctx->stmt_semantic_unknown, ctx->stmt_datestyle);
 
     if (ctx->stmt_semantic_unknown) {
         if (hash_out) *hash_out = 0;

@@ -116,6 +116,7 @@ typedef struct keel_session_flow {
     /* Pending message when waiting for pool (bounded queue support) */
     const uint8_t*                 pending_msg;     /**< Message waiting for backend */
     size_t                         pending_msg_len; /**< Pending message length */
+    keel_flow_result_t             pending_msg_resume; /**< Flow result after pending message send */
     bool                           queued_for_pool; /**< True if waiting in pool queue */
 
     /* COPY IN fast-path state: tracks message boundaries across recv buffers
@@ -340,6 +341,26 @@ typedef struct keel_session_flow {
      *  the reactor arms a read on this fd.  Reset to -1 after the
      *  result is consumed.  Owned by the auth context (closed there). */
     int     auth_notify_fd;
+
+    /** Flush in-flight tracking (PostgreSQL extended query protocol).
+     *
+     *  asyncpg 0.31+ and other drivers use Flush ('H') rather than Sync ('S')
+     *  to end the prepare phase (Parse+Describe+Flush).  Unlike Sync, Flush
+     *  does not cause the backend to emit ReadyForQuery, so KEEL must not wait
+     *  for 'Z' before re-arming FE recv.
+     *
+     *  flush_in_flight:    Set when a Flush-terminated batch is sent to the
+     *                      backend.  Cleared when all expected responses are
+     *                      received or on query_complete.
+     *  flush_pending_count: Number of backend control-message terminals still
+     *                      expected (ParseComplete, BindComplete, CommandComplete,
+     *                      CloseComplete, RowDescription, NoData, ErrorResponse).
+     *                      Before Flush arrives this may hold responses for an
+     *                      extended batch already forwarded from a previous recv.
+     *                      When this reaches 0 with flush_in_flight set, the
+     *                      engine returns KEEL_FLOW_OK to re-arm FE recv. */
+    bool     flush_in_flight;
+    uint16_t flush_pending_count;
 } keel_session_flow_t;
 
 /* ============================================================================
