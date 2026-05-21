@@ -126,6 +126,7 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
     ctx->pending_parse_name[0] = '\0';
     ctx->pending_deallocate_valid = false;
     ctx->pending_deallocate_absorbed_error = false;
+    ctx->pending_deallocate_complete = false;
     ctx->stmt_discard_plans_before_execute = false;
     ctx->stmt_discard_plans_absorb_pending = false;
     ctx->named_stmt_count = 0;
@@ -2842,12 +2843,19 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                                          dentry->valid &&
                                          dentry->confirmed);
                     pg_stmt_remove(ctx, dealloc_name);
-                    /* Re-evaluate pin_clear: if no confirmed stmts remain, clear pin */
-                    if (ctx->session_stmt_hash == 0)
+                    /* Re-evaluate pin_clear: a by-name DEALLOCATE only
+                     * releases the virtual prepared-stmt pin when it removed
+                     * the last confirmed statement.  Classification marks all
+                     * DEALLOCATE as pin_clear up front, so explicitly preserve
+                     * the pin while other tracked statements remain. */
+                    if (pg_stmt_has_confirmed_entries(ctx))
+                        act->pin_clear &= ~(keel_flow_pin_reason_t)KEEL_FPIN_PREPARED_STMT;
+                    else
                         act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
                     if (was_confirmed) {
                         ctx->pending_deallocate_valid = true;
                         ctx->pending_deallocate_absorbed_error = false;
+                        ctx->pending_deallocate_complete = false;
                     }
                     handled_by_name = true;
                 }
@@ -3106,6 +3114,8 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->route_hint = KEEL_FROUTE_PRIMARY;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* ParseComplete */
+
         /* Parse: 'P' + int32 len + string stmt_name + string query + ...
          * If stmt_name is non-empty, this creates a named prepared statement
          * that persists across transactions → pin to backend.
@@ -3247,6 +3257,7 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* BindComplete */
         /* Bind: 'B' + int32 len + string portal_name + string stmt_name + ...
          * Look up stmt_name in the cache and activate it for the next Execute. */
         if (len > 5) {
@@ -3344,12 +3355,18 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        /* Describe('S') emits ParameterDescription+RowDescription/NoData;
+         * Describe('P') emits RowDescription/NoData.  We count only the
+         * terminal (RowDescription or NoData) — ParameterDescription is not
+         * a flush_pending_count terminal. */
+        act->ext_response_count = 1;
         return 0;
     case 'E': { /* Execute — replay cached Parse classification for hooks */
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* CommandComplete (DataRows don't count) */
         if (ctx->cached_valid) {
             act->sql_view = ctx->cached_sql;
             act->sql_view_len = ctx->cached_sql_len;
@@ -3472,12 +3489,20 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
     case 'H': /* Flush */
         act->type = KEEL_FE_ACT_FORWARD_TO_BACKEND;
         act->be_payload = data; act->be_payload_len = len;
+        /* Flush never produces a backend response on its own.  The engine sets
+         * no_response so the FE handler does not arm backend recv after sending.
+         * When Flush terminates an extended-query batch (Parse+Describe+Flush),
+         * engine_flow.c overrides no_response=false and sets flush_in_flight so
+         * the BE handler knows to re-arm FE recv once all expected responses
+         * (ParseComplete, RowDescription, …) have been forwarded. */
+        act->no_response = true;
         return 0;
     case 'C': { /* Close — may destroy a named prepared statement */
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = KEEL_MSG_KIND_EXTENDED;
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
+        act->ext_response_count = 1;  /* CloseComplete */
         /* Close: 'C' + int32 len + byte type ('S'=stmt/'P'=portal) + string name
          * If closing a named statement, decrement count; unpin when zero.
          * Also remove from the prepared statement classification cache. */
@@ -3842,11 +3867,50 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             (tag[7] == '\0' || !isalnum((unsigned char)tag[7]))) {
             act->stmt_replay_accepted = true;
         }
+        if (ctx->pending_deallocate_valid &&
+            strncmp(tag, "DEALLOCATE", 10) == 0 &&
+            (tag[10] == '\0' || !isalnum((unsigned char)tag[10]))) {
+            ctx->pending_deallocate_complete = true;
+        }
+        /* search_path has no GUC_REPORT flag in PostgreSQL so it never
+         * generates a ParameterStatus message.  KEEL's state_profile is
+         * normally only updated from ParameterStatus; bridge the gap by
+         * synthesising a profile update from the stmt context so that SSV
+         * state-sync can replay SET search_path on future pool borrows.
+         * Only emit when a non-empty search_path is tracked; empty means no
+         * explicit SET was issued and the pool's DISCARD ALL handles cleanup. */
+        if (strncmp(tag, "SET", 3) == 0 && tag[3] == '\0' &&
+            ctx->stmt_search_path[0] != '\0') {
+            act->has_profile_update = true;
+            act->profile_key        = "search_path";
+            act->profile_key_len    = 11; /* strlen("search_path") */
+            act->profile_value      = ctx->stmt_search_path;
+            act->profile_value_len  = strlen(ctx->stmt_search_path);
+        }
         return 0;
     }
     case 'E': /* ErrorResponse */
         act->is_error_response = true;
         ctx->stmt_discard_plans_absorb_pending = false;
+        /* Detect query_canceled (SQLSTATE 57014) to suppress the following
+         * ReadyForQuery so no stale Z reaches the client socket buffer.
+         * For any other error the flag is cleared to prevent spurious fires. */
+        {
+            ctx->cancel_rfq_suppress = false;
+            const uint8_t* ep  = data + 5;
+            const uint8_t* eend = data + len;
+            while (ep < eend && *ep != '\0') {
+                uint8_t ftype = *ep++;
+                const char* fval = (const char*)ep;
+                size_t fvl = strnlen(fval, (size_t)(eend - ep));
+                if (ftype == 'C' && fvl == 5 &&
+                    fval[0]=='5' && fval[1]=='7' &&
+                    fval[2]=='0' && fval[3]=='1' && fval[4]=='4') {
+                    ctx->cancel_rfq_suppress = true;
+                }
+                ep += fvl + 1;
+            }
+        }
         /* Tracking mode: backend rejected the staged PREPARE — roll back the
          * cache entry to the prior confirmed state (or remove it if there was
          * no prior entry).  The ErrorResponse is still forwarded to the client
@@ -3885,6 +3949,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             act->fe_payload     = NULL;
             act->fe_payload_len = 0;
             ctx->pending_deallocate_absorbed_error = true;
+            ctx->pending_deallocate_complete = true;
         }
         return 0;
     case 'Z': /* ReadyForQuery */
@@ -3936,7 +4001,8 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
              * (absorbed in the 'E' handler above), inject a synthetic
              * CommandComplete("DEALLOCATE") before this ReadyForQuery so the
              * client receives a well-formed success response. */
-            if (ctx->pending_deallocate_valid) {
+            if (ctx->pending_deallocate_valid &&
+                ctx->pending_deallocate_complete) {
                 if (ctx->pending_deallocate_absorbed_error) {
                     uint8_t* p = ctx->ryw_resp_buf;
                     /* CommandComplete("DEALLOCATE") */
@@ -3955,6 +4021,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 }
                 ctx->pending_deallocate_valid          = false;
                 ctx->pending_deallocate_absorbed_error = false;
+                ctx->pending_deallocate_complete       = false;
             }
 
             /* Safety guard: clear any stale pending tracking PREPARE state.
@@ -3979,6 +4046,19 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 pg_stmt_recompute_session_hash(ctx);
                 ctx->pending_track_valid     = false;
                 ctx->pending_track_had_prior = false;
+            }
+
+            /* Cancel-RFQ suppression: if the last error was query_canceled
+             * (SQLSTATE 57014), absorb this ReadyForQuery so the client only
+             * sees the ErrorResponse and NOT a bare Z.  The next query's
+             * ReadyForQuery will serve as the protocol sync point.
+             * query_complete and backend_reusable remain set so the engine
+             * still returns the backend connection to the pool. */
+            if (ctx->cancel_rfq_suppress) {
+                ctx->cancel_rfq_suppress = false;
+                act->type           = KEEL_BE_ACT_ABSORB;
+                act->fe_payload     = NULL;
+                act->fe_payload_len = 0;
             }
         }
         return 0;
@@ -4846,10 +4926,6 @@ static int pgf_get_stmt_replay(void* vctx,
     if (replay_len_out) *replay_len_out = 0;
     if (stmt_count_out) *stmt_count_out = 0;
     if (hash_out)       *hash_out       = ctx->session_stmt_hash;
-
-    fprintf(stderr, "[DBG-GETSRP] session_stmt_hash=%016llx full=%d semantic_unknown=%d datestyle='%s'\n",
-        (unsigned long long)ctx->session_stmt_hash, (int)(replay_buf_out != NULL),
-        (int)ctx->stmt_semantic_unknown, ctx->stmt_datestyle);
 
     if (ctx->stmt_semantic_unknown) {
         if (hash_out) *hash_out = 0;

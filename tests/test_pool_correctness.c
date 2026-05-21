@@ -414,6 +414,34 @@ static void test_admission_control_max_pinned(void)
     TEST_END();
 }
 
+static void test_close_pinned_connection_releases_admission_slot(void)
+{
+    TEST_BEGIN("closing a pinned backend decrements pinned admission count");
+
+    int be_fds[2];
+    backend_pool_t* pool = make_test_pool(2, be_fds);
+    pool->max_pinned = 1;
+
+    int session1 = 1, session2 = 2;
+    backend_conn_t* c1 = backend_pool_borrow_pinned(pool, &session1);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_EQ(pool->pinned_count, 1);
+
+    backend_pool_close_connection(pool, c1, BACKEND_CLOSE_REASON_CLIENT_DISCONNECT);
+    TEST_ASSERT_EQ(pool->pinned_count, 0);
+    TEST_ASSERT_NULL(c1->pinned_session);
+
+    backend_conn_t* c2 = backend_pool_borrow_pinned(pool, &session2);
+    TEST_ASSERT_NOT_NULL(c2);
+    TEST_ASSERT_EQ(pool->pinned_count, 1);
+
+    backend_pool_return(pool, c2, false);
+    TEST_ASSERT_EQ(pool->pinned_count, 0);
+
+    destroy_test_pool(pool, be_fds, 2);
+    TEST_END();
+}
+
 /* ============================================================================
  * Test: Quarantine Pin Flag Definitions
  * ============================================================================ */
@@ -1424,6 +1452,7 @@ int main(void)
     test_backend_generation_validation();
     test_close_reason_once();
     test_admission_control_max_pinned();
+    test_close_pinned_connection_releases_admission_slot();
     test_quarantine_pin_flags();
     test_sticky_primary_fields();
     test_borrow_rejects_cleaning();

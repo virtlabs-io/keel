@@ -198,6 +198,13 @@ typedef struct keel_fe_action {
     bool                    splice_eligible;    /**< Can use zero-copy splice */
     bool                    no_response;        /**< Backend won't respond (e.g., COM_STMT_CLOSE) */
 
+    /** For extended-protocol messages that enter the send batch before a Flush
+     *  terminal: how many backend control-message "groups" this FE message
+     *  expects in response (used by flush_pending_count tracking).
+     *  Parse/Bind/Execute/Close → 1, Describe → 1 (RowDescription/NoData is
+     *  the terminal; ParameterDescription is not counted), Flush/Sync → 0. */
+    uint8_t                 ext_response_count;
+
     /* Cross-service Read-Your-Writes: injected consistency position.
      * When non-empty (first byte != '\0'), the engine stores this LSN in
      * the session's WRITE_LSN consistency atom so that subsequent replica

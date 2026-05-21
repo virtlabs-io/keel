@@ -2184,6 +2184,21 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
             worker->id, imm, errno);
         close_session(worker, session, recv_ctx);
     } else if (fr == KEEL_FLOW_OK) {
+        /* Replay any FE bytes saved while the session waited for a backend.
+         * Pool resume may send one non-terminal extended-protocol message
+         * (Parse/Bind/Execute) and return OK; the rest of the already-received
+         * pipeline is in client_residual and must be processed immediately. */
+        if (!keel_residual_empty(&session->client_residual)) {
+            size_t rlen = keel_residual_len(&session->client_residual);
+            if (rlen > 0) {
+                size_t copy_len = rlen < recv_ctx->fe_cap ? rlen : recv_ctx->fe_cap;
+                size_t consumed = keel_residual_consume(&session->client_residual,
+                                                       recv_ctx->fe_buf, copy_len);
+                on_client_recv_complete(recv_ctx, (int)consumed);
+                return;
+            }
+        }
+
         /* Re-arm frontend recv */
         recv_ctx->fe_pending = true;
         int rc = keel_reactor_recv(worker->reactor, session->client_fd,
@@ -2808,6 +2823,35 @@ static void on_client_recv_complete(void* userdata, int result)
             goto queue_fe_recv;
         }
         result = (int)plain_len;
+    }
+
+    /* Prepend any saved frontend residual from a previous partial message.
+     * Backend receives already do this with server_residual; frontend traffic
+     * needs the same treatment so TCP fragmentation does not drop header/body
+     * bytes before the protocol plugin sees a complete frame. */
+    if (!keel_residual_empty(&session->client_residual)) {
+        size_t rlen = keel_residual_len(&session->client_residual);
+        size_t new_len = rlen + (size_t)result;
+        if (new_len > recv_ctx->fe_cap) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
+                "Worker %u: frontend residual too large (%zu bytes > cap %u)",
+                worker->id, new_len, recv_ctx->fe_cap);
+            close_session(worker, session, recv_ctx);
+            return;
+        }
+        memmove(recv_ctx->fe_buf + rlen, recv_ctx->fe_buf, (size_t)result);
+        size_t consumed = keel_residual_consume(&session->client_residual,
+                                                recv_ctx->fe_buf, rlen);
+        if (consumed != rlen) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
+                "Worker %u: frontend residual consume short (%zu/%zu)",
+                worker->id, consumed, rlen);
+            close_session(worker, session, recv_ctx);
+            return;
+        }
+        session->client_residual.expected_len = 0;
+        session->client_residual.header_complete = false;
+        result = (int)new_len;
     }
 
     /* Drive the protocol flow engine */

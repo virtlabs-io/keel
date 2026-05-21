@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <sys/types.h>
 
@@ -353,6 +354,12 @@ typedef struct keel_session {
     keel_trace_ctx_t    trace_ctx;       /* W3C trace context (propagated or generated) */
     keel_span_t         trace_span;      /* Root span for this session's lifetime */
     bool                trace_sampled;   /* True if this session is being traced */
+
+    /* Early-cancel flag: set atomically by the cancel handler when a
+     * CancelRequest arrives before the session has borrowed a backend
+     * connection.  The FE query handler synthesises E(57014) and skips
+     * backend borrow when this is true. */
+    _Atomic bool        cancel_pending;
 
     /* Slab management - DO NOT MOVE */
     struct keel_session* next_free;      /* Free list link */

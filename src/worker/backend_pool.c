@@ -244,49 +244,36 @@ static inline void backend_pool_reset_stmt_profile(backend_conn_t* conn)
     memset(&conn->stmt_profile, 0, sizeof(conn->stmt_profile));
 }
 
+static inline void backend_pool_unpin_locked(backend_pool_t* pool,
+                                             backend_conn_t* conn)
+{
+    if (!pool || !conn || conn->pinned_session == NULL)
+        return;
+    if (pool->pinned_count > 0)
+        pool->pinned_count--;
+    conn->pinned_session = NULL;
+}
+
 bool backend_pool_stmt_compatible(const keel_stmt_compat_profile_t* required,
                                   const backend_conn_t* conn)
 {
     if (!required || !conn)
         return false;
 
-    if (required->semantic_unknown || conn->stmt_profile.semantic_unknown) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL semantic_unknown req=%d conn=%d\n",
-            (int)required->semantic_unknown, (int)conn->stmt_profile.semantic_unknown);
+    if (required->semantic_unknown || conn->stmt_profile.semantic_unknown)
         return false;
-    }
-    if (conn->stmt_set_hash != required->stmt_set_hash) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL stmt_set_hash req=%016llx conn=%016llx\n",
-            (unsigned long long)required->stmt_set_hash, (unsigned long long)conn->stmt_set_hash);
+    if (conn->stmt_set_hash != required->stmt_set_hash)
         return false;
-    }
-    if (conn->stmt_profile.semantic_profile_hash != required->semantic_profile_hash) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL semantic_profile_hash req=%016llx conn=%016llx\n",
-            (unsigned long long)required->semantic_profile_hash,
-            (unsigned long long)conn->stmt_profile.semantic_profile_hash);
+    if (conn->stmt_profile.semantic_profile_hash != required->semantic_profile_hash)
         return false;
-    }
-    if (conn->stmt_profile.schema_epoch != required->schema_epoch) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL schema_epoch req=%u conn=%u\n",
-            (unsigned)required->schema_epoch, (unsigned)conn->stmt_profile.schema_epoch);
+    if (conn->stmt_profile.schema_epoch != required->schema_epoch)
         return false;
-    }
-    if (conn->stmt_profile.role_hash != required->role_hash) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL role_hash req=%016llx conn=%016llx\n",
-            (unsigned long long)required->role_hash, (unsigned long long)conn->stmt_profile.role_hash);
+    if (conn->stmt_profile.role_hash != required->role_hash)
         return false;
-    }
-    if (conn->stmt_profile.search_path_hash != required->search_path_hash) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL search_path_hash req=%016llx conn=%016llx\n",
-            (unsigned long long)required->search_path_hash,
-            (unsigned long long)conn->stmt_profile.search_path_hash);
+    if (conn->stmt_profile.search_path_hash != required->search_path_hash)
         return false;
-    }
-    if (conn->stmt_profile.guc_hash != required->guc_hash) {
-        fprintf(stderr, "[DBG-COMPAT] FAIL guc_hash req=%016llx conn=%016llx\n",
-            (unsigned long long)required->guc_hash, (unsigned long long)conn->stmt_profile.guc_hash);
+    if (conn->stmt_profile.guc_hash != required->guc_hash)
         return false;
-    }
     return true;
 }
 
@@ -346,7 +333,7 @@ static void backend_pool_close_slot_locked(backend_pool_t* pool,
         conn->fd = -1;
     }
 
-    conn->pinned_session = NULL;
+    backend_pool_unpin_locked(pool, conn);
     conn->active_owner = NULL;
     conn->in_transaction = false;
     conn->needs_sync = false;
@@ -1293,14 +1280,12 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
      *     already handles those, and replaying onto a backend that already
      *     has the right set would produce "already exists" errors.
      *
-     * (b) required_stmt_hash == 0: session has NO stmts (first borrow) but
-     *     there are no clean backends (Step 2 found nothing) and the pool
-     *     is at capacity.  ALL backends in idle_list have stmts from other
-     *     sessions.  We must reclaim one: grab any stmted backend, mark it
-     *     needs_full_cleanup; the engine will run full cleanup asynchronously
-     *     before forwarding the session's pending message.  This avoids
-     *     a 10-second timeout when the pool is fully occupied by stmted
-     *     connections and new sessions can't get a clean backend. */
+     * Sessions with required_stmt_hash == 0 are usually still in their first
+     * extended-protocol Parse cycle: the statement has not been confirmed by
+     * ParseComplete yet, so the session has no stable replay profile.  Do not
+     * reclaim a stmt-bearing backend for that case.  The caller should queue
+     * and let refill/returns provide a clean backend instead of forcing cleanup
+     * in the middle of a split Parse/Bind/Flush sequence. */
 
     {
         backend_conn_t** prev = &pool->idle_list;
@@ -1315,7 +1300,8 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                 conn = conn->next;
                 continue;
             }
-            if (conn->stmt_set_hash != 0 &&
+            if (required_stmt_hash != 0 &&
+                conn->stmt_set_hash != 0 &&
                 conn->stmt_set_hash != required_stmt_hash) {
                 backend_conn_state_t expected = BACKEND_CONN_IDLE;
                 if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
@@ -1370,12 +1356,16 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
  */
 backend_conn_t* backend_pool_borrow_pinned(backend_pool_t* pool, void* session)
 {
+    if (!pool || !session) return NULL;
+
     /* Check if this session already has a pinned connection */
+    pthread_mutex_lock(&pool->lock);
     for (size_t i = 0; i < pool->total_count; i++) {
         backend_conn_t* conn = &pool->connections[i];
         if (conn->pinned_session == session &&
             atomic_load(&conn->state) == BACKEND_CONN_ACTIVE) {
             /* Session is already pinned to this connection */
+            pthread_mutex_unlock(&pool->lock);
             return conn;
         }
     }
@@ -1385,13 +1375,23 @@ backend_conn_t* backend_pool_borrow_pinned(backend_pool_t* pool, void* session)
      * limit, reject the pin request to prevent pool starvation.  This
      * leaves idle connections available for unpinned sessions. */
     if (pool->max_pinned > 0 && pool->pinned_count >= pool->max_pinned) {
+        pthread_mutex_unlock(&pool->lock);
         return NULL;
     }
+    pthread_mutex_unlock(&pool->lock);
 
     backend_conn_t* conn = backend_pool_borrow(pool, 0);
     if (conn) {
+        pthread_mutex_lock(&pool->lock);
+        if (pool->max_pinned > 0 && pool->pinned_count >= pool->max_pinned) {
+            pthread_mutex_unlock(&pool->lock);
+            backend_pool_return(pool, conn, false);
+            return NULL;
+        }
         conn->pinned_session = session;
         pool->pinned_count++;
+        KEEL_CHECK_POOL_INVARIANTS(pool);
+        pthread_mutex_unlock(&pool->lock);
     }
     return conn;
 }
@@ -1627,9 +1627,7 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
     /* Transaction complete — clear the session pin so the connection
      * goes back to the idle pool instead of staying stuck in STATE_PINNED.
      * Decrement pinned_count if this connection was pinned. */
-    if (conn->pinned_session != NULL && pool->pinned_count > 0)
-        pool->pinned_count--;
-    conn->pinned_session = NULL;
+    backend_pool_unpin_locked(pool, conn);
     conn->active_owner = NULL;
     conn->last_used = get_time_ms();
     if (pool->active_count > 0)
@@ -1806,8 +1804,6 @@ void backend_pool_release_session(backend_pool_t* pool, void* session)
     for (size_t i = 0; i < pool->total_count; i++) {
         backend_conn_t* conn = &pool->connections[i];
         if (conn->pinned_session == session) {
-            if (pool->pinned_count > 0) pool->pinned_count--;
-            
             /* On error/disconnect paths, close the backend connection immediately.
              * Trying to do synchronous cleanup would block
              * the event loop and cause hangs under load. */

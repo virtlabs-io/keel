@@ -203,6 +203,9 @@ enum {
     /* ACTIVE backend without an active_owner is a dangling reference: the
      * worker that borrowed it has no way to return or discard it. */
     KEEL_PINV_ACTIVE_WITHOUT_OWNER   = (1 << 11),
+    /* pinned_count must equal the number of slots with pinned_session set.
+     * Phantom pins break max_pinned admission control and can starve waiters. */
+    KEEL_PINV_PINNED_COUNT_MISMATCH  = (1 << 12),
 };
 
 /**
@@ -301,6 +304,7 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
         size_t actual_cleaning = 0;
         size_t actual_clean_list = 0;
         size_t actual_dirty_list = 0;
+        size_t actual_pinned = 0;
 
         for (const backend_conn_t *c = pool->clean_list; c; c = c->next)
             actual_clean_list++;
@@ -323,6 +327,8 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
                 if (c == slot) refs++;
 
             backend_conn_state_t s = atomic_load(&((backend_conn_t *)slot)->state);
+            if (slot->pinned_session)
+                actual_pinned++;
             if (refs > 1)
                 v |= KEEL_PINV_LIST_DUPLICATE;
             if (refs > 0 && s != BACKEND_CONN_IDLE)
@@ -350,6 +356,8 @@ uint32_t keel_invariant_check_pool(const backend_pool_t *pool)
 
         if (actual_cleaning != pool->cleaning_count)
             v |= KEEL_PINV_COUNT_MISMATCH;
+        if (actual_pinned != pool->pinned_count)
+            v |= KEEL_PINV_PINNED_COUNT_MISMATCH;
     }
 
     return v;
