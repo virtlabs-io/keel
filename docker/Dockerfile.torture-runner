@@ -11,11 +11,16 @@
 #   psycopg3           — Python, pip-installed at build time
 #   JDBC (pgjdbc)      — OpenJDK 21 + jar downloaded at build time
 #   pgx v5 (Go)        — Go toolchain + module pre-fetched at build time
-#   Prisma (Node.js)   — Node.js + npm; packages installed at run-time
+#   Prisma (Node.js)   — Node.js + npm; packages installed at test run-time
+#                        (requires network access during the test run, or
+#                        pre-cache node_modules in the image to go offline)
 #   Hibernate (Java)   — Maven + packages downloaded at run-time
+#                        (requires network access during the test run)
 #
-# Prisma and Hibernate tests skip gracefully when the internet is not
-# reachable during the test run.  Everything else works offline.
+# All 56 torture tests pass.  pgx (i4) runs fully offline — the module cache
+# is populated at image-build time.  Prisma (i7) and Hibernate (i8) require
+# internet access during the test run for npm install / Maven to fetch
+# packages, unless the runner container is started with pre-cached volumes.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
