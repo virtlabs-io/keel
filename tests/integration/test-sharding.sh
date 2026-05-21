@@ -153,14 +153,21 @@ pass "Single-shard SELECT returned correct row"
 # =============================================================================
 info "Test 5: Prometheus /metrics endpoint..."
 
-# Retry the metrics fetch briefly — the HTTP listener comes up with the pool
-# but may need a moment to fully initialise on the first scrape.
+# Retry the metrics fetch AND the content check — the HTTP listener comes up
+# with the pool but the per-worker counters are aggregated into the
+# Prometheus exposition asynchronously, so the first scrape after a query
+# may return the schema scaffolding without the counter lines yet populated.
 METRICS=""
-for _i in $(seq 1 10); do
-    METRICS=$(curl -sf "http://$KEEL_HOST:$PROM_PORT/metrics" 2>/dev/null) && break
+for _i in $(seq 1 15); do
+    METRICS=$(curl -sf "http://$KEEL_HOST:$PROM_PORT/metrics" 2>/dev/null || true)
+    if [[ -n "$METRICS" ]] \
+        && echo "$METRICS" | grep -q "keel_queries_total" \
+        && echo "$METRICS" | grep -q "keel_pool_borrows"; then
+        break
+    fi
     sleep 1
 done
-[[ -n "$METRICS" ]] || fail "Could not fetch /metrics after 10 attempts"
+[[ -n "$METRICS" ]] || fail "Could not fetch /metrics after 15 attempts"
 
 echo "$METRICS" | grep -q "keel_queries_total" \
     || fail "/metrics missing keel_queries_total"

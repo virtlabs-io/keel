@@ -354,7 +354,7 @@ SQL
 done
 BGSCRIPT
 
-    bash "$tmpscript" &
+    bash < "$tmpscript" &
     echo $! > "$pid_file"
     rm -f "$tmpscript"
 }

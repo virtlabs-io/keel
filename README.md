@@ -964,6 +964,12 @@ tests/integration/test-mysql-pxc.sh
 
 # MariaDB Galera Cluster
 tests/integration/test-mysql-mariadb.sh
+
+# PostgreSQL Protocol Torture Suite — all drivers, 56 tests
+tests/suites/run_torture.sh
+tests/suites/run_torture.sh --verbose       # show driver output per test
+tests/suites/run_torture.sh --soak 3600     # 1-hour soak tests
+tests/suites/run_torture.sh --no-build      # skip image rebuild
 ```
 
 ### Chaos Tests

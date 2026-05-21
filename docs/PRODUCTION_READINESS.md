@@ -120,3 +120,79 @@ Before adding UI polish, the admin and Prometheus surfaces must answer:
 - how many sessions are waiting, pinned, cleaning, or commit-in-doubt;
 - why a backend was closed;
 - whether cleanup/replay has timed out or failed.
+
+---
+
+## Release Gates
+
+A release is **blocked** until every gate below passes.  Unit and integration
+tests alone are not sufficient — production readiness requires long soak tests
+with real PostgreSQL workloads and real client drivers.
+
+### Static / lint gates (run on every CI push)
+
+| Gate | Script | Label |
+|------|--------|-------|
+| Memory policy — no direct `malloc`/`free` outside `mem/` | `scripts/check_forbidden_syscalls.sh` | `lint` |
+| Reactor-blocking lint | `scripts/check_forbidden_blocking.sh` | `lint` |
+| Auth log safety — no auth material in log calls | `scripts/check_auth_log_safety.sh` | `gate;security` |
+| Result-cache experimental gate | `scripts/check_result_cache_gate.sh` | `gate` |
+
+Run all lint + gate tests:
+```bash
+ctest --test-dir build -L "lint|gate" --output-on-failure
+```
+
+### Driver-level torture suite (required before each release)
+
+The **PostgreSQL Protocol Torture Suite** (`tests/suites/suite_torture.py`)
+must pass against a real PostgreSQL backend with every supported client driver:
+
+| Test | Driver | What is exercised |
+|------|--------|-------------------|
+| I1 | psql | Simple/extended protocol, COPY, large result sets |
+| I2 | pgbench | TPC-B throughput, prepared-statement mode |
+| I3 | JDBC (pgjdbc) | Server-side prepare, threshold re-prepare |
+| I4 | pgx v5 (Go) | Named prepared statements, extended protocol |
+| I5 | asyncpg (Python) | Async pools, concurrent prepared-statement reuse |
+| I6 | psycopg3 (Python) | Pipeline mode, COPY FROM STDIN, async |
+| I7 | Prisma (Node.js) | ORM raw query, connection pool lifecycle |
+| I8 | Hibernate (Java) | ORM native SQL, SessionFactory lifecycle |
+| I9 | Failover chaos | Primary killed mid-txn; clean error + 5 s recovery |
+| I10 | Pool cycle | Prepared-statement virtualisation across pool recycle |
+| I11 | Long soak | Mixed load for ≥ 1 h; p99 stable, error rate < 1 % |
+| I12 | Connection storm | 500 sequential connect/query/close cycles |
+
+Run the torture suite:
+```bash
+python tests/suites/suite_torture.py --verbose --soak 3600
+```
+
+A release **must not** be tagged if I11 fails at `--soak 3600` (1-hour soak).
+
+### Soak pass criteria
+
+| Metric | Threshold |
+|--------|-----------|
+| Error rate | < 1 % across all query attempts |
+| p99 latency drift | < 3× compared with the first 5-minute window |
+| RSS growth | < 50 MiB over the full soak duration |
+| Open FD trend | Must not grow monotonically (no FD leak) |
+| Proxy process | Must not crash or restart during the soak |
+
+These thresholds are enforced by suite `H` (`tests/suites/suite_soak.py`) and
+by the torture suite's I11 test.  Both must pass.
+
+### Unsupported SQL/protocol edge cases (documented, not gated)
+
+See [docs/PROTOCOL_EDGE_CASES.md](PROTOCOL_EDGE_CASES.md) for the full
+inventory of PostgreSQL wire-protocol and SQL patterns that KEEL does not
+support.  Attempting unsupported patterns through a production proxy **must**:
+
+1. Return a well-formed PostgreSQL `ErrorResponse` (never silently corrupt data).
+2. Emit a `keel_scatter_unsupported_pattern_total{kind=…}` counter increment so
+   operators can alert on unexpected usage.
+3. Never crash the proxy worker.
+
+CI verifies (1) and (3) via `test_pg_protocol_flow` and the protocol torture
+suite (I-series).  Counter correctness is verified by `test_router_metrics`.

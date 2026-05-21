@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# KEEL Torture-Suite Runner
+# =============================================================================
+# All-batteries container that exercises KEEL with every supported PostgreSQL
+# client driver.  Used exclusively by docker/compose/pg-torture.yml.
+#
+# Driver inventory:
+#   psql / pgbench     — inherited from the postgres:16 base image
+#   asyncpg            — Python, pip-installed at build time
+#   psycopg3           — Python, pip-installed at build time
+#   JDBC (pgjdbc)      — OpenJDK 21 + jar downloaded at build time
+#   pgx v5 (Go)        — Go toolchain + module pre-fetched at build time
+#   Prisma (Node.js)   — Node.js + npm; packages installed at test run-time
+#                        (requires network access during the test run, or
+#                        pre-cache node_modules in the image to go offline)
+#   Hibernate (Java)   — Maven + packages downloaded at run-time
+#                        (requires network access during the test run)
+#
+# All 56 torture tests pass.  pgx (i4) runs fully offline — the module cache
+# is populated at image-build time.  Prisma (i7) and Hibernate (i8) require
+# internet access during the test run for npm install / Maven to fetch
+# packages, unless the runner container is started with pre-cached volumes.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — Go module pre-fetch
+# Pre-fetching pgx inside the build context means no internet access is
+# required when the test suite actually runs `go run`.
+# -----------------------------------------------------------------------------
+FROM golang:1.25-bookworm AS go-prefetch
+
+WORKDIR /prefetch
+
+RUN go mod init keel_torture_prefetch \
+ && go get github.com/jackc/pgx/v5@latest \
+ && go mod download \
+ && go mod verify
+
+# -----------------------------------------------------------------------------
+# Stage 2 — Main runner image
+#
+# Base: postgres:16 (Debian bookworm-slim).  It ships psql AND pgbench at
+# /usr/bin already — no extra apt repository needed for those tools.
+# -----------------------------------------------------------------------------
+FROM postgres:16 AS runner
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---------------------------------------------------------------------------
+# Additional system packages (psql + pgbench are already in base image)
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # --- Python -----------------------------------------------------------
+    python3 \
+    python3-pip \
+    python3-venv \
+    # --- Java (JDBC test) -------------------------------------------------
+    default-jdk-headless \
+    # --- Go runtime — toolchain is copied from go-prefetch stage ----------
+    # (no apt install needed; the full toolchain is COPY-d below)
+    # --- Node.js (Prisma test) --------------------------------------------
+    nodejs \
+    npm \
+    # --- Maven (Hibernate test) -------------------------------------------
+    maven \
+    # --- Network capture (I14 packet-capture test) ------------------------
+    tcpdump \
+    # --- Process + network utilities (metrics / diagnostics) --------------
+    iproute2 \
+    procps \
+    # --- Misc utilities ---------------------------------------------------
+    wget \
+    netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Copy Go toolchain + pre-fetched module cache from the prefetch stage
+# ---------------------------------------------------------------------------
+COPY --from=go-prefetch /usr/local/go  /usr/local/go
+COPY --from=go-prefetch /go            /go
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH=/go
+ENV GOMODCACHE=/go/pkg/mod
+
+# Verify Go is usable
+RUN go version
+
+# ---------------------------------------------------------------------------
+# Python driver packages
+# ---------------------------------------------------------------------------
+RUN pip3 install --no-cache-dir --break-system-packages \
+    asyncpg \
+    "psycopg[binary]"
+
+# ---------------------------------------------------------------------------
+# PostgreSQL JDBC jar
+# Pinned to a specific version so the image is reproducible.
+# ---------------------------------------------------------------------------
+ENV KEEL_JDBC_JAR=/opt/postgresql-42.7.3.jar
+
+RUN wget -q \
+    "https://jdbc.postgresql.org/download/postgresql-42.7.3.jar" \
+    -O "${KEEL_JDBC_JAR}" \
+ && echo "Verifying JDBC jar…" \
+ && java -cp "${KEEL_JDBC_JAR}" org.postgresql.Driver 2>&1 | grep -q "No suitable driver" \
+    && echo "JDBC jar OK" || true
+
+# ---------------------------------------------------------------------------
+# Working directory — the repo is bind-mounted here at run time
+# ---------------------------------------------------------------------------
+WORKDIR /keel
+
+# ---------------------------------------------------------------------------
+# Entrypoint — runs the torture suite with whatever args are passed
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["python3", "tests/suites/suite_torture.py"]
+CMD ["--verbose"]

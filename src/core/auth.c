@@ -589,8 +589,11 @@ static keel_auth_state_t scram_process(
 
     const char* msg = (const char*)data;
 
-    KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH, "[SCRAM] step=%d, received len=%zu, data=%.80s",
-                  sctx->step, len, msg ? msg : "(null)");
+    /* NOTE: do NOT log `msg` / raw SCRAM data — it contains authentication
+     * material (nonce, ClientProof, client-first-message-bare) that must
+     * never appear in log files.  Log only non-secret diagnostics. */
+    KEEL_LOG_DEBUG(KEEL_LOG_CAT_AUTH, "[SCRAM] step=%d received_len=%zu",
+                   sctx->step, len);
     
     switch (sctx->step) {
     case 0: {
@@ -795,11 +798,16 @@ static keel_auth_state_t scram_process(
         
         /* Compare with stored key */
         if (memcmp(verify_key, sctx->stored_key, SCRAM_SHA256_DIGEST_LEN) != 0) {
-            KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH, "[SCRAM] proof FAILED: auth_msg=%.100s cfb_len=%zu sf_len=%zu cfwp_len=%zu",
-                          auth_message,
-                          strlen(sctx->client_first_bare),
-                          strlen(sctx->server_first),
-                          strlen(sctx->client_final_without_proof));
+            /* NOTE: auth_message contains the SCRAM auth-message string which
+             * is derived from exchanged nonces and salts — do NOT log it.
+             * Log only byte lengths so operators can diagnose protocol
+             * framing bugs without leaking authentication material. */
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH,
+                           "[SCRAM] ClientProof verification FAILED: "
+                           "cfb_len=%zu sf_len=%zu cfwp_len=%zu",
+                           strlen(sctx->client_first_bare),
+                           strlen(sctx->server_first),
+                           strlen(sctx->client_final_without_proof));
             keel_free(auth_message);
             ctx->state = KEEL_AUTH_STATE_FAILED;
             ctx->error_message = keel_strdup("Invalid password");

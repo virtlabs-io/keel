@@ -1,0 +1,164 @@
+# =============================================================================
+# KEEL Protocol Torture Suite — Docker Compose Stack
+# =============================================================================
+#
+# Topology:
+#   postgres    PostgreSQL 16 backend          → host port 27432
+#   keel        KEEL proxy (pool + PS-virt)    → host port 28432
+#                Admin interface               → host port 28433
+#                Prometheus metrics            → host port 29102
+#   runner      All-driver torture runner      (internal only, one-shot)
+#
+# Usage:
+# ---------------------------------------------------------------------------
+# Quick-start (rebuilds KEEL from source, runs all tests, tears down):
+#
+#   tests/suites/run_torture.sh
+#
+# Manual / incremental workflow:
+#
+#   # 1. Build images
+#   docker compose -f docker/compose/pg-torture.yml build
+#
+#   # 2. Start backend services
+#   docker compose -f docker/compose/pg-torture.yml up -d postgres keel
+#
+#   # 3. Run the torture suite (prints results, exits with its return code)
+#   docker compose -f docker/compose/pg-torture.yml run --rm runner
+#
+#   # 4. Run a specific subset or increase soak duration
+#   docker compose -f docker/compose/pg-torture.yml run --rm \
+#       -e KEEL_TORTURE_SOAK_S=3600 runner --verbose
+#
+#   # 5. Tear down
+#   docker compose -f docker/compose/pg-torture.yml down -v
+#
+# Environment variables:
+#   KEEL_IMAGE              Pre-built KEEL image (skips source build)
+#                           e.g. KEEL_IMAGE=keel:latest
+#   KEEL_TORTURE_SOAK_S     Soak-test duration in seconds (default: 60)
+#   CURRENT_UID             Run containers as this UID (prevents vol perm issues)
+#                           Set automatically by run_torture.sh
+# =============================================================================
+
+name: keel-pg-torture
+
+networks:
+  torture-net:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Named volumes — dropped on `down -v`
+# ---------------------------------------------------------------------------
+volumes:
+  torture_pg_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL backend
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: torture-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - log_min_duration_statement=5000
+      - -c
+      - log_statement=none
+    volumes:
+      - torture_pg_data:/var/lib/postgresql/data
+    networks:
+      - torture-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    # Expose to host for manual inspection / psql debugging
+    ports:
+      - "27432:5432"
+
+  # ---------------------------------------------------------------------------
+  # KEEL proxy
+  # ---------------------------------------------------------------------------
+  keel:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.linux
+    image: ${KEEL_IMAGE:-keel:torture}
+    container_name: torture-keel
+    hostname: keel
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../keel/keel-torture.ini:/etc/keel/keel.ini:ro
+    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    networks:
+      - torture-net
+    ports:
+      - "28432:7432"   # Proxy
+      - "28433:6433"   # Admin
+      - "29102:9101"   # Prometheus metrics
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 2 localhost 9101 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 50
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # All-driver torture runner
+  #
+  # This service is intentionally NOT started by `up -d` — use:
+  #   docker compose run --rm runner [args...]
+  # or let run_torture.sh drive it.
+  #
+  # The repo is bind-mounted at /keel so tests always run from current sources.
+  # ---------------------------------------------------------------------------
+  runner:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.torture-runner
+    image: keel-torture-runner:latest
+    container_name: torture-runner
+    cap_add:
+      - NET_RAW        # required by tcpdump for I14 packet-capture test
+    depends_on:
+      keel:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      # Proxy endpoint (container-internal)
+      KEEL_HOST: keel
+      KEEL_PORT: "7432"
+      KEEL_USER: postgres
+      KEEL_PASSWORD: postgres
+      KEEL_DATABASE: postgres
+      # Direct PostgreSQL endpoint (for chaos tests)
+      KEEL_PG_HOST: postgres
+      KEEL_PG_PORT: "5432"
+      # Soak duration — override with -e KEEL_TORTURE_SOAK_S=3600
+      KEEL_TORTURE_SOAK_S: "${KEEL_TORTURE_SOAK_S:-60}"
+    volumes:
+      # Bind-mount the repo so tests always reflect current sources.
+      # The Dockerfile only provides the driver toolchain.
+      - ../..:/keel:ro
+    networks:
+      - torture-net
+    # Prevent accidental start with `up -d`
+    profiles:
+      - runner

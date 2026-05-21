@@ -13,6 +13,110 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 ## [Unreleased]
 
 ### Added
+
+**PostgreSQL Protocol Torture Suite (Category I) — 56/56 tests pass**
+- New torture tests added to `tests/suites/suite_torture.py`:
+  - `test_i29_live_reload_under_load` — issues admin `RELOAD` while 30 concurrent
+    workers run queries; verifies reload completes with zero query failures
+  - `test_i34_set_tracking_across_pool_cycles` — verifies `SET` parameters
+    (e.g. `search_path`, `TimeZone`, `application_name`) are preserved across
+    pool-cycle boundaries via SSV (Semantic State Virtualization); requires
+    `mode = smart`
+  - `test_i35_temp_table_session_pin` — verifies that creating a `TEMP TABLE`
+    causes KEEL to pin the session to its backend for the remainder of the
+    connection lifetime; session pinning is asserted via repeated `SELECT` on
+    the temp table across multiple queries
+  - `test_i36_with_hold_cursor_across_commit` — declares a `WITH HOLD` cursor,
+    commits the transaction, then fetches from the cursor; proxy must keep the
+    backend pinned and forward `FETCH` responses correctly
+  - `test_i40_cancel_request_storm` — launches 10 concurrent long-running
+    queries and fires a `CancelRequest` for each; asserts all 10 queries cancel
+    within 5 seconds and the connection pool remains fully healthy afterwards
+
+- Torture suite runner Docker image (`docker/Dockerfile.torture-runner`):
+  - Go toolchain pre-installed with `github.com/jackc/pgx/v5` module cache
+    populated at image-build time — pgx tests run offline with no network access
+  - Node.js, npm, and `npx` pre-installed — Prisma tests run without manual
+    package installation
+
+**Torture suite convenience script** (`tests/suites/run_torture.sh`) — one-command
+entry point: builds all Docker images, boots a disposable PostgreSQL + KEEL stack,
+runs the full 56-test suite, and tears everything down.  Flags: `--no-build`,
+`--keep-stack`, `--soak <seconds>`, `--verbose`, `--report-dir <path>`.
+
+### Fixed
+
+**PostgreSQL Engine — Critical Protocol Correctness**
+
+- **BackendKeyData capture during SCRAM authentication** (`src/worker/backend_connect_async.c`):
+  The `case 'K':` handler was absent from the SCRAM authentication state machine,
+  so `BackendKeyData` (the 8-byte PID + secret used for cancel requests) was
+  silently discarded during SCRAM logins.  Cancel requests issued against SCRAM
+  connections would have had a wrong or zeroed secret and would have been ignored
+  by PostgreSQL.  Added `case 'K':` to capture the PID + secret correctly during
+  SCRAM auth.
+
+- **Cancel request forwarding** — Cancel requests are now forwarded to the correct
+  backend.  Previously, a cancel issued by a client could be sent to the wrong
+  backend connection, or lost entirely.
+
+- **ReadyForQuery suppression after cancel (cancel_rfq_suppress)**
+  (`src/protocol/postgres/postgres_flow.c`):
+  After a query is cancelled, PostgreSQL sends `ErrorResponse` with SQLSTATE
+  `57014` (query_cancelled) followed by `ReadyForQuery`.  KEEL was forwarding
+  both messages verbatim, which caused some drivers (JDBC, pgx) to see an
+  unexpected `Z` message and go out of sync.  Now: when KEEL observes an
+  `ErrorResponse` with SQLSTATE `57014`, it sets `cancel_rfq_suppress` in the
+  flow context; the subsequent `Z` is absorbed internally and not forwarded to
+  the client.
+
+- **cancel_pending early-cancel race** (`include/keel/session/session.h`):
+  Added `_Atomic bool cancel_pending` to the session struct.  A `CancelRequest`
+  that arrives before the query is dispatched to a backend is now latched and
+  forwarded as soon as the backend connection is established, preventing the
+  race where a fast cancel arrived "too early" and was silently dropped.
+
+- **Batch send pipeline stall**: A bug in the batch-send path caused a pipeline
+  to stall when multiple client messages were coalesced into a single `writev`
+  call.  Fixed write-completion tracking to correctly account for all bytes
+  of a vectored send.
+
+- **state_sync + Extended Protocol pipeline deadlock**
+  (`src/engine/engine_flow.c`):
+  When a client sent an Extended Protocol pipeline (Parse → Bind → Execute →
+  Sync) and the Parse triggered a state-sync (e.g. because the new backend
+  needed `SET search_path` replayed before the prepared statement), KEEL
+  computed `resume = KEEL_FLOW_OK` (Parse is non-terminal) and re-armed only the
+  frontend receiver.  Backend responses were never read, causing KEEL to deadlock
+  for the full `statement_timeout` (15 s on JDBC test connections).
+  Fix: after draining and forwarding the full pipeline buffer via
+  `captured_fe_pin_effects(setup_follow_buf)`, if the buffer contains a `Sync`
+  message (`pin_clear & KEEL_FPIN_EXTENDED_PROTO`), override
+  `resume = KEEL_FLOW_WAIT_BACKEND` so the backend receiver is armed and the
+  `ReadyForQuery` response is read.
+
+**Torture suite test infrastructure**
+
+- **test_i4_pgx / test_i7_prisma missing `cwd`** (`tests/suites/suite_torture.py`):
+  All `_run()` calls in `test_i4_pgx` and `test_i7_prisma` were missing
+  `cwd=str(tdp)`.  Without it, `go mod init`, `go get`, `go run .`, `npm install`,
+  `npx prisma generate`, and `node test.js` all ran in `/keel` (the read-only
+  bind-mount of the source tree) rather than in the temp directory where the test
+  files were written.  `go mod init` failed immediately with
+  `open /keel/go.mod: read-only file system`; `npm install` found no `package.json`.
+  Both tests always skipped regardless of whether Go or Node.js were installed.
+
+- **Prisma schema missing model** (`tests/suites/suite_torture.py`):
+  Prisma v5 requires at least one model in `schema.prisma` to generate a working
+  `@prisma/client`, even for raw-query-only usage (`$queryRawUnsafe`).  The test
+  schema had no models; `prisma generate` exited 0 (printing a warning) but
+  produced an uninitialised client stub that threw at runtime.  Added a minimal
+  `KeelTest` model so `prisma generate` produces a fully usable client.
+
+- Added `mode = smart` to `docker/keel/keel-torture.ini` — required for SSV
+  (session state virtualization) tests i34 and beyond.
+
+### Added
 - Fuzzing CI workflow (`.github/workflows/fuzzing.yml`): libFuzzer + ASan/UBSan
   on every PR for `test_fuzz_harness`, `test_admin_sql_fuzz`, `test_sm_fuzz`,
   `test_cluster_fuzz`; nightly 10-minute campaign; `KEEL_ENABLE_FUZZ` CMake option
