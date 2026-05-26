@@ -1,7 +1,7 @@
 # KEEL Roadmap
 
-> Last updated: 2026-05-05
-> Branch: `main`
+> Last updated: 2026-05-26
+> Branch: `v0.3-alpha`
 
 This document tracks what KEEL has delivered, what is in progress, and what is planned.
 Items are organised by status and priority.
@@ -10,7 +10,16 @@ Items are organised by status and priority.
 
 ## Completed
 
-Everything listed below is implemented, tested, and available in the current build.
+Each item below is present in the codebase with focused tests. **Production
+maturity varies across items** — [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)
+is the single source of truth for which features are Stable, Hardening,
+Experimental, or Aspirational. Anything in this list that depends on an
+experimental subsystem (sharding, scatter-merge, multi-shard 2PC, WAL LSN /
+GTID replica catch-up probes, cluster wire compression, result cache, web
+management UI) must not be treated as production-supported unless the matching
+gate in `PRODUCTION_READINESS.md` is satisfied for the target deployment. For
+`v0.3-alpha` the recommended production deployment is **PostgreSQL in `pool`
+mode** with `experimental_features = false`.
 
 ### Core Engine
 - **io_uring Share-Nothing Reactor** — per-worker io_uring rings with linked SQEs, registered FDs, batch sends, submit+wait merging, and zero-poll hot path

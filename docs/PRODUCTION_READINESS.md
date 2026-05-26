@@ -4,7 +4,7 @@ This document separates the code that is ready for production hardening from
 features that are implemented but still under failure-mode validation, and from
 features that are aspirational or roadmap-only.
 
-## Production Support Status for v0.2-alpha
+## Production Support Status for v0.3-alpha
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize`
 and `experimental_features = false`.
@@ -49,7 +49,7 @@ and `experimental_features = false`.
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |
 
-## Production-Supported Profiles (v0.2-alpha)
+## Production-Supported Profiles (v0.3-alpha)
 
 Default profile (enabled without opt-in):
 

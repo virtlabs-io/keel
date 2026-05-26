@@ -1,7 +1,10 @@
 # KEEL — Known Limitations
 
-> Status: 2026-05-22 — branch `fix/m0-heap-corruption-and-m4-param-routing`
-> Suite baseline: **563 passed / 16 xfailed / 4 xpassed / ~1 unrelated flaky** (full e2e run)
+> Status: 2026-05-26 — branch `v0.3-alpha`
+> Source of truth for production maturity: [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
+> This document tracks functional limitations exposed by the e2e suite; it is
+> not a production-readiness statement.
+> Last full e2e baseline: **563 passed / 16 xfailed / 4 xpassed / ~1 unrelated flaky**.
 > Failure inventory under `--runxfail` (sharding suites only): **16 failing**
 > in `test_sharding_limitations.py`.
 
