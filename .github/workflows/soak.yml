@@ -157,9 +157,12 @@ jobs:
           # Capture initial FD count
           BASELINE_FD=$(ls /proc/${KEEL_PID}/fd 2>/dev/null | wc -l)
 
-          # Capture warm-up TPS and latency
-          WARMUP_TPS=$(grep -E "^tps = " "$WARMUP_LOG" | tail -1 | awk '{print $3}')
-          WARMUP_LAT=$(grep "latency average" "$WARMUP_LOG" | awk '{print $4}')
+          # Capture warm-up TPS and latency. pgbench prints "latency average"
+          # once per --file plus once as the overall summary; only the overall
+          # line is un-indented. Anchor + head -1 to keep these single-valued
+          # (multi-line values blow up $GITHUB_ENV with "Value cannot be null").
+          WARMUP_TPS=$(grep -E "^tps = " "$WARMUP_LOG" | head -1 | awk '{print $3}')
+          WARMUP_LAT=$(grep -E "^latency average" "$WARMUP_LOG" | head -1 | awk '{print $4}')
 
           echo "BASELINE_RSS_MB=${BASELINE_RSS_MB}" >> "$GITHUB_ENV"
           echo "BASELINE_FD=${BASELINE_FD}"         >> "$GITHUB_ENV"
@@ -227,8 +230,8 @@ jobs:
         run: |
           echo "=== Soak Test Assertions ==="
 
-          SOAK_TPS=$(grep -E "^tps = " "$SOAK_LOG" | tail -1 | awk '{print $3}' || echo "0")
-          SOAK_LAT=$(grep "latency average" "$SOAK_LOG" | awk '{print $4}' || echo "0")
+          SOAK_TPS=$(grep -E "^tps = " "$SOAK_LOG" | head -1 | awk '{print $3}' || echo "0")
+          SOAK_LAT=$(grep -E "^latency average" "$SOAK_LOG" | head -1 | awk '{print $4}' || echo "0")
 
           echo "  Warm-up TPS:   ${WARMUP_TPS}"
           echo "  Soak TPS:      ${SOAK_TPS}"
