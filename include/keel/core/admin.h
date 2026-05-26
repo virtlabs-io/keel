@@ -33,6 +33,7 @@ struct keel_engine;
 struct keel_stats_collector;
 struct keel_cluster;
 struct keel_router;
+struct keel_otlp_exporter;
 typedef struct keel_query_rules keel_query_rules_t;
 typedef struct keel_throttle_rules keel_throttle_rules_t;
 typedef struct keel_discovery keel_discovery_t;
@@ -184,6 +185,16 @@ void keel_admin_set_throttle_rules(keel_admin_t *admin,
  */
 void keel_admin_set_discovery(keel_admin_t *admin,
                               keel_discovery_t *discovery);
+
+/**
+ * @brief Attach an OTLP exporter so its self-stats are exposed via the admin
+ *        HTTP listener at `GET /api/observability/exporter.json`.
+ *
+ * Ownership is NOT transferred. Pass NULL to detach. When KEEL was built
+ * without `KEEL_ENABLE_OTLP`, this is a no-op and the endpoint returns 503.
+ */
+void keel_admin_set_otlp_exporter(keel_admin_t *admin,
+                                  struct keel_otlp_exporter *exporter);
 
 /**
  * @brief Return the TCP port the admin console is actually listening on.

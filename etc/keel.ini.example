@@ -249,6 +249,55 @@ path = /metrics
 
 
 # =============================================================================
+# [observability]  -- OpenTelemetry / OTLP push exporter (optional)
+#
+# Available only when KEEL is built with -DKEEL_ENABLE_OTLP=ON.
+# Ignored otherwise.
+#
+# The aggregator runs on its own thread, samples the metric inventory
+# documented in docs/METRICS_REFERENCE.md, encodes it as OTLP protobuf,
+# and pushes it to a collector. Failures never block the reactor and
+# never break admin/serving paths. Self-stats:
+#   GET /api/observability/exporter.json
+# =============================================================================
+[observability]
+
+# Enable the OTLP exporter. Requires otlp_endpoint_url to be non-empty.
+# Default: 0
+otlp_enabled = 0
+
+# Full HTTP URL of the OTLP/HTTP metrics endpoint.
+# Example: http://otel-collector:4318/v1/metrics
+otlp_endpoint_url =
+
+# Optional bearer token sent as `Authorization: Bearer <token>`.
+otlp_bearer_token =
+
+# Per-HTTP-request timeout in milliseconds.
+# Default: 5000
+otlp_timeout_ms = 5000
+
+# How often (ms) the aggregator takes a snapshot and pushes it.
+# Default: 5000
+otlp_interval_ms = 5000
+
+# Retries per failed export attempt. Each retry uses the same timeout.
+# Default: 2
+otlp_max_retries = 2
+
+# Maximum number of pending snapshots queued for export. When the queue
+# is full the oldest snapshot is dropped (drop counter is exposed via
+# /api/observability/exporter.json).
+# Default: 4
+otlp_queue_capacity = 4
+
+# Size of the protobuf encode scratch buffer in bytes. Must be large
+# enough to hold a single full snapshot encoding.
+# Default: 65536
+otlp_encode_buf_bytes = 65536
+
+
+# =============================================================================
 # [worker_group.<name>]  -- Listener / pool definition
 #
 # You may define as many [worker_group.*] sections as you need.  Each section

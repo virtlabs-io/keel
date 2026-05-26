@@ -78,7 +78,9 @@ ehthumbs.db
 Thumbs.db
 
 # Package manager directories
-third_party/
+third_party/*
+!third_party/nanopb
+!third_party/otel-proto
 vendor/
 
 # Documentation build

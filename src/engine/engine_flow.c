@@ -103,62 +103,9 @@ static void cancel_on_sent(void* userdata, int result)
 /**
  * @brief Synchronise the session's pin-reason summary from flow-level pin state.
  *
- * Translates the bitmask of active flow pins (`sf->pins`) into the coarser
- * `session->pin_reason` field used by monitoring and routing decisions.
- * Called whenever pin state may have changed during query processing.
- *
- * @param session Session descriptor whose `pin_reason` is updated.
- * @param sf      Flow descriptor holding the current `pins` bitmask.
+ * Implementation lives in session_flow_pins.c so callers that only need
+ * pin bookkeeping do not transitively pull in backend_pool dependencies.
  */
-static inline void sync_session_ssv_state(keel_session_t* session,
-                                          keel_session_flow_t* sf)
-{
-    session->pin_reason = (uint32_t)keel_ssv_pin_reason_from_flow_pins(sf->pins);
-}
-
-static inline void observe_pin_transition(struct keel_stats_ctx* stats,
-                                          keel_flow_pin_reason_t prev_pins,
-                                          keel_flow_pin_reason_t next_pins)
-{
-    if (!stats)
-        return;
-
-    if (prev_pins == KEEL_FPIN_NONE && next_pins != KEEL_FPIN_NONE)
-        KEEL_STAT_GAUGE_INC(stats, sessions_pinned);
-    else if (prev_pins != KEEL_FPIN_NONE && next_pins == KEEL_FPIN_NONE)
-        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned);
-
-    keel_flow_pin_reason_t added = next_pins & ~prev_pins;
-    if (added & KEEL_FPIN_TRANSACTION) {
-        KEEL_STAT_INC(stats, pin_reason_transaction);
-        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_transaction);
-    }
-    if ((prev_pins & KEEL_FPIN_TRANSACTION) &&
-        !(next_pins & KEEL_FPIN_TRANSACTION))
-        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_transaction);
-
-    if (added & KEEL_FPIN_EXTENDED_PROTO) {
-        KEEL_STAT_INC(stats, pin_reason_extended_protocol);
-        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_extended_protocol);
-    }
-    if ((prev_pins & KEEL_FPIN_EXTENDED_PROTO) &&
-        !(next_pins & KEEL_FPIN_EXTENDED_PROTO))
-        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_extended_protocol);
-
-    if (added & KEEL_FPIN_PREPARED_STMT) {
-        KEEL_STAT_INC(stats, pin_reason_prepared_stmt);
-        KEEL_STAT_GAUGE_INC(stats, sessions_pinned_prepared_stmt);
-    }
-    if ((prev_pins & KEEL_FPIN_PREPARED_STMT) &&
-        !(next_pins & KEEL_FPIN_PREPARED_STMT))
-        KEEL_STAT_GAUGE_DEC(stats, sessions_pinned_prepared_stmt);
-
-    const keel_flow_pin_reason_t tracked =
-        KEEL_FPIN_TRANSACTION | KEEL_FPIN_EXTENDED_PROTO |
-        KEEL_FPIN_PREPARED_STMT;
-    if (added & ~tracked)
-        KEEL_STAT_INC(stats, pin_reason_other);
-}
 
 /**
  * @brief io_uring connect-completion callback that advances the cancel handshake.
@@ -508,6 +455,8 @@ ssize_t keel_try_send_nb(int fd, const void* buf, size_t len)
  * Ask the protocol plugin to report any pin transitions hidden in those
  * deferred bytes, keeping the engine wire-format agnostic. */
 static void apply_captured_fe_pin_effects(keel_session_flow_t* sf,
+                                          keel_session_t* session,
+                                          keel_worker_t* worker,
                                           const uint8_t* buf,
                                           size_t len)
 {
@@ -518,8 +467,7 @@ static void apply_captured_fe_pin_effects(keel_session_flow_t* sf,
     keel_flow_pin_reason_t pin_clear = KEEL_FPIN_NONE;
     sf->flow->captured_fe_pin_effects(sf->ctx, buf, len,
                                       &pin_update, &pin_clear);
-    sf->pins |= pin_update;
-    sf->pins &= ~pin_clear;
+    keel_session_flow_apply_pin_change(sf, session, worker, pin_update, pin_clear);
 }
 
 /**
@@ -1356,7 +1304,7 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
                 rbuf && rlen > 0 && rcount > 0) {
                 /* Apply pin effects for messages in pending_data that bypass
                  * the FE loop (Sync clears KEEL_FPIN_EXTENDED_PROTO). */
-                apply_captured_fe_pin_effects(sf, pending_data, pending_len);
+                apply_captured_fe_pin_effects(sf, session, worker, pending_data, pending_len);
                 keel_flow_result_t rr = KEEL_FLOW_WAIT_BACKEND;
                 if (be_conn->needs_full_cleanup) {
                     be_conn->needs_full_cleanup = false;
@@ -1905,13 +1853,8 @@ copy_scan_done:
         }
 
         /* Update pins */
-        {
-            keel_flow_pin_reason_t prev_pins = sf->pins;
-            sf->pins |= act.pin_update;
-            sf->pins &= ~act.pin_clear;
-            sync_session_ssv_state(session, sf);
-            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
-        }
+        keel_session_flow_apply_pin_change(sf, session, worker,
+                                           act.pin_update, act.pin_clear);
 
         /* Dispatch on action type */
         switch (act.type) {
@@ -2912,7 +2855,7 @@ copy_scan_done:
 	                            sf->pending_msg     = act.be_payload;
 	                            sf->pending_msg_len = act.be_payload_len;
 	                            sf->pending_msg_resume = pending_resume;
-	                            apply_captured_fe_pin_effects(sf, act.be_payload, act.be_payload_len);
+	                            apply_captured_fe_pin_effects(sf, session, worker, act.be_payload, act.be_payload_len);
 	                            /* Save any pipelined bytes that follow in this recv. */
 	                            if ((size_t)flen < len - pos) {
 	                                keel_residual_append(&session->client_residual,
@@ -2923,7 +2866,7 @@ copy_scan_done:
 	                            sf->pending_msg     = data + pos;
 	                            sf->pending_msg_len = (size_t)flen;
 	                            sf->pending_msg_resume = pending_resume;
-	                            apply_captured_fe_pin_effects(sf, data + pos, (size_t)flen);
+	                            apply_captured_fe_pin_effects(sf, session, worker, data + pos, (size_t)flen);
 	                            if ((size_t)flen < len - pos) {
 	                                keel_residual_append(&session->client_residual,
 	                                                    data + pos + (size_t)flen,
@@ -3179,12 +3122,12 @@ copy_scan_done:
                     if (act.be_payload != NULL &&
                         act.be_payload != (const uint8_t*)(data + pos)) {
                         /* Rewritten payload — use it verbatim */
-                        apply_captured_fe_pin_effects(sf,
+                        apply_captured_fe_pin_effects(sf, session, worker,
                                                 act.be_payload,
                                                 act.be_payload_len);
                     } else {
                         /* Un-rewritten — capture full pipeline */
-                        apply_captured_fe_pin_effects(sf, data + pos, len - pos);
+                        apply_captured_fe_pin_effects(sf, session, worker, data + pos, len - pos);
                     }
 
                     const uint8_t* follow_buf = NULL;
@@ -3477,8 +3420,7 @@ be_forward_done:
              * CommandComplete(COMMIT) we know the outcome is uncertain. */
             if (KEEL_TIER_HAS_TXN_TRACK(sf->mode) &&
                 sf->txn_tracking && (act.effect & KEEL_QE_ENDS_TX)) {
-                sf->commit_in_flight = true;
-                sf->pending_commit_xid = 0;    /* will be filled by xid probe */
+                keel_session_flow_commit_mark_in_flight(sf);
                 KEEL_LOG_TRACE(KEEL_LOG_CAT_CORE, "[COMMIT-IN-FLIGHT] SET msg_type=0x%02x msg_kind=%d ctx=%p",
                         (act.be_payload && act.be_payload_len > 0) ? (unsigned)act.be_payload[0] : 0,
                         (int)act.msg_kind, sf->ctx);
@@ -3963,12 +3905,25 @@ static void send_commit_doubt_response(const keel_proto_flow_vtable_t* flow,
  * @param worker   Owning worker (provides server_pools).
  * @return KEEL_FLOW_WAIT_COMMIT_CHECK or KEEL_FLOW_CLOSED or KEEL_FLOW_ERROR.
  */
-keel_flow_result_t keel_engine_flow_handle_commit_doubt(
+void keel_session_flow_commit_mark_in_flight(keel_session_flow_t* sf)
+{
+    if (!sf) return;
+    sf->commit_in_flight = true;
+    sf->pending_commit_xid = 0;
+}
+
+void keel_session_flow_commit_clear_in_flight(keel_session_flow_t* sf)
+{
+    if (!sf) return;
+    sf->commit_in_flight = false;
+}
+
+void keel_session_flow_commit_mark_doubt(
     keel_session_flow_t* sf,
     keel_session_t* session,
     keel_worker_t* worker)
 {
-    const keel_proto_flow_vtable_t* flow = sf ? sf->flow : NULL;
+    if (!sf || !session) return;
     sf->commit_in_doubt      = true;
     sf->indoubt_xid          = sf->pending_commit_xid;
     sf->commit_in_flight     = false;
@@ -3977,20 +3932,46 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     /* Mirror to session so engine drain can avoid force-closing this session */
     session->commit_in_doubt = true;
     session->indoubt_xid     = sf->indoubt_xid;
-    if (worker->stats_ctx) {
+
+    if (worker && worker->stats_ctx) {
         KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_started);
         KEEL_STAT_GAUGE_INC(worker->stats_ctx, sessions_commit_in_doubt);
     }
+}
+
+void keel_session_flow_commit_clear_doubt(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    keel_worker_t* worker,
+    keel_commit_doubt_resolution_t resolution)
+{
+    if (!sf || !session) return;
+    sf->commit_in_doubt      = false;
+    session->commit_in_doubt = false;
+    session->indoubt_xid     = 0;
+
+    if (worker && worker->stats_ctx) {
+        if (resolution == KEEL_COMMIT_DOUBT_RESOLVED)
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_resolved);
+        else
+            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
+        KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
+    }
+}
+
+keel_flow_result_t keel_engine_flow_handle_commit_doubt(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    keel_worker_t* worker)
+{
+    const keel_proto_flow_vtable_t* flow = sf ? sf->flow : NULL;
+    keel_session_flow_commit_mark_doubt(sf, session, worker);
 
     if (sf->indoubt_xid == 0) {
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_XID, 0);
-        sf->commit_in_doubt = false;
-        session->commit_in_doubt = false; session->indoubt_xid = 0;
-        if (worker->stats_ctx) {
-            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-        }
+        keel_session_flow_commit_clear_doubt(sf, session, worker,
+                                             KEEL_COMMIT_DOUBT_FAILED);
         return KEEL_FLOW_CLOSED;
     }
 
@@ -4005,12 +3986,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     if (!pool) {
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_RW_POOL, sf->indoubt_xid);
-        sf->commit_in_doubt = false;
-        session->commit_in_doubt = false; session->indoubt_xid = 0;
-        if (worker->stats_ctx) {
-            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-        }
+        keel_session_flow_commit_clear_doubt(sf, session, worker,
+                                             KEEL_COMMIT_DOUBT_FAILED);
         return KEEL_FLOW_CLOSED;
     }
 
@@ -4018,12 +3995,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     if (!check_conn) {
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_NO_CHECK_CONN, sf->indoubt_xid);
-        sf->commit_in_doubt = false;
-        session->commit_in_doubt = false; session->indoubt_xid = 0;
-        if (worker->stats_ctx) {
-            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-        }
+        keel_session_flow_commit_clear_doubt(sf, session, worker,
+                                             KEEL_COMMIT_DOUBT_FAILED);
         return KEEL_FLOW_CLOSED;
     }
 
@@ -4037,12 +4010,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         backend_pool_return(pool, check_conn, false);
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_CHECK_BUILD_FAIL, sf->indoubt_xid);
-        sf->commit_in_doubt = false;
-        session->commit_in_doubt = false; session->indoubt_xid = 0;
-        if (worker->stats_ctx) {
-            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-        }
+        keel_session_flow_commit_clear_doubt(sf, session, worker,
+                                             KEEL_COMMIT_DOUBT_FAILED);
         return KEEL_FLOW_CLOSED;
     }
 
@@ -4051,12 +4020,8 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
         backend_pool_return(pool, check_conn, false);
         send_commit_doubt_response(flow, sf->ctx, session->client_fd,
                                    KEEL_CIDR_CHECK_SEND_FAIL, sf->indoubt_xid);
-        sf->commit_in_doubt = false;
-        session->commit_in_doubt = false; session->indoubt_xid = 0;
-        if (worker->stats_ctx) {
-            KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-            KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-        }
+        keel_session_flow_commit_clear_doubt(sf, session, worker,
+                                             KEEL_COMMIT_DOUBT_FAILED);
         return KEEL_FLOW_CLOSED;
     }
 
@@ -4221,15 +4186,11 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     sf->xid_check_conn = NULL;
                     session->server_fd = -1;
                 }
-                sf->commit_in_doubt = false;
-                session->commit_in_doubt = false; session->indoubt_xid = 0;
-                if (worker->stats_ctx) {
-                    if (sf->indoubt_check_result == 1 || sf->indoubt_check_result == 2)
-                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_resolved);
-                    else
-                        KEEL_STAT_INC(worker->stats_ctx, commit_in_doubt_failed);
-                    KEEL_STAT_GAUGE_DEC(worker->stats_ctx, sessions_commit_in_doubt);
-                }
+                keel_session_flow_commit_clear_doubt(
+                    sf, session, worker,
+                    (sf->indoubt_check_result == 1 || sf->indoubt_check_result == 2)
+                        ? KEEL_COMMIT_DOUBT_RESOLVED
+                        : KEEL_COMMIT_DOUBT_FAILED);
 
                 if (sf->indoubt_check_result == 1) {
                     send_commit_doubt_response(flow, sf->ctx, session->client_fd,
@@ -4882,13 +4843,8 @@ keel_flow_result_t keel_engine_flow_on_be_data(
         }
 
         /* Update pins */
-        {
-            keel_flow_pin_reason_t prev_pins = sf->pins;
-            sf->pins |= act.pin_update;
-            sf->pins &= ~act.pin_clear;
-            sync_session_ssv_state(session, sf);
-            observe_pin_transition(worker->stats_ctx, prev_pins, sf->pins);
-        }
+        keel_session_flow_apply_pin_change(sf, session, worker,
+                                           act.pin_update, act.pin_clear);
         if (act.pin_clear & KEEL_FPIN_COPY) {
             sf->copy_skip = 0;      /* Reset COPY scanner state */
             sf->copy_hdr_len = 0;
@@ -5137,7 +5093,7 @@ fe_forward_done: ;
         /* Clear the in-flight flag once the COMMIT response has fully arrived
          * (ReadyForQuery 'I' signals the backend is idle again). */
         if (act.backend_reusable && sf->commit_in_flight)
-            sf->commit_in_flight = false;
+            keel_session_flow_commit_clear_in_flight(sf);
 
         /* Copy mode transition */
         if (act.enters_copy_mode) {
@@ -5361,20 +5317,22 @@ fe_forward_done: ;
                  * The session must stay on this backend because server-side
                  * state (temp table, prepared stmt, cursor, advisory lock)
                  * now exists. */
-                sf->pins &= ~(uint32_t)KEEL_FPIN_QUARANTINE;
+                keel_session_flow_apply_pin_change(sf, session, worker,
+                                                   KEEL_FPIN_NONE,
+                                                   KEEL_FPIN_QUARANTINE);
                 if (session->backend_conn)
                     session->backend_conn->hard_pinned = true;
                 session->hard_pinned = true;
                 sf->quarantine_pending = 0;
-                sync_session_ssv_state(session, sf);
                 if (worker->stats_ctx)
                     KEEL_STAT_INC(worker->stats_ctx, quarantine_count);
                 KEEL_DEBUG_LOG("W%u: quarantine → hard-pin (session %lu)\n",
                               worker->id, (unsigned long)session->id);
             } else {
                 /* No pending quarantine evidence — clear it */
-                sf->pins &= ~(uint32_t)KEEL_FPIN_QUARANTINE;
-                sync_session_ssv_state(session, sf);
+                keel_session_flow_apply_pin_change(sf, session, worker,
+                                                   KEEL_FPIN_NONE,
+                                                   KEEL_FPIN_QUARANTINE);
                 can_release = true;
             }
         }

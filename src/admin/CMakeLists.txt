@@ -30,6 +30,10 @@ target_link_libraries(keel_admin
     PRIVATE pthread
 )
 
+if(KEEL_ENABLE_OTLP)
+    target_link_libraries(keel_admin PRIVATE keel_otlp)
+endif()
+
 # Minimal library containing only the embedded HTML string.
 # Tests link this instead of full keel_admin to avoid pulling in the engine.
 add_library(keel_web_ui STATIC

@@ -2124,6 +2124,16 @@ typedef struct keel_proxy_config {
 static keel_admin_config_t g_admin_cfg = KEEL_ADMIN_CONFIG_DEFAULT;
 static keel_admin_t *g_admin = NULL;
 
+#ifdef KEEL_HAS_OTLP
+#include "../observability/otlp/keel_otlp_aggregator.h"
+#include "../observability/otlp/keel_otlp_config.h"
+#include "../observability/otlp/keel_otlp_exporter.h"
+static keel_otlp_exporter_config_t g_otlp_cfg;
+static bool                        g_otlp_enabled = false;
+static keel_otlp_exporter_t*       g_otlp_exporter = NULL;
+static keel_otlp_aggregator_t*     g_otlp_agg = NULL;
+#endif
+
 /* Cluster configuration (global) */
 static keel_cluster_config_t g_cluster_cfg = KEEL_CLUSTER_CONFIG_DEFAULT;
 static keel_cluster_t *g_cluster = NULL;
@@ -2308,6 +2318,19 @@ static keel_log_plugin_t* g_log_plugin = NULL;
 static keel_query_log_t   g_query_log  = {0};
 
 static void cleanup_startup_failure(keel_config_t* config, bool tls_initialized) {
+#ifdef KEEL_HAS_OTLP
+    if (g_otlp_agg) {
+        keel_otlp_aggregator_stop(g_otlp_agg);
+        keel_otlp_aggregator_destroy(g_otlp_agg);
+        g_otlp_agg = NULL;
+    }
+    if (g_otlp_exporter) {
+        keel_admin_set_otlp_exporter(g_admin, NULL);
+        keel_otlp_exporter_stop(g_otlp_exporter);
+        keel_otlp_exporter_destroy(g_otlp_exporter);
+        g_otlp_exporter = NULL;
+    }
+#endif
     keel_admin_stop(g_admin);
     g_admin = NULL;
 
@@ -4345,6 +4368,21 @@ int main(int argc, char** argv) {
             }
 
             /* =============================================================
+             * Parse [observability] section — OTLP metrics exporter
+             * ============================================================= */
+#ifdef KEEL_HAS_OTLP
+            (void)keel_otlp_config_load(config, &g_otlp_cfg, &g_otlp_enabled);
+            if (g_otlp_enabled) {
+                KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                    "OTLP exporter configured: endpoint=%s interval=%ums "
+                    "queue_cap=%u",
+                    g_otlp_cfg.http.endpoint_url,
+                    g_otlp_cfg.interval_ms,
+                    g_otlp_cfg.queue_capacity);
+            }
+#endif
+
+            /* =============================================================
              * Parse [cluster] section — multi-proxy HA
              * ============================================================= */
             if (keel_config_has_section(config, "cluster")) {
@@ -5330,6 +5368,44 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef KEEL_HAS_OTLP
+    /* Start OTLP exporter + aggregator (cold-path stats fan-out to OTel collector) */
+    if (g_otlp_enabled && g_engine) {
+        g_otlp_exporter = keel_otlp_exporter_create(&g_otlp_cfg);
+        if (g_otlp_exporter && keel_otlp_exporter_start(g_otlp_exporter) == 0) {
+            keel_stats_collector_t* coll = keel_engine_get_stats_collector(g_engine);
+            if (coll) {
+                g_otlp_agg = keel_otlp_aggregator_create(
+                    coll, g_otlp_exporter, g_otlp_cfg.interval_ms);
+                if (g_otlp_agg && keel_otlp_aggregator_start(g_otlp_agg) == 0) {
+                    keel_admin_set_otlp_exporter(g_admin, g_otlp_exporter);
+                    printf("  OTLP:     %s (interval=%ums)\n",
+                           g_otlp_cfg.http.endpoint_url, g_otlp_cfg.interval_ms);
+                } else {
+                    fprintf(stderr,
+                            "Warning: failed to start OTLP aggregator; disabling exporter\n");
+                    if (g_otlp_agg) { keel_otlp_aggregator_destroy(g_otlp_agg); g_otlp_agg = NULL; }
+                    keel_otlp_exporter_stop(g_otlp_exporter);
+                    keel_otlp_exporter_destroy(g_otlp_exporter);
+                    g_otlp_exporter = NULL;
+                }
+            } else {
+                fprintf(stderr,
+                        "Warning: stats collector unavailable; disabling OTLP exporter\n");
+                keel_otlp_exporter_stop(g_otlp_exporter);
+                keel_otlp_exporter_destroy(g_otlp_exporter);
+                g_otlp_exporter = NULL;
+            }
+        } else {
+            fprintf(stderr, "Warning: failed to start OTLP exporter\n");
+            if (g_otlp_exporter) {
+                keel_otlp_exporter_destroy(g_otlp_exporter);
+                g_otlp_exporter = NULL;
+            }
+        }
+    }
+#endif
+
     /* Start cluster manager (if enabled) */
     if (g_cluster_cfg.enabled) {
         g_cluster = keel_cluster_create(&g_cluster_cfg);
@@ -5603,6 +5679,21 @@ int main(int argc, char** argv) {
     /* Dump full instrumentation stats on shutdown */
     stats_dump();
     
+#ifdef KEEL_HAS_OTLP
+    /* Stop OTLP aggregator first so no more snapshots are queued, then exporter. */
+    if (g_otlp_agg) {
+        keel_otlp_aggregator_stop(g_otlp_agg);
+        keel_otlp_aggregator_destroy(g_otlp_agg);
+        g_otlp_agg = NULL;
+    }
+    if (g_otlp_exporter) {
+        keel_admin_set_otlp_exporter(g_admin, NULL);
+        keel_otlp_exporter_stop(g_otlp_exporter);
+        keel_otlp_exporter_destroy(g_otlp_exporter);
+        g_otlp_exporter = NULL;
+    }
+#endif
+
     /* Stop admin console + Prometheus */
     keel_admin_stop(g_admin);
     g_admin = NULL;

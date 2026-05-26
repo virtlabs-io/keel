@@ -88,6 +88,14 @@ typedef enum backend_close_reason {
     BACKEND_CLOSE_REASON_PRUNE_IDLE,
     BACKEND_CLOSE_REASON_PRUNE_AGED,
     BACKEND_CLOSE_REASON_DRAIN_IDLE,
+    BACKEND_CLOSE_REASON_BACKEND_EOF,        /**< Backend closed unexpectedly (EOF / RST) outside cleanup */
+    BACKEND_CLOSE_REASON_CONNECT_FAILED,     /**< Connect/handshake socket-level failure */
+    BACKEND_CLOSE_REASON_AUTH_FAILED,        /**< Authentication denied by backend */
+    BACKEND_CLOSE_REASON_PROTOCOL_ERROR,     /**< Wire-protocol violation during steady-state */
+    BACKEND_CLOSE_REASON_SYNC_ERROR,         /**< Extended-protocol Sync mismatch / desync */
+    BACKEND_CLOSE_REASON_STMT_REPLAY_ERROR,  /**< Prepared-statement replay/setup failed */
+    BACKEND_CLOSE_REASON_SHUTDOWN,           /**< Process-level shutdown teardown */
+    BACKEND_CLOSE_REASON_POOL_EVICTION,      /**< Evicted to honour a pool resize/policy */
 } backend_close_reason_t;
 
 /**

@@ -135,11 +135,43 @@ static void pool_record_backend_close(backend_pool_t* pool,
     case BACKEND_CLOSE_REASON_CLIENT_DISCONNECT:
         KEEL_STAT_INC(pool->stats_ctx, backend_close_client_disconnect);
         break;
-    case BACKEND_CLOSE_REASON_NONE:
     case BACKEND_CLOSE_REASON_IO_ERROR:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_io_error);
+        break;
     case BACKEND_CLOSE_REASON_PRUNE_IDLE:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_prune_idle);
+        break;
     case BACKEND_CLOSE_REASON_PRUNE_AGED:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_prune_aged);
+        break;
     case BACKEND_CLOSE_REASON_DRAIN_IDLE:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_drain_idle);
+        break;
+    case BACKEND_CLOSE_REASON_BACKEND_EOF:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_backend_eof);
+        break;
+    case BACKEND_CLOSE_REASON_CONNECT_FAILED:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_connect_failed);
+        break;
+    case BACKEND_CLOSE_REASON_AUTH_FAILED:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_auth_failed);
+        break;
+    case BACKEND_CLOSE_REASON_PROTOCOL_ERROR:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_protocol_error);
+        break;
+    case BACKEND_CLOSE_REASON_SYNC_ERROR:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_sync_error);
+        break;
+    case BACKEND_CLOSE_REASON_STMT_REPLAY_ERROR:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_stmt_replay_error);
+        break;
+    case BACKEND_CLOSE_REASON_SHUTDOWN:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_shutdown);
+        break;
+    case BACKEND_CLOSE_REASON_POOL_EVICTION:
+        KEEL_STAT_INC(pool->stats_ctx, backend_close_pool_eviction);
+        break;
+    case BACKEND_CLOSE_REASON_NONE:
         break;
     }
 }
@@ -1635,7 +1667,7 @@ void backend_pool_return(backend_pool_t* pool, backend_conn_t* conn, bool in_tra
 
     if (conn->protocol_desync) {
         conn->quarantine = BACKEND_QUARANTINE_PROTOCOL_DESYNC;
-        backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_CLEANUP_ERROR, false);
+        backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_PROTOCOL_ERROR, false);
         KEEL_CHECK_POOL_INVARIANTS(pool);
         pthread_mutex_unlock(&pool->lock);
         return;
@@ -2074,7 +2106,7 @@ static void refill_async_complete(struct backend_conn* conn, bool success, void*
         /* Async connect failed (for example: backend rejected too many clients).
          * Back off for 1 second to avoid hammering the backend. */
         pthread_mutex_lock(&pool->lock);
-        backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, false);
+        backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_CONNECT_FAILED, false);
         pthread_mutex_unlock(&pool->lock);
         pool->refill_backoff_until = get_time_ms() + 1000;
         return;

@@ -59,6 +59,10 @@ target_link_libraries(keel
     PRIVATE keeltrace
 )
 
+if(KEEL_ENABLE_OTLP)
+    target_link_libraries(keel PRIVATE keel_otlp)
+endif()
+
 # Coverage support
 if(KEEL_ENABLE_COVERAGE)
     target_link_options(keel PRIVATE ${KEEL_COVERAGE_FLAGS})

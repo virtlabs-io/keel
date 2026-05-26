@@ -81,6 +81,7 @@ option(KEEL_ENABLE_TRACE "Enable L4 USDT probe points" OFF)
 option(KEEL_ENABLE_FULL_STATS "Enable L5 SQL fingerprint aggregation" OFF)
 option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" ON)
 option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" ON)
+option(KEEL_ENABLE_OTLP "Build OTLP metrics exporter (requires nanopb; off by default until v0.2-alpha lands)" OFF)
 
 # Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
 # while the BEGIN's ReadyForQuery is being absorbed asynchronously.  Sessions
@@ -494,6 +495,11 @@ add_subdirectory(src/admin)
 
 # Distributed tracing (W3C context, OTLP export)
 add_subdirectory(src/trace)
+
+# OTLP metrics exporter (opt-in; off by default until v0.2-alpha)
+if(KEEL_ENABLE_OTLP)
+    add_subdirectory(src/observability)
+endif()
 
 # Main executable
 add_subdirectory(src/main)

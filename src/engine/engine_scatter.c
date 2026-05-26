@@ -853,7 +853,7 @@ done:
         /* Response not fully consumed — connection is in an unknown protocol
          * state.  Close the fd and mark the pool slot CLOSED so the pool's
          * background refill timer can reconnect it. */
-        backend_pool_close_connection(pool, be, BACKEND_CLOSE_REASON_IO_ERROR);
+        backend_pool_close_connection(pool, be, BACKEND_CLOSE_REASON_PROTOCOL_ERROR);
         return rc;
     }
     backend_pool_return(pool, be, false);
