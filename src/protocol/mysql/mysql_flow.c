@@ -2792,6 +2792,245 @@ static int myf_cancel_async(const char* host, uint16_t port,
 }
 
 /* ============================================================================
+ * Parity hooks: get_stmt_compat_profile / captured_fe_pin_effects /
+ * build_commit_doubt_check / generate_commit_doubt_response
+ * ============================================================================
+ *
+ * These four hooks bring the MySQL vtable to feature parity with the
+ * PostgreSQL plugin so the engine does not have to special-case the
+ * protocol when handling backend reuse, deferred client payloads, or
+ * commit-in-doubt recovery.
+ */
+
+/**
+ * @brief Vtable hook: report the session’s prepared-statement compatibility
+ *        profile so the router can decide whether a borrowed backend is
+ *        semantically reusable.
+ *
+ * MySQL tracks the live named-statement set in ctx->session_stmt_hash
+ * (XOR-fold of per-stmt_id hashes; see my_stmt_add/my_stmt_remove). The
+ * remaining semantic fields — search_path / role / GUC equivalents — are
+ * NOT tracked yet for MySQL: things like SET @@session.*, user variables
+ * (KEEL_FPIN_USER_VARIABLE), and active LOCK TABLES are surfaced through
+ * pins rather than a profile hash. To stay correct in the face of that
+ * gap we set @c semantic_unknown so the engine takes the conservative
+ * clean-replay path instead of trusting a zero hash to mean “identical”.
+ */
+static int myf_get_stmt_compat_profile(void* vctx,
+                                       keel_stmt_compat_profile_t* out)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!ctx || !out) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->stmt_set_hash    = ctx->session_stmt_hash;
+    /* No semantic hashes yet — force the engine onto the safe path. */
+    out->semantic_unknown = true;
+    return 0;
+}
+
+/**
+ * @brief Vtable hook: walk a captured frontend payload and report pin
+ *        bits the engine would otherwise miss.
+ *
+ * The engine calls this when it has had to defer a whole FE chunk (e.g.
+ * during state_sync drain, slot cleanup, or PS replay) so the frame-by-
+ * frame on_fe_msg() loop does not run on those bytes. MySQL has no
+ * pipeline marker analogous to the Postgres extended-protocol Sync ('S'),
+ * so today this hook is a frame-structure validator only — it iterates
+ * complete MySQL packets and reports no pin transitions. The walk is kept
+ * (rather than returning immediately) so we tolerate partial trailing
+ * frames as the contract requires, and so that future per-frame pin
+ * effects (e.g. clearing KEEL_FPIN_LOCK_TABLE on UNLOCK TABLES) can be
+ * slotted in without further engine-side changes.
+ */
+static void myf_captured_fe_pin_effects(void* vctx,
+                                         const uint8_t* data,
+                                         size_t len,
+                                         keel_flow_pin_reason_t* pin_update,
+                                         keel_flow_pin_reason_t* pin_clear)
+{
+    (void)vctx;
+    if (pin_update) *pin_update = KEEL_FPIN_NONE;
+    if (pin_clear)  *pin_clear  = KEEL_FPIN_NONE;
+    if (!data) return;
+
+    size_t pos = 0;
+    while (pos + MY_HDR <= len) {
+        uint32_t pkt_len = (uint32_t)data[pos]
+                         | ((uint32_t)data[pos + 1] << 8)
+                         | ((uint32_t)data[pos + 2] << 16);
+        size_t frame_len = (size_t)MY_HDR + pkt_len;
+        if (pos + frame_len > len) return;          /* partial trailing frame */
+        /* No per-frame pin transitions are reported here. */
+        pos += frame_len;
+    }
+}
+
+/**
+ * @brief Vtable hook: build a COM_QUERY that checks the outcome of a
+ *        commit that was lost mid-flight.
+ *
+ * MySQL does NOT have a direct equivalent of PostgreSQL's txid_status():
+ * once the original connection is gone the only way to tell whether the
+ * transaction landed is to compare the GTID set we captured just before
+ * the COMMIT against @@global.gtid_executed on a fresh backend.
+ *
+ * The engine currently never sets keel_be_action_t::commit_xid_captured
+ * for MySQL (the protocol code path that would capture a numeric XID
+ * does not exist yet), so in practice @p xid is always zero here and
+ * we return 0 (“unsupported — fall through to the NO_XID response”).
+ * Implementing the hook now means the day the MySQL plugin starts
+ * capturing GTIDs into the engine's @c indoubt_xid slot (or routing the
+ * captured GTID via a side channel), this builder will start emitting
+ * a real wire check without further engine changes.
+ *
+ * When @p xid is non-zero we emit the GTID_SUBSET probe shape:
+ *   `SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed)`
+ * — result `1` means the original commit landed, `0` means it did not.
+ */
+static ssize_t myf_build_commit_doubt_check(void* vctx,
+                                            uint64_t xid,
+                                            uint8_t* out_buf,
+                                            size_t out_cap)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < MY_HDR + 1)
+        return -1;
+    /* No commit-token captured yet — tell the engine we cannot probe. */
+    if (xid == 0 || !ctx || ctx->keel_write_gtid[0] == '\0')
+        return 0;
+
+    /* Defence in depth: same GTID-charset gate as myf_replica_reached_token
+     * so we never embed an attacker-controlled byte in the SQL literal. */
+    size_t gtid_len = strlen(ctx->keel_write_gtid);
+    if (gtid_len == 0 || gtid_len > 500) return -1;
+    for (size_t i = 0; i < gtid_len; ++i) {
+        unsigned char c = (unsigned char)ctx->keel_write_gtid[i];
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F') ||
+                  c == ':' || c == ',' || c == '-' ||
+                  c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        if (!ok) return -1;
+    }
+
+    char sql[576];
+    int sql_len = snprintf(sql, sizeof(sql),
+                           "SELECT GTID_SUBSET('%s', @@global.gtid_executed)",
+                           ctx->keel_write_gtid);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql))
+        return -1;
+
+    size_t payload_len = 1u + (size_t)sql_len;          /* COM_QUERY + SQL */
+    size_t pkt_total   = (size_t)MY_HDR + payload_len;
+    if (pkt_total > out_cap) return -1;
+
+    wrle24(out_buf, (uint32_t)payload_len);
+    out_buf[3] = 0;                                     /* seq_id = 0 */
+    out_buf[MY_HDR] = MY_COM_QUERY;
+    memcpy(out_buf + MY_HDR + 1, sql, (size_t)sql_len);
+    return (ssize_t)pkt_total;
+}
+
+/**
+ * @brief Vtable hook: build the client-facing response after a
+ *        commit-in-doubt episode resolves (or fails to resolve).
+ *
+ * Mirrors pgf_generate_commit_doubt_response but emits MySQL packets:
+ *   - RESOLVED_COMMITTED → OK packet (affected_rows=0, autocommit).
+ *   - everything else    → ERR packet with a SQLSTATE that matches the
+ *                          severity (‘40000’ for ABORTED, ‘08006’ for
+ *                          connection-level loss-of-confirmation cases).
+ *
+ * Without this hook the engine falls back to writing a Postgres-style 'E'
+ * frame onto the MySQL client socket, which breaks the protocol stream.
+ */
+static ssize_t myf_generate_commit_doubt_response(void* vctx,
+                                                  keel_commit_doubt_reason_t reason,
+                                                  uint64_t xid,
+                                                  uint8_t* out_buf,
+                                                  size_t out_cap)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < MY_HDR + 16) return -1;
+
+    /* ---- Success: OK packet (affected_rows=0, last_insert_id=0,
+     *      status=SERVER_STATUS_AUTOCOMMIT, warnings=0). ---- */
+    if (reason == KEEL_CIDR_RESOLVED_COMMITTED) {
+        static const uint8_t kOkPayload[] = {
+            0x00,           /* OK header */
+            0x00,           /* affected_rows (lenenc=0) */
+            0x00,           /* last_insert_id (lenenc=0) */
+            0x02, 0x00,     /* status_flags = SERVER_STATUS_AUTOCOMMIT */
+            0x00, 0x00,     /* warnings = 0 */
+        };
+        size_t total = (size_t)MY_HDR + sizeof(kOkPayload);
+        if (total > out_cap) return -1;
+        wrle24(out_buf, (uint32_t)sizeof(kOkPayload));
+        out_buf[3] = ctx ? (uint8_t)(ctx->seq_id + 1) : 1;
+        memcpy(out_buf + MY_HDR, kOkPayload, sizeof(kOkPayload));
+        return (ssize_t)total;
+    }
+
+    /* ---- Failure: build a MySQL ERR packet with a human-readable msg. ---- */
+    const char* sqlstate = "08006";
+    uint16_t    err_no   = 1105;        /* ER_UNKNOWN_ERROR */
+    char        msg[256];
+    switch (reason) {
+    case KEEL_CIDR_NO_XID:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction outcome unknown (no commit token captured)");
+        break;
+    case KEEL_CIDR_NO_RW_POOL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: no RW pool \u2014 compare captured GTID against @@global.gtid_executed to resolve (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_NO_CHECK_CONN:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: pool unavailable \u2014 verify GTID_SUBSET against @@global.gtid_executed (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_CHECK_BUILD_FAIL:
+    case KEEL_CIDR_CHECK_SEND_FAIL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: outcome-check failed \u2014 verify GTID_SUBSET manually (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_RESOLVED_ABORTED:
+        sqlstate = "40000";
+        err_no   = 1213;    /* ER_LOCK_DEADLOCK — closest “txn rolled back” code */
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction was rolled back");
+        break;
+    case KEEL_CIDR_RESOLVED_UNKNOWN:
+    default:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: outcome uncertain for token=%llu \u2014 verify GTID_SUBSET manually",
+                 (unsigned long long)xid);
+        break;
+    }
+
+    size_t ml    = strlen(msg);
+    size_t pl    = 1 + 2 + 1 + 5 + ml;        /* 0xFF + errno + '#' + SQLSTATE + msg */
+    size_t total = (size_t)MY_HDR + pl;
+    if (total > out_cap) return -1;
+
+    wrle24(out_buf, (uint32_t)pl);
+    out_buf[3] = ctx ? (uint8_t)(ctx->seq_id + 1) : 1;
+
+    size_t p = MY_HDR;
+    out_buf[p++] = MY_ERR;
+    out_buf[p++] = (uint8_t)(err_no & 0xFF);
+    out_buf[p++] = (uint8_t)((err_no >> 8) & 0xFF);
+    out_buf[p++] = '#';
+    memcpy(out_buf + p, sqlstate, 5); p += 5;
+    memcpy(out_buf + p, msg, ml);
+    return (ssize_t)total;
+}
+
+/* ============================================================================
  * VTable Definition
  * ============================================================================ */
 
@@ -2812,6 +3051,9 @@ const keel_proto_flow_vtable_t keel_proto_flow_mysql = {
     .generate_startup = myf_gen_startup,
     .generate_error   = myf_gen_error,
     .generate_ready_for_query = NULL,   /* MySQL: not needed (OK packet suffices) */
+    /* Commit-in-doubt resolution (PG parity) */
+    .build_commit_doubt_check        = myf_build_commit_doubt_check,
+    .generate_commit_doubt_response  = myf_generate_commit_doubt_response,
     /* Phase 5 optional extensions */
     .get_info              = myf_get_info,
     .classify_error        = myf_classify_error,
@@ -2827,6 +3069,8 @@ const keel_proto_flow_vtable_t keel_proto_flow_mysql = {
     .get_metrics           = myf_get_metrics,
     .notify_write_lsn      = myf_notify_write_lsn,
     .get_stmt_replay       = myf_get_stmt_replay,
+    .get_stmt_compat_profile   = myf_get_stmt_compat_profile,
     .rewrite_execute_anonymous = NULL,  /* MySQL has no anonymous PS mode */
+    .captured_fe_pin_effects   = myf_captured_fe_pin_effects,
     .cancel_async              = myf_cancel_async,
 };

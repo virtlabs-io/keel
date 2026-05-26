@@ -620,7 +620,12 @@ static int test_mysql_replica_reached_token(void) {
 
         keel_consistency_token_t tok;
         memset(&tok, 0, sizeof(tok));
-        strncpy(tok.value, "uuid:1-5", sizeof(tok.value) - 1);
+        /* Real-shape GTID set (UUID = hex+hyphens). Plain placeholders like
+         * "uuid:1-5" are now rejected by the charset validator in
+         * myf_replica_reached_token added with the GTID-injection fix. */
+        strncpy(tok.value,
+                "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+                sizeof(tok.value) - 1);
 
         bool reached = false;
         int rc = keel_proto_flow_mysql.replica_reached_token(
