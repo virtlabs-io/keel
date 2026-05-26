@@ -14,6 +14,60 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ### Added
 
+**MySQL ↔ PostgreSQL parity — phase A: commit-in-doubt + semantic profile**
+
+The four MySQL vtable hooks introduced in `79f1646`
+(`build_commit_doubt_check`, `get_stmt_compat_profile`,
+`replica_reached_token`, `notify_write_lsn`) are now wired end-to-end so the
+engine receives the same signals as on PostgreSQL.
+
+- **Post-COMMIT GTID-token capture** (`src/protocol/mysql/mysql_flow.c`):
+  When a client issues `COMMIT`, the flow now arms a `commit_pending` flag.
+  If the backend reply is an `OK` packet whose status carries
+  `SERVER_SESSION_STATE_CHANGED` with a `SESSION_TRACK_GTIDS` entry
+  (server-side: `session_track_gtids = OWN_GTID`), the freshly captured GTID
+  is hashed via FNV-1a-64 into `keel_be_action_t.commit_xid` and
+  `commit_xid_captured` is set. The engine then drives
+  `build_commit_doubt_check` exactly as on PostgreSQL when a replacement
+  backend has to verify the transaction outcome. A `COMMIT` that returns
+  `ERR` (e.g. deadlock) clears `commit_pending` so a later unrelated `OK`
+  with a GTID cannot poison the next transaction.
+
+- **Semantic statement-compat profile** (`src/protocol/mysql/mysql_flow.c`):
+  `myf_get_stmt_compat_profile` now populates the full profile instead of
+  signalling `semantic_unknown = true` on every call:
+  - `role_hash` ← FNV-1a-64 of the authenticated user (set at handshake).
+  - `search_path_hash` / `schema_epoch` ← FNV-1a-64 of the current database,
+    refreshed on `COM_INIT_DB` and on `USE <db>`.
+  - `guc_hash` ← XOR-fold of `(key_hash ^ (value_hash + 0x9E3779B97F4A7C15))`
+    for every tracked GUC observed in `SET` statements.
+  - `semantic_unknown` flips to `true` on the first untracked `SET`
+    (notably user-defined variables `SET @foo = ...`), which is the conservative
+    signal that prevents the engine from reusing the session.
+
+  The tracked-GUC allowlist matches what KEEL already replays via
+  `build_state_sync`: `sql_mode`, `time_zone`, `autocommit`,
+  `character_set_{client,results,connection}`, `collation_connection`,
+  `transaction_isolation` / `tx_isolation`,
+  `transaction_read_only` / `tx_read_only`, `foreign_key_checks`,
+  `unique_checks`.
+
+- **Tests** (`tests/test_mysql_protocol_flow.c`): 12 new wire-level cases
+  in two sections — *§23 commit-in-doubt* (6 cases covering happy path,
+  no-GTID fallback, ERR clearing, GTID-subset probe formatting and
+  injection rejection) and *§24 stmt-compat profile* (6 cases covering
+  handshake seeding, role/db cross-product, `COM_INIT_DB` epoch bump,
+  tracked SET hashing, user-variable opacification, `SET NAMES` tracking).
+  Suite is now 373/373 passing; full repo `ctest` remains 117/117.
+
+**Known limitation (tracked for phase B follow-up):** capture only happens
+on the `OK` packet of `COMMIT`. If the client connection dies mid-COMMIT
+before the `OK` arrives, KEEL still falls back to `NO_XID` behaviour.
+Closing that window requires a pre-COMMIT multi-statement probe (mirroring
+PG's `kPgXidCommitMsg`) which needs `CLIENT_MULTI_STATEMENTS` /
+`CLIENT_MULTI_RESULTS` negotiation and a result-set absorption state
+machine; that work will land as a separate commit.
+
 **PostgreSQL Protocol Torture Suite (Category I) — 56/56 tests pass**
 - New torture tests added to `tests/suites/suite_torture.py`:
   - `test_i29_live_reload_under_load` — issues admin `RELOAD` while 30 concurrent

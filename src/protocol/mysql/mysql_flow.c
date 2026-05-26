@@ -172,6 +172,29 @@ typedef struct my_flow_ctx {
 
     /* ---- Cancel support ---- */
     uint32_t         synthetic_conn_id;  /**< (worker_id << 16 | slab_index) for KILL QUERY routing */
+
+    /* ---- Commit-in-doubt: post-COMMIT GTID-token capture ----
+     *
+     * `commit_pending` flips to true when the FE side sees a COMMIT
+     * issued via COM_QUERY (qtype == KEEL_QUERY_COMMIT) and stays set
+     * until the BE side observes the corresponding OK / ERR packet.
+     * On the OK, if `keel_write_gtid` was refreshed via the OK packet's
+     * SESSION_TRACK_GTIDS payload, the BE handler hashes it into
+     * `keel_be_action_t::commit_xid` so the engine can resolve a later
+     * connection drop via the GTID_SUBSET probe built by
+     * `myf_build_commit_doubt_check`. */
+    bool             commit_pending;
+
+    /* ---- Statement-compat profile hashes (mirror PG) ----
+     *
+     * Populated lazily as we observe handshake completion and tracked
+     * SET / USE statements. Surfaced via `myf_get_stmt_compat_profile`
+     * so the engine can hash-match a returning backend with a
+     * compatible session profile before reuse. */
+    uint64_t         stmt_role_hash;    /**< Hash of authenticated username */
+    uint64_t         stmt_db_hash;       /**< Hash of current database (USE / COM_INIT_DB) */
+    uint64_t         stmt_guc_hash;      /**< XOR-fold of tracked GUC kv hashes (sql_mode, time_zone, ...) */
+    bool             stmt_semantic_unknown; /**< True after an untracked SET we cannot model */
 } my_flow_ctx_t;
 
 /* ============================================================================
@@ -289,6 +312,71 @@ static uint64_t my_stmt_id_hash(uint32_t stmt_id) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+/**
+ * @brief FNV-1a 64 hash over an arbitrary byte range (case-sensitive).
+ *
+ * Used for session-profile hashes (role / db / GUC kv) so that distinct
+ * inputs produce distinct uint64 values suitable for XOR-folding or
+ * equality comparison by the engine's session reuse path.
+ */
+static uint64_t my_fnv64(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/**
+ * @brief Lowercase-folded FNV-1a 64 for case-insensitive GUC name match.
+ */
+static uint64_t my_fnv64_ci(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = p[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32);
+        h ^= (uint64_t)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/**
+ * @brief Return true if @p name (length @p nl) is a session-GUC we track
+ *        deterministically in `stmt_guc_hash`.
+ *
+ * The set mirrors the MySQL session variables that materially change
+ * statement semantics on reuse: SQL mode, time zone, autocommit,
+ * character-set / collation pinning. Any SET that is NOT in this list
+ * forces `stmt_semantic_unknown` to true so the engine treats the
+ * session as opaque for reuse purposes.
+ */
+static bool my_is_tracked_guc(const char* name, size_t nl) {
+    static const char* kTracked[] = {
+        "sql_mode", "time_zone", "autocommit",
+        "character_set_client", "character_set_results",
+        "character_set_connection", "collation_connection",
+        "transaction_isolation", "tx_isolation",
+        "transaction_read_only", "tx_read_only",
+        "foreign_key_checks", "unique_checks",
+    };
+    for (size_t i = 0; i < sizeof(kTracked) / sizeof(kTracked[0]); i++) {
+        size_t kl = strlen(kTracked[i]);
+        if (kl != nl) continue;
+        bool match = true;
+        for (size_t j = 0; j < nl; j++) {
+            char a = name[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (a != kTracked[i][j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 /**
@@ -955,6 +1043,19 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         ctx->reusable = true;
         ctx->result_state = MY_RS_IDLE;
 
+        /* Seed the stmt-compat profile from the authenticated identity.
+         * Username → role_hash, database → db_hash. semantic_unknown starts
+         * false: only an untracked SET flips it. */
+        ctx->stmt_role_hash       = ctx->username[0]
+                                  ? my_fnv64(ctx->username, strlen(ctx->username))
+                                  : 0;
+        ctx->stmt_db_hash         = ctx->database[0]
+                                  ? my_fnv64(ctx->database, strlen(ctx->database))
+                                  : 0;
+        ctx->stmt_guc_hash        = 0;
+        ctx->stmt_semantic_unknown = false;
+        ctx->commit_pending       = false;
+
         /* Build OK response (AuthOk) into per-context buffer */
         build_ok_packet(ctx->ok_buf, &ctx->ok_len, ctx->seq_id + 1);
 
@@ -985,6 +1086,15 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         keel_msg_kind_t kind;
         uint32_t qtype = 0;
         classify_sql_mysql(sql, sl, &eff, &route, &pin_set, &pin_clr, &kind, &qtype);
+
+        /* Commit-in-doubt: arm the post-COMMIT capture so that the
+         * matching OK packet (BE side) emits commit_xid_captured. The flag
+         * is also cleared by ROLLBACK and by ERR packets so a failed
+         * COMMIT does not poison subsequent transactions. */
+        if (qtype == KEEL_QUERY_COMMIT)
+            ctx->commit_pending = true;
+        else if (qtype == KEEL_QUERY_ROLLBACK)
+            ctx->commit_pending = false;
 
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = kind;
@@ -1112,6 +1222,24 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                     }
                 }
             }
+
+            /* Stmt-compat profile: fold tracked GUC kv into guc_hash, or
+             * flip semantic_unknown for anything we cannot model. The
+             * SET NAMES branch above always falls into the tracked path
+             * (key="character_set_client"). User-variable SETs (@var=...)
+             * and bare "SET ROLE" / "SET PASSWORD" / "SET TRANSACTION"
+             * fall through to semantic_unknown so reuse is suppressed. */
+            if (act->has_state_delta &&
+                my_is_tracked_guc(act->state_key, act->state_key_len)) {
+                uint64_t kh = my_fnv64_ci(act->state_key, act->state_key_len);
+                uint64_t vh = act->state_value_len
+                            ? my_fnv64(act->state_value, act->state_value_len)
+                            : 0;
+                /* XOR-fold so re-setting the same kv is a no-op for the hash. */
+                ctx->stmt_guc_hash ^= kh ^ (vh + 0x9E3779B97F4A7C15ULL);
+            } else {
+                ctx->stmt_semantic_unknown = true;
+            }
         }
 
         /* Cross-service RYW: intercept SET @keel_write_gtid and SELECT @keel_write_gtid
@@ -1183,6 +1311,8 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             if (dl >= sizeof(ctx->database)) dl = sizeof(ctx->database) - 1;
             memcpy(ctx->database, data + MY_HDR + 1, dl);
             ctx->database[dl] = '\0';
+            /* Refresh the schema/db hash for the stmt-compat profile. */
+            ctx->stmt_db_hash = dl ? my_fnv64(ctx->database, dl) : 0;
         }
         act->type = KEEL_FE_ACT_FORWARD_TO_BACKEND;
         act->be_payload = data;
@@ -1383,6 +1513,8 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         act->is_error_response = true;
         act->query_complete = true;
         ctx->result_state = MY_RS_IDLE;
+        /* A failed COMMIT must not leave the post-commit capture armed. */
+        ctx->commit_pending = false;
 
         /* LOAD DATA aborted: ERR during INFILE means streaming is done */
         if (ctx->in_copy) {
@@ -1669,6 +1801,32 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         if (!more_results) {
             act->query_complete = true;
             ctx->result_state = MY_RS_IDLE;
+        }
+
+        /* ---- Commit-in-doubt: post-COMMIT GTID-token capture ----
+         *
+         * If the FE side observed a COMMIT (commit_pending == true) and we
+         * are now seeing its terminal OK packet, hash the latest GTID from
+         * `ctx->keel_write_gtid` (refreshed above from SESSION_TRACK_GTIDS
+         * when the server has session_track_gtids='OWN_GTID') and report
+         * it as the commit token via keel_be_action_t.commit_xid_*.
+         *
+         * The engine stores this in session_flow.pending_commit_xid so a
+         * subsequent commit-doubt episode can drive
+         * `myf_build_commit_doubt_check`, which embeds the same GTID into
+         * a `SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed)` probe
+         * on a fresh backend to resolve the outcome. */
+        if (ctx->commit_pending && act->query_complete) {
+            if (ctx->keel_write_gtid[0] != '\0') {
+                uint64_t h = my_fnv64(ctx->keel_write_gtid,
+                                      strlen(ctx->keel_write_gtid));
+                /* Never report a zero token: the engine treats xid==0 as
+                 * "no token captured" and short-circuits to NO_XID. */
+                if (h == 0) h = 1;
+                act->commit_xid_captured = true;
+                act->commit_xid          = h;
+            }
+            ctx->commit_pending = false;
         }
 
         return 0;
@@ -2823,9 +2981,20 @@ static int myf_get_stmt_compat_profile(void* vctx,
     if (!ctx || !out) return -1;
 
     memset(out, 0, sizeof(*out));
-    out->stmt_set_hash    = ctx->session_stmt_hash;
-    /* No semantic hashes yet — force the engine onto the safe path. */
-    out->semantic_unknown = true;
+    out->stmt_set_hash        = ctx->session_stmt_hash;
+    out->role_hash            = ctx->stmt_role_hash;
+    /* MySQL has no Postgres-style search_path; current database is the
+     * closest analog for hash-based reuse gating. */
+    out->search_path_hash     = ctx->stmt_db_hash;
+    out->guc_hash             = ctx->stmt_guc_hash;
+    /* schema_epoch bumps whenever the tracked database changes; reuse the
+     * db_hash as the epoch identity so a USE flips it. */
+    out->schema_epoch         = ctx->stmt_db_hash;
+    out->semantic_profile_hash = ctx->stmt_role_hash
+                              ^ ctx->stmt_db_hash
+                              ^ ctx->stmt_guc_hash;
+    /* Only mark the profile opaque if we actually saw an unmodellable SET. */
+    out->semantic_unknown     = ctx->stmt_semantic_unknown;
     return 0;
 }
 
@@ -2873,21 +3042,22 @@ static void myf_captured_fe_pin_effects(void* vctx,
  *
  * MySQL does NOT have a direct equivalent of PostgreSQL's txid_status():
  * once the original connection is gone the only way to tell whether the
- * transaction landed is to compare the GTID set we captured just before
- * the COMMIT against @@global.gtid_executed on a fresh backend.
+ * transaction landed is to compare the GTID set we captured around the
+ * COMMIT against @@global.gtid_executed on a fresh backend.
  *
- * The engine currently never sets keel_be_action_t::commit_xid_captured
- * for MySQL (the protocol code path that would capture a numeric XID
- * does not exist yet), so in practice @p xid is always zero here and
- * we return 0 (“unsupported — fall through to the NO_XID response”).
- * Implementing the hook now means the day the MySQL plugin starts
- * capturing GTIDs into the engine's @c indoubt_xid slot (or routing the
- * captured GTID via a side channel), this builder will start emitting
- * a real wire check without further engine changes.
+ * The token plumbing relies on the server emitting
+ * SESSION_TRACK_GTIDS in the OK packet for COMMIT (enabled via
+ * @@SESSION.session_track_gtids='OWN_GTID'). myf_on_be_msg parses that
+ * field into ctx->keel_write_gtid and signals capture by setting
+ * keel_be_action_t::commit_xid_captured on the COMMIT's OK packet. The
+ * engine forwards the captured token here as @p xid; we use it only as
+ * a "token is valid" signal and source the actual GTID string from the
+ * context, since the engine's uint64 slot cannot round-trip the full
+ * GTID set.
  *
- * When @p xid is non-zero we emit the GTID_SUBSET probe shape:
+ * When @p xid is non-zero and a GTID was captured we emit:
  *   `SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed)`
- * — result `1` means the original commit landed, `0` means it did not.
+ * \u2014 result `1` means the original commit landed, `0` means it did not.
  */
 static ssize_t myf_build_commit_doubt_check(void* vctx,
                                             uint64_t xid,
