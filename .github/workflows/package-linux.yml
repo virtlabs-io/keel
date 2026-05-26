@@ -113,9 +113,17 @@ jobs:
             gpg --batch --yes "${passphrase_args[@]}" --armor --detach-sign "$f"
           done
 
-      - name: Warn when signing is not configured
+      - name: Fail when signing is not configured for a tagged release
         if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true'
-        run: echo "PACKAGE_SIGNING_PRIVATE_KEY secret not configured; publishing unsigned artifacts."
+        run: |
+          echo "::error::PACKAGE_SIGNING_PRIVATE_KEY secret is not configured." >&2
+          echo "::error::Tagged releases must publish signed artifacts; refusing to continue." >&2
+          echo "::error::Configure the PACKAGE_SIGNING_PRIVATE_KEY (and optionally PACKAGE_SIGNING_PASSPHRASE) repository secret, or delete the tag." >&2
+          exit 1
+
+      - name: Warn when signing is not configured (non-tag build)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true' }}
+        run: echo "PACKAGE_SIGNING_PRIVATE_KEY secret not configured; non-tag build will produce unsigned artifacts."
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
