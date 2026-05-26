@@ -4,6 +4,11 @@ on:
   schedule:
     # 03:00 UTC every night — offset from chaos (02:00) to avoid resource contention
     - cron: '0 3 * * *'
+  # Release gates: run on PRs targeting a release branch and on every version tag.
+  pull_request:
+    branches: ["v*-alpha", "v*-beta"]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       duration:

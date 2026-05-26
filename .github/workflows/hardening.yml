@@ -5,7 +5,10 @@ env:
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
+  push:
+    branches: ["v*-alpha", "v*-beta"]
+    tags: ["v*"]
   schedule:
     # Weekly full hardening: Sunday 03:00 UTC
     - cron: '0 3 * * 0'

@@ -11,7 +11,8 @@ on:
       - 'tests/CMakeLists.txt'
       - '.github/workflows/fuzzing.yml'
   push:
-    branches: [main]
+    branches: [main, "v*-alpha", "v*-beta"]
+    tags: ["v*"]
     paths:
       - 'src/**'
       - 'include/**'

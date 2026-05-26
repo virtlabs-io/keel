@@ -4,12 +4,21 @@ on:
   schedule:
     # 02:00 UTC every night
     - cron: '0 2 * * *'
+  # Release gates: run on PRs targeting a release branch and on every version tag.
+  pull_request:
+    branches: ["v*-alpha", "v*-beta"]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       scenario:
         description: 'Specific scenario to run (leave empty to run all)'
         required: false
         default: ''
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   chaos:
