@@ -123,7 +123,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          WARMUP_LOG=$(mktemp)
+          WARMUP_LOG=/tmp/keel-soak-warmup.log
+          echo "WARMUP_LOG=${WARMUP_LOG}" >> "$GITHUB_ENV"
+          set +e
           pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
             -n -r -T 60 -c 16 -j 4 \
             --random-seed=1 \
@@ -134,6 +136,18 @@ jobs:
             --file=bench/scripts/write_insert.sql@8 \
             --file=bench/scripts/write_delete.sql@2 \
             > "$WARMUP_LOG" 2>&1
+          PGBENCH_RC=$?
+          set -e
+          echo "===== warm-up pgbench output (rc=${PGBENCH_RC}) ====="
+          cat "$WARMUP_LOG" || true
+          echo "====================================================="
+          if [[ $PGBENCH_RC -ne 0 ]]; then
+            echo "warm-up pgbench failed — dumping keel state for diagnosis"
+            ps -fp "${KEEL_PID}" || true
+            ss -tlnp 2>/dev/null | grep -E ':7432|:5432' || true
+            tail -50 /proc/${KEEL_PID}/status 2>/dev/null || true
+            exit $PGBENCH_RC
+          fi
 
           # Capture baseline RSS of keel process (kB → MB)
           RSS_KB=$(cat /proc/${KEEL_PID}/status | grep VmRSS | awk '{print $2}')
@@ -156,7 +170,6 @@ jobs:
           echo "  Avg latency:   ${WARMUP_LAT} ms"
           echo "  Baseline RSS:  ${BASELINE_RSS_MB} MB"
           echo "  Baseline FDs:  ${BASELINE_FD}"
-          rm -f "$WARMUP_LOG"
 
       # ────────────────────────────────────────────────────────────────────────
       # Main soak run — pgbench in background, monitor loop in foreground
@@ -168,8 +181,10 @@ jobs:
           SOAK_DURATION: ${{ github.event.inputs.duration || '1800' }}
           SOAK_CLIENTS:  ${{ github.event.inputs.clients  || '32'   }}
         run: |
-          SOAK_LOG=$(mktemp)
-          METRICS_LOG=$(mktemp)
+          SOAK_LOG=/tmp/keel-soak-run.log
+          METRICS_LOG=/tmp/keel-soak-metrics.log
+          : > "$SOAK_LOG"
+          : > "$METRICS_LOG"
 
           # Start pgbench workload in background
           pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
@@ -305,9 +320,11 @@ jobs:
         with:
           name: soak-metrics-${{ github.run_id }}
           path: |
-            /tmp/keel-soak-*.log
-            /tmp/keel-metrics-*.log
+            /tmp/keel-soak-warmup.log
+            /tmp/keel-soak-run.log
+            /tmp/keel-soak-metrics.log
           retention-days: 14
+          if-no-files-found: warn
 
       - name: Stop keel proxy
         if: always()
