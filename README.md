@@ -2,9 +2,9 @@
 
 # KEEL - Database Connection Pooler
 
-[![CI](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/ci.yml)
-[![Hardening](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/hardening.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/hardening.yml)
-[![codecov](https://codecov.io/gh/virtlabs-io/dbcp-keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/dbcp-keel)
+[![CI](https://github.com/virtlabs-io/keel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/keel/actions/workflows/ci.yml)
+[![Hardening](https://github.com/virtlabs-io/keel/actions/workflows/hardening.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/keel/actions/workflows/hardening.yml)
+[![codecov](https://codecov.io/gh/virtlabs-io/keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.2-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
@@ -576,8 +576,8 @@ sudo dnf install cmake gcc openssl-devel liburing-devel
 
 ```bash
 # Clone the repository
-git clone https://github.com/virtlabs-io/dbcp-keel.git
-cd dbcp-keel
+git clone https://github.com/virtlabs-io/keel.git
+cd keel
 
 # Create build directory
 mkdir build && cd build

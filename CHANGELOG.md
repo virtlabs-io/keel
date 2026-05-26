@@ -299,7 +299,7 @@ Initial internal alpha release. Core engine, PostgreSQL pooling, basic routing, 
 
 ---
 
-[Unreleased]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.3.0...HEAD
-[alpha-0.3.0]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
-[0.3.0-dev]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
-[alpha-0.1]: https://github.com/virtlabs-io/dbcp-keel/releases/tag/alpha-0.1
+[Unreleased]: https://github.com/virtlabs-io/keel/compare/alpha-0.3.0...HEAD
+[alpha-0.3.0]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
+[0.3.0-dev]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
+[alpha-0.1]: https://github.com/virtlabs-io/keel/releases/tag/alpha-0.1

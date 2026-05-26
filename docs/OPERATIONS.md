@@ -146,7 +146,7 @@ drain completes.
 ```bash
 # 1. Download the new binary to a staging path
 curl -Lo /usr/local/bin/keel.new \
-  https://github.com/virtlabs-io/dbcp-keel/releases/download/alpha-0.4.0/keel-linux-amd64
+  https://github.com/virtlabs-io/keel/releases/download/alpha-0.4.0/keel-linux-amd64
 
 # 2. Verify the SHA256 and GPG signature (see docs/RELEASE_SIGNING.md)
 sha256sum -c SHA256SUMS

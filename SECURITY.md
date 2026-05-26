@@ -13,7 +13,7 @@
 
 Report security issues privately via GitHub's built-in mechanism:
 
-1. Go to the [Security tab](https://github.com/virtlabs-io/dbcp-keel/security/advisories/new) of this repository.
+1. Go to the [Security tab](https://github.com/virtlabs-io/keel/security/advisories/new) of this repository.
 2. Click **"Report a vulnerability"**.
 3. Fill in the details: affected component, reproduction steps, potential impact, and any suggested fix.
 

@@ -61,7 +61,7 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the project maintainers by opening a private report at:
 
-https://github.com/virtlabs-io/dbcp-keel/security/advisories/new
+https://github.com/virtlabs-io/keel/security/advisories/new
 
 All complaints will be reviewed and investigated promptly and fairly.
 
