@@ -1,6 +1,6 @@
 # MySQL ↔ PostgreSQL parity for the engine vtable
 
-Status: **phase A landed** (this commit) · phase B deferred to follow-up commit
+Status: **phase A landed** (this commit) · **phase B landed** (follow-up commit)
 Scope: `src/protocol/mysql/mysql_flow.c`, `keel_proto_flow_vtable_t`
 Owner: protocol team
 
@@ -93,37 +93,51 @@ guaranteed to receive the same state-sync payload.
 
 ---
 
-## Phase B — deferred to a follow-up commit
+## Phase B — pre-COMMIT GTID probe (landed)
 
 Phase A only covers the narrow window where the OK packet for COMMIT
-actually reaches KEEL. The longer window — "client connection dies any
-time between issuing COMMIT and receiving its OK" — still falls back to
-the engine's `NO_XID` behaviour.
+actually reaches KEEL. To close the longer window — "client connection
+dies any time between issuing COMMIT and receiving its OK" — phase B
+mirrors PostgreSQL's `kPgXidCommitMsg` approach in
+`src/protocol/mysql/mysql_flow.c`:
 
-Closing that gap means mirroring PostgreSQL's `kPgXidCommitMsg`
-(`postgres_flow.c:2000`) approach:
+1. **Capabilities.** `myf_gen_startup` now unconditionally advertises
+   `CLIENT_MULTI_STATEMENTS` (bit 16) and `CLIENT_MULTI_RESULTS`
+   (bit 17) so the backend accepts multi-statement payloads.
+2. **FE rewrite.** When `txn_tracking` is on and the FE handler sees a
+   bare COMMIT, `act->be_payload` is swapped for the static template
+   `kMyXidCommitMsg`:
 
-1. **Negotiate `CLIENT_MULTI_STATEMENTS` and `CLIENT_MULTI_RESULTS`** in
-   `myf_gen_startup` so the backend will accept a multi-statement payload.
-2. **Rewrite the COMMIT payload** in `myf_on_fe_msg` to
-   `SELECT @@gtid_executed AS _keel_token; COMMIT;` (or, more robust,
-   `SELECT @@gtid_executed AS _keel_token /*before*/; COMMIT;
-   SELECT @@gtid_executed AS _keel_token /*after*/;` to capture both
-   sides of the commit boundary).
-3. **Add a small result-set absorption state machine** (`MY_RS_GTID_PROBE_*`)
-   in `myf_on_be_msg`:
-   - Absorb the `_keel_token` result set silently (don't forward to the
-     client).
-   - Capture the token into `ctx->keel_write_gtid` and stash it in
-     `commit_xid` before the COMMIT's own OK is forwarded.
-   - **Rewrite the `seq_id`** on the forwarded COMMIT OK so the client
-     observes the standard single-OK response with `seq_id = 1`.
-4. **Engine integration.** The engine already consumes
-   `be_act.commit_xid_captured`; no engine change is required.
-5. **Tests.** Add cases for probe absorption, seq_id rewriting, and the
-   handshake negotiating both multi-statement caps.
+   ```
+   SELECT @@gtid_executed AS _keel_token;COMMIT
+   ```
 
-Until phase B lands the documented limitation in `CHANGELOG.md` applies:
-mid-COMMIT connection death falls back to `NO_XID` behaviour, which is
-identical to KEEL's pre-`79f1646` behaviour and is safe (it errs on the
-side of declaring "unknown" rather than guessing).
+   (`COM_QUERY`, 49 wire bytes including header). `ctx->xid_probe_active`
+   is set and the existing `commit_pending` flag is left in place so the
+   phase A capture still fires on resume paths that bypass the rewrite.
+3. **BE absorption.** `myf_on_be_msg` runs a tiny state machine driven
+   by `result_state` while the probe is active: the SELECT response
+   (column_count, column_def, EOF, data_row, EOF MORE_RESULTS) is
+   absorbed (`KEEL_BE_ACT_ABSORB`, `fe_payload = NULL`). The data row
+   yields the GTID, which is hashed via FNV-1a-64 and reported via
+   `commit_xid_captured` / `commit_xid` on the absorbed action — the
+   engine harvests it regardless of `act.type` (see
+   `engine_flow.c:5088-5091`).
+4. **Forwarded COMMIT outcome.** The final OK packet (`seq_id = 6`) is
+   copied into the per-context `xid_probe_out_buf`, its `seq_id` is
+   rewritten to `1`, and the rewritten buffer is forwarded so the
+   client observes the standard `COMMIT(seq=0) ← OK(seq=1)` exchange.
+   ERR mid-probe gets the same seq rewrite and clears the probe state
+   so the next COMMIT can re-arm.
+5. **Engine integration.** No engine change required.
+6. **Tests.** `tests/test_mysql_protocol_flow.c` §25 adds 7 cases:
+   capability negotiation, COMMIT rewrite under tracking, passthrough
+   when tracking is off, end-to-end SELECT-result absorption with GTID
+   capture, seq_id-rewritten OK forwarding, ERR teardown + re-arm, and
+   ROLLBACK passthrough. Suite is 407/407.
+
+With phase B landed the mid-COMMIT connection-death window matches PG:
+the token is captured before the COMMIT executes, so a replacement
+backend can resolve the outcome via `myf_build_commit_doubt_check`. The
+phase A fallback remains for sessions that disable `txn_tracking` or
+for servers without `session_track_gtids = OWN_GTID` on the resume path.

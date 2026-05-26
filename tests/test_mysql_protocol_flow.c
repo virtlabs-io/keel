@@ -2864,6 +2864,216 @@ static void test_compat_profile_set_names_is_tracked(void) {
 }
 
 /* ============================================================================
+ * 25) Commit-in-doubt phase B: pre-COMMIT GTID probe (kMyXidCommitMsg)
+ * ============================================================================
+ *
+ * txn_tracking is sourced from session->worker at create_context time. Because
+ * the tests synthesise a NULL session, the flag starts false. The internal
+ * test seam below lets the suite force the flag on without exposing the full
+ * `my_flow_ctx_t`. The probe wire layout the BE handler must absorb is:
+ *
+ *   seq=1  column_count = 1     (lenenc 0x01)
+ *   seq=2  column_def for `_keel_token`
+ *   seq=3  EOF                  (end of columns)
+ *   seq=4  data_row             (single lenenc string = GTID)
+ *   seq=5  EOF MORE_RESULTS     (end of SELECT; second result follows)
+ *   seq=6  OK                   (COMMIT outcome — forwarded with seq=1)
+ * ============================================================================ */
+
+extern bool keel_mysql_flow_test_enable_txn_tracking(void* vctx);
+
+static void test_xid_probe_negotiates_multi_stmt_caps(void) {
+    TEST_BEGIN("xidprobe: handshake response advertises MULTI_STATEMENTS|MULTI_RESULTS");
+    void* ctx = VT->create_context(NULL);
+    uint8_t buf[512];
+    ssize_t n = VT->generate_startup(ctx, "u", "d", buf, sizeof(buf));
+    TEST_ASSERT(n > MY_HDR + 4);
+    uint32_t caps = (uint32_t)buf[MY_HDR + 0]
+                  | ((uint32_t)buf[MY_HDR + 1] << 8)
+                  | ((uint32_t)buf[MY_HDR + 2] << 16)
+                  | ((uint32_t)buf[MY_HDR + 3] << 24);
+    TEST_ASSERT(caps & (1U << 16));   /* CLIENT_MULTI_STATEMENTS */
+    TEST_ASSERT(caps & (1U << 17));   /* CLIENT_MULTI_RESULTS    */
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_commit_rewrites_payload_when_tracking(void) {
+    TEST_BEGIN("xidprobe: COMMIT is rewritten to kMyXidCommitMsg when tracking");
+    void* ctx = do_handshake("user", "db");
+    TEST_ASSERT(keel_mysql_flow_test_enable_txn_tracking(ctx));
+
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &act);
+
+    /* The rewrite swaps be_payload to point at the static template. */
+    TEST_ASSERT(act.be_payload != qbuf);
+    TEST_ASSERT(act.be_payload_len > MY_HDR);
+    /* Payload starts with COM_QUERY then the literal SELECT @@gtid_executed. */
+    TEST_ASSERT_EQ(act.be_payload[MY_HDR], 0x03);
+    TEST_ASSERT(memmem(act.be_payload + MY_HDR + 1,
+                       act.be_payload_len - MY_HDR - 1,
+                       "@@gtid_executed", 15) != NULL);
+    TEST_ASSERT(memmem(act.be_payload + MY_HDR + 1,
+                       act.be_payload_len - MY_HDR - 1,
+                       "_keel_token", 11) != NULL);
+    TEST_ASSERT(memmem(act.be_payload + MY_HDR + 1,
+                       act.be_payload_len - MY_HDR - 1,
+                       "COMMIT", 6) != NULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_passthrough_when_tracking_off(void) {
+    TEST_BEGIN("xidprobe: COMMIT forwarded as-is when txn_tracking is off");
+    void* ctx = do_handshake("user", "db");
+
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &act);
+
+    TEST_ASSERT_EQ(act.be_payload, qbuf);
+    TEST_ASSERT_EQ(act.be_payload_len, qlen);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_absorbs_select_result_set(void) {
+    TEST_BEGIN("xidprobe: SELECT response is absorbed and GTID is captured");
+    void* ctx = do_handshake("user", "db");
+    TEST_ASSERT(keel_mysql_flow_test_enable_txn_tracking(ctx));
+
+    /* Arm the probe via FE COMMIT. */
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &fe_act);
+
+    /* seq=1: column_count = 1 */
+    uint8_t p1[16];
+    size_t l1 = build_column_count(p1, 1, 1);
+    keel_be_action_t a1;
+    VT->on_be_msg(ctx, p1, l1, &a1);
+    TEST_ASSERT_EQ(a1.type, KEEL_BE_ACT_ABSORB);
+
+    /* seq=2: one column_def */
+    uint8_t p2[64];
+    size_t l2 = build_column_def(p2, 2);
+    keel_be_action_t a2;
+    VT->on_be_msg(ctx, p2, l2, &a2);
+    TEST_ASSERT_EQ(a2.type, KEEL_BE_ACT_ABSORB);
+
+    /* seq=3: EOF after columns */
+    uint8_t p3[16];
+    size_t l3 = build_eof(p3, 3, 0x0002);
+    keel_be_action_t a3;
+    VT->on_be_msg(ctx, p3, l3, &a3);
+    TEST_ASSERT_EQ(a3.type, KEEL_BE_ACT_ABSORB);
+
+    /* seq=4: data row carrying GTID — must capture commit_xid */
+    const char* gtid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-7";
+    uint8_t p4[64];
+    size_t l4 = build_data_row(p4, 4, gtid);
+    keel_be_action_t a4;
+    VT->on_be_msg(ctx, p4, l4, &a4);
+    TEST_ASSERT_EQ(a4.type, KEEL_BE_ACT_ABSORB);
+    TEST_ASSERT(a4.commit_xid_captured);
+    TEST_ASSERT(a4.commit_xid != 0);
+
+    /* seq=5: EOF with MORE_RESULTS — end of SELECT, probe still active */
+    uint8_t p5[16];
+    size_t l5 = build_eof(p5, 5, /*MORE_RESULTS*/0x0008);
+    keel_be_action_t a5;
+    VT->on_be_msg(ctx, p5, l5, &a5);
+    TEST_ASSERT_EQ(a5.type, KEEL_BE_ACT_ABSORB);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_forwards_commit_ok_with_seq_rewrite(void) {
+    TEST_BEGIN("xidprobe: COMMIT OK is forwarded with seq_id rewritten to 1");
+    void* ctx = do_handshake("user", "db");
+    TEST_ASSERT(keel_mysql_flow_test_enable_txn_tracking(ctx));
+
+    uint8_t qbuf[64];
+    VT->on_fe_msg(ctx, qbuf, build_com_query(qbuf, 0, "COMMIT"),
+                  &(keel_fe_action_t){0});
+
+    /* Drive the 5 absorbed packets quickly. */
+    uint8_t p[256];
+    keel_be_action_t a;
+    VT->on_be_msg(ctx, p, build_column_count(p, 1, 1), &a);
+    VT->on_be_msg(ctx, p, build_column_def(p, 2), &a);
+    VT->on_be_msg(ctx, p, build_eof(p, 3, 0x0002), &a);
+    VT->on_be_msg(ctx, p, build_data_row(p, 4, "g:1-1"), &a);
+    VT->on_be_msg(ctx, p, build_eof(p, 5, 0x0008), &a);
+
+    /* seq=6: the COMMIT result OK. Must be forwarded with seq rewritten. */
+    uint8_t okbuf[64];
+    size_t oklen = build_ok(okbuf, 6, 0, 0, 0x0002);
+    keel_be_action_t okact;
+    VT->on_be_msg(ctx, okbuf, oklen, &okact);
+    TEST_ASSERT_EQ(okact.type, KEEL_BE_ACT_FORWARD_FE);
+    TEST_ASSERT(okact.fe_payload != okbuf);              /* moved into scratch */
+    TEST_ASSERT(okact.fe_payload_len == oklen);
+    TEST_ASSERT_EQ(okact.fe_payload[3], 1);              /* seq_id rewritten */
+    TEST_ASSERT_EQ(okact.fe_payload[MY_HDR], 0x00);      /* still an OK */
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_err_bails_out(void) {
+    TEST_BEGIN("xidprobe: ERR mid-probe tears down state and rewrites seq");
+    void* ctx = do_handshake("user", "db");
+    TEST_ASSERT(keel_mysql_flow_test_enable_txn_tracking(ctx));
+
+    uint8_t qbuf[64];
+    VT->on_fe_msg(ctx, qbuf, build_com_query(qbuf, 0, "COMMIT"),
+                  &(keel_fe_action_t){0});
+
+    /* Server replies with ERR at seq=1 (SELECT itself rejected). */
+    uint8_t ebuf[128];
+    size_t elen = build_err(ebuf, 1, 1064, "42000", "syntax");
+    keel_be_action_t act;
+    VT->on_be_msg(ctx, ebuf, elen, &act);
+    TEST_ASSERT(act.is_error_response);
+    TEST_ASSERT_EQ(act.fe_payload[3], 1);                /* seq stable */
+
+    /* Probe must be cleared so a subsequent COMMIT can re-arm. */
+    uint8_t qbuf2[64];
+    keel_fe_action_t act2;
+    VT->on_fe_msg(ctx, qbuf2, build_com_query(qbuf2, 0, "COMMIT"), &act2);
+    TEST_ASSERT(act2.be_payload != qbuf2);               /* re-armed */
+    TEST_ASSERT(act2.be_payload_len > MY_HDR);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_xid_probe_rollback_does_not_arm(void) {
+    TEST_BEGIN("xidprobe: ROLLBACK is not rewritten even when tracking is on");
+    void* ctx = do_handshake("user", "db");
+    TEST_ASSERT(keel_mysql_flow_test_enable_txn_tracking(ctx));
+
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "ROLLBACK");
+    keel_fe_action_t act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &act);
+    TEST_ASSERT_EQ(act.be_payload, qbuf);
+    TEST_ASSERT_EQ(act.be_payload_len, qlen);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
  * main()
  * ============================================================================ */
 
@@ -3031,6 +3241,15 @@ int main(void)
     test_compat_profile_tracked_set_updates_guc_hash();
     test_compat_profile_user_variable_flips_unknown();
     test_compat_profile_set_names_is_tracked();
+
+    /* 25) Commit-in-doubt phase B: pre-COMMIT GTID probe */
+    test_xid_probe_negotiates_multi_stmt_caps();
+    test_xid_probe_commit_rewrites_payload_when_tracking();
+    test_xid_probe_passthrough_when_tracking_off();
+    test_xid_probe_absorbs_select_result_set();
+    test_xid_probe_forwards_commit_ok_with_seq_rewrite();
+    test_xid_probe_err_bails_out();
+    test_xid_probe_rollback_does_not_arm();
 
     printf("\n=== Summary ===\n");
     return test_summary();

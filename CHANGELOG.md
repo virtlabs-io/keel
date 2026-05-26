@@ -68,6 +68,49 @@ PG's `kPgXidCommitMsg`) which needs `CLIENT_MULTI_STATEMENTS` /
 `CLIENT_MULTI_RESULTS` negotiation and a result-set absorption state
 machine; that work will land as a separate commit.
 
+**MySQL ↔ PostgreSQL parity — phase B: pre-COMMIT GTID probe**
+
+Closes the mid-COMMIT connection-death window that phase A leaves open by
+rewriting `COMMIT` on the wire — mirroring PostgreSQL's
+`kPgXidCommitMsg`. When `txn_tracking` is on, the FE handler swaps the
+plain `COMMIT` payload for `kMyXidCommitMsg`:
+
+```
+SELECT @@gtid_executed AS _keel_token;COMMIT
+```
+
+sent as a single `COM_QUERY` and negotiated via `CLIENT_MULTI_STATEMENTS`
++ `CLIENT_MULTI_RESULTS` (now advertised unconditionally by
+`myf_gen_startup`). The backend reply contains two result sets — the
+`SELECT` response (column_count, column_def, EOF, data_row, EOF
+MORE_RESULTS) followed by the `COMMIT` outcome (`OK` or `ERR`).
+
+- **BE absorption state machine** (`src/protocol/mysql/mysql_flow.c`):
+  the 5 `SELECT`-response packets are silently absorbed
+  (`KEEL_BE_ACT_ABSORB`). The GTID is extracted from the data row, hashed
+  via FNV-1a-64, and reported via `commit_xid_captured` / `commit_xid`
+  on the absorbed data-row action — so the engine owns the token
+  **before** the `COMMIT` even executes on the backend. The final `OK`
+  is forwarded to the client out of a per-context scratch buffer with
+  `seq_id` rewritten from `6` to `1`, preserving the canonical
+  `client COMMIT(seq=0) ← server OK(seq=1)` exchange. Any `ERR` packet
+  observed mid-probe also gets the seq rewrite and tears the probe
+  state down so the next `COMMIT` can re-arm.
+
+- **Backward compatibility:** phase A's post-COMMIT capture remains the
+  fallback path when `txn_tracking` is off, when the rewrite is bypassed
+  (e.g. on a resume path), or when the server lacks
+  `session_track_gtids = OWN_GTID`. Both paths emit the same
+  FNV-1a-64-derived `commit_xid`, so the engine cannot tell the two
+  apart.
+
+- **Tests** (`tests/test_mysql_protocol_flow.c` §25): 7 new wire-level
+  cases — capability negotiation (`MULTI_STATEMENTS|MULTI_RESULTS`),
+  `COMMIT` rewrite under tracking, passthrough when tracking is off,
+  end-to-end SELECT-result absorption with GTID capture,
+  seq_id-rewritten OK forwarding, ERR teardown + re-arm, and ROLLBACK
+  passthrough. Suite is now 407/407.
+
 **PostgreSQL Protocol Torture Suite (Category I) — 56/56 tests pass**
 - New torture tests added to `tests/suites/suite_torture.py`:
   - `test_i29_live_reload_under_load` — issues admin `RELOAD` while 30 concurrent
