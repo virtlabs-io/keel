@@ -60,56 +60,12 @@ engine receives the same signals as on PostgreSQL.
   tracked SET hashing, user-variable opacification, `SET NAMES` tracking).
   Suite is now 373/373 passing; full repo `ctest` remains 117/117.
 
-**Known limitation (tracked for phase B follow-up):** capture only happens
-on the `OK` packet of `COMMIT`. If the client connection dies mid-COMMIT
-before the `OK` arrives, KEEL still falls back to `NO_XID` behaviour.
-Closing that window requires a pre-COMMIT multi-statement probe (mirroring
-PG's `kPgXidCommitMsg`) which needs `CLIENT_MULTI_STATEMENTS` /
-`CLIENT_MULTI_RESULTS` negotiation and a result-set absorption state
-machine; that work will land as a separate commit.
-
-**MySQL ↔ PostgreSQL parity — phase B: pre-COMMIT GTID probe**
-
-Closes the mid-COMMIT connection-death window that phase A leaves open by
-rewriting `COMMIT` on the wire — mirroring PostgreSQL's
-`kPgXidCommitMsg`. When `txn_tracking` is on, the FE handler swaps the
-plain `COMMIT` payload for `kMyXidCommitMsg`:
-
-```
-SELECT @@gtid_executed AS _keel_token;COMMIT
-```
-
-sent as a single `COM_QUERY` and negotiated via `CLIENT_MULTI_STATEMENTS`
-+ `CLIENT_MULTI_RESULTS` (now advertised unconditionally by
-`myf_gen_startup`). The backend reply contains two result sets — the
-`SELECT` response (column_count, column_def, EOF, data_row, EOF
-MORE_RESULTS) followed by the `COMMIT` outcome (`OK` or `ERR`).
-
-- **BE absorption state machine** (`src/protocol/mysql/mysql_flow.c`):
-  the 5 `SELECT`-response packets are silently absorbed
-  (`KEEL_BE_ACT_ABSORB`). The GTID is extracted from the data row, hashed
-  via FNV-1a-64, and reported via `commit_xid_captured` / `commit_xid`
-  on the absorbed data-row action — so the engine owns the token
-  **before** the `COMMIT` even executes on the backend. The final `OK`
-  is forwarded to the client out of a per-context scratch buffer with
-  `seq_id` rewritten from `6` to `1`, preserving the canonical
-  `client COMMIT(seq=0) ← server OK(seq=1)` exchange. Any `ERR` packet
-  observed mid-probe also gets the seq rewrite and tears the probe
-  state down so the next `COMMIT` can re-arm.
-
-- **Backward compatibility:** phase A's post-COMMIT capture remains the
-  fallback path when `txn_tracking` is off, when the rewrite is bypassed
-  (e.g. on a resume path), or when the server lacks
-  `session_track_gtids = OWN_GTID`. Both paths emit the same
-  FNV-1a-64-derived `commit_xid`, so the engine cannot tell the two
-  apart.
-
-- **Tests** (`tests/test_mysql_protocol_flow.c` §25): 7 new wire-level
-  cases — capability negotiation (`MULTI_STATEMENTS|MULTI_RESULTS`),
-  `COMMIT` rewrite under tracking, passthrough when tracking is off,
-  end-to-end SELECT-result absorption with GTID capture,
-  seq_id-rewritten OK forwarding, ERR teardown + re-arm, and ROLLBACK
-  passthrough. Suite is now 407/407.
+**Documented limitation:** capture only happens on the `OK` packet of
+`COMMIT`. If the client connection dies mid-COMMIT before the `OK`
+arrives, KEEL reports the outcome as **UNKNOWN** (engine returns
+`08006` / `40000` SQLSTATE on the next attempt). This is the intended
+sound behaviour — see *Removed* below for why the previous "phase B"
+attempt to close this window was withdrawn.
 
 **PostgreSQL Protocol Torture Suite (Category I) — 56/56 tests pass**
 - New torture tests added to `tests/suites/suite_torture.py`:
@@ -140,6 +96,58 @@ MORE_RESULTS) followed by the `COMMIT` outcome (`OK` or `ERR`).
 entry point: builds all Docker images, boots a disposable PostgreSQL + KEEL stack,
 runs the full 56-test suite, and tears everything down.  Flags: `--no-build`,
 `--keep-stack`, `--soak <seconds>`, `--verbose`, `--report-dir <path>`.
+
+### Removed
+
+**MySQL pre-COMMIT GTID probe (the previous "phase B") — withdrawn as unsound.**
+
+The phase B path rewrote `COMMIT` into the multi-statement payload
+`SELECT @@gtid_executed AS _keel_token;COMMIT`, captured the GTID set
+returned by the embedded `SELECT`, and later resolved commit-in-doubt
+episodes via `SELECT GTID_SUBSET('<captured_set>', @@global.gtid_executed)`
+on a replacement backend.
+
+That design is unsound: the captured `@@gtid_executed` snapshot is taken
+**before** the new commit lands, so by construction it is already a
+subset of any later `@@global.gtid_executed`. The `GTID_SUBSET()` probe
+therefore returns `1` regardless of whether the in-flight COMMIT actually
+committed — a lost COMMIT response would always be falsely resolved as
+`RESOLVED_COMMITTED`.
+
+What was removed from `src/protocol/mysql/mysql_flow.c`:
+
+- The `kMyXidCommitMsg` rewrite payload.
+- The FE-side COMMIT rewrite and its `txn_tracking` gate (struct field,
+  worker-config plumbing inside the plugin, and the test seam
+  `keel_mysql_flow_test_enable_txn_tracking`).
+- The BE-side absorption state machine (column_count → column_def → EOF →
+  data_row → EOF MORE_RESULTS) and the `seq_id` rewrite on the forwarded
+  COMMIT OK / mid-probe ERR.
+
+What was removed from `myf_gen_startup`:
+
+- The **unconditional** advertisement of `CLIENT_MULTI_STATEMENTS` and
+  `CLIENT_MULTI_RESULTS` in the handshake response. Those caps existed
+  solely to support the phase B rewrite. With phase B gone the proxy
+  reverts to the upstream MySQL default of rejecting client-supplied
+  multi-statement bundles, restoring the per-session security semantics
+  callers expect from a stock MySQL connection.
+
+MySQL commit-in-doubt resolution now follows the sound phase A path only:
+a token is captured iff the COMMIT's `OK` packet carried a
+`SESSION_TRACK_GTIDS` entry **in that same packet**. The post-COMMIT
+capture is now gated on a per-packet `gtid_refreshed_this_packet` flag —
+a stale `ctx->keel_write_gtid` populated by an earlier round-trip or by
+`notify_write_lsn()` (RYW intercept) can no longer be promoted into a
+commit token. If no fresh `SESSION_TRACK_GTIDS` is delivered, the engine
+reports the outcome as **UNKNOWN** rather than committed.
+
+Negative test added in `tests/test_mysql_protocol_flow.c` §25
+(`test_stale_gtid_does_not_resolve_lost_commit`) plants a pre-existing
+GTID via `notify_write_lsn()`, drives a COMMIT whose OK reply lacks
+`SESSION_TRACK_GTIDS`, and asserts that `commit_xid_captured` stays
+`false` and `commit_xid == 0` — the proof that a pre-existing GTID set
+cannot resolve a lost COMMIT as committed.
 
 ### Fixed
 

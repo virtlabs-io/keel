@@ -88,45 +88,23 @@
 #define MY_CLIENT_PLUGIN_AUTH         (1U << 19)
 
 /* ----------------------------------------------------------------------------
- * kMyXidCommitMsg — pre-COMMIT GTID-probe payload (phase B of PG parity)
+ * Note on MySQL commit-in-doubt resolution.
  *
- * When txn_tracking is enabled and the client issues a bare COMMIT, the FE
- * handler rewrites the wire payload to a multi-statement COM_QUERY that
- * harvests @@gtid_executed BEFORE the COMMIT runs. This closes the mid-COMMIT
- * window: if the client connection dies between sending COMMIT and receiving
- * its OK, the engine still owns a captured token it can replay through
- * `myf_build_commit_doubt_check` on a replacement backend.
+ * A previous iteration ("Phase B") rewrote bare COMMIT into the multi-statement
+ * payload `SELECT @@gtid_executed AS _keel_token;COMMIT` to harvest a GTID set
+ * BEFORE the COMMIT executed.  That design was unsound: the captured token is
+ * the PRE-COMMIT @@global.gtid_executed set, which is by definition already a
+ * subset of any future @@global.gtid_executed.  Resolving a lost COMMIT via
+ * `GTID_SUBSET(<pre-commit-set>, @@global.gtid_executed)` therefore always
+ * returns 1 and would falsely report a lost commit as committed.
  *
- * The wire layout:
- *   header: 3-byte LE payload length (= 45), 1-byte seq_id (0 — client cmd)
- *   payload[0]: 0x03 (COM_QUERY)
- *   payload[1..]: SQL bytes
- *
- * SQL is `SELECT @@gtid_executed AS _keel_token;COMMIT` (44 chars).
- * The `_keel_token` column alias is the content-marker the BE handler uses
- * to recognise the probe response even on resume paths where the rewrite
- * came from a previous backend incarnation.
- *
- * Requires CLIENT_MULTI_STATEMENTS at handshake; negotiated in myf_gen_startup.
- * Server replies with two result sets:
- *   1) SELECT result: column-count, column-def, EOF, data-row, EOF(MORE_RESULTS)
- *   2) COMMIT result: a single OK packet
- * The BE handler absorbs (1) silently, extracts the GTID from the data row,
- * and forwards (2) to the client with the seq_id rewritten to 1 so the
- * client sees the standard `client→COMMIT(seq=0) ← server→OK(seq=1)` flow.
- */
-static const uint8_t kMyXidCommitMsg[] = {
-    /* header: payload_len=45, seq_id=0 */
-    0x2D, 0x00, 0x00, 0x00,
-    /* COM_QUERY */
-    0x03,
-    /* SQL: SELECT @@gtid_executed AS _keel_token;COMMIT */
-    'S','E','L','E','C','T',' ',
-    '@','@','g','t','i','d','_','e','x','e','c','u','t','e','d',' ',
-    'A','S',' ',
-    '_','k','e','e','l','_','t','o','k','e','n',';',
-    'C','O','M','M','I','T'
-};
+ * MySQL commit-in-doubt resolution now follows a single sound path:
+ *   - The plugin only sets `commit_xid_captured` on the COMMIT's OK packet,
+ *     and only when that OK actually carried a SESSION_TRACK_GTIDS entry
+ *     (requires `session_track_gtids = OWN_GTID` on the server).
+ *   - If the client disconnects before that OK arrives, no token is captured
+ *     and the engine reports the outcome as UNKNOWN — never as committed.
+ * ---------------------------------------------------------------------------- */
 
 /* ============================================================================
  * Result-Set State Machine
@@ -238,35 +216,7 @@ typedef struct my_flow_ctx {
     uint64_t         stmt_db_hash;       /**< Hash of current database (USE / COM_INIT_DB) */
     uint64_t         stmt_guc_hash;      /**< XOR-fold of tracked GUC kv hashes (sql_mode, time_zone, ...) */
     bool             stmt_semantic_unknown; /**< True after an untracked SET we cannot model */
-
-    /* ---- Commit-in-doubt phase B: pre-COMMIT GTID probe ----
-     *
-     * When `txn_tracking` is set, COMMIT is rewritten on the wire to the
-     * multi-statement payload `kMyXidCommitMsg`. While the absorbed result
-     * set is being drained `xid_probe_active` is true and the BE handler
-     * silently consumes packets 1..5 (the SELECT response), pulling the
-     * GTID out of the data row. The final OK packet (the COMMIT outcome)
-     * is then forwarded to the client out of `xid_probe_out_buf` with the
-     * seq_id rewritten so the client observes seq=1 even though the server
-     * emitted seq=6. */
-    bool             txn_tracking;            /**< Sourced from session->worker at create time */
-    bool             xid_probe_active;        /**< Probe in progress: absorbing SELECT result set */
-    bool             xid_probe_token_captured;/**< Data row was parsed; commit_xid emitted */
-    uint8_t          xid_probe_out_buf[1024]; /**< Scratch for seq_id-rewritten COMMIT OK forward */
-    size_t           xid_probe_out_len;       /**< Length of bytes in xid_probe_out_buf */
 } my_flow_ctx_t;
-
-/* ----------------------------------------------------------------------------
- * Test seam — let white-box tests enable txn_tracking after create_context()
- * without exposing the full struct.  NOT a stable API; intended only for
- * `tests/test_mysql_protocol_flow.c`.  Returns false when the context is NULL.
- */
-bool keel_mysql_flow_test_enable_txn_tracking(void* vctx);
-bool keel_mysql_flow_test_enable_txn_tracking(void* vctx) {
-    if (!vctx) return false;
-    ((my_flow_ctx_t*)vctx)->txn_tracking = true;
-    return true;
-}
 
 /* ============================================================================
  * Byte Helpers
@@ -1018,10 +968,6 @@ static void* myf_create(keel_session_t* s) {
                                | (s->slab_index & 0xFFFF);
         s->cancel_pid = ctx->synthetic_conn_id;
         s->cancel_secret = (uint32_t)((uintptr_t)s ^ 0x5A5A5A5A) ^ (uint32_t)s->id;
-        /* Inherit txn_tracking from the worker config so the pre-COMMIT
-         * GTID probe (kMyXidCommitMsg) is enabled when the operator opted in
-         * via transaction_tracking=on. */
-        ctx->txn_tracking = s->worker->txn_tracking;
     } else {
         ctx->synthetic_conn_id = 1;
     }
@@ -1182,27 +1128,6 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->be_payload_len = len;
         act->sql_view = sql;
         act->sql_view_len = sl;
-
-        /* Commit-in-doubt phase B: rewrite a bare COMMIT into the
-         * `kMyXidCommitMsg` multi-statement payload so the GTID is captured
-         * BEFORE the COMMIT executes.  Skipped if the probe is already in
-         * flight (defensive against pathological pipelining) or if
-         * txn_tracking is off (the connection then falls back to phase A,
-         * which captures the GTID from the post-COMMIT OK packet).
-         *
-         * Phase A's `commit_pending` flag stays set so that if the rewrite
-         * is bypassed downstream (e.g. on a resume path) the post-COMMIT
-         * capture still fires when the OK arrives. The probe-absorption
-         * path in `myf_on_be_msg` also re-sets `commit_xid_captured` on
-         * the data row, so by the time the COMMIT OK is forwarded the
-         * engine already owns the token. */
-        if (ctx->txn_tracking && qtype == KEEL_QUERY_COMMIT && !ctx->xid_probe_active) {
-            act->be_payload     = kMyXidCommitMsg;
-            act->be_payload_len = sizeof(kMyXidCommitMsg);
-            ctx->xid_probe_active        = true;
-            ctx->xid_probe_token_captured = false;
-            ctx->xid_probe_out_len       = 0;
-        }
 
         /* Cache eligibility: only for pure reads without side effects */
         act->cache_eligible = !(eff & (KEEL_QE_WRITE | KEEL_QE_DDL |
@@ -1618,84 +1543,7 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
             act->exits_copy_mode = true;
             act->pin_clear |= KEEL_FPIN_COPY;
         }
-
-        /* Phase B: if the probe was in flight (either SELECT failed at
-         * seq=1 or COMMIT failed at seq=6), tear it down and rewrite the
-         * seq_id so the client sees the standard seq=1 response. */
-        if (ctx->xid_probe_active) {
-            size_t cpy = len < sizeof(ctx->xid_probe_out_buf)
-                       ? len : sizeof(ctx->xid_probe_out_buf);
-            memcpy(ctx->xid_probe_out_buf, data, cpy);
-            ctx->xid_probe_out_buf[3] = 1;
-            ctx->xid_probe_out_len    = cpy;
-            act->fe_payload     = ctx->xid_probe_out_buf;
-            act->fe_payload_len = cpy;
-            ctx->xid_probe_active        = false;
-            ctx->xid_probe_token_captured = false;
-        }
         return 0;
-    }
-
-    /* ========================================================================
-     * Phase B (commit-in-doubt pre-COMMIT probe) — absorb the SELECT result
-     * set silently and capture the GTID token from the data row. The final
-     * OK packet (the COMMIT outcome) is NOT absorbed here: it falls through
-     * to the regular OK handler below for state-machine updates, and the
-     * seq_id rewrite is applied at the tail of that handler.
-     *
-     * The probe response wire layout (5 absorbed packets + 1 forwarded):
-     *   seq=1  column_count = 1     (lenenc 0x01)
-     *   seq=2  column_def for `_keel_token`
-     *   seq=3  EOF                  (end of columns)
-     *   seq=4  data_row             (one lenenc string = GTID)
-     *   seq=5  EOF MORE_RESULTS     (end of SELECT, more coming)
-     *   seq=6  OK                   (COMMIT result) ← falls through
-     * ======================================================================== */
-    if (ctx->xid_probe_active) {
-        size_t pl = (len >= MY_HDR) ? (len - MY_HDR) : 0;
-        bool   is_eof = (marker == MY_EOF && pl < 9);
-
-        /* Only intercept while we are still inside the SELECT result set.
-         * Once the second EOF moves us back to IDLE, the next packet must
-         * be the COMMIT's OK — we let it fall through. */
-        if (ctx->result_state != MY_RS_IDLE || !(marker == MY_OK)) {
-            if (is_eof) {
-                if (ctx->result_state == MY_RS_COLUMNS) {
-                    ctx->result_state = MY_RS_ROWS;
-                } else if (ctx->result_state == MY_RS_ROWS) {
-                    ctx->result_state = MY_RS_IDLE;
-                }
-            } else if (ctx->result_state == MY_RS_IDLE) {
-                /* First probe packet: column_count (we know it is 1). */
-                ctx->result_state      = MY_RS_COLUMNS;
-                ctx->columns_remaining = 1;
-            } else if (ctx->result_state == MY_RS_ROWS
-                       && !ctx->xid_probe_token_captured) {
-                /* Data row: extract the first lenenc string and hash it
-                 * into the engine's commit_xid. */
-                size_t   off  = MY_HDR;
-                uint64_t slen = read_lenenc(data, len, &off);
-                if (slen != (uint64_t)-1 && slen > 0 && off + slen <= len) {
-                    size_t cpy = slen < sizeof(ctx->keel_write_gtid) - 1
-                               ? (size_t)slen
-                               : sizeof(ctx->keel_write_gtid) - 1;
-                    memcpy(ctx->keel_write_gtid, data + off, cpy);
-                    ctx->keel_write_gtid[cpy] = '\0';
-                    uint64_t h = my_fnv64(ctx->keel_write_gtid, cpy);
-                    if (h == 0) h = 1;
-                    act->commit_xid_captured     = true;
-                    act->commit_xid              = h;
-                    ctx->xid_probe_token_captured = true;
-                }
-            }
-            act->type           = KEEL_BE_ACT_ABSORB;
-            act->fe_payload     = NULL;
-            act->fe_payload_len = 0;
-            return 0;
-        }
-        /* marker == MY_OK at MY_RS_IDLE during probe: this is the COMMIT
-         * outcome. Fall through; seq_id is rewritten at the bottom of the
-         * OK handler. */
     }
 
     /* ========================================================================
@@ -1832,6 +1680,13 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
          * packet that we simply skip. */
         size_t pos = MY_HDR + 1;  /* skip 0x00 marker */
 
+        /* True iff this OK packet actually delivered a SESSION_TRACK_GTIDS
+         * entry.  Required to keep commit-in-doubt resolution sound: a
+         * stale ctx->keel_write_gtid (populated by a previous round-trip
+         * or by notify_write_lsn for RYW) must NOT be promoted into a
+         * commit token for the current COMMIT. */
+        bool gtid_refreshed_this_packet = false;
+
         /* Skip affected_rows (length-encoded integer) */
         uint64_t affected = read_lenenc(data, len, &pos);
         if (affected == (uint64_t)-1) goto ok_fallback;
@@ -1962,6 +1817,7 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                                                 ? gtid_len : sizeof(ctx->keel_write_gtid) - 1;
                                 memcpy(ctx->keel_write_gtid, gtid_val, copy_len);
                                 ctx->keel_write_gtid[copy_len] = '\0';
+                                gtid_refreshed_this_packet = true;
                             }
                         }
                         pos = entry_end;  /* advance past this entry */
@@ -1978,19 +1834,19 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
 
         /* ---- Commit-in-doubt: post-COMMIT GTID-token capture ----
          *
-         * If the FE side observed a COMMIT (commit_pending == true) and we
-         * are now seeing its terminal OK packet, hash the latest GTID from
-         * `ctx->keel_write_gtid` (refreshed above from SESSION_TRACK_GTIDS
-         * when the server has session_track_gtids='OWN_GTID') and report
-         * it as the commit token via keel_be_action_t.commit_xid_*.
+         * Only resolve a commit token when this very OK packet delivered a
+         * fresh SESSION_TRACK_GTIDS entry.  Using any non-empty
+         * `ctx->keel_write_gtid` would be unsound: the field can be carrying
+         * a stale GTID from a prior round-trip or from notify_write_lsn (RYW
+         * intercept), in which case a lost-COMMIT scenario would falsely
+         * resolve as committed via GTID_SUBSET.  See the file-top comment
+         * "Note on MySQL commit-in-doubt resolution".
          *
-         * The engine stores this in session_flow.pending_commit_xid so a
-         * subsequent commit-doubt episode can drive
-         * `myf_build_commit_doubt_check`, which embeds the same GTID into
-         * a `SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed)` probe
-         * on a fresh backend to resolve the outcome. */
+         * If the server did not emit SESSION_TRACK_GTIDS (typically because
+         * `session_track_gtids != OWN_GTID`), we leave commit_xid_captured
+         * unset; the engine then reports a later disconnect as UNKNOWN. */
         if (ctx->commit_pending && act->query_complete) {
-            if (ctx->keel_write_gtid[0] != '\0') {
+            if (gtid_refreshed_this_packet && ctx->keel_write_gtid[0] != '\0') {
                 uint64_t h = my_fnv64(ctx->keel_write_gtid,
                                       strlen(ctx->keel_write_gtid));
                 /* Never report a zero token: the engine treats xid==0 as
@@ -2000,26 +1856,6 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 act->commit_xid          = h;
             }
             ctx->commit_pending = false;
-        }
-
-        /* Phase B: if the probe is still armed when we get here, this OK
-         * is the COMMIT outcome forwarded after the absorbed SELECT result
-         * set. Copy into the scratch buffer with seq_id rewritten to 1 so
-         * the client observes the canonical `client COMMIT(seq=0) ←
-         * server OK(seq=1)` exchange. The data-row absorption above
-         * already set commit_xid_captured, so dropping commit_pending here
-         * is safe even if `keel_write_gtid` was not refreshed via the
-         * SESSION_TRACK_GTIDS path. */
-        if (ctx->xid_probe_active) {
-            size_t cpy = len < sizeof(ctx->xid_probe_out_buf)
-                       ? len : sizeof(ctx->xid_probe_out_buf);
-            memcpy(ctx->xid_probe_out_buf, data, cpy);
-            ctx->xid_probe_out_buf[3] = 1;
-            ctx->xid_probe_out_len    = cpy;
-            act->fe_payload     = ctx->xid_probe_out_buf;
-            act->fe_payload_len = cpy;
-            ctx->xid_probe_active        = false;
-            ctx->xid_probe_token_captured = false;
         }
 
         return 0;
@@ -2194,13 +2030,15 @@ static ssize_t myf_gen_startup(void* v, const char* user,
     uint8_t payload[512];
     size_t pos = 0;
 
+    /* We do NOT advertise CLIENT_MULTI_STATEMENTS or CLIENT_MULTI_RESULTS:
+     * the proxy itself does not issue multi-statement payloads (the unsound
+     * Phase B pre-COMMIT probe that required them has been removed), and
+     * leaving them off preserves the upstream MySQL default of rejecting
+     * client-supplied multi-statement bundles — which has SQL-injection
+     * surface implications callers should opt into explicitly, not inherit
+     * from a proxy. */
     uint32_t caps = MY_CLIENT_PROTOCOL_41 | MY_CLIENT_PLUGIN_AUTH | 0xf7ff;
-    /* Phase B (commit-in-doubt pre-COMMIT probe) requires the server to
-     * accept the multi-statement payload `kMyXidCommitMsg` and to return
-     * two result sets in a single round-trip.  Both caps are required
-     * unconditionally so the gate is purely the per-context txn_tracking
-     * flag, not the wire negotiation. */
-    caps |= MY_CLIENT_MULTI_STATEMENTS | MY_CLIENT_MULTI_RESULTS;
+    caps &= ~(MY_CLIENT_MULTI_STATEMENTS | MY_CLIENT_MULTI_RESULTS);
     if (db && db[0]) caps |= MY_CLIENT_CONNECT_WITH_DB;
 
     /* Capability flags (4 bytes LE) */
