@@ -2237,6 +2237,14 @@ static int myf_get_metrics(void* vctx, keel_plugin_metrics_t* out) {
  * Length-encoded string values up to the two-byte prefix encoding are
  * handled; larger values or unexpected layouts return an error.
  *
+ * Blocking send()/recv() are intentional and mirror the equivalent PG
+ * helpers (pgf_query_single_value / pgf_capture_consistency_token):
+ * these vtable hooks are invoked off the data hot path (backend probe,
+ * metadata fetch on acquire, RYW gate when a session has tracked a
+ * write), where a brief synchronous round-trip is acceptable. Callers
+ * that need a hard upper bound on wall-clock time apply SO_RCVTIMEO /
+ * SO_SNDTIMEO around the call (see myf_replica_reached_token below).
+ *
  * @param be_fd      Connected backend file descriptor.
  * @param sql        NUL-terminated SQL statement.
  * @param value_buf  Buffer to receive the result (NUL-terminated on success).
@@ -2328,7 +2336,12 @@ static int myf_query_single_value(int be_fd, const char* sql,
         if (first == 0xFC && pkt_len >= 3) {
             /* 2-byte LE length follows */
             size_t str_len  = (size_t)payload[1] | ((size_t)payload[2] << 8);
-            size_t copy_len = str_len < value_max - 1 ? str_len : value_max - 1;
+            /* Reject truncated packets: the str_len bytes that follow the
+             * 3-byte prefix must actually be inside the packet body. Without
+             * this check a malicious or corrupt server could declare a
+             * length larger than the packet and we would memcpy past it. */
+            if ((size_t)pkt_len < 3 + str_len) return -1;
+            size_t copy_len = (str_len < value_max - 1) ? str_len : value_max - 1;
             memcpy(value_buf, payload + 3, copy_len);
             value_buf[copy_len] = '\0';
             return 0;
@@ -2443,6 +2456,46 @@ static int myf_replica_reached_token(void* vctx, int replica_fd,
         return 0;
     }
 
+    /* Reject anything that is not a plain GTID set before it ever reaches
+     * the SQL string. A GTID set is
+     *   <uuid>:<n>[-<m>][:<n>[-<m>]]*[,<uuid>:...]*
+     * which is exclusively [0-9a-fA-F:,\-] plus whitespace. Anything else
+     * (notably a single quote) would let a compromised primary inject SQL
+     * into the replica session via WAIT_FOR_EXECUTED_GTID_SET(). */
+    for (const char* p = token->value; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F') ||
+                  c == ':' || c == ',' || c == '-' ||
+                  c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        if (!ok) return -1;
+    }
+    /* Defence in depth: cap the length to what the SQL buffer can hold so
+     * the snprintf below cannot silently truncate inside a quoted literal. */
+    size_t token_len = strlen(token->value);
+    if (token_len == 0 || token_len > 500) return -1;
+
+    /* Bound the synchronous wait so a slow/hung replica cannot stall the
+     * worker thread indefinitely. Save and restore the previous socket
+     * timeouts so we do not leak settings back to the pool. */
+    struct timeval saved_rcv = {0, 0}, saved_snd = {0, 0};
+    bool timeout_set = false;
+    if (timeout_ms > 0) {
+        socklen_t optlen = sizeof(saved_rcv);
+        getsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &saved_rcv, &optlen);
+        optlen = sizeof(saved_snd);
+        getsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &saved_snd, &optlen);
+
+        struct timeval tv = {
+            .tv_sec  = (time_t)(timeout_ms / 1000),
+            .tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000),
+        };
+        setsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        timeout_set = true;
+    }
+
     /* timeout_ms=0 → immediate snapshot check (0.001 s for MySQL) */
     double timeout_sec = (timeout_ms > 0) ? (double)timeout_ms / 1000.0 : 0.001;
 
@@ -2452,8 +2505,14 @@ static int myf_replica_reached_token(void* vctx, int replica_fd,
              token->value, timeout_sec);
 
     char result[8];
-    if (myf_query_single_value(replica_fd, sql, result, sizeof(result)) != 0)
-        return -1;
+    int rc = myf_query_single_value(replica_fd, sql, result, sizeof(result));
+
+    if (timeout_set) {
+        setsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &saved_rcv, sizeof(saved_rcv));
+        setsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &saved_snd, sizeof(saved_snd));
+    }
+
+    if (rc != 0) return -1;
 
     /* WAIT_FOR_EXECUTED_GTID_SET returns 0 = reached, 1 = timeout */
     *out_reached = (result[0] == '0');
