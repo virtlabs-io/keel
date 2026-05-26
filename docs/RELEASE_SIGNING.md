@@ -115,9 +115,19 @@ sha256sum -c SHA256SUMS
 
 ### "PACKAGE_SIGNING_PRIVATE_KEY secret not configured"
 
-This is a warning that appears when the secret is not set. The release will complete successfully with unsigned artifacts.
+Behaviour depends on the trigger:
 
-To fix, ensure both secrets are configured as described in Step 3.
+- **Tagged releases (`refs/tags/*`)** — the `package-linux` workflow
+  hard-fails when this secret is missing. Tagged releases must publish
+  signed artifacts; an unsigned tagged release is not allowed. Either
+  configure the secret as described in Step 3, or delete the tag.
+- **Non-tag builds (branches, PRs)** — a warning is logged and the
+  build produces unsigned artifacts, intended for development and
+  pre-release validation only. These artifacts must not be promoted to
+  a release.
+
+This matches the signing-required policy in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for release artifacts.
 
 ### "error receiving key from agent: Frase-senha incorreta"
 

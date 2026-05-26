@@ -160,6 +160,15 @@ Run all lint + gate tests:
 ctest --test-dir build -L "lint|gate" --output-on-failure
 ```
 
+### Release artifact signing (required for every tagged release)
+
+Tagged releases (`refs/tags/*`) **must** publish signed artifacts. The
+`package-linux` workflow hard-fails when `PACKAGE_SIGNING_PRIVATE_KEY`
+is not configured for a tagged build — an unsigned tagged release is not
+a valid release. Non-tag branch/PR builds may produce unsigned artifacts
+for development only and must not be promoted. Operator setup and key
+management procedure: [docs/RELEASE_SIGNING.md](RELEASE_SIGNING.md).
+
 ### Driver-level torture suite (required before each release)
 
 The **PostgreSQL Protocol Torture Suite** (`tests/suites/suite_torture.py`)
