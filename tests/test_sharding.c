@@ -283,6 +283,11 @@ static void test_param_cannot_map_without_binding(void) {
 static keel_router_t* create_sharded_router(void) {
     keel_router_config_t config = keel_router_config_default();
     config.primary_read_weight = 0.0;
+    /* Existing dispatch tests in this file exercise scatter paths; opt the
+     * helper into the experimental scatter gate so the per-test SQL is not
+     * rejected by the default fail-closed dispatcher. New rejection tests
+     * below construct their own router and leave the gate at the default. */
+    config.scatter_merge_enabled = true;
 
     keel_router_t* router = keel_router_create(&config);
     if (!router) {
@@ -2754,6 +2759,88 @@ static void test_shard_count_change_range_rule(void) {
     TEST_END();
 }
 
+/* ============================================================================
+ * Scatter fail-closed gate (silent-wrong-result hardening)
+ *
+ * Scatter dispatch is experimental and only safe for a restricted set of
+ * query shapes. Two regressions guard the new behaviour:
+ *
+ *   - `scatter_merge_enabled = false` (the default) must cause any scatter
+ *     classification to fail closed with KEEL_ERR_NOT_SUPPORTED and a
+ *     populated reject_reason / reject_message so the engine surfaces a
+ *     SQLSTATE 0A000 error to the client.
+ *   - `WITH RECURSIVE …` over sharded tables must fail closed even when the
+ *     gate is enabled, because each shard evaluates the recursion locally
+ *     and the results cannot be merged correctly.
+ * ============================================================================ */
+
+static keel_router_t* create_sharded_router_no_gate(void) {
+    /* Mirror create_sharded_router(), but leave scatter_merge_enabled at the
+     * default (false) so we can exercise the fail-closed path. */
+    keel_router_config_t config = keel_router_config_default();
+    config.primary_read_weight = 0.0;
+    keel_router_t* router = keel_router_create(&config);
+    if (!router) return NULL;
+
+    keel_route_server_t s0p = { .name = "shard0-primary", .host = "h", .port = 5432,
+                                 .role = KEEL_SERVER_PRIMARY, .weight = 100, .shard_id = 0 };
+    keel_route_server_t s0r = { .name = "shard0-replica", .host = "h", .port = 5433,
+                                 .role = KEEL_SERVER_REPLICA, .weight = 100, .shard_id = 0 };
+    keel_route_server_t s1p = { .name = "shard1-primary", .host = "h", .port = 5434,
+                                 .role = KEEL_SERVER_PRIMARY, .weight = 100, .shard_id = 1 };
+    keel_route_server_t s1r = { .name = "shard1-replica", .host = "h", .port = 5435,
+                                 .role = KEEL_SERVER_REPLICA, .weight = 100, .shard_id = 1 };
+    keel_router_add_server(router, &s0p);
+    keel_router_add_server(router, &s0r);
+    keel_router_add_server(router, &s1p);
+    keel_router_add_server(router, &s1r);
+    return router;
+}
+
+static void test_dispatch_scatter_gate_off_rejects(void) {
+    TEST_BEGIN("dispatch_scatter_gate_off_rejects");
+    keel_router_t* router = create_sharded_router_no_gate();
+    keel_router_add_shard_rule(router, "users", "id", 2);
+
+    keel_dispatch_result_t out;
+    /* No shard-key predicate → SCATTER classification.
+     * Default config has scatter_merge_enabled=false → must fail closed. */
+    keel_error_t err = keel_router_dispatch_sql(
+        router,
+        KEEL_STR("SELECT * FROM users WHERE email = 'x@y.z'"),
+        NULL, NULL, false, &out);
+
+    TEST_ASSERT_EQ(err, KEEL_ERR_NOT_SUPPORTED);
+    TEST_ASSERT_EQ(out.reject_reason, KEEL_DISPATCH_REJECT_SCATTER_DISABLED);
+    TEST_ASSERT(out.reject_message[0] != '\0');
+
+    keel_router_destroy(router);
+    TEST_END();
+}
+
+static void test_dispatch_recursive_cte_rejected(void) {
+    TEST_BEGIN("dispatch_recursive_cte_rejected");
+    /* Gate ON via the helper — recursive CTE must STILL be rejected because
+     * cross-shard recursion produces silently wrong results. */
+    keel_router_t* router = create_sharded_router();
+    keel_router_add_shard_rule(router, "users", "id", 2);
+
+    keel_dispatch_result_t out;
+    keel_error_t err = keel_router_dispatch_sql(
+        router,
+        KEEL_STR("WITH RECURSIVE t(n) AS ("
+                 "  SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5"
+                 ") SELECT * FROM users WHERE email = 'x@y.z'"),
+        NULL, NULL, false, &out);
+
+    TEST_ASSERT_EQ(err, KEEL_ERR_NOT_SUPPORTED);
+    TEST_ASSERT_EQ(out.reject_reason, KEEL_DISPATCH_REJECT_RECURSIVE_CTE);
+    TEST_ASSERT(out.reject_message[0] != '\0');
+
+    keel_router_destroy(router);
+    TEST_END();
+}
+
 int main(void) {
     test_extract_int_literal();
     test_extract_alias_qualified();
@@ -2888,5 +2975,8 @@ int main(void) {
     test_shard_count_same_no_change();
     test_shard_count_change_rule_reflects_new_count();
     test_shard_count_change_range_rule();
+    /* Scatter fail-closed gate (silent-wrong-result hardening) */
+    test_dispatch_scatter_gate_off_rejects();
+    test_dispatch_recursive_cte_rejected();
     return test_summary();
 }

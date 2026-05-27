@@ -12,6 +12,34 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ## [Unreleased]
 
+### Changed — Scatter/Sharding fail-closed gating
+
+Before marketing sharding as a differentiator, the dispatcher now refuses
+query shapes that would silently produce wrong results, and scatter dispatch
+itself is hidden behind an explicit per-worker-group opt-in.
+
+- **Scatter dispatch is gated behind `scatter_merge = on`** (default `off`).
+  `keel_router_config_t` gains a `scatter_merge_enabled` flag that
+  `keel_server_init` populates from the worker-group INI. When the gate is
+  off, `keel_router_dispatch_sql()` rejects scatter-eligible statements with
+  `KEEL_ERR_NOT_SUPPORTED`, bumps the
+  `keel_scatter_unsupported_pattern_total{kind="gate_disabled"}` counter,
+  and the engine returns a PostgreSQL `ErrorResponse` with SQLSTATE `0A000`
+  (`feature_not_supported`) + a `ReadyForQuery` so the session stays usable.
+- **`WITH RECURSIVE` over sharded tables now always fails closed.** The
+  dispatcher checks for `with_recursive` against the registered shard rules
+  *before* the routing decision and rejects matching statements with the
+  same `0A000` error path. This closes the silent-duplication failure mode
+  documented in [docs/LIMITATIONS.md §1.1](docs/LIMITATIONS.md#11-recursive-common-table-expressions-ctes).
+- New tests: `tests/test_sharding.c::test_dispatch_scatter_gate_off_rejects`
+  and `::test_dispatch_recursive_cte_rejected`.
+- New public surface: `keel_dispatch_result_t` carries `reject_reason`
+  (`keel_dispatch_reject_t`) and `reject_message[200]` so the engine can
+  surface a human-readable cause without re-parsing.
+- Docs updated: `docs/LIMITATIONS.md` §1.1,
+  `docs/PRODUCTION_READINESS.md` scatter row,
+  `docs/COMPATIBILITY.md` `scatter_merge` row.
+
 ### Added
 
 **MySQL ↔ PostgreSQL parity — phase A: commit-in-doubt + semantic profile**

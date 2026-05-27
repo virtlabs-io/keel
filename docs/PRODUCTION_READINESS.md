@@ -38,7 +38,7 @@ and `experimental_features = false`.
 | Sticky-primary read-after-write | Stable | Sticky window is conservative and reactor-safe. |
 | WAL LSN / GTID replica catch-up probes | Experimental | Token parsing/storage exists; live replica catch-up probes must remain reactor-owned before production promotion. |
 | Automatic failover and role detection | Hardening | Routing changes are implemented; deterministic behavior under Patroni failover, split-brain windows, timeline switches, stale replicas, and role flapping remains a required test gate. |
-| Horizontal sharding and scatter-merge | Experimental | Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
+| Horizontal sharding and scatter-merge | Experimental | Gated at dispatch behind `scatter_merge = on` per worker group (default `off`); scatter-eligible queries are rejected with SQLSTATE `0A000` until opted in. Recursive CTEs over sharded tables always fail closed with `0A000` (see [LIMITATIONS §1.1](LIMITATIONS.md#11-recursive-common-table-expressions-ctes)). Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
 | Multi-shard 2PC | Experimental | Requires commit-in-doubt and crash-recovery matrix validation before production promotion. |
 | TLS/mTLS | Stable | kTLS acceleration is hardening because kernel and cipher compatibility vary by deployment. |
 | Cloud and enterprise auth | Hardening | Token caching and provider hooks exist; provider outages and renewal edge cases must be validated per environment. |

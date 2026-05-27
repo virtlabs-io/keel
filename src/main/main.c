@@ -5169,6 +5169,11 @@ int main(int argc, char** argv) {
             }
             if (has_shard_ids) {
                 keel_router_config_t rcfg = keel_router_config_default();
+                /* Wire the per-worker-group `scatter_merge` INI flag into the
+                 * router's fail-closed gate. Default remains `off`: scatter
+                 * dispatches are rejected with KEEL_ERR_NOT_SUPPORTED until
+                 * the operator explicitly opts in. */
+                rcfg.scatter_merge_enabled = wg->scatter_merge_enabled;
                 wg->router = keel_router_create(&rcfg);
                 if (wg->router) {
                     /* Register each server in the pool with the router */

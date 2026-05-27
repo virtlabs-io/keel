@@ -170,6 +170,8 @@ keel_router_config_t keel_router_config_default(void) {
         .health_check_retries = 3,
         .connect_timeout = KEEL_MSEC(KEEL_DEFAULT_CONNECT_TIMEOUT_MS),
         .query_timeout = KEEL_MSEC(KEEL_DEFAULT_QUERY_TIMEOUT_MS),
+        /* Scatter is experimental; operators must opt in per worker group. */
+        .scatter_merge_enabled = false,
     };
 }
 
@@ -1987,6 +1989,7 @@ size_t keel_router_write_prometheus(const keel_router_t* router,
             "union_all",
             "dml_returning",
             "ddl",
+            "gate_disabled",
         };
         PROM_APPEND(
             "# HELP keel_scatter_unsupported_pattern_total Scatter dispatches whose"
@@ -3637,6 +3640,48 @@ keel_error_t keel_router_dispatch_sql(keel_router_t*                   router,  
     /* Parse once; reused for the SINGLE routing path. */
     keel_qt_query_t* qt = keel_sql_analyze_full(sql, router->temp_arena);
 
+    /* ---------------------------------------------------------------------- */
+    /* Fail-closed gate: WITH RECURSIVE across sharded tables.                */
+    /*                                                                        */
+    /* When a recursive CTE references a sharded table the planner sometimes  */
+    /* classifies the statement as SCATTER (engine_scatter concatenates rows  */
+    /* from each shard's local recursion → silently wrong results — see       */
+    /* docs/LIMITATIONS.md §1.1) and sometimes as UNSUPPORTED (planner can't  */
+    /* extract a shard key past the CTE → engine falls back to single-shard,  */
+    /* which is correct but masks the underlying hazard). To make the proxy   */
+    /* deterministic, we reject the statement up front whenever the outer    */
+    /* SELECT carries WITH RECURSIVE *and* the query touches any registered  */
+    /* shard table. Recursive CTEs over non-sharded tables fall through to   */
+    /* the rule loop and ultimately to the unsharded fallback.               */
+    /* ---------------------------------------------------------------------- */
+    if (qt && qt->ast && qt->ast->kind == KEEL_SQL_NODE_STMT_SELECT &&
+        ((const keel_sql_stmt_select_t*)qt->ast)->with_recursive)
+    {
+        bool touches_sharded = false;
+        for (size_t i = 0; i < qt->table_count && !touches_sharded; i++) {
+            keel_str_t t = qt->tables[i].table;
+            if (t.len == 0) continue;
+            for (size_t r = 0; r < router->shard_rule_count; r++) {
+                const char* rt = router->shard_rules[r].table;
+                size_t rl = rt ? strlen(rt) : 0;
+                if (rl == t.len && rl > 0 && strncasecmp(rt, t.data, rl) == 0) {
+                    touches_sharded = true;
+                    break;
+                }
+            }
+        }
+        if (touches_sharded) {
+            keel_router_track_unsupported_pattern(
+                router, KEEL_SCATTER_UNSUPPORTED_RECURSIVE_CTE);
+            out->reject_reason = KEEL_DISPATCH_REJECT_RECURSIVE_CTE;
+            snprintf(out->reject_message, sizeof out->reject_message,
+                "WITH RECURSIVE across sharded tables is not supported "
+                "(silent-wrong-result risk); pin the session or run on a single shard");
+            pthread_mutex_unlock(&router->dispatch_mutex);
+            return KEEL_ERR_NOT_SUPPORTED;
+        }
+    }
+
     keel_error_t result = KEEL_ERR_NOT_SUPPORTED;
 
     /* Iterate registered rules looking for the first non-UNSUPPORTED outcome. */
@@ -3691,6 +3736,45 @@ keel_error_t keel_router_dispatch_sql(keel_router_t*                   router,  
 
         /* KEEL_SHARD_PLAN_SCATTER */
         out->kind = KEEL_DISPATCH_SCATTER;
+
+        /* ------------------------------------------------------------------ */
+        /* Fail-closed gates BEFORE we materialise the scatter plan.          */
+        /*                                                                    */
+        /* 1. `WITH RECURSIVE …` over sharded tables produces silently wrong  */
+        /*    results (each shard evaluates the recursion against its local   */
+        /*    slice; rows duplicate / corrupt globally — see                  */
+        /*    docs/LIMITATIONS.md §1.1). Reject regardless of the gate.       */
+        /* 2. When `scatter_merge = off` (default), any scatter classification */
+        /*    is rejected so unsupported shapes never silently fan out.       */
+        /*                                                                    */
+        /* Both populate out->reject_reason so the engine emits a clear       */
+        /* PostgreSQL/MySQL error instead of falling back to single-shard.    */
+        /* ------------------------------------------------------------------ */
+        if (qt && qt->ast && qt->ast->kind == KEEL_SQL_NODE_STMT_SELECT) {
+            const keel_sql_stmt_select_t* rsel =
+                (const keel_sql_stmt_select_t*)qt->ast;
+            if (rsel->with_recursive) {
+                keel_router_track_unsupported_pattern(
+                    router, KEEL_SCATTER_UNSUPPORTED_RECURSIVE_CTE);
+                out->reject_reason = KEEL_DISPATCH_REJECT_RECURSIVE_CTE;
+                snprintf(out->reject_message, sizeof out->reject_message,
+                    "WITH RECURSIVE across shards is not supported "
+                    "(silent-wrong-result risk); pin the session or run on a single shard");
+                result = KEEL_ERR_NOT_SUPPORTED;
+                goto dispatch_done;
+            }
+        }
+        if (!router->config.scatter_merge_enabled) {
+            keel_router_track_unsupported_pattern(
+                router, KEEL_SCATTER_UNSUPPORTED_GATE_DISABLED);
+            out->reject_reason = KEEL_DISPATCH_REJECT_SCATTER_DISABLED;
+            snprintf(out->reject_message, sizeof out->reject_message,
+                "scatter-merge dispatch is disabled "
+                "(set scatter_merge = on in the worker_group to opt in to the experimental feature)");
+            result = KEEL_ERR_NOT_SUPPORTED;
+            goto dispatch_done;
+        }
+
         keel_error_t err = keel_router_scatter_servers(router, session, rule, is_write, &out->scatter);
         if (err == KEEL_OK && qt && qt->ast)
             scatter_extract_merge_spec(qt->ast, rule ? rule->column : NULL, out);
@@ -3814,6 +3898,7 @@ dispatch_done:
             const keel_sql_stmt_select_t* sel =
                 (const keel_sql_stmt_select_t*)qt->ast;
             if (sel->with_recursive) {
+                /* Already rejected above; defensive no-op kept for clarity. */
                 keel_router_track_unsupported_pattern(
                     router, KEEL_SCATTER_UNSUPPORTED_RECURSIVE_CTE);
             }

@@ -2587,7 +2587,55 @@ copy_scan_done:
                             continue;
                         }
                     }
-                    /* KEEL_ERR_NOT_SUPPORTED: no shard rule matched — use existing routing */
+                    /* derr != KEEL_OK falls through here. Two cases:
+                     *   1) reject_reason == NONE: no shard rule matched the
+                     *      table — fall back to the non-sharded routing path
+                     *      below (existing behaviour).
+                     *   2) reject_reason != NONE: the dispatcher fail-closed
+                     *      a known silent-wrong-result class (scatter gate
+                     *      off, recursive CTE, …). Emit a PostgreSQL
+                     *      ErrorResponse (SQLSTATE 0A000 = feature_not_supported)
+                     *      plus ReadyForQuery, then advance the phase so the
+                     *      session stays usable. Do NOT fall back. */
+                    if (derr != KEEL_OK &&
+                        dr.reject_reason != KEEL_DISPATCH_REJECT_NONE) {
+                        KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
+                            "W%u: session %lu: dispatch rejected (reason=%d): %s",
+                            worker->id, (unsigned long)session->id,
+                            (int)dr.reject_reason, dr.reject_message);
+                        uint8_t sendbuf[512];
+                        size_t  sendlen = 0;
+                        {
+                            uint8_t errbuf[256];
+                            const char* reason = dr.reject_message[0]
+                                ? dr.reject_message
+                                : "dispatch rejected";
+                            ssize_t el = flow->generate_error(sf->ctx, "0A000",
+                                reason, errbuf, sizeof(errbuf));
+                            if (el > 0) {
+                                memcpy(sendbuf, errbuf, (size_t)el);
+                                sendlen += (size_t)el;
+                            }
+                        }
+                        if (flow->generate_ready_for_query) {
+                            uint8_t z[16];
+                            ssize_t zlen = flow->generate_ready_for_query(
+                                sf->ctx, z, sizeof(z));
+                            if (zlen > 0) {
+                                memcpy(sendbuf + sendlen, z, (size_t)zlen);
+                                sendlen += (size_t)zlen;
+                            }
+                        }
+                        if (sendlen > 0) {
+                            keel_try_send_nb(session->client_fd, sendbuf, sendlen);
+                        }
+                        pos += (size_t)flen;
+                        sf->phase = KEEL_PHASE_READY;
+                        keel_dispatch_result_cleanup(&dr);
+                        continue;
+                    }
+                    /* KEEL_ERR_NOT_SUPPORTED with reject_reason==NONE:
+                     * no shard rule matched — use existing routing. */
                 }
 
                 switch (route) {
