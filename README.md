@@ -1096,6 +1096,7 @@ Detailed architecture documentation is available in the [`docs/`](docs/) directo
 | [QUERY_FLOW.md](docs/QUERY_FLOW.md) | Query execution flow, SQL analysis, routing, forwarding, result handling |
 | [MULTIPLEXING.md](docs/MULTIPLEXING.md) | Worker architecture deep-dive, SO_REUSEPORT, reactor model, connection migration, automatic rebalancing |
 | [PREPARED_STATEMENTS.md](docs/PREPARED_STATEMENTS.md) | Prepared statement pooling strategies (virtualize/pinning/tracking/anonymous), config guide, real-world examples |
+| [PARSER_PLUGIN_ARCHITECTURE.md](docs/PARSER_PLUGIN_ARCHITECTURE.md) | Frontend-bound parser plugin architecture, semantic plan contract, and rollout phases |
 | [SSV_POSTGRES_IMPLEMENTATION.md](docs/SSV_POSTGRES_IMPLEMENTATION.md) | Implementation record for PostgreSQL prepared-statement semantic virtualization: architecture, scope boundaries, tradeoffs, diagrams, code excerpts, and validation |
 | [TRANSACTION_TRACKING.md](docs/TRANSACTION_TRACKING.md) | XID probe, commit-in-doubt recovery, WAL LSN consistency tokens |
 | [SHARDING.md](docs/SHARDING.md) | Horizontal sharding architecture, shard rule configuration, API reference, hot-reload, Prometheus metrics |
