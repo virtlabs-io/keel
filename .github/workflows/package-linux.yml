@@ -140,25 +140,12 @@ jobs:
           name: keel-linux-packages
           path: artifacts/packages/*
 
-      - name: Ensure GitHub Release exists
+      - name: Publish GitHub Release with assets
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists"
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --verify-tag \
-              --title "$GITHUB_REF_NAME" \
-              --notes "Automated Linux package assets for $GITHUB_REF_NAME"
-          fi
-
-      - name: Upload DEB/RPM/TGZ to Release assets
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          set -euo pipefail
           shopt -s nullglob
           files=(
             artifacts/packages/keel_*.deb
@@ -166,18 +153,27 @@ jobs:
             artifacts/packages/keel-*-Linux-*.tar.gz
             artifacts/packages/keel-*.cdx.json
           )
+          if [[ "${HAS_SIGNING_KEY}" == "true" ]]; then
+            files+=(artifacts/packages/*.asc artifacts/packages/SHA256SUMS)
+          fi
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "No package artifacts found to upload" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
-
-      - name: Upload signatures to Release assets
-        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "$GITHUB_REF_NAME" \
-            artifacts/packages/*.asc \
-            artifacts/packages/SHA256SUMS \
-            --clobber
+          # Immutable-releases policy: assets can only be attached at creation
+          # time. If a release for this tag already exists (e.g. a prior failed
+          # run), delete it first so we can re-create it with the assets
+          # attached atomically. The tag itself is preserved (--cleanup-tag=false).
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release delete "$GITHUB_REF_NAME" --yes --cleanup-tag=false
+          fi
+          prerelease_flag=()
+          if [[ "${IS_PRERELEASE_TAG}" == "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            "${prerelease_flag[@]}" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Automated Linux package assets for $GITHUB_REF_NAME" \
+            "${files[@]}"
