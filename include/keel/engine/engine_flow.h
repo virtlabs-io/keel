@@ -395,6 +395,81 @@ keel_flow_result_t keel_engine_flow_handle_commit_doubt(
     keel_session_t* session,
     keel_worker_t* worker);
 
+/* ============================================================================
+ * Commit state transitions (v0.2-alpha observability §27/§28).
+ *
+ * Encapsulate the otherwise scattered bool flips on commit_in_flight /
+ * commit_in_doubt so that every transition bumps the right counter/gauge
+ * exactly once.  The metrics-invariants CI gate concentrates raw mutation
+ * of these fields in src/engine/engine_flow.c + src/engine/state_machine.c
+ * + src/session/session.c; new call sites MUST go through these helpers.
+ * ============================================================================ */
+
+/**
+ * @brief Outcome of a commit-in-doubt check used by clear_doubt().
+ */
+typedef enum keel_commit_doubt_resolution {
+    KEEL_COMMIT_DOUBT_RESOLVED, /**< outcome was definitively determined */
+    KEEL_COMMIT_DOUBT_FAILED,   /**< outcome could not be determined */
+} keel_commit_doubt_resolution_t;
+
+/**
+ * @brief Mark COMMIT as in flight after forwarding bytes to the backend.
+ *
+ * Sets sf->commit_in_flight = true and resets pending_commit_xid.  No
+ * counter is bumped; the in-flight counter would be transient and noisy.
+ */
+void keel_session_flow_commit_mark_in_flight(keel_session_flow_t* sf);
+
+/**
+ * @brief Clear COMMIT in-flight after a clean ReadyForQuery from backend.
+ */
+void keel_session_flow_commit_clear_in_flight(keel_session_flow_t* sf);
+
+/**
+ * @brief Mark the session commit-in-doubt (backend died mid-commit).
+ *
+ * Mirrors the doubt flag onto session, captures pending_commit_xid as the
+ * XID to recheck, and bumps commit_in_doubt_started + sessions_commit_in_doubt.
+ */
+void keel_session_flow_commit_mark_doubt(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    keel_worker_t* worker);
+
+/**
+ * @brief Clear commit-in-doubt after a recheck completes.
+ *
+ * Bumps commit_in_doubt_resolved or commit_in_doubt_failed based on
+ * @p resolution, and decrements sessions_commit_in_doubt.
+ */
+void keel_session_flow_commit_clear_doubt(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    keel_worker_t* worker,
+    keel_commit_doubt_resolution_t resolution);
+
+/**
+ * @brief Apply an additive/subtractive change to the session pin mask.
+ *
+ * Atomically (from the engine's point of view):
+ *  1. snapshots the previous pin mask,
+ *  2. sets the new mask as `(prev | add) & ~clear`,
+ *  3. mirrors the coarse session->pin_reason summary,
+ *  4. observes the transition into per-reason counters and the
+ *     sessions_pinned gauges.
+ *
+ * Callers MUST go through this helper for any pin change that needs to
+ * be visible in metrics; the metrics-invariants CI gate concentrates
+ * raw `sf->pins` writes in src/engine/.
+ */
+void keel_session_flow_apply_pin_change(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    keel_worker_t* worker,
+    keel_flow_pin_reason_t add,
+    keel_flow_pin_reason_t clear);
+
 /**
  * @brief Process frontend data through the flow engine.
  *

@@ -1,7 +1,10 @@
 # KEEL — Known Limitations
 
-> Status: 2026-05-22 — branch `fix/m0-heap-corruption-and-m4-param-routing`
-> Suite baseline: **563 passed / 16 xfailed / 4 xpassed / ~1 unrelated flaky** (full e2e run)
+> Status: 2026-05-26 — branch `v0.3-alpha`
+> Source of truth for production maturity: [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
+> This document tracks functional limitations exposed by the e2e suite; it is
+> not a production-readiness statement.
+> Last full e2e baseline: **563 passed / 16 xfailed / 4 xpassed / ~1 unrelated flaky**.
 > Failure inventory under `--runxfail` (sharding suites only): **16 failing**
 > in `test_sharding_limitations.py`.
 
@@ -103,7 +106,26 @@ Limitations are grouped by subsystem:
 
 ### 1.1 Recursive Common Table Expressions (CTEs)
 
-**Failing tests (3):**
+**Status (v0.3-alpha):** **fail-closed.** `keel_router_dispatch_sql()` now
+rejects any `WITH RECURSIVE` statement that touches a registered shard table
+with `KEEL_ERR_NOT_SUPPORTED`; the engine surfaces a PostgreSQL `ErrorResponse`
+with SQLSTATE `0A000` (`feature_not_supported`) and a `ReadyForQuery`, so the
+session stays usable and the client sees a deterministic error instead of
+silently-wrong rows. See `src/core/router_weighted.c` (recursive-CTE gate
+above the rule loop) and `tests/test_sharding.c::test_dispatch_recursive_cte_rejected`.
+
+Scatter dispatch itself is also gated behind `scatter_merge = on` per
+worker group (default: `off`). When the gate is off, scatter-eligible
+statements receive the same `0A000` error so operators must explicitly opt
+into the experimental fan-out path. See [PRODUCTION_READINESS](PRODUCTION_READINESS.md)
+and the `scatter_merge` row in [COMPATIBILITY](COMPATIBILITY.md).
+
+The historical correctness analysis below is preserved for posterity; it
+describes the behaviour **before** the dispatch-time gate was added.
+
+---
+
+**Failing tests (3, historical — now superseded by fail-closed rejection):**
 - `test_sharding_comprehensive.py::TestCTEs::test_recursive_cte_countdown`
   → assertion `[5,5,4,4,3,3,…] == [5,4,3,2,1,0]`
 - `test_sharding_comprehensive.py::TestCTEs::test_recursive_cte_fibonacci`
@@ -112,7 +134,7 @@ Limitations are grouped by subsystem:
 - `test_sharding_advanced.py::TestComplexAggregationAtScale::test_recursive_cte_large_n_sum`
   → `assert 10100 == 5050`
 
-**Observed behaviour.** A `WITH RECURSIVE t AS (… UNION ALL SELECT … FROM t)`
+**Observed behaviour (pre-gate).** A `WITH RECURSIVE t AS (… UNION ALL SELECT … FROM t)`
 query that has no shard key is dispatched as a scatter to every shard. Each
 shard independently evaluates the recursion against its (empty/local) data
 and returns its own series; the proxy concatenates rows verbatim.
@@ -128,10 +150,10 @@ The `requires_merge` flag is only set for scatter SELECTs that contain
 aggregates / GROUP BY / ORDER BY / LIMIT — recursive CTEs without those
 clauses bypass merge entirely and the rows are duplicated.
 
-**Impact.** Any user that issues a recursive CTE through KEEL gets
-**silently wrong results**. Severity is high *if* recursive CTEs are used,
-but in OLTP workloads they are rare. The lack of an error makes silent
-duplication the dangerous failure mode.
+**Impact (post-gate).** Recursive CTEs are now rejected at dispatch with
+`KEEL_ERR_NOT_SUPPORTED` / SQLSTATE `0A000`. The previous silent-duplication
+failure mode is no longer reachable through `keel_router_dispatch_sql()`.
+A correct distributed evaluation is still out of scope.
 
 **Workaround.**
 - Pin the session before the query (`SET keel.pin = on;` if exposed) so the

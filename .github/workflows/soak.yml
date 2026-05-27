@@ -4,6 +4,11 @@ on:
   schedule:
     # 03:00 UTC every night — offset from chaos (02:00) to avoid resource contention
     - cron: '0 3 * * *'
+  # Release gates: run on PRs targeting a release branch and on every version tag.
+  pull_request:
+    branches: ["v*-alpha", "v*-beta"]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       duration:
@@ -78,6 +83,7 @@ jobs:
           protocol = postgres
           bind_addr = 127.0.0.1
           bind_port = 7432
+          auth_method = trust
           num_workers = 4
           min_pool_size = 16
           max_pool_size = 64
@@ -123,7 +129,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          WARMUP_LOG=$(mktemp)
+          WARMUP_LOG=/tmp/keel-soak-warmup.log
+          echo "WARMUP_LOG=${WARMUP_LOG}" >> "$GITHUB_ENV"
+          set +e
           pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
             -n -r -T 60 -c 16 -j 4 \
             --random-seed=1 \
@@ -134,6 +142,18 @@ jobs:
             --file=bench/scripts/write_insert.sql@8 \
             --file=bench/scripts/write_delete.sql@2 \
             > "$WARMUP_LOG" 2>&1
+          PGBENCH_RC=$?
+          set -e
+          echo "===== warm-up pgbench output (rc=${PGBENCH_RC}) ====="
+          cat "$WARMUP_LOG" || true
+          echo "====================================================="
+          if [[ $PGBENCH_RC -ne 0 ]]; then
+            echo "warm-up pgbench failed — dumping keel state for diagnosis"
+            ps -fp "${KEEL_PID}" || true
+            ss -tlnp 2>/dev/null | grep -E ':7432|:5432' || true
+            tail -50 /proc/${KEEL_PID}/status 2>/dev/null || true
+            exit $PGBENCH_RC
+          fi
 
           # Capture baseline RSS of keel process (kB → MB)
           RSS_KB=$(cat /proc/${KEEL_PID}/status | grep VmRSS | awk '{print $2}')
@@ -142,9 +162,12 @@ jobs:
           # Capture initial FD count
           BASELINE_FD=$(ls /proc/${KEEL_PID}/fd 2>/dev/null | wc -l)
 
-          # Capture warm-up TPS and latency
-          WARMUP_TPS=$(grep -E "^tps = " "$WARMUP_LOG" | tail -1 | awk '{print $3}')
-          WARMUP_LAT=$(grep "latency average" "$WARMUP_LOG" | awk '{print $4}')
+          # Capture warm-up TPS and latency. pgbench prints "latency average"
+          # once per --file plus once as the overall summary; only the overall
+          # line is un-indented. Anchor + head -1 to keep these single-valued
+          # (multi-line values blow up $GITHUB_ENV with "Value cannot be null").
+          WARMUP_TPS=$(grep -E "^tps = " "$WARMUP_LOG" | head -1 | awk '{print $3}')
+          WARMUP_LAT=$(grep -E "^latency average" "$WARMUP_LOG" | head -1 | awk '{print $4}')
 
           echo "BASELINE_RSS_MB=${BASELINE_RSS_MB}" >> "$GITHUB_ENV"
           echo "BASELINE_FD=${BASELINE_FD}"         >> "$GITHUB_ENV"
@@ -156,7 +179,6 @@ jobs:
           echo "  Avg latency:   ${WARMUP_LAT} ms"
           echo "  Baseline RSS:  ${BASELINE_RSS_MB} MB"
           echo "  Baseline FDs:  ${BASELINE_FD}"
-          rm -f "$WARMUP_LOG"
 
       # ────────────────────────────────────────────────────────────────────────
       # Main soak run — pgbench in background, monitor loop in foreground
@@ -168,8 +190,10 @@ jobs:
           SOAK_DURATION: ${{ github.event.inputs.duration || '1800' }}
           SOAK_CLIENTS:  ${{ github.event.inputs.clients  || '32'   }}
         run: |
-          SOAK_LOG=$(mktemp)
-          METRICS_LOG=$(mktemp)
+          SOAK_LOG=/tmp/keel-soak-run.log
+          METRICS_LOG=/tmp/keel-soak-metrics.log
+          : > "$SOAK_LOG"
+          : > "$METRICS_LOG"
 
           # Start pgbench workload in background
           pgbench "host=127.0.0.1 port=7432 dbname=soakdb user=postgres" \
@@ -211,8 +235,8 @@ jobs:
         run: |
           echo "=== Soak Test Assertions ==="
 
-          SOAK_TPS=$(grep -E "^tps = " "$SOAK_LOG" | tail -1 | awk '{print $3}' || echo "0")
-          SOAK_LAT=$(grep "latency average" "$SOAK_LOG" | awk '{print $4}' || echo "0")
+          SOAK_TPS=$(grep -E "^tps = " "$SOAK_LOG" | head -1 | awk '{print $3}' || echo "0")
+          SOAK_LAT=$(grep -E "^latency average" "$SOAK_LOG" | head -1 | awk '{print $4}' || echo "0")
 
           echo "  Warm-up TPS:   ${WARMUP_TPS}"
           echo "  Soak TPS:      ${SOAK_TPS}"
@@ -305,9 +329,11 @@ jobs:
         with:
           name: soak-metrics-${{ github.run_id }}
           path: |
-            /tmp/keel-soak-*.log
-            /tmp/keel-metrics-*.log
+            /tmp/keel-soak-warmup.log
+            /tmp/keel-soak-run.log
+            /tmp/keel-soak-metrics.log
           retention-days: 14
+          if-no-files-found: warn
 
       - name: Stop keel proxy
         if: always()

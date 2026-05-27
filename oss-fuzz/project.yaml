@@ -10,7 +10,7 @@
 #   python infra/helper.py build_fuzzers keel --sanitizer address
 #   python infra/helper.py run_fuzzer keel test_fuzz_harness
 
-homepage: "https://github.com/virtlabs-io/dbcp-keel"
+homepage: "https://github.com/virtlabs-io/keel"
 language: c
 primary_contact: "security@virtlabs.io"
 auto_ccs:

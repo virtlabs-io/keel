@@ -94,6 +94,10 @@ COPY tests/           tests/
 COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/          docker/
+# docs/ is required by tests/lint scripts (e.g. check_metrics_reference.sh,
+# check_metrics_reference CTest entry) that enforce parity between
+# registered metrics and docs/METRICS_REFERENCE.md.
+COPY docs/            docs/
 
 RUN cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \

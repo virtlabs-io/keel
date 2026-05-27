@@ -12,7 +12,88 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ## [Unreleased]
 
+### Changed — Scatter/Sharding fail-closed gating
+
+Before marketing sharding as a differentiator, the dispatcher now refuses
+query shapes that would silently produce wrong results, and scatter dispatch
+itself is hidden behind an explicit per-worker-group opt-in.
+
+- **Scatter dispatch is gated behind `scatter_merge = on`** (default `off`).
+  `keel_router_config_t` gains a `scatter_merge_enabled` flag that
+  `keel_server_init` populates from the worker-group INI. When the gate is
+  off, `keel_router_dispatch_sql()` rejects scatter-eligible statements with
+  `KEEL_ERR_NOT_SUPPORTED`, bumps the
+  `keel_scatter_unsupported_pattern_total{kind="gate_disabled"}` counter,
+  and the engine returns a PostgreSQL `ErrorResponse` with SQLSTATE `0A000`
+  (`feature_not_supported`) + a `ReadyForQuery` so the session stays usable.
+- **`WITH RECURSIVE` over sharded tables now always fails closed.** The
+  dispatcher checks for `with_recursive` against the registered shard rules
+  *before* the routing decision and rejects matching statements with the
+  same `0A000` error path. This closes the silent-duplication failure mode
+  documented in [docs/LIMITATIONS.md §1.1](docs/LIMITATIONS.md#11-recursive-common-table-expressions-ctes).
+- New tests: `tests/test_sharding.c::test_dispatch_scatter_gate_off_rejects`
+  and `::test_dispatch_recursive_cte_rejected`.
+- New public surface: `keel_dispatch_result_t` carries `reject_reason`
+  (`keel_dispatch_reject_t`) and `reject_message[200]` so the engine can
+  surface a human-readable cause without re-parsing.
+- Docs updated: `docs/LIMITATIONS.md` §1.1,
+  `docs/PRODUCTION_READINESS.md` scatter row,
+  `docs/COMPATIBILITY.md` `scatter_merge` row.
+
 ### Added
+
+**MySQL ↔ PostgreSQL parity — phase A: commit-in-doubt + semantic profile**
+
+The four MySQL vtable hooks introduced in `79f1646`
+(`build_commit_doubt_check`, `get_stmt_compat_profile`,
+`replica_reached_token`, `notify_write_lsn`) are now wired end-to-end so the
+engine receives the same signals as on PostgreSQL.
+
+- **Post-COMMIT GTID-token capture** (`src/protocol/mysql/mysql_flow.c`):
+  When a client issues `COMMIT`, the flow now arms a `commit_pending` flag.
+  If the backend reply is an `OK` packet whose status carries
+  `SERVER_SESSION_STATE_CHANGED` with a `SESSION_TRACK_GTIDS` entry
+  (server-side: `session_track_gtids = OWN_GTID`), the freshly captured GTID
+  is hashed via FNV-1a-64 into `keel_be_action_t.commit_xid` and
+  `commit_xid_captured` is set. The engine then drives
+  `build_commit_doubt_check` exactly as on PostgreSQL when a replacement
+  backend has to verify the transaction outcome. A `COMMIT` that returns
+  `ERR` (e.g. deadlock) clears `commit_pending` so a later unrelated `OK`
+  with a GTID cannot poison the next transaction.
+
+- **Semantic statement-compat profile** (`src/protocol/mysql/mysql_flow.c`):
+  `myf_get_stmt_compat_profile` now populates the full profile instead of
+  signalling `semantic_unknown = true` on every call:
+  - `role_hash` ← FNV-1a-64 of the authenticated user (set at handshake).
+  - `search_path_hash` / `schema_epoch` ← FNV-1a-64 of the current database,
+    refreshed on `COM_INIT_DB` and on `USE <db>`.
+  - `guc_hash` ← XOR-fold of `(key_hash ^ (value_hash + 0x9E3779B97F4A7C15))`
+    for every tracked GUC observed in `SET` statements.
+  - `semantic_unknown` flips to `true` on the first untracked `SET`
+    (notably user-defined variables `SET @foo = ...`), which is the conservative
+    signal that prevents the engine from reusing the session.
+
+  The tracked-GUC allowlist matches what KEEL already replays via
+  `build_state_sync`: `sql_mode`, `time_zone`, `autocommit`,
+  `character_set_{client,results,connection}`, `collation_connection`,
+  `transaction_isolation` / `tx_isolation`,
+  `transaction_read_only` / `tx_read_only`, `foreign_key_checks`,
+  `unique_checks`.
+
+- **Tests** (`tests/test_mysql_protocol_flow.c`): 12 new wire-level cases
+  in two sections — *§23 commit-in-doubt* (6 cases covering happy path,
+  no-GTID fallback, ERR clearing, GTID-subset probe formatting and
+  injection rejection) and *§24 stmt-compat profile* (6 cases covering
+  handshake seeding, role/db cross-product, `COM_INIT_DB` epoch bump,
+  tracked SET hashing, user-variable opacification, `SET NAMES` tracking).
+  Suite is now 373/373 passing; full repo `ctest` remains 117/117.
+
+**Documented limitation:** capture only happens on the `OK` packet of
+`COMMIT`. If the client connection dies mid-COMMIT before the `OK`
+arrives, KEEL reports the outcome as **UNKNOWN** (engine returns
+`08006` / `40000` SQLSTATE on the next attempt). This is the intended
+sound behaviour — see *Removed* below for why the previous "phase B"
+attempt to close this window was withdrawn.
 
 **PostgreSQL Protocol Torture Suite (Category I) — 56/56 tests pass**
 - New torture tests added to `tests/suites/suite_torture.py`:
@@ -43,6 +124,58 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 entry point: builds all Docker images, boots a disposable PostgreSQL + KEEL stack,
 runs the full 56-test suite, and tears everything down.  Flags: `--no-build`,
 `--keep-stack`, `--soak <seconds>`, `--verbose`, `--report-dir <path>`.
+
+### Removed
+
+**MySQL pre-COMMIT GTID probe (the previous "phase B") — withdrawn as unsound.**
+
+The phase B path rewrote `COMMIT` into the multi-statement payload
+`SELECT @@gtid_executed AS _keel_token;COMMIT`, captured the GTID set
+returned by the embedded `SELECT`, and later resolved commit-in-doubt
+episodes via `SELECT GTID_SUBSET('<captured_set>', @@global.gtid_executed)`
+on a replacement backend.
+
+That design is unsound: the captured `@@gtid_executed` snapshot is taken
+**before** the new commit lands, so by construction it is already a
+subset of any later `@@global.gtid_executed`. The `GTID_SUBSET()` probe
+therefore returns `1` regardless of whether the in-flight COMMIT actually
+committed — a lost COMMIT response would always be falsely resolved as
+`RESOLVED_COMMITTED`.
+
+What was removed from `src/protocol/mysql/mysql_flow.c`:
+
+- The `kMyXidCommitMsg` rewrite payload.
+- The FE-side COMMIT rewrite and its `txn_tracking` gate (struct field,
+  worker-config plumbing inside the plugin, and the test seam
+  `keel_mysql_flow_test_enable_txn_tracking`).
+- The BE-side absorption state machine (column_count → column_def → EOF →
+  data_row → EOF MORE_RESULTS) and the `seq_id` rewrite on the forwarded
+  COMMIT OK / mid-probe ERR.
+
+What was removed from `myf_gen_startup`:
+
+- The **unconditional** advertisement of `CLIENT_MULTI_STATEMENTS` and
+  `CLIENT_MULTI_RESULTS` in the handshake response. Those caps existed
+  solely to support the phase B rewrite. With phase B gone the proxy
+  reverts to the upstream MySQL default of rejecting client-supplied
+  multi-statement bundles, restoring the per-session security semantics
+  callers expect from a stock MySQL connection.
+
+MySQL commit-in-doubt resolution now follows the sound phase A path only:
+a token is captured iff the COMMIT's `OK` packet carried a
+`SESSION_TRACK_GTIDS` entry **in that same packet**. The post-COMMIT
+capture is now gated on a per-packet `gtid_refreshed_this_packet` flag —
+a stale `ctx->keel_write_gtid` populated by an earlier round-trip or by
+`notify_write_lsn()` (RYW intercept) can no longer be promoted into a
+commit token. If no fresh `SESSION_TRACK_GTIDS` is delivered, the engine
+reports the outcome as **UNKNOWN** rather than committed.
+
+Negative test added in `tests/test_mysql_protocol_flow.c` §25
+(`test_stale_gtid_does_not_resolve_lost_commit`) plants a pre-existing
+GTID via `notify_write_lsn()`, drives a COMMIT whose OK reply lacks
+`SESSION_TRACK_GTIDS`, and asserts that `commit_xid_captured` stays
+`false` and `commit_xid == 0` — the proof that a pre-existing GTID set
+cannot resolve a lost COMMIT as committed.
 
 ### Fixed
 
@@ -299,7 +432,7 @@ Initial internal alpha release. Core engine, PostgreSQL pooling, basic routing, 
 
 ---
 
-[Unreleased]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.3.0...HEAD
-[alpha-0.3.0]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
-[0.3.0-dev]: https://github.com/virtlabs-io/dbcp-keel/compare/alpha-0.1...alpha-0.3.0
-[alpha-0.1]: https://github.com/virtlabs-io/dbcp-keel/releases/tag/alpha-0.1
+[Unreleased]: https://github.com/virtlabs-io/keel/compare/alpha-0.3.0...HEAD
+[alpha-0.3.0]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
+[0.3.0-dev]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
+[alpha-0.1]: https://github.com/virtlabs-io/keel/releases/tag/alpha-0.1

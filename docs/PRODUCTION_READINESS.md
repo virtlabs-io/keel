@@ -4,7 +4,7 @@ This document separates the code that is ready for production hardening from
 features that are implemented but still under failure-mode validation, and from
 features that are aspirational or roadmap-only.
 
-## Production Support Status for v0.2-alpha
+## Production Support Status for v0.3-alpha
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize`
 and `experimental_features = false`.
@@ -38,16 +38,18 @@ and `experimental_features = false`.
 | Sticky-primary read-after-write | Stable | Sticky window is conservative and reactor-safe. |
 | WAL LSN / GTID replica catch-up probes | Experimental | Token parsing/storage exists; live replica catch-up probes must remain reactor-owned before production promotion. |
 | Automatic failover and role detection | Hardening | Routing changes are implemented; deterministic behavior under Patroni failover, split-brain windows, timeline switches, stale replicas, and role flapping remains a required test gate. |
-| Horizontal sharding and scatter-merge | Experimental | Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
+| Horizontal sharding and scatter-merge | Experimental | Gated at dispatch behind `scatter_merge = on` per worker group (default `off`); scatter-eligible queries are rejected with SQLSTATE `0A000` until opted in. Recursive CTEs over sharded tables always fail closed with `0A000` (see [LIMITATIONS §1.1](LIMITATIONS.md#11-recursive-common-table-expressions-ctes)). Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
 | Multi-shard 2PC | Experimental | Requires commit-in-doubt and crash-recovery matrix validation before production promotion. |
 | TLS/mTLS | Stable | kTLS acceleration is hardening because kernel and cipher compatibility vary by deployment. |
 | Cloud and enterprise auth | Hardening | Token caching and provider hooks exist; provider outages and renewal edge cases must be validated per environment. |
 | Admin console, JSON API, Prometheus | Stable for inspection; hardening for UI polish | Operational inspectability takes priority over UI expansion. |
+| Observability — metric inventory + admin/Prometheus surfaces | Stable | 188 metrics catalogued in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md), enforced in CI by `scripts/check_metrics_invariants.sh` and `scripts/check_metrics_reference.sh`. Zero per-request label cardinality on the hot path. |
+| Observability — OTLP/HTTP push exporter (`KEEL_ENABLE_OTLP=ON`) | Stable | Background aggregator, non-blocking submit, collector outage isolated from serving (`test_otlp_fault_injection`), perf budget enforced by `test_otlp_overhead_bench`. Operator quick-start: [docs/OBSERVABILITY.md](OBSERVABILITY.md). |
 | Web management UI | Experimental | Useful as a read-only view, but not a production control plane. |
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |
 
-## Production-Supported Profiles (v0.2-alpha)
+## Production-Supported Profiles (v0.3-alpha)
 
 Default profile (enabled without opt-in):
 
@@ -118,8 +120,21 @@ Before adding UI polish, the admin and Prometheus surfaces must answer:
 - whether state sync, statement replay, or cleanup was required;
 - why a session is pinned;
 - how many sessions are waiting, pinned, cleaning, or commit-in-doubt;
-- why a backend was closed;
-- whether cleanup/replay has timed out or failed.
+- why a backend was closed (one of the 16 reason-coded
+  `keel.backend.close.*` counters; see
+  [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md) §5.9);
+- whether cleanup/replay has timed out or failed;
+- whether the OTLP exporter is delivering snapshots — when enabled,
+  `GET /api/observability/exporter.json` reports attempts, successes,
+  failures, queue depth, drops, and last error (see
+  [docs/OBSERVABILITY.md](OBSERVABILITY.md) §5).
+
+Reason-coded metrics enforce a single-writer point in the relevant
+state machine (proposal §28 R1/R2): every backend-close transition
+increments exactly one `keel.backend.close.<reason>` counter, and
+every commit-in-doubt transition increments exactly one
+`keel.commit_in_doubt.<outcome>` counter — operators can sum reason
+counters and reconcile against the close total without double-counting.
 
 ---
 
@@ -135,6 +150,8 @@ with real PostgreSQL workloads and real client drivers.
 |------|--------|-------|
 | Memory policy — no direct `malloc`/`free` outside `mem/` | `scripts/check_forbidden_syscalls.sh` | `lint` |
 | Reactor-blocking lint | `scripts/check_forbidden_blocking.sh` | `lint` |
+| Metric invariants — no per-request label cardinality, no hot-path allocations | `scripts/check_metrics_invariants.sh` | `lint` |
+| Metrics reference parity — every registered metric is documented in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md) and vice versa | `scripts/check_metrics_reference.sh` | `lint` |
 | Auth log safety — no auth material in log calls | `scripts/check_auth_log_safety.sh` | `gate;security` |
 | Result-cache experimental gate | `scripts/check_result_cache_gate.sh` | `gate` |
 
@@ -142,6 +159,15 @@ Run all lint + gate tests:
 ```bash
 ctest --test-dir build -L "lint|gate" --output-on-failure
 ```
+
+### Release artifact signing (required for every tagged release)
+
+Tagged releases (`refs/tags/*`) **must** publish signed artifacts. The
+`package-linux` workflow hard-fails when `PACKAGE_SIGNING_PRIVATE_KEY`
+is not configured for a tagged build — an unsigned tagged release is not
+a valid release. Non-tag branch/PR builds may produce unsigned artifacts
+for development only and must not be promoted. Operator setup and key
+management procedure: [docs/RELEASE_SIGNING.md](RELEASE_SIGNING.md).
 
 ### Driver-level torture suite (required before each release)
 

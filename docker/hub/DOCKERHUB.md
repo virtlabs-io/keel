@@ -78,7 +78,16 @@ services:
 
 ## Feature Readiness
 
-KEEL has a broad feature surface. Features are labelled by production maturity:
+KEEL has a broad feature surface. Features are labelled by production maturity.
+The canonical maturity matrix lives in
+[`docs/PRODUCTION_READINESS.md`](https://github.com/virtlabs-io/keel/blob/main/docs/PRODUCTION_READINESS.md);
+the summary below mirrors it.
+
+> **Recommended production deployment for `v0.3-alpha`:** PostgreSQL in
+> `mode = pool` with `prepared_statement = virtualize` and
+> `experimental_features = false`. MySQL support, smart routing, SSV,
+> Patroni failover, and transaction tracking are in the **Hardening** bucket
+> — enable deliberately with monitoring.
 
 ### ✅ Stable (production-ready)
 
@@ -86,10 +95,10 @@ These are safe to use in production today with default settings.
 
 | Feature | What it does |
 |---------|-------------|
-| **Transaction pooling** | Connections returned to the pool after each transaction; hundreds of app connections share a small backend pool |
-| **Prepared statement virtualization** | Named prepared statements transparently replayed on any backend — works with Hibernate, pgx, GORM, SQLAlchemy, Prisma |
-| **Full TLS + mTLS** | Frontend TLS termination, backend TLS, optional client certificate verification, kernel TLS acceleration |
-| **SCRAM-SHA-256 / MD5 auth** | Full PostgreSQL authentication including `caching_sha2_password` for MySQL |
+| **PostgreSQL transaction pooling** | Connections returned to the pool after each transaction; hundreds of app connections share a small backend pool |
+| **PostgreSQL prepared-statement virtualization** | Named prepared statements transparently replayed on any backend — works with Hibernate, pgx, GORM, SQLAlchemy, Prisma |
+| **Full TLS + mTLS** | Frontend TLS termination, backend TLS, optional client certificate verification (kTLS acceleration is *Hardening* — kernel/cipher support varies) |
+| **SCRAM-SHA-256 / MD5 auth** | Full PostgreSQL authentication; `caching_sha2_password` / `mysql_native_password` for MySQL |
 | **Admin console** | `psql`-compatible admin interface: `SHOW POOLS`, `SHOW STATS`, `SHOW SERVERS`, `RELOAD`, and 20+ commands |
 | **Prometheus metrics** | `/metrics` endpoint with pool, session, query, and TLS counters + P50/P95/P99 histograms |
 | **Live config reload** | SIGHUP reloads pool sizes, TLS certs, timeouts, and server weights without restart |
@@ -102,6 +111,7 @@ These features are implemented and tested but the full failure-mode surface is s
 
 | Feature | What it does |
 |---------|-------------|
+| **MySQL transaction pooling** | Wire support, prepared-statement session map, GTID capture, XA pinning — parity with PostgreSQL tracked in `docs/MYSQL_PG_PARITY.md` |
 | **Automatic read/write splitting** | SQL parser classifies queries; SELECTs go to replicas, writes to primary — with sticky-primary override after writes |
 | **Patroni / health probe failover** | Automatic role detection via `pg_is_in_recovery()`, Patroni REST API, MySQL `@@read_only`; dead servers removed from rotation |
 | **Session-context preservation (SSV)** | Keeps `SET` parameters, `search_path`, and session GUCs consistent across pooled backends |
@@ -109,6 +119,8 @@ These features are implemented and tested but the full failure-mode surface is s
 | **NOTIFY / LISTEN proxying** | Transparent proxy for PostgreSQL pub-sub; LISTEN sessions pinned automatically |
 | **Query rules (declarative routing)** | INI-based route overrides, blocking, and SQL rewriting — no scripting required |
 | **OSC proxying** | Auto-detects `gh-ost` and `pt-online-schema-change`; pins shadow-table DML to primary |
+| **Cloud-native auth** | AWS RDS IAM, GCP Cloud SQL IAM, Azure AD/Entra — validate token renewal and provider-outage behaviour per environment |
+| **kTLS acceleration** | Kernel TLS offload — kernel and cipher compatibility vary by deployment |
 
 ### 🧪 Experimental (opt-in, not production defaults)
 
@@ -120,7 +132,7 @@ These require `experimental_features = true` in config. Use in non-critical envi
 | **Scatter-merge queries** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `ORDER BY`, `LIMIT` merged globally across shards |
 | **WAL LSN / GTID replica catch-up** | Token-based replica lag checks for cross-service read-after-write safety |
 | **Multi-proxy HA cluster** | 2–3 KEEL nodes gossip configuration and monitor each other; zlib/zstd wire compression for WAN |
-| **Result cache** | Query result caching framework (infrastructure ready, correctness guarantees in progress) |
+| **Result cache** | Query result caching framework — *Aspirational*: infrastructure hooks exist, correctness/invalidation guarantees are not production-supported |
 
 ---
 

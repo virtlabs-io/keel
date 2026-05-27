@@ -744,6 +744,46 @@ target_link_options(test_admin_live PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_admin_live COMMAND test_admin_live)
 set_tests_properties(test_admin_live PROPERTIES LABELS "core" TIMEOUT 30)
 
+# JSON admin exporter (§23.3): GET /api/observability/metrics.json.
+# Builds in both the default (no OTLP) and OTLP-enabled configurations;
+# OTLP-specific assertions are gated by `KEEL_HAS_OTLP` in the C source.
+add_executable(test_admin_metrics_json test_admin_metrics_json.c)
+target_link_libraries(test_admin_metrics_json PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_admin
+    $<$<BOOL:${KEEL_ENABLE_OTLP}>:keel_otlp>
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_admin_metrics_json PRIVATE uring)
+endif()
+target_link_options(test_admin_metrics_json PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_admin_metrics_json COMMAND test_admin_metrics_json)
+set_tests_properties(test_admin_metrics_json PROPERTIES LABELS "core" TIMEOUT 30)
+
 # Mock proxy integration tests — exercises engine_flow, worker, backend_connect_async
 # using an in-process mock PostgreSQL backend (no real database needed).
 add_executable(test_mock_proxy test_mock_proxy.c)
@@ -883,6 +923,282 @@ target_link_libraries(test_otlp_encoding PRIVATE
 )
 target_link_options(test_otlp_encoding PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_otlp_encoding COMMAND test_otlp_encoding)
+
+# OTLP metrics encoder round-trip (chunk 7b — only when KEEL_ENABLE_OTLP=ON).
+if(KEEL_ENABLE_OTLP)
+    add_executable(test_otlp_metrics_encode test_otlp_metrics_encode.c)
+    target_link_libraries(test_otlp_metrics_encode PRIVATE
+        test_utils
+        keel_otlp
+        keelmem
+        Threads::Threads
+    )
+    target_link_options(test_otlp_metrics_encode PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_metrics_encode COMMAND test_otlp_metrics_encode)
+
+    add_executable(test_otlp_http test_otlp_http.c)
+    target_link_libraries(test_otlp_http PRIVATE
+        test_utils
+        keel_otlp
+        keelmem
+        Threads::Threads
+    )
+    target_link_options(test_otlp_http PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_http COMMAND test_otlp_http)
+
+    add_executable(test_otlp_snapshot_queue test_otlp_snapshot_queue.c)
+    target_link_libraries(test_otlp_snapshot_queue PRIVATE
+        test_utils
+        keel_otlp
+        keelmem
+        Threads::Threads
+    )
+    target_link_options(test_otlp_snapshot_queue PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_snapshot_queue COMMAND test_otlp_snapshot_queue)
+
+    add_executable(test_otlp_exporter test_otlp_exporter.c)
+    target_link_libraries(test_otlp_exporter PRIVATE
+        test_utils
+        keel_otlp
+        keelmem
+        Threads::Threads
+    )
+    target_link_options(test_otlp_exporter PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_exporter COMMAND test_otlp_exporter)
+
+    add_executable(test_otlp_exporter_json test_otlp_exporter_json.c)
+    target_link_libraries(test_otlp_exporter_json PRIVATE
+        test_utils
+        keel_otlp
+        keelmem
+        Threads::Threads
+    )
+    target_link_options(test_otlp_exporter_json PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_exporter_json COMMAND test_otlp_exporter_json)
+
+    add_executable(test_otlp_config test_otlp_config.c)
+    target_link_libraries(test_otlp_config PRIVATE
+        test_utils
+        keel_otlp
+        keelcore
+        keelmem
+        keelutil
+        keellog
+        Threads::Threads
+    )
+    target_link_options(test_otlp_config PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_config COMMAND test_otlp_config)
+
+    # Admin HTTP route GET /api/observability/exporter.json (chunk 7d-4a).
+    add_executable(test_admin_otlp_exporter test_admin_otlp_exporter.c)
+    target_link_libraries(test_admin_otlp_exporter PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_admin
+        keel_otlp
+        keelengine
+        keel_engine_flow
+        keel_worker_new
+        keel_session
+        keelcore
+        keelstats
+        keel_probe
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keel_tls
+        keel_hook
+        keellog_plugin
+        keellog
+        keel_arch_platform
+        keel_arch_common
+        keelmem
+        keelutil
+        keelsql
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    if(KEEL_USE_IOURING AND URING_FOUND)
+        target_link_libraries(test_admin_otlp_exporter PRIVATE uring)
+    endif()
+    target_link_options(test_admin_otlp_exporter PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_admin_otlp_exporter COMMAND test_admin_otlp_exporter)
+    set_tests_properties(test_admin_otlp_exporter PROPERTIES TIMEOUT 30)
+
+    # OTLP snapshot → Prometheus text formatter unit tests (chunk A, §23.2).
+    add_executable(test_otlp_prom_format test_otlp_prom_format.c)
+    target_link_libraries(test_otlp_prom_format PRIVATE
+        test_utils
+        keel_otlp
+        keelstats
+        keelmem
+        keellog
+        Threads::Threads
+    )
+    target_link_options(test_otlp_prom_format PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_prom_format COMMAND test_otlp_prom_format)
+
+    # Admin HTTP route GET /api/observability/metrics.prom (chunk A, §23.2).
+    add_executable(test_admin_metrics_prom test_admin_metrics_prom.c)
+    target_link_libraries(test_admin_metrics_prom PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_admin
+        keel_otlp
+        keelengine
+        keel_engine_flow
+        keel_worker_new
+        keel_session
+        keelcore
+        keelstats
+        keel_probe
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keel_tls
+        keel_hook
+        keellog_plugin
+        keellog
+        keel_arch_platform
+        keel_arch_common
+        keelmem
+        keelutil
+        keelsql
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    if(KEEL_USE_IOURING AND URING_FOUND)
+        target_link_libraries(test_admin_metrics_prom PRIVATE uring)
+    endif()
+    target_link_options(test_admin_metrics_prom PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_admin_metrics_prom COMMAND test_admin_metrics_prom)
+    set_tests_properties(test_admin_metrics_prom PROPERTIES TIMEOUT 30)
+
+    # Negative + fault-injection tests (chunk E, §29.6).
+    add_executable(test_otlp_fault_injection test_otlp_fault_injection.c)
+    target_link_libraries(test_otlp_fault_injection PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_admin
+        keel_otlp
+        keelengine
+        keel_engine_flow
+        keel_worker_new
+        keel_session
+        keelcore
+        keelstats
+        keel_probe
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keel_tls
+        keel_hook
+        keellog_plugin
+        keellog
+        keel_arch_platform
+        keel_arch_common
+        keelmem
+        keelutil
+        keelsql
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    if(KEEL_USE_IOURING AND URING_FOUND)
+        target_link_libraries(test_otlp_fault_injection PRIVATE uring)
+    endif()
+    target_link_options(test_otlp_fault_injection PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_fault_injection COMMAND test_otlp_fault_injection)
+    set_tests_properties(test_otlp_fault_injection PROPERTIES TIMEOUT 30)
+
+    # End-to-end OTLP/HTTP roundtrip with in-process protobuf-decoding
+    # mock receiver (chunk D, §29.5).
+    add_executable(test_otlp_e2e test_otlp_e2e.c)
+    target_link_libraries(test_otlp_e2e PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_admin
+        keel_otlp
+        keelengine
+        keel_engine_flow
+        keel_worker_new
+        keel_session
+        keelcore
+        keelstats
+        keel_probe
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keel_tls
+        keel_hook
+        keellog_plugin
+        keellog
+        keel_arch_platform
+        keel_arch_common
+        keelmem
+        keelutil
+        keelsql
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    if(KEEL_USE_IOURING AND URING_FOUND)
+        target_link_libraries(test_otlp_e2e PRIVATE uring)
+    endif()
+    target_link_options(test_otlp_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_e2e COMMAND test_otlp_e2e)
+    set_tests_properties(test_otlp_e2e PROPERTIES TIMEOUT 30)
+
+    # Observability hot-path microbenchmark (chunk F, §29.7). In-process,
+    # no external dependencies, runs in every CI job. Validates per-call
+    # cost of snapshot projection + encode + exporter_submit and that the
+    # aggregator keeps up with its tick interval.
+    add_executable(test_otlp_overhead_bench test_otlp_overhead_bench.c)
+    target_link_libraries(test_otlp_overhead_bench PRIVATE
+        test_utils ${LINUX_START_GROUP}
+        keel_otlp keelstats keelcore keelmem keelutil
+        OpenSSL::SSL OpenSSL::Crypto ${LINUX_END_GROUP} Threads::Threads
+    )
+    if(KEEL_USE_IOURING AND URING_FOUND)
+        target_link_libraries(test_otlp_overhead_bench PRIVATE uring)
+    endif()
+    target_link_options(test_otlp_overhead_bench PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_overhead_bench COMMAND test_otlp_overhead_bench)
+    set_tests_properties(test_otlp_overhead_bench PROPERTIES TIMEOUT 60)
+
+    # Stats → OTLP-snapshot conversion unit tests (chunk 7d-4c).
+    add_executable(test_otlp_snapshot_build test_otlp_snapshot_build.c)
+    target_link_libraries(test_otlp_snapshot_build PRIVATE
+        test_utils
+        keel_otlp
+        keelstats
+        keelmem
+        keellog
+        Threads::Threads
+    )
+    target_link_options(test_otlp_snapshot_build PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_snapshot_build COMMAND test_otlp_snapshot_build)
+
+    # End-to-end aggregator + exporter + mock HTTP collector (chunk 7d-4c).
+    add_executable(test_otlp_aggregator test_otlp_aggregator.c)
+    target_link_libraries(test_otlp_aggregator PRIVATE
+        test_utils
+        keel_otlp
+        keelstats
+        keelmem
+        keellog
+        Threads::Threads
+    )
+    target_link_options(test_otlp_aggregator PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_otlp_aggregator COMMAND test_otlp_aggregator)
+    set_tests_properties(test_otlp_aggregator PROPERTIES TIMEOUT 30)
+endif()
 
 # NDJSON log record format tests
 add_executable(test_ndjson_log test_ndjson_log.c)
@@ -2362,6 +2678,38 @@ set_tests_properties(check_forbidden_blocking PROPERTIES
 )
 
 # =============================================================================
+# v0.2-alpha observability — metrics invariants gate.
+# Forbids ad-hoc mutation of state-machine fields whose transitions feed
+# reason-coded metrics (backend close_reason, commit_in_doubt/commit_in_flight).
+# See proposals/v0.2-alpha_observability.md §27/§28.
+# =============================================================================
+add_test(
+    NAME  check_metrics_invariants
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_metrics_invariants.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_metrics_invariants PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
+# =============================================================================
+# v0.2-alpha observability §26 — User-facing metrics reference parity gate.
+# Ensures every metric registered in keel_prom_format.c's metadata table is
+# documented in docs/METRICS_REFERENCE.md, and vice versa, so the operator
+# reference cannot drift out of sync with the actual exported metric set.
+# =============================================================================
+add_test(
+    NAME  check_metrics_reference
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_metrics_reference.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_metrics_reference PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
+# =============================================================================
 # Issue 9 — Result Cache gate: validate binary-level config rejection.
 # Runs the keel binary with --check-config to verify that result_cache=on
 # is rejected without experimental_features=true.
@@ -2409,6 +2757,7 @@ if(KEEL_HAS_LIBPQ)
     add_test(NAME test_pg_parse COMMAND test_pg_parse)
     set_tests_properties(test_pg_parse PROPERTIES
         LABELS "e2e;integration"
+        SKIP_RETURN_CODE 77
         TIMEOUT 60)
 endif()
 

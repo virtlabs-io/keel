@@ -1,6 +1,6 @@
 [Unit]
 Description=Keel database connection pooler
-Documentation=https://github.com/virtlabs-io/dbcp-keel
+Documentation=https://github.com/virtlabs-io/keel
 After=network-online.target
 Wants=network-online.target
 

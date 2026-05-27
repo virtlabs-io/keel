@@ -10,6 +10,7 @@
  */
 
 #include "keel/engine/state_machine.h"
+#include "keel/engine/engine_flow.h"
 #include "keel/session/session.h"
 #include "keel/util/util.h"
 
@@ -547,7 +548,9 @@ int keel_session_transition_bind(
     if (bind_type == KEEL_BIND_PINNED_TXN) {
         session->in_transaction = true;
         conn->in_transaction = true;
-        sf->pins |= KEEL_FPIN_TRANSACTION;
+        keel_session_flow_apply_pin_change(sf, session, session->worker,
+                                           KEEL_FPIN_TRANSACTION,
+                                           KEEL_FPIN_NONE);
     } else if (bind_type == KEEL_BIND_HARD_PINNED) {
         session->hard_pinned = true;
         conn->hard_pinned = true;
@@ -644,7 +647,9 @@ int keel_session_transition_begin_txn(
 
     keel_tx_status_t old_tx = sf->tx;
     sf->tx = KEEL_TX_ACTIVE;
-    sf->pins |= KEEL_FPIN_TRANSACTION;
+    keel_session_flow_apply_pin_change(sf, session, session->worker,
+                                       KEEL_FPIN_TRANSACTION,
+                                       KEEL_FPIN_NONE);
     session->in_transaction = true;
 
     if (session->backend_conn)
@@ -684,7 +689,9 @@ int keel_session_transition_end_txn(
 
     keel_tx_status_t old_tx = sf->tx;
     sf->tx = new_tx_status;
-    sf->pins &= ~(keel_flow_pin_reason_t)KEEL_FPIN_TRANSACTION;
+    keel_session_flow_apply_pin_change(sf, session, session->worker,
+                                       KEEL_FPIN_NONE,
+                                       KEEL_FPIN_TRANSACTION);
     session->in_transaction = false;
 
     if (session->backend_conn)

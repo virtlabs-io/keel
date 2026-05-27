@@ -3707,12 +3707,15 @@ static void on_backend_recv_complete(void* userdata, int result)
                 KEEL_STAT_INC(worker->stats_ctx, backend_error_fatal);
         }
         /* Mark pooled connection as broken so it gets discarded */
+        backend_close_reason_t close_reason =
+            (result == 0) ? BACKEND_CLOSE_REASON_BACKEND_EOF
+                          : BACKEND_CLOSE_REASON_IO_ERROR;
         if (session->backend_conn) {
             backend_conn_t* be_conn = session->backend_conn;
             if (backend_pool_validate_generation(be_conn, session->backend_generation)) {
                 if (be_conn->pool) {
                     backend_pool_close_connection(be_conn->pool, be_conn,
-                                                  BACKEND_CLOSE_REASON_IO_ERROR);
+                                                  close_reason);
                 }
             }
             session->backend_conn = NULL;

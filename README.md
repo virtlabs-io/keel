@@ -2,12 +2,12 @@
 
 # KEEL - Database Connection Pooler
 
-[![CI](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/ci.yml)
-[![Hardening](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/hardening.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/dbcp-keel/actions/workflows/hardening.yml)
-[![codecov](https://codecov.io/gh/virtlabs-io/dbcp-keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/dbcp-keel)
+[![CI](https://github.com/virtlabs-io/keel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/keel/actions/workflows/ci.yml)
+[![Hardening](https://github.com/virtlabs-io/keel/actions/workflows/hardening.yml/badge.svg?branch=main)](https://github.com/virtlabs-io/keel/actions/workflows/hardening.yml)
+[![codecov](https://codecov.io/gh/virtlabs-io/keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.2-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
+A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.3-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
 
 Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Benchmarks](bench/README.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
@@ -23,7 +23,7 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Multi-protocol** — PostgreSQL and MySQL from the same binary
 - **Transaction pooling** — connections returned to the pool after each transaction
 
-## Production Support Status for v0.2-alpha
+## Production Support Status for v0.3-alpha
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize` and `experimental_features = false`.
 
@@ -34,7 +34,7 @@ Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize
 | **Experimental** | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
 | **Aspirational** | Result cache correctness guarantees |
 
-`smart` and `full` remain useful tiers, but they are not the default production recommendation for `v0.2-alpha`. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
+`smart` and `full` remain useful tiers, but they are not the default production recommendation for `v0.3-alpha`. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
 
 ## Feature Status
 
@@ -51,7 +51,7 @@ For the full maturity inventory, failure-mode matrix, and failover semantics,
 see [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md). New production
 claims should be added there before feature docs or UI copy are expanded.
 
-### Production Profiles (v0.2-alpha)
+### Production Profiles (v0.3-alpha)
 
 `pool` is now the default runtime tier and only production-safe defaults are enabled by default.
 
@@ -367,7 +367,7 @@ primary = host=db.local port=5432 dbname=app user=app password=secret role=RW we
 
 #### Scenario 2: PostgreSQL with Read/Write Splitting + Patroni HA
 
-This profile is in the **hardening** bucket for `v0.2-alpha`. Use it only when
+This profile is in the **hardening** bucket for `v0.3-alpha`. Use it only when
 you need read/write routing and have validated failover behavior in your own environment.
 
 ```ini
@@ -576,8 +576,8 @@ sudo dnf install cmake gcc openssl-devel liburing-devel
 
 ```bash
 # Clone the repository
-git clone https://github.com/virtlabs-io/dbcp-keel.git
-cd dbcp-keel
+git clone https://github.com/virtlabs-io/keel.git
+cd keel
 
 # Create build directory
 mkdir build && cd build

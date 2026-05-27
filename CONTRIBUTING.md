@@ -22,7 +22,7 @@ This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.
 
 ## Reporting Bugs
 
-1. Check [existing issues](https://github.com/virtlabs-io/dbcp-keel/issues) to avoid duplicates.
+1. Check [existing issues](https://github.com/virtlabs-io/keel/issues) to avoid duplicates.
 2. Use the **Bug Report** issue template and include:
    - KEEL version (`keel --version`)
    - OS and kernel version (`uname -a`)
@@ -44,8 +44,8 @@ For minor fixes (typos, docs, small bugs), a PR is sufficient.
 
 ```bash
 # Clone
-git clone https://github.com/virtlabs-io/dbcp-keel.git
-cd dbcp-keel
+git clone https://github.com/virtlabs-io/keel.git
+cd keel
 
 # Install dependencies (Ubuntu 24.04)
 sudo apt-get install -y build-essential cmake ninja-build pkg-config \

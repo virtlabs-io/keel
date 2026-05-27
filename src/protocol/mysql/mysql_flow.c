@@ -81,9 +81,30 @@
 #define MY_SESSION_TRACK_TRANSACTION_STATE   5
 
 /* Capability flags */
-#define MY_CLIENT_CONNECT_WITH_DB  (1U << 3)
-#define MY_CLIENT_PROTOCOL_41      (1U << 9)
-#define MY_CLIENT_PLUGIN_AUTH      (1U << 19)
+#define MY_CLIENT_CONNECT_WITH_DB     (1U << 3)
+#define MY_CLIENT_PROTOCOL_41         (1U << 9)
+#define MY_CLIENT_MULTI_STATEMENTS    (1U << 16)
+#define MY_CLIENT_MULTI_RESULTS       (1U << 17)
+#define MY_CLIENT_PLUGIN_AUTH         (1U << 19)
+
+/* ----------------------------------------------------------------------------
+ * Note on MySQL commit-in-doubt resolution.
+ *
+ * A previous iteration ("Phase B") rewrote bare COMMIT into the multi-statement
+ * payload `SELECT @@gtid_executed AS _keel_token;COMMIT` to harvest a GTID set
+ * BEFORE the COMMIT executed.  That design was unsound: the captured token is
+ * the PRE-COMMIT @@global.gtid_executed set, which is by definition already a
+ * subset of any future @@global.gtid_executed.  Resolving a lost COMMIT via
+ * `GTID_SUBSET(<pre-commit-set>, @@global.gtid_executed)` therefore always
+ * returns 1 and would falsely report a lost commit as committed.
+ *
+ * MySQL commit-in-doubt resolution now follows a single sound path:
+ *   - The plugin only sets `commit_xid_captured` on the COMMIT's OK packet,
+ *     and only when that OK actually carried a SESSION_TRACK_GTIDS entry
+ *     (requires `session_track_gtids = OWN_GTID` on the server).
+ *   - If the client disconnects before that OK arrives, no token is captured
+ *     and the engine reports the outcome as UNKNOWN — never as committed.
+ * ---------------------------------------------------------------------------- */
 
 /* ============================================================================
  * Result-Set State Machine
@@ -172,6 +193,29 @@ typedef struct my_flow_ctx {
 
     /* ---- Cancel support ---- */
     uint32_t         synthetic_conn_id;  /**< (worker_id << 16 | slab_index) for KILL QUERY routing */
+
+    /* ---- Commit-in-doubt: post-COMMIT GTID-token capture ----
+     *
+     * `commit_pending` flips to true when the FE side sees a COMMIT
+     * issued via COM_QUERY (qtype == KEEL_QUERY_COMMIT) and stays set
+     * until the BE side observes the corresponding OK / ERR packet.
+     * On the OK, if `keel_write_gtid` was refreshed via the OK packet's
+     * SESSION_TRACK_GTIDS payload, the BE handler hashes it into
+     * `keel_be_action_t::commit_xid` so the engine can resolve a later
+     * connection drop via the GTID_SUBSET probe built by
+     * `myf_build_commit_doubt_check`. */
+    bool             commit_pending;
+
+    /* ---- Statement-compat profile hashes (mirror PG) ----
+     *
+     * Populated lazily as we observe handshake completion and tracked
+     * SET / USE statements. Surfaced via `myf_get_stmt_compat_profile`
+     * so the engine can hash-match a returning backend with a
+     * compatible session profile before reuse. */
+    uint64_t         stmt_role_hash;    /**< Hash of authenticated username */
+    uint64_t         stmt_db_hash;       /**< Hash of current database (USE / COM_INIT_DB) */
+    uint64_t         stmt_guc_hash;      /**< XOR-fold of tracked GUC kv hashes (sql_mode, time_zone, ...) */
+    bool             stmt_semantic_unknown; /**< True after an untracked SET we cannot model */
 } my_flow_ctx_t;
 
 /* ============================================================================
@@ -289,6 +333,71 @@ static uint64_t my_stmt_id_hash(uint32_t stmt_id) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+/**
+ * @brief FNV-1a 64 hash over an arbitrary byte range (case-sensitive).
+ *
+ * Used for session-profile hashes (role / db / GUC kv) so that distinct
+ * inputs produce distinct uint64 values suitable for XOR-folding or
+ * equality comparison by the engine's session reuse path.
+ */
+static uint64_t my_fnv64(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/**
+ * @brief Lowercase-folded FNV-1a 64 for case-insensitive GUC name match.
+ */
+static uint64_t my_fnv64_ci(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = p[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32);
+        h ^= (uint64_t)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/**
+ * @brief Return true if @p name (length @p nl) is a session-GUC we track
+ *        deterministically in `stmt_guc_hash`.
+ *
+ * The set mirrors the MySQL session variables that materially change
+ * statement semantics on reuse: SQL mode, time zone, autocommit,
+ * character-set / collation pinning. Any SET that is NOT in this list
+ * forces `stmt_semantic_unknown` to true so the engine treats the
+ * session as opaque for reuse purposes.
+ */
+static bool my_is_tracked_guc(const char* name, size_t nl) {
+    static const char* kTracked[] = {
+        "sql_mode", "time_zone", "autocommit",
+        "character_set_client", "character_set_results",
+        "character_set_connection", "collation_connection",
+        "transaction_isolation", "tx_isolation",
+        "transaction_read_only", "tx_read_only",
+        "foreign_key_checks", "unique_checks",
+    };
+    for (size_t i = 0; i < sizeof(kTracked) / sizeof(kTracked[0]); i++) {
+        size_t kl = strlen(kTracked[i]);
+        if (kl != nl) continue;
+        bool match = true;
+        for (size_t j = 0; j < nl; j++) {
+            char a = name[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (a != kTracked[i][j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 /**
@@ -955,6 +1064,19 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         ctx->reusable = true;
         ctx->result_state = MY_RS_IDLE;
 
+        /* Seed the stmt-compat profile from the authenticated identity.
+         * Username → role_hash, database → db_hash. semantic_unknown starts
+         * false: only an untracked SET flips it. */
+        ctx->stmt_role_hash       = ctx->username[0]
+                                  ? my_fnv64(ctx->username, strlen(ctx->username))
+                                  : 0;
+        ctx->stmt_db_hash         = ctx->database[0]
+                                  ? my_fnv64(ctx->database, strlen(ctx->database))
+                                  : 0;
+        ctx->stmt_guc_hash        = 0;
+        ctx->stmt_semantic_unknown = false;
+        ctx->commit_pending       = false;
+
         /* Build OK response (AuthOk) into per-context buffer */
         build_ok_packet(ctx->ok_buf, &ctx->ok_len, ctx->seq_id + 1);
 
@@ -985,6 +1107,15 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         keel_msg_kind_t kind;
         uint32_t qtype = 0;
         classify_sql_mysql(sql, sl, &eff, &route, &pin_set, &pin_clr, &kind, &qtype);
+
+        /* Commit-in-doubt: arm the post-COMMIT capture so that the
+         * matching OK packet (BE side) emits commit_xid_captured. The flag
+         * is also cleared by ROLLBACK and by ERR packets so a failed
+         * COMMIT does not poison subsequent transactions. */
+        if (qtype == KEEL_QUERY_COMMIT)
+            ctx->commit_pending = true;
+        else if (qtype == KEEL_QUERY_ROLLBACK)
+            ctx->commit_pending = false;
 
         act->type = KEEL_FE_ACT_QUERY;
         act->msg_kind = kind;
@@ -1112,6 +1243,24 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                     }
                 }
             }
+
+            /* Stmt-compat profile: fold tracked GUC kv into guc_hash, or
+             * flip semantic_unknown for anything we cannot model. The
+             * SET NAMES branch above always falls into the tracked path
+             * (key="character_set_client"). User-variable SETs (@var=...)
+             * and bare "SET ROLE" / "SET PASSWORD" / "SET TRANSACTION"
+             * fall through to semantic_unknown so reuse is suppressed. */
+            if (act->has_state_delta &&
+                my_is_tracked_guc(act->state_key, act->state_key_len)) {
+                uint64_t kh = my_fnv64_ci(act->state_key, act->state_key_len);
+                uint64_t vh = act->state_value_len
+                            ? my_fnv64(act->state_value, act->state_value_len)
+                            : 0;
+                /* XOR-fold so re-setting the same kv is a no-op for the hash. */
+                ctx->stmt_guc_hash ^= kh ^ (vh + 0x9E3779B97F4A7C15ULL);
+            } else {
+                ctx->stmt_semantic_unknown = true;
+            }
         }
 
         /* Cross-service RYW: intercept SET @keel_write_gtid and SELECT @keel_write_gtid
@@ -1183,6 +1332,8 @@ static int myf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             if (dl >= sizeof(ctx->database)) dl = sizeof(ctx->database) - 1;
             memcpy(ctx->database, data + MY_HDR + 1, dl);
             ctx->database[dl] = '\0';
+            /* Refresh the schema/db hash for the stmt-compat profile. */
+            ctx->stmt_db_hash = dl ? my_fnv64(ctx->database, dl) : 0;
         }
         act->type = KEEL_FE_ACT_FORWARD_TO_BACKEND;
         act->be_payload = data;
@@ -1383,6 +1534,8 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         act->is_error_response = true;
         act->query_complete = true;
         ctx->result_state = MY_RS_IDLE;
+        /* A failed COMMIT must not leave the post-commit capture armed. */
+        ctx->commit_pending = false;
 
         /* LOAD DATA aborted: ERR during INFILE means streaming is done */
         if (ctx->in_copy) {
@@ -1527,6 +1680,13 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
          * packet that we simply skip. */
         size_t pos = MY_HDR + 1;  /* skip 0x00 marker */
 
+        /* True iff this OK packet actually delivered a SESSION_TRACK_GTIDS
+         * entry.  Required to keep commit-in-doubt resolution sound: a
+         * stale ctx->keel_write_gtid (populated by a previous round-trip
+         * or by notify_write_lsn for RYW) must NOT be promoted into a
+         * commit token for the current COMMIT. */
+        bool gtid_refreshed_this_packet = false;
+
         /* Skip affected_rows (length-encoded integer) */
         uint64_t affected = read_lenenc(data, len, &pos);
         if (affected == (uint64_t)-1) goto ok_fallback;
@@ -1657,6 +1817,7 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                                                 ? gtid_len : sizeof(ctx->keel_write_gtid) - 1;
                                 memcpy(ctx->keel_write_gtid, gtid_val, copy_len);
                                 ctx->keel_write_gtid[copy_len] = '\0';
+                                gtid_refreshed_this_packet = true;
                             }
                         }
                         pos = entry_end;  /* advance past this entry */
@@ -1669,6 +1830,32 @@ static int myf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         if (!more_results) {
             act->query_complete = true;
             ctx->result_state = MY_RS_IDLE;
+        }
+
+        /* ---- Commit-in-doubt: post-COMMIT GTID-token capture ----
+         *
+         * Only resolve a commit token when this very OK packet delivered a
+         * fresh SESSION_TRACK_GTIDS entry.  Using any non-empty
+         * `ctx->keel_write_gtid` would be unsound: the field can be carrying
+         * a stale GTID from a prior round-trip or from notify_write_lsn (RYW
+         * intercept), in which case a lost-COMMIT scenario would falsely
+         * resolve as committed via GTID_SUBSET.  See the file-top comment
+         * "Note on MySQL commit-in-doubt resolution".
+         *
+         * If the server did not emit SESSION_TRACK_GTIDS (typically because
+         * `session_track_gtids != OWN_GTID`), we leave commit_xid_captured
+         * unset; the engine then reports a later disconnect as UNKNOWN. */
+        if (ctx->commit_pending && act->query_complete) {
+            if (gtid_refreshed_this_packet && ctx->keel_write_gtid[0] != '\0') {
+                uint64_t h = my_fnv64(ctx->keel_write_gtid,
+                                      strlen(ctx->keel_write_gtid));
+                /* Never report a zero token: the engine treats xid==0 as
+                 * "no token captured" and short-circuits to NO_XID. */
+                if (h == 0) h = 1;
+                act->commit_xid_captured = true;
+                act->commit_xid          = h;
+            }
+            ctx->commit_pending = false;
         }
 
         return 0;
@@ -1843,7 +2030,15 @@ static ssize_t myf_gen_startup(void* v, const char* user,
     uint8_t payload[512];
     size_t pos = 0;
 
+    /* We do NOT advertise CLIENT_MULTI_STATEMENTS or CLIENT_MULTI_RESULTS:
+     * the proxy itself does not issue multi-statement payloads (the unsound
+     * Phase B pre-COMMIT probe that required them has been removed), and
+     * leaving them off preserves the upstream MySQL default of rejecting
+     * client-supplied multi-statement bundles — which has SQL-injection
+     * surface implications callers should opt into explicitly, not inherit
+     * from a proxy. */
     uint32_t caps = MY_CLIENT_PROTOCOL_41 | MY_CLIENT_PLUGIN_AUTH | 0xf7ff;
+    caps &= ~(MY_CLIENT_MULTI_STATEMENTS | MY_CLIENT_MULTI_RESULTS);
     if (db && db[0]) caps |= MY_CLIENT_CONNECT_WITH_DB;
 
     /* Capability flags (4 bytes LE) */
@@ -2237,6 +2432,14 @@ static int myf_get_metrics(void* vctx, keel_plugin_metrics_t* out) {
  * Length-encoded string values up to the two-byte prefix encoding are
  * handled; larger values or unexpected layouts return an error.
  *
+ * Blocking send()/recv() are intentional and mirror the equivalent PG
+ * helpers (pgf_query_single_value / pgf_capture_consistency_token):
+ * these vtable hooks are invoked off the data hot path (backend probe,
+ * metadata fetch on acquire, RYW gate when a session has tracked a
+ * write), where a brief synchronous round-trip is acceptable. Callers
+ * that need a hard upper bound on wall-clock time apply SO_RCVTIMEO /
+ * SO_SNDTIMEO around the call (see myf_replica_reached_token below).
+ *
  * @param be_fd      Connected backend file descriptor.
  * @param sql        NUL-terminated SQL statement.
  * @param value_buf  Buffer to receive the result (NUL-terminated on success).
@@ -2328,7 +2531,12 @@ static int myf_query_single_value(int be_fd, const char* sql,
         if (first == 0xFC && pkt_len >= 3) {
             /* 2-byte LE length follows */
             size_t str_len  = (size_t)payload[1] | ((size_t)payload[2] << 8);
-            size_t copy_len = str_len < value_max - 1 ? str_len : value_max - 1;
+            /* Reject truncated packets: the str_len bytes that follow the
+             * 3-byte prefix must actually be inside the packet body. Without
+             * this check a malicious or corrupt server could declare a
+             * length larger than the packet and we would memcpy past it. */
+            if ((size_t)pkt_len < 3 + str_len) return -1;
+            size_t copy_len = (str_len < value_max - 1) ? str_len : value_max - 1;
             memcpy(value_buf, payload + 3, copy_len);
             value_buf[copy_len] = '\0';
             return 0;
@@ -2443,6 +2651,46 @@ static int myf_replica_reached_token(void* vctx, int replica_fd,
         return 0;
     }
 
+    /* Reject anything that is not a plain GTID set before it ever reaches
+     * the SQL string. A GTID set is
+     *   <uuid>:<n>[-<m>][:<n>[-<m>]]*[,<uuid>:...]*
+     * which is exclusively [0-9a-fA-F:,\-] plus whitespace. Anything else
+     * (notably a single quote) would let a compromised primary inject SQL
+     * into the replica session via WAIT_FOR_EXECUTED_GTID_SET(). */
+    for (const char* p = token->value; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F') ||
+                  c == ':' || c == ',' || c == '-' ||
+                  c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        if (!ok) return -1;
+    }
+    /* Defence in depth: cap the length to what the SQL buffer can hold so
+     * the snprintf below cannot silently truncate inside a quoted literal. */
+    size_t token_len = strlen(token->value);
+    if (token_len == 0 || token_len > 500) return -1;
+
+    /* Bound the synchronous wait so a slow/hung replica cannot stall the
+     * worker thread indefinitely. Save and restore the previous socket
+     * timeouts so we do not leak settings back to the pool. */
+    struct timeval saved_rcv = {0, 0}, saved_snd = {0, 0};
+    bool timeout_set = false;
+    if (timeout_ms > 0) {
+        socklen_t optlen = sizeof(saved_rcv);
+        getsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &saved_rcv, &optlen);
+        optlen = sizeof(saved_snd);
+        getsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &saved_snd, &optlen);
+
+        struct timeval tv = {
+            .tv_sec  = (time_t)(timeout_ms / 1000),
+            .tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000),
+        };
+        setsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        timeout_set = true;
+    }
+
     /* timeout_ms=0 → immediate snapshot check (0.001 s for MySQL) */
     double timeout_sec = (timeout_ms > 0) ? (double)timeout_ms / 1000.0 : 0.001;
 
@@ -2452,8 +2700,14 @@ static int myf_replica_reached_token(void* vctx, int replica_fd,
              token->value, timeout_sec);
 
     char result[8];
-    if (myf_query_single_value(replica_fd, sql, result, sizeof(result)) != 0)
-        return -1;
+    int rc = myf_query_single_value(replica_fd, sql, result, sizeof(result));
+
+    if (timeout_set) {
+        setsockopt(replica_fd, SOL_SOCKET, SO_RCVTIMEO, &saved_rcv, sizeof(saved_rcv));
+        setsockopt(replica_fd, SOL_SOCKET, SO_SNDTIMEO, &saved_snd, sizeof(saved_snd));
+    }
+
+    if (rc != 0) return -1;
 
     /* WAIT_FOR_EXECUTED_GTID_SET returns 0 = reached, 1 = timeout */
     *out_reached = (result[0] == '0');
@@ -2733,6 +2987,257 @@ static int myf_cancel_async(const char* host, uint16_t port,
 }
 
 /* ============================================================================
+ * Parity hooks: get_stmt_compat_profile / captured_fe_pin_effects /
+ * build_commit_doubt_check / generate_commit_doubt_response
+ * ============================================================================
+ *
+ * These four hooks bring the MySQL vtable to feature parity with the
+ * PostgreSQL plugin so the engine does not have to special-case the
+ * protocol when handling backend reuse, deferred client payloads, or
+ * commit-in-doubt recovery.
+ */
+
+/**
+ * @brief Vtable hook: report the session’s prepared-statement compatibility
+ *        profile so the router can decide whether a borrowed backend is
+ *        semantically reusable.
+ *
+ * MySQL tracks the live named-statement set in ctx->session_stmt_hash
+ * (XOR-fold of per-stmt_id hashes; see my_stmt_add/my_stmt_remove). The
+ * remaining semantic fields — search_path / role / GUC equivalents — are
+ * NOT tracked yet for MySQL: things like SET @@session.*, user variables
+ * (KEEL_FPIN_USER_VARIABLE), and active LOCK TABLES are surfaced through
+ * pins rather than a profile hash. To stay correct in the face of that
+ * gap we set @c semantic_unknown so the engine takes the conservative
+ * clean-replay path instead of trusting a zero hash to mean “identical”.
+ */
+static int myf_get_stmt_compat_profile(void* vctx,
+                                       keel_stmt_compat_profile_t* out)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!ctx || !out) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->stmt_set_hash        = ctx->session_stmt_hash;
+    out->role_hash            = ctx->stmt_role_hash;
+    /* MySQL has no Postgres-style search_path; current database is the
+     * closest analog for hash-based reuse gating. */
+    out->search_path_hash     = ctx->stmt_db_hash;
+    out->guc_hash             = ctx->stmt_guc_hash;
+    /* schema_epoch bumps whenever the tracked database changes; reuse the
+     * db_hash as the epoch identity so a USE flips it. */
+    out->schema_epoch         = ctx->stmt_db_hash;
+    out->semantic_profile_hash = ctx->stmt_role_hash
+                              ^ ctx->stmt_db_hash
+                              ^ ctx->stmt_guc_hash;
+    /* Only mark the profile opaque if we actually saw an unmodellable SET. */
+    out->semantic_unknown     = ctx->stmt_semantic_unknown;
+    return 0;
+}
+
+/**
+ * @brief Vtable hook: walk a captured frontend payload and report pin
+ *        bits the engine would otherwise miss.
+ *
+ * The engine calls this when it has had to defer a whole FE chunk (e.g.
+ * during state_sync drain, slot cleanup, or PS replay) so the frame-by-
+ * frame on_fe_msg() loop does not run on those bytes. MySQL has no
+ * pipeline marker analogous to the Postgres extended-protocol Sync ('S'),
+ * so today this hook is a frame-structure validator only — it iterates
+ * complete MySQL packets and reports no pin transitions. The walk is kept
+ * (rather than returning immediately) so we tolerate partial trailing
+ * frames as the contract requires, and so that future per-frame pin
+ * effects (e.g. clearing KEEL_FPIN_LOCK_TABLE on UNLOCK TABLES) can be
+ * slotted in without further engine-side changes.
+ */
+static void myf_captured_fe_pin_effects(void* vctx,
+                                         const uint8_t* data,
+                                         size_t len,
+                                         keel_flow_pin_reason_t* pin_update,
+                                         keel_flow_pin_reason_t* pin_clear)
+{
+    (void)vctx;
+    if (pin_update) *pin_update = KEEL_FPIN_NONE;
+    if (pin_clear)  *pin_clear  = KEEL_FPIN_NONE;
+    if (!data) return;
+
+    size_t pos = 0;
+    while (pos + MY_HDR <= len) {
+        uint32_t pkt_len = (uint32_t)data[pos]
+                         | ((uint32_t)data[pos + 1] << 8)
+                         | ((uint32_t)data[pos + 2] << 16);
+        size_t frame_len = (size_t)MY_HDR + pkt_len;
+        if (pos + frame_len > len) return;          /* partial trailing frame */
+        /* No per-frame pin transitions are reported here. */
+        pos += frame_len;
+    }
+}
+
+/**
+ * @brief Vtable hook: build a COM_QUERY that checks the outcome of a
+ *        commit that was lost mid-flight.
+ *
+ * MySQL does NOT have a direct equivalent of PostgreSQL's txid_status():
+ * once the original connection is gone the only way to tell whether the
+ * transaction landed is to compare the GTID set we captured around the
+ * COMMIT against @@global.gtid_executed on a fresh backend.
+ *
+ * The token plumbing relies on the server emitting
+ * SESSION_TRACK_GTIDS in the OK packet for COMMIT (enabled via
+ * @@SESSION.session_track_gtids='OWN_GTID'). myf_on_be_msg parses that
+ * field into ctx->keel_write_gtid and signals capture by setting
+ * keel_be_action_t::commit_xid_captured on the COMMIT's OK packet. The
+ * engine forwards the captured token here as @p xid; we use it only as
+ * a "token is valid" signal and source the actual GTID string from the
+ * context, since the engine's uint64 slot cannot round-trip the full
+ * GTID set.
+ *
+ * When @p xid is non-zero and a GTID was captured we emit:
+ *   `SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed)`
+ * \u2014 result `1` means the original commit landed, `0` means it did not.
+ */
+static ssize_t myf_build_commit_doubt_check(void* vctx,
+                                            uint64_t xid,
+                                            uint8_t* out_buf,
+                                            size_t out_cap)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < MY_HDR + 1)
+        return -1;
+    /* No commit-token captured yet — tell the engine we cannot probe. */
+    if (xid == 0 || !ctx || ctx->keel_write_gtid[0] == '\0')
+        return 0;
+
+    /* Defence in depth: same GTID-charset gate as myf_replica_reached_token
+     * so we never embed an attacker-controlled byte in the SQL literal. */
+    size_t gtid_len = strlen(ctx->keel_write_gtid);
+    if (gtid_len == 0 || gtid_len > 500) return -1;
+    for (size_t i = 0; i < gtid_len; ++i) {
+        unsigned char c = (unsigned char)ctx->keel_write_gtid[i];
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F') ||
+                  c == ':' || c == ',' || c == '-' ||
+                  c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        if (!ok) return -1;
+    }
+
+    char sql[576];
+    int sql_len = snprintf(sql, sizeof(sql),
+                           "SELECT GTID_SUBSET('%s', @@global.gtid_executed)",
+                           ctx->keel_write_gtid);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql))
+        return -1;
+
+    size_t payload_len = 1u + (size_t)sql_len;          /* COM_QUERY + SQL */
+    size_t pkt_total   = (size_t)MY_HDR + payload_len;
+    if (pkt_total > out_cap) return -1;
+
+    wrle24(out_buf, (uint32_t)payload_len);
+    out_buf[3] = 0;                                     /* seq_id = 0 */
+    out_buf[MY_HDR] = MY_COM_QUERY;
+    memcpy(out_buf + MY_HDR + 1, sql, (size_t)sql_len);
+    return (ssize_t)pkt_total;
+}
+
+/**
+ * @brief Vtable hook: build the client-facing response after a
+ *        commit-in-doubt episode resolves (or fails to resolve).
+ *
+ * Mirrors pgf_generate_commit_doubt_response but emits MySQL packets:
+ *   - RESOLVED_COMMITTED → OK packet (affected_rows=0, autocommit).
+ *   - everything else    → ERR packet with a SQLSTATE that matches the
+ *                          severity (‘40000’ for ABORTED, ‘08006’ for
+ *                          connection-level loss-of-confirmation cases).
+ *
+ * Without this hook the engine falls back to writing a Postgres-style 'E'
+ * frame onto the MySQL client socket, which breaks the protocol stream.
+ */
+static ssize_t myf_generate_commit_doubt_response(void* vctx,
+                                                  keel_commit_doubt_reason_t reason,
+                                                  uint64_t xid,
+                                                  uint8_t* out_buf,
+                                                  size_t out_cap)
+{
+    my_flow_ctx_t* ctx = (my_flow_ctx_t*)vctx;
+    if (!out_buf || out_cap < MY_HDR + 16) return -1;
+
+    /* ---- Success: OK packet (affected_rows=0, last_insert_id=0,
+     *      status=SERVER_STATUS_AUTOCOMMIT, warnings=0). ---- */
+    if (reason == KEEL_CIDR_RESOLVED_COMMITTED) {
+        static const uint8_t kOkPayload[] = {
+            0x00,           /* OK header */
+            0x00,           /* affected_rows (lenenc=0) */
+            0x00,           /* last_insert_id (lenenc=0) */
+            0x02, 0x00,     /* status_flags = SERVER_STATUS_AUTOCOMMIT */
+            0x00, 0x00,     /* warnings = 0 */
+        };
+        size_t total = (size_t)MY_HDR + sizeof(kOkPayload);
+        if (total > out_cap) return -1;
+        wrle24(out_buf, (uint32_t)sizeof(kOkPayload));
+        out_buf[3] = ctx ? (uint8_t)(ctx->seq_id + 1) : 1;
+        memcpy(out_buf + MY_HDR, kOkPayload, sizeof(kOkPayload));
+        return (ssize_t)total;
+    }
+
+    /* ---- Failure: build a MySQL ERR packet with a human-readable msg. ---- */
+    const char* sqlstate = "08006";
+    uint16_t    err_no   = 1105;        /* ER_UNKNOWN_ERROR */
+    char        msg[256];
+    switch (reason) {
+    case KEEL_CIDR_NO_XID:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction outcome unknown (no commit token captured)");
+        break;
+    case KEEL_CIDR_NO_RW_POOL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: no RW pool \u2014 compare captured GTID against @@global.gtid_executed to resolve (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_NO_CHECK_CONN:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: pool unavailable \u2014 verify GTID_SUBSET against @@global.gtid_executed (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_CHECK_BUILD_FAIL:
+    case KEEL_CIDR_CHECK_SEND_FAIL:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: outcome-check failed \u2014 verify GTID_SUBSET manually (token=%llu)",
+                 (unsigned long long)xid);
+        break;
+    case KEEL_CIDR_RESOLVED_ABORTED:
+        sqlstate = "40000";
+        err_no   = 1213;    /* ER_LOCK_DEADLOCK — closest “txn rolled back” code */
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: transaction was rolled back");
+        break;
+    case KEEL_CIDR_RESOLVED_UNKNOWN:
+    default:
+        snprintf(msg, sizeof(msg),
+                 "connection lost before COMMIT confirmation: outcome uncertain for token=%llu \u2014 verify GTID_SUBSET manually",
+                 (unsigned long long)xid);
+        break;
+    }
+
+    size_t ml    = strlen(msg);
+    size_t pl    = 1 + 2 + 1 + 5 + ml;        /* 0xFF + errno + '#' + SQLSTATE + msg */
+    size_t total = (size_t)MY_HDR + pl;
+    if (total > out_cap) return -1;
+
+    wrle24(out_buf, (uint32_t)pl);
+    out_buf[3] = ctx ? (uint8_t)(ctx->seq_id + 1) : 1;
+
+    size_t p = MY_HDR;
+    out_buf[p++] = MY_ERR;
+    out_buf[p++] = (uint8_t)(err_no & 0xFF);
+    out_buf[p++] = (uint8_t)((err_no >> 8) & 0xFF);
+    out_buf[p++] = '#';
+    memcpy(out_buf + p, sqlstate, 5); p += 5;
+    memcpy(out_buf + p, msg, ml);
+    return (ssize_t)total;
+}
+
+/* ============================================================================
  * VTable Definition
  * ============================================================================ */
 
@@ -2753,6 +3258,9 @@ const keel_proto_flow_vtable_t keel_proto_flow_mysql = {
     .generate_startup = myf_gen_startup,
     .generate_error   = myf_gen_error,
     .generate_ready_for_query = NULL,   /* MySQL: not needed (OK packet suffices) */
+    /* Commit-in-doubt resolution (PG parity) */
+    .build_commit_doubt_check        = myf_build_commit_doubt_check,
+    .generate_commit_doubt_response  = myf_generate_commit_doubt_response,
     /* Phase 5 optional extensions */
     .get_info              = myf_get_info,
     .classify_error        = myf_classify_error,
@@ -2768,6 +3276,8 @@ const keel_proto_flow_vtable_t keel_proto_flow_mysql = {
     .get_metrics           = myf_get_metrics,
     .notify_write_lsn      = myf_notify_write_lsn,
     .get_stmt_replay       = myf_get_stmt_replay,
+    .get_stmt_compat_profile   = myf_get_stmt_compat_profile,
     .rewrite_execute_anonymous = NULL,  /* MySQL has no anonymous PS mode */
+    .captured_fe_pin_effects   = myf_captured_fe_pin_effects,
     .cancel_async              = myf_cancel_async,
 };

@@ -115,10 +115,10 @@ the deprecation policy, and migration notes for any breaking changes between rel
 | Key | Tier | Default | Reloadable | Notes |
 |-----|------|---------|------------|-------|
 | `prepared_statement` | Stable | `virtualize` | ❌ restart | `virtualize` `pinning` `tracking` `anonymous` |
-| `transaction_tracking` | Stable | `off` | ❌ restart | XID probe + read-after-write LSN tokens |
+| `transaction_tracking` | Hardening | `off` | ❌ restart | XID probe + read-after-write LSN tokens. Tier per [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md). |
 | `fast_network_path` | Experimental | `on` | ❌ restart | MSG_PEEK + splice bypass for DataRow frames |
-| `result_cache` | Stable | `off` | ❌ restart | Query result caching; disables zero-copy splice bypass when `on` |
-| `scatter_merge` | Experimental | `off` | ❌ restart | Enables scatter-merge routing behavior |
+| `result_cache` | Aspirational | `off` | ❌ restart | Query result caching framework hooks; correctness and invalidation are not production guarantees. Tier per [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md). Disables zero-copy splice bypass when `on`. |
+| `scatter_merge` | Experimental | `off` | ❌ restart | Enables scatter-merge routing. When `off` (default), scatter-eligible queries are rejected at dispatch with SQLSTATE `0A000` (`feature_not_supported`). Recursive CTEs over sharded tables are always rejected regardless of this flag. |
 | `wal_lsn_capture` | Experimental | `off` | ❌ restart | Enables WAL LSN capture |
 | `gtid_capture` | Experimental | `off` | ❌ restart | Enables GTID capture |
 

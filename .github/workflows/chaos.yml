@@ -4,12 +4,21 @@ on:
   schedule:
     # 02:00 UTC every night
     - cron: '0 2 * * *'
+  # Release gates: run on PRs targeting a release branch and on every version tag.
+  pull_request:
+    branches: ["v*-alpha", "v*-beta"]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       scenario:
         description: 'Specific scenario to run (leave empty to run all)'
         required: false
         default: ''
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   chaos:
@@ -58,21 +67,38 @@ jobs:
       - name: Start chaos stack
         run: |
           docker compose -f docker/compose/pg-chaos.yml up -d
-          # Wait up to 120s for all services to be healthy
-          timeout 120 bash -c '
+          # Wait up to 180s for every service to be running and (if it has a
+          # healthcheck) healthy. `docker compose ps --format json` emits one
+          # JSON object per line (NDJSON); parse line-by-line rather than
+          # regex-scanning the buffer, which fails on nested fields like
+          # Publishers[].
+          timeout 180 bash -c '
             until docker compose -f docker/compose/pg-chaos.yml ps --format json \
               | python3 -c "
           import sys, json
-          data = sys.stdin.read()
-          # compose ps can return a stream of JSON objects or a JSON array
-          import re
-          objs = re.findall(r\"\{[^}]+\}\", data, re.DOTALL)
-          services = [json.loads(o) for o in objs if o.strip()]
-          unhealthy = [s for s in services if s.get(\"Health\") not in (\"\", \"healthy\", None)]
-          notrunning = [s for s in services if s.get(\"State\") != \"running\"]
-          if unhealthy or notrunning:
-              sys.exit(1)
-              " 2>/dev/null; do
+          ok = True
+          count = 0
+          for line in sys.stdin:
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  s = json.loads(line)
+              except json.JSONDecodeError:
+                  ok = False
+                  break
+              count += 1
+              if s.get(\"State\") != \"running\":
+                  ok = False
+                  break
+              h = s.get(\"Health\") or \"\"
+              if h not in (\"\", \"healthy\"):
+                  ok = False
+                  break
+          if count == 0:
+              ok = False
+          sys.exit(0 if ok else 1)
+              "; do
               sleep 3
               echo "Waiting for stack..."
             done

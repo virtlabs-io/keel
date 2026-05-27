@@ -238,7 +238,17 @@ typedef struct keel_router_config {
     /* Timeouts */
     keel_duration_t      connect_timeout;    /**< Connection timeout */
     keel_duration_t      query_timeout;      /**< Default query timeout */
-    
+
+    /**
+     * Master gate for scatter/sharding dispatch. When false (the default),
+     * `keel_router_dispatch_sql()` refuses any statement that classifies as
+     * SCATTER and returns @c KEEL_ERR_NOT_SUPPORTED with
+     * @ref KEEL_DISPATCH_REJECT_SCATTER_DISABLED so the engine surfaces a
+     * clear error to the client. Operators opt in per worker group with
+     * `scatter_merge = on`; see docs/PRODUCTION_READINESS.md.
+     */
+    bool                scatter_merge_enabled;
+
 } keel_router_config_t;
 
 /** Maximum shard count supported in a single scatter call. */
@@ -274,10 +284,11 @@ typedef struct keel_router_config {
 typedef enum keel_scatter_unsupported_kind {
     KEEL_SCATTER_UNSUPPORTED_PERCENTILE = 0,    /**< PERCENTILE_CONT / PERCENTILE_DISC */
     KEEL_SCATTER_UNSUPPORTED_WINDOW_FUNC,       /**< Window function (OVER clause) */
-    KEEL_SCATTER_UNSUPPORTED_RECURSIVE_CTE,     /**< WITH RECURSIVE */
+    KEEL_SCATTER_UNSUPPORTED_RECURSIVE_CTE,     /**< WITH RECURSIVE (now rejected, not silently scattered) */
     KEEL_SCATTER_UNSUPPORTED_UNION_ALL,         /**< Set-operation across scatter */
     KEEL_SCATTER_UNSUPPORTED_DML_RETURNING,     /**< UPDATE/DELETE … RETURNING via scatter */
     KEEL_SCATTER_UNSUPPORTED_DDL,               /**< DDL passed through scatter */
+    KEEL_SCATTER_UNSUPPORTED_GATE_DISABLED,     /**< Scatter rejected because `scatter_merge = off` */
     KEEL_SCATTER_UNSUPPORTED_KIND_COUNT         /**< Sentinel — not a real kind */
 } keel_scatter_unsupported_kind_t;
 
@@ -811,6 +822,23 @@ typedef enum keel_dispatch_kind {
 } keel_dispatch_kind_t;
 
 /**
+ * @brief Reason a dispatch decision rejected the statement.
+ *
+ * Populated on @ref keel_dispatch_result_t when
+ * `keel_router_dispatch_sql()` returns @c KEEL_ERR_NOT_SUPPORTED so the
+ * engine can surface a precise client-facing error (PostgreSQL SQLSTATE
+ * `0A000` / MySQL `ER_NOT_SUPPORTED_YET`) instead of silently falling back
+ * to the non-sharded path. @c KEEL_DISPATCH_REJECT_NONE means the
+ * NOT_SUPPORTED result was *not* a fail-closed decision (e.g. no shard
+ * rule matched the table) and the caller may fall back as before.
+ */
+typedef enum keel_dispatch_reject {
+    KEEL_DISPATCH_REJECT_NONE = 0,
+    KEEL_DISPATCH_REJECT_SCATTER_DISABLED, /**< `scatter_merge = off` blocks fan-out */
+    KEEL_DISPATCH_REJECT_RECURSIVE_CTE,    /**< `WITH RECURSIVE` cannot be merged correctly */
+} keel_dispatch_reject_t;
+
+/**
  * @brief Result of `keel_router_dispatch_sql()`.
  *
  * When @c kind == @ref KEEL_DISPATCH_SINGLE, @c single is populated and
@@ -830,6 +858,12 @@ typedef enum keel_dispatch_kind {
  */
 typedef struct keel_dispatch_result {
     keel_dispatch_kind_t  kind;
+    /** When @c kind is unused because dispatch returned NOT_SUPPORTED, this
+     *  describes why the statement was refused. @c KEEL_DISPATCH_REJECT_NONE
+     *  means "no rule matched, caller may fall back"; any other value means
+     *  "fail closed: surface @ref reject_message to the client." */
+    keel_dispatch_reject_t reject_reason;
+    char                  reject_message[200];
     keel_route_decision_t single;         /**< Valid only for SINGLE dispatch */
     keel_scatter_plan_t   scatter;        /**< Valid only for SCATTER dispatch */
     /** True when the proxy must collect and merge rows across shards.

@@ -35,6 +35,12 @@ jobs:
       packages: write
       id-token: write  # for OIDC signing (cosign)
 
+    outputs:
+      # First fully-qualified image reference that was pushed; smoke-test
+      # pulls this rather than guessing :latest (latest only exists for
+      # default-branch builds).
+      image: ${{ steps.first_tag.outputs.image }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,6 +131,17 @@ jobs:
       # ------------------------------------------------------------------
       # Summary
       # ------------------------------------------------------------------
+      - name: Record first published image reference
+        id: first_tag
+        run: |
+          first=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)
+          if [[ -z "$first" ]]; then
+            echo "::error::No image tags were produced by metadata-action" >&2
+            exit 1
+          fi
+          echo "image=$first" >> "$GITHUB_OUTPUT"
+          echo "Published primary image reference: $first"
+
       - name: Image digest
         run: |
           echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
@@ -161,18 +178,18 @@ jobs:
 
       - name: Pull image
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          IMAGE="${{ needs.docker-publish.outputs.image }}"
           echo "Pulling ${IMAGE}"
           docker pull "${IMAGE}"
 
       - name: Smoke test — binary version flag
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          IMAGE="${{ needs.docker-publish.outputs.image }}"
           docker run --rm "${IMAGE}" keel --version
 
       - name: Smoke test — entrypoint env override
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          IMAGE="${{ needs.docker-publish.outputs.image }}"
           # Start keel with env overrides; expect it to fail to connect to PG
           # (no PG running) but the env-override INI write must succeed.
           # We just verify the process starts and the entrypoint script works.

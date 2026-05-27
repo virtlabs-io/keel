@@ -294,6 +294,18 @@ typedef struct keel_stats_basic {
     keel_counter_t   backend_close_cleanup_error;   /**< Cleaning backend closed after cleanup/protocol error */
     keel_counter_t   backend_close_cleanup_timeout; /**< Cleaning backend closed after cleanup timeout */
     keel_counter_t   backend_close_client_disconnect; /**< Backend closed because owning client disconnected */
+    keel_counter_t   backend_close_io_error;        /**< Backend closed after socket-level I/O error */
+    keel_counter_t   backend_close_prune_idle;      /**< Idle backend pruned by size policy */
+    keel_counter_t   backend_close_prune_aged;      /**< Backend pruned for exceeding max-age */
+    keel_counter_t   backend_close_drain_idle;      /**< Idle backend closed during pool drain */
+    keel_counter_t   backend_close_backend_eof;     /**< Backend closed unexpectedly (EOF/RST) outside cleanup */
+    keel_counter_t   backend_close_connect_failed;  /**< Backend close after connect/handshake socket failure */
+    keel_counter_t   backend_close_auth_failed;     /**< Backend close after authentication denial */
+    keel_counter_t   backend_close_protocol_error;  /**< Backend close after steady-state protocol violation */
+    keel_counter_t   backend_close_sync_error;      /**< Backend close after extended-protocol Sync mismatch */
+    keel_counter_t   backend_close_stmt_replay_error;/**< Backend close after prepared-statement replay failure */
+    keel_counter_t   backend_close_shutdown;        /**< Backend close during process shutdown */
+    keel_counter_t   backend_close_pool_eviction;   /**< Backend close due to pool resize/policy eviction */
     keel_counter_t   cleaning_timeout_total;        /**< Cleanup state-machine timeout events */
     keel_counter_t   pin_reason_transaction;        /**< Times transaction pin became active */
     keel_counter_t   pin_reason_extended_protocol;  /**< Times extended-protocol pin became active */

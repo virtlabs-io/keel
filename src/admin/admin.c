@@ -88,6 +88,14 @@
 #include <openssl/sha.h>
 #endif
 
+#ifdef KEEL_HAS_OTLP
+#include "../observability/otlp/keel_otlp_exporter.h"
+#include "../observability/otlp/keel_exporter_stats.h"
+#include "../observability/otlp/keel_exporter_json.h"
+#include "../observability/otlp/keel_otlp_aggregator.h"
+#include "../observability/otlp/keel_prom_format.h"
+#endif
+
 /* ============================================================================
  * Internal state
  * ============================================================================ */
@@ -105,6 +113,7 @@ struct keel_admin {
     int                 admin_fd;
     int                 prom_fd;
     keel_auth_manager_t *auth_mgr;
+    struct keel_otlp_exporter *otlp_exporter;  /* optional, see admin.h */
 };
 
 /* Helpers wr16/wr32/rd32 replaced by keel_be16_put/keel_be32_put/keel_be32_get
@@ -5393,6 +5402,324 @@ static void write_status_json(keel_admin_t *admin, int fd) {
 }
 
 /**
+ * @brief Serve the OTLP exporter's self-stats as JSON
+ *        (GET /api/observability/exporter.json).
+ *
+ * Returns 503 when KEEL was built without `KEEL_ENABLE_OTLP` or when no
+ * exporter has been attached via `keel_admin_set_otlp_exporter()`.
+ *
+ * Body keys are defined by proposals/v0.2-alpha_observability.md §21.
+ */
+static void serve_exporter_json(keel_admin_t *admin, int fd) {
+#ifdef KEEL_HAS_OTLP
+    if (!admin || !admin->otlp_exporter) {
+        const char *resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 41\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"otlp_exporter_not_configured\"}";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    keel_exporter_stats_t st;
+    keel_otlp_exporter_self_stats(admin->otlp_exporter, &st);
+
+    char body[1024];
+    int  body_len = keel_exporter_stats_to_json(&st, body, sizeof(body));
+    if (body_len < 0 || body_len >= (int)sizeof(body)) {
+        const char *resp =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    char hdr[256];
+    int  hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n", body_len);
+    safe_send(fd, hdr, (size_t)hl);
+    safe_send(fd, body, (size_t)body_len);
+#else
+    (void)admin;
+    const char *resp =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 33\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"otlp_not_compiled_in\"}";
+    safe_send(fd, resp, strlen(resp));
+#endif
+}
+
+/**
+ * @brief Serve a grouped JSON snapshot of all KEEL metrics plus exporter
+ *        health (GET /api/observability/metrics.json).
+ *
+ * Implements the JSON admin/debug exporter from
+ * proposals/v0.2-alpha_observability.md §23.3:
+ *   - grouped metrics
+ *   - exporter health
+ *   - queue depth
+ *   - last export error
+ *   - snapshot time
+ *   - metric debug inspection
+ *
+ * The exporter block reflects three states:
+ *   - `{"compiled_in": false}` when KEEL was built without `KEEL_ENABLE_OTLP`.
+ *   - `{"compiled_in": true, "configured": false}` when compiled but no
+ *     exporter has been attached via `keel_admin_set_otlp_exporter()`.
+ *   - Full self-stats block otherwise.
+ */
+static void serve_metrics_json(keel_admin_t *admin, int fd) {
+    if (!admin || !admin->engine) {
+        const char *resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 28\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"engine_not_ready\"}";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    keel_stats_collector_t *sc = keel_engine_get_stats_collector(admin->engine);
+    if (!sc) {
+        const char *resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 32\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"stats_not_available\"}";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    keel_stats_snapshot_t snap;
+    keel_stats_snapshot_take(sc, &snap);
+
+    const keel_stats_basic_t *b = &snap.basic;
+    const char *level_str = keel_stats_level_to_str(snap.level);
+    if (!level_str) level_str = "unknown";
+
+    char *body = NULL;
+    size_t body_len = 0;
+    FILE *f = open_memstream(&body, &body_len);
+    if (!f) return;
+
+    fprintf(f,
+        "{\n"
+        "  \"snapshot\": {\n"
+        "    \"time_unix_ns\": %lld,\n"
+        "    \"uptime_seconds\": %.3f,\n"
+        "    \"workers\": %zu,\n"
+        "    \"level\": \"%s\"\n"
+        "  },\n"
+        "  \"metrics\": {\n"
+        "    \"sessions\": {"
+        "\"created\":%llu,\"closed\":%llu,\"active\":%lld,\"pinned\":%lld"
+        "},\n"
+        "    \"queries\": {"
+        "\"total\":%llu,\"read\":%llu,\"write\":%llu,\"tx\":%llu"
+        "},\n"
+        "    \"errors\": {"
+        "\"total\":%llu,\"auth\":%llu,\"proto\":%llu,\"backend\":%llu,\"timeout\":%llu"
+        "},\n"
+        "    \"bytes\": {"
+        "\"recv\":%llu,\"sent\":%llu,\"backend_recv\":%llu,\"backend_sent\":%llu,\"spliced\":%llu"
+        "},\n"
+        "    \"pool\": {"
+        "\"borrows\":%llu,\"returns\":%llu,\"creates\":%llu,\"destroys\":%llu,\"hits\":%llu,\"misses\":%llu"
+        "},\n"
+        "    \"reactor\": {"
+        "\"loop_iterations\":%llu,\"ops_submitted\":%llu,\"ops_completed\":%llu"
+        "},\n"
+        "    \"multiplex\": {"
+        "\"discard_all\":%llu,\"state_sync\":%llu,\"backends_cleaning\":%lld"
+        "}\n"
+        "  },\n",
+        (long long)snap.snapshot_time_ns,
+        (double)snap.uptime_ns / 1.0e9,
+        snap.num_workers,
+        level_str,
+        (unsigned long long)keel_counter_get(&b->sessions_created),
+        (unsigned long long)keel_counter_get(&b->sessions_closed),
+        (long long)keel_gauge_get(&b->sessions_active),
+        (long long)keel_gauge_get(&b->sessions_pinned),
+        (unsigned long long)keel_counter_get(&b->queries_total),
+        (unsigned long long)keel_counter_get(&b->queries_read),
+        (unsigned long long)keel_counter_get(&b->queries_write),
+        (unsigned long long)keel_counter_get(&b->queries_tx),
+        (unsigned long long)keel_counter_get(&b->errors_total),
+        (unsigned long long)keel_counter_get(&b->errors_auth),
+        (unsigned long long)keel_counter_get(&b->errors_proto),
+        (unsigned long long)keel_counter_get(&b->errors_backend),
+        (unsigned long long)keel_counter_get(&b->errors_timeout),
+        (unsigned long long)keel_counter_get(&b->bytes_recv),
+        (unsigned long long)keel_counter_get(&b->bytes_sent),
+        (unsigned long long)keel_counter_get(&b->bytes_backend_recv),
+        (unsigned long long)keel_counter_get(&b->bytes_backend_sent),
+        (unsigned long long)keel_counter_get(&b->bytes_spliced),
+        (unsigned long long)keel_counter_get(&b->pool_borrows),
+        (unsigned long long)keel_counter_get(&b->pool_returns),
+        (unsigned long long)keel_counter_get(&b->pool_creates),
+        (unsigned long long)keel_counter_get(&b->pool_destroys),
+        (unsigned long long)keel_counter_get(&b->pool_hits),
+        (unsigned long long)keel_counter_get(&b->pool_misses),
+        (unsigned long long)keel_counter_get(&b->loop_iterations),
+        (unsigned long long)keel_counter_get(&b->ops_submitted),
+        (unsigned long long)keel_counter_get(&b->ops_completed),
+        (unsigned long long)keel_counter_get(&b->discard_all_count),
+        (unsigned long long)keel_counter_get(&b->state_sync_count),
+        (long long)keel_gauge_get(&b->backends_cleaning));
+
+#ifdef KEEL_HAS_OTLP
+    if (admin->otlp_exporter) {
+        keel_exporter_stats_t st;
+        keel_otlp_exporter_self_stats(admin->otlp_exporter, &st);
+        char ebuf[1024];
+        int  elen = keel_exporter_stats_to_json(&st, ebuf, sizeof(ebuf));
+        if (elen > 0 && elen < (int)sizeof(ebuf)) {
+            fprintf(f, "  \"exporter\": %s\n", ebuf);
+        } else {
+            fprintf(f, "  \"exporter\": {\"compiled_in\":true,\"configured\":true,\"error\":\"serialization_failed\"}\n");
+        }
+    } else {
+        fprintf(f, "  \"exporter\": {\"compiled_in\":true,\"configured\":false}\n");
+    }
+#else
+    fprintf(f, "  \"exporter\": {\"compiled_in\":false}\n");
+#endif
+
+    fprintf(f, "}\n");
+    fclose(f);
+
+    char hdr[256];
+    int  hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n", body_len);
+    safe_send(fd, hdr, (size_t)hl);
+    safe_send(fd, body, body_len);
+    /* open_memstream() returns a libc-malloc'd buffer; must use libc free. */
+    free(body); /* NOLINT(keel-syscall) */
+}
+
+/**
+ * @brief Serve the curated OTLP-aligned metric set in Prometheus text
+ *        exposition format (GET /api/observability/metrics.prom).
+ *
+ * Per proposals/v0.2-alpha_observability.md §23.2, this endpoint shares
+ * its metric model with the OTLP exporter via
+ * `keel_otlp_snapshot_from_stats()` and `keel_prom_format_snapshot()`.
+ * Names, units, and `_total` suffix are produced by the OTLP converter;
+ * the formatter only adds HELP and TYPE metadata.
+ *
+ * The legacy `GET /metrics` endpoint remains the richer, free-form
+ * Prometheus surface (per-worker labels, histograms, derived gauges).
+ *
+ * Available in OTLP builds only (requires the snapshot conversion in
+ * `keel_otlp`). Returns 503 when KEEL was built without
+ * `KEEL_ENABLE_OTLP`.
+ */
+static void serve_metrics_prom(keel_admin_t *admin, int fd) {
+#ifdef KEEL_HAS_OTLP
+    if (!admin || !admin->engine) {
+        const char *resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 18\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "engine_not_ready\r\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    keel_stats_collector_t *sc = keel_engine_get_stats_collector(admin->engine);
+    if (!sc) {
+        const char *resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 22\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "stats_not_available\r\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    keel_stats_snapshot_t stats_snap;
+    keel_stats_snapshot_take(sc, &stats_snap);
+
+    keel_otlp_snapshot_t otlp_snap;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    uint64_t start_ns = (uint64_t)((int64_t)now_ns - stats_snap.uptime_ns);
+
+    if (keel_otlp_snapshot_from_stats(&stats_snap, start_ns, now_ns, &otlp_snap) != 0) {
+        const char *resp =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    /* Each metric is ~120-180 bytes (3 lines: HELP + TYPE + value). 32
+     * metrics → ~6 KiB worst case; 8 KiB gives generous headroom. */
+    char body[8192];
+    int  body_len = keel_prom_format_snapshot(&otlp_snap, body, sizeof(body));
+    if (body_len < 0) {
+        const char *resp =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    char hdr[256];
+    int  hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n", body_len);
+    safe_send(fd, hdr, (size_t)hl);
+    safe_send(fd, body, (size_t)body_len);
+#else
+    (void)admin;
+    const char *resp =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 21\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "otlp_not_compiled_in\n";
+    safe_send(fd, resp, strlen(resp));
+#endif
+}
+
+/**
  * @brief Serve one accepted HTTP admin connection.
  *
  * @param admin Admin subsystem handle.
@@ -5404,6 +5731,9 @@ static void write_status_json(keel_admin_t *admin, int fd) {
  * - `GET /`
  * - `GET /ui`
  * - `GET /api/status.json`
+ * - `GET /api/observability/exporter.json`
+ * - `GET /api/observability/metrics.json`
+ * - `GET /api/observability/metrics.prom`
  * - `GET /healthz`
  * - `GET /readyz`
  * - `GET /livez`
@@ -5522,6 +5852,15 @@ static void handle_prom_http(keel_admin_t *admin, int fd) {
     }
     else if (strncmp(buf, "GET /api/status.json", 20) == 0) {
         write_status_json(admin, fd);
+    }
+    else if (strncmp(buf, "GET /api/observability/exporter.json", 36) == 0) {
+        serve_exporter_json(admin, fd);
+    }
+    else if (strncmp(buf, "GET /api/observability/metrics.json", 35) == 0) {
+        serve_metrics_json(admin, fd);
+    }
+    else if (strncmp(buf, "GET /api/observability/metrics.prom", 35) == 0) {
+        serve_metrics_prom(admin, fd);
     }
     else {
         const char *resp =
@@ -5884,6 +6223,11 @@ void keel_admin_set_throttle_rules(keel_admin_t *admin,
 
 void keel_admin_set_discovery(keel_admin_t *admin, keel_discovery_t *discovery) {
     if (admin) admin->discovery = discovery;
+}
+
+void keel_admin_set_otlp_exporter(keel_admin_t *admin,
+                                  struct keel_otlp_exporter *exporter) {
+    if (admin) admin->otlp_exporter = exporter;
 }
 
 uint16_t keel_admin_get_port(const keel_admin_t *admin) {

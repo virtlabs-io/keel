@@ -2581,6 +2581,375 @@ static void test_classify_xa_commit(void) {
 }
 
 /* ============================================================================
+ * 23) Commit-in-doubt: post-COMMIT GTID-token capture
+ * ============================================================================
+ *
+ * MySQL has no native txid_status() equivalent. The plugin instead relies on
+ * MySQL's SESSION_TRACK_GTIDS payload in the OK packet — when the server has
+ * @@SESSION.session_track_gtids='OWN_GTID' it emits the just-committed GTID
+ * inside the OK that closes the COMMIT round-trip. The plugin captures that
+ * GTID into ctx->keel_write_gtid and hashes it into commit_xid so the engine
+ * can later drive the GTID_SUBSET probe built by myf_build_commit_doubt_check
+ * on a replacement backend.
+ *
+ * These tests pin the end-to-end behaviour:
+ *   (a) COMMIT + OK-with-GTID → action.commit_xid_captured && commit_xid != 0.
+ *   (b) COMMIT + plain OK     → no capture (engine falls back to NO_XID).
+ *   (c) COMMIT + ERR          → pending flag is cleared so a later UNRELATED
+ *                                OK-with-GTID does NOT pretend to carry a
+ *                                commit token.
+ */
+
+static void test_commit_xid_captured_on_commit_ok(void) {
+    TEST_BEGIN("commit-doubt: COMMIT + OK(SESSION_TRACK_GTIDS) captures token");
+    void* ctx = do_handshake("user", "db");
+
+    /* FE: arm capture by issuing COMMIT. */
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &fe_act);
+
+    /* BE: server replies with OK carrying SESSION_TRACK_GTIDS. */
+    const char* gtid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-42";
+    uint8_t obuf[512];
+    size_t olen = build_ok_with_session_track_gtids(obuf, 1, 0x0002, gtid);
+    keel_be_action_t be_act;
+    VT->on_be_msg(ctx, obuf, olen, &be_act);
+
+    TEST_ASSERT(be_act.query_complete);
+    TEST_ASSERT(be_act.commit_xid_captured);
+    TEST_ASSERT(be_act.commit_xid != 0);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_commit_xid_not_captured_without_gtid(void) {
+    TEST_BEGIN("commit-doubt: COMMIT + plain OK (no GTID) → no token");
+    void* ctx = do_handshake("user", "db");
+
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &fe_act);
+
+    /* Plain OK packet — no SESSION_TRACK_GTIDS flag in status. */
+    uint8_t obuf[64];
+    size_t olen = build_ok(obuf, 1, 0, 0, 0x0002);
+    keel_be_action_t be_act;
+    VT->on_be_msg(ctx, obuf, olen, &be_act);
+
+    TEST_ASSERT(be_act.query_complete);
+    TEST_ASSERT(!be_act.commit_xid_captured);
+    TEST_ASSERT_EQ(be_act.commit_xid, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_commit_pending_cleared_on_err(void) {
+    TEST_BEGIN("commit-doubt: ERR clears pending so later OK does not falsely capture");
+    void* ctx = do_handshake("user", "db");
+
+    /* FE: COMMIT arms capture. */
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &fe_act);
+
+    /* BE: server returns ERR (e.g. deadlock during COMMIT) — pending must clear. */
+    uint8_t ebuf[128];
+    size_t elen = build_err(ebuf, 1, 1213, "40001", "deadlock");
+    keel_be_action_t be_err;
+    VT->on_be_msg(ctx, ebuf, elen, &be_err);
+    TEST_ASSERT(be_err.is_error_response);
+
+    /* Now drive an unrelated SELECT and have its OK carry a (spurious) GTID. */
+    uint8_t qbuf2[64];
+    size_t qlen2 = build_com_query(qbuf2, 0, "SELECT 1");
+    keel_fe_action_t fe_act2;
+    VT->on_fe_msg(ctx, qbuf2, qlen2, &fe_act2);
+
+    const char* gtid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-99";
+    uint8_t obuf[512];
+    size_t olen = build_ok_with_session_track_gtids(obuf, 1, 0x0002, gtid);
+    keel_be_action_t be_ok;
+    VT->on_be_msg(ctx, obuf, olen, &be_ok);
+
+    /* The OK ended a non-COMMIT round-trip — commit_xid must NOT be captured. */
+    TEST_ASSERT(!be_ok.commit_xid_captured);
+    TEST_ASSERT_EQ(be_ok.commit_xid, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_build_commit_doubt_check_with_gtid(void) {
+    TEST_BEGIN("commit-doubt: build_commit_doubt_check emits GTID_SUBSET probe");
+    void* ctx = do_handshake("user", "db");
+
+    /* Plant a GTID via the public notify_write_lsn API. */
+    const char* gtid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-42";
+    VT->notify_write_lsn(ctx, gtid);
+
+    uint8_t out[1024];
+    ssize_t n = VT->build_commit_doubt_check(ctx, /*xid=*/1, out, sizeof(out));
+    TEST_ASSERT(n > MY_HDR + 1);
+
+    /* Frame: COM_QUERY (0x03) followed by SQL containing the GTID. */
+    TEST_ASSERT_EQ(out[MY_HDR], 0x03);
+    /* The exact SQL we expect: SELECT GTID_SUBSET('<gtid>', @@global.gtid_executed) */
+    const char* sql = (const char*)(out + MY_HDR + 1);
+    TEST_ASSERT(strstr(sql, "GTID_SUBSET") != NULL);
+    TEST_ASSERT(strstr(sql, gtid) != NULL);
+    TEST_ASSERT(strstr(sql, "@@global.gtid_executed") != NULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_build_commit_doubt_check_rejects_empty_gtid(void) {
+    TEST_BEGIN("commit-doubt: build_commit_doubt_check returns 0 when GTID empty");
+    void* ctx = do_handshake("user", "db");
+
+    /* No notify_write_lsn — keel_write_gtid is empty. */
+    uint8_t out[1024];
+    ssize_t n = VT->build_commit_doubt_check(ctx, /*xid=*/1, out, sizeof(out));
+    TEST_ASSERT_EQ(n, 0);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_build_commit_doubt_check_rejects_bad_charset(void) {
+    TEST_BEGIN("commit-doubt: build_commit_doubt_check rejects injection chars");
+    void* ctx = do_handshake("user", "db");
+
+    /* notify_write_lsn does no validation, so we can plant a malicious GTID
+     * directly. The hook itself MUST reject it before formatting. */
+    VT->notify_write_lsn(ctx, "1'; DROP TABLE x; --");
+
+    uint8_t out[1024];
+    ssize_t n = VT->build_commit_doubt_check(ctx, /*xid=*/1, out, sizeof(out));
+    TEST_ASSERT_EQ(n, -1);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
+ * 24) Statement-compat profile hashes
+ * ============================================================================
+ *
+ * The engine uses keel_stmt_compat_profile_t to decide whether a returning
+ * backend can safely resume an existing session. PG fills the full profile
+ * (role / search_path / GUC / schema_epoch). These tests pin MySQL to the
+ * same contract: handshake seeds role_hash + db_hash, USE / COM_INIT_DB
+ * bumps the schema epoch, tracked SETs fold into guc_hash, and any
+ * untracked SET flips semantic_unknown so the engine refuses reuse.
+ */
+
+static void test_compat_profile_handshake_seeds_hashes(void) {
+    TEST_BEGIN("compat: handshake populates role_hash and search_path_hash");
+    void* ctx = do_handshake("alice", "shop");
+
+    keel_stmt_compat_profile_t p;
+    int rc = VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT(p.role_hash != 0);
+    TEST_ASSERT(p.search_path_hash != 0);
+    TEST_ASSERT_EQ(p.search_path_hash, p.schema_epoch);
+    TEST_ASSERT(!p.semantic_unknown);
+    TEST_ASSERT_EQ(p.guc_hash, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_compat_profile_distinct_role_db_hashes(void) {
+    TEST_BEGIN("compat: different role/db produce different hashes");
+    void* a = do_handshake("alice", "shop");
+    void* b = do_handshake("bob",   "shop");
+    void* c = do_handshake("alice", "billing");
+
+    keel_stmt_compat_profile_t pa, pb, pc;
+    VT->get_stmt_compat_profile(a, &pa);
+    VT->get_stmt_compat_profile(b, &pb);
+    VT->get_stmt_compat_profile(c, &pc);
+
+    TEST_ASSERT(pa.role_hash != pb.role_hash);
+    TEST_ASSERT(pa.search_path_hash == pb.search_path_hash);
+    TEST_ASSERT(pa.role_hash == pc.role_hash);
+    TEST_ASSERT(pa.search_path_hash != pc.search_path_hash);
+
+    VT->destroy_context(a);
+    VT->destroy_context(b);
+    VT->destroy_context(c);
+    TEST_END();
+}
+
+static void test_compat_profile_com_init_db_updates_db_hash(void) {
+    TEST_BEGIN("compat: COM_INIT_DB bumps search_path_hash");
+    void* ctx = do_handshake("user", "shop");
+
+    keel_stmt_compat_profile_t before;
+    VT->get_stmt_compat_profile(ctx, &before);
+
+    uint8_t buf[64];
+    size_t len = build_com_with_payload(buf, 0, 0x02 /*COM_INIT_DB*/, "billing");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, buf, len, &fe_act);
+
+    keel_stmt_compat_profile_t after;
+    VT->get_stmt_compat_profile(ctx, &after);
+    TEST_ASSERT(before.search_path_hash != after.search_path_hash);
+    TEST_ASSERT(before.schema_epoch     != after.schema_epoch);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_compat_profile_tracked_set_updates_guc_hash(void) {
+    TEST_BEGIN("compat: SET sql_mode folds into guc_hash without opacifying");
+    void* ctx = do_handshake("user", "db");
+
+    uint8_t buf[128];
+    size_t len = build_com_query(buf, 0, "SET sql_mode='STRICT_ALL_TABLES'");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, buf, len, &fe_act);
+
+    keel_stmt_compat_profile_t p;
+    VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT(p.guc_hash != 0);
+    TEST_ASSERT(!p.semantic_unknown);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_compat_profile_user_variable_flips_unknown(void) {
+    TEST_BEGIN("compat: SET @user_var flips semantic_unknown to true");
+    void* ctx = do_handshake("user", "db");
+
+    uint8_t buf[128];
+    size_t len = build_com_query(buf, 0, "SET @foo = 1");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, buf, len, &fe_act);
+
+    keel_stmt_compat_profile_t p;
+    VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT(p.semantic_unknown);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_compat_profile_set_names_is_tracked(void) {
+    TEST_BEGIN("compat: SET NAMES is tracked, not opaque");
+    void* ctx = do_handshake("user", "db");
+
+    uint8_t buf[128];
+    size_t len = build_com_query(buf, 0, "SET NAMES utf8mb4");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, buf, len, &fe_act);
+
+    keel_stmt_compat_profile_t p;
+    VT->get_stmt_compat_profile(ctx, &p);
+    TEST_ASSERT(!p.semantic_unknown);
+    TEST_ASSERT(p.guc_hash != 0);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
+ * 25) MySQL commit-in-doubt soundness guarantees
+ * ============================================================================
+ *
+ * Phase B (the pre-COMMIT GTID probe that rewrote COMMIT into a
+ * multi-statement `SELECT @@gtid_executed;COMMIT`) has been removed: the
+ * captured @@gtid_executed set was, by construction, ALREADY a subset of any
+ * later @@global.gtid_executed, so the resulting GTID_SUBSET() probe would
+ * always return 1 — falsely resolving a lost COMMIT as committed.
+ *
+ * These tests pin the post-Phase-B contract:
+ *   (a) The handshake response MUST NOT advertise MULTI_STATEMENTS or
+ *       MULTI_RESULTS (Phase B was the only consumer; leaving them off keeps
+ *       the upstream MySQL default of rejecting client multi-statement
+ *       bundles, which has SQL-injection surface implications).
+ *   (b) A bare COMMIT MUST be forwarded byte-for-byte.
+ *   (c) A stale ctx->keel_write_gtid (populated by notify_write_lsn for RYW)
+ *       MUST NOT be promoted into a commit token when the COMMIT's OK packet
+ *       did not actually deliver a fresh SESSION_TRACK_GTIDS entry. This is
+ *       the negative proof that a pre-existing GTID set cannot resolve a
+ *       lost COMMIT as committed.
+ * ============================================================================ */
+
+static void test_handshake_does_not_advertise_multi_statements(void) {
+    TEST_BEGIN("handshake: MULTI_STATEMENTS|MULTI_RESULTS are NOT advertised");
+    void* ctx = VT->create_context(NULL);
+    uint8_t buf[512];
+    ssize_t n = VT->generate_startup(ctx, "u", "d", buf, sizeof(buf));
+    TEST_ASSERT(n > MY_HDR + 4);
+    uint32_t caps = (uint32_t)buf[MY_HDR + 0]
+                  | ((uint32_t)buf[MY_HDR + 1] << 8)
+                  | ((uint32_t)buf[MY_HDR + 2] << 16)
+                  | ((uint32_t)buf[MY_HDR + 3] << 24);
+    TEST_ASSERT(!(caps & (1U << 16)));  /* CLIENT_MULTI_STATEMENTS */
+    TEST_ASSERT(!(caps & (1U << 17)));  /* CLIENT_MULTI_RESULTS    */
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_commit_forwarded_unchanged(void) {
+    TEST_BEGIN("commit-doubt: bare COMMIT is forwarded byte-for-byte");
+    void* ctx = do_handshake("user", "db");
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &act);
+    TEST_ASSERT_EQ(act.be_payload, qbuf);
+    TEST_ASSERT_EQ(act.be_payload_len, qlen);
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_stale_gtid_does_not_resolve_lost_commit(void) {
+    TEST_BEGIN("commit-doubt: stale keel_write_gtid + plain OK → no capture");
+    void* ctx = do_handshake("user", "db");
+
+    /* Simulate a pre-existing GTID set in the context: in production this
+     * field can be populated by notify_write_lsn() (engine-side RYW token
+     * intercept) or by SESSION_TRACK_GTIDS from a PRIOR round-trip. */
+    VT->notify_write_lsn(ctx, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-100");
+
+    /* FE: COMMIT arms commit_pending. */
+    uint8_t qbuf[64];
+    size_t qlen = build_com_query(qbuf, 0, "COMMIT");
+    keel_fe_action_t fe_act;
+    VT->on_fe_msg(ctx, qbuf, qlen, &fe_act);
+
+    /* BE: server replies with a plain OK — NO SESSION_TRACK_GTIDS entry.
+     * This represents either (a) a server with session_track_gtids != OWN_GTID
+     * or (b) the engine’s view of a lost OK reconstructed from a different
+     * backend.  In both cases the plugin MUST NOT promote the stale GTID into
+     * a commit token, because doing so would let `GTID_SUBSET(<stale_set>,
+     * @@global.gtid_executed)` falsely report the lost COMMIT as committed. */
+    uint8_t obuf[64];
+    size_t  olen = build_ok(obuf, 1, 0, 0, 0x0002);
+    keel_be_action_t be_act;
+    VT->on_be_msg(ctx, obuf, olen, &be_act);
+
+    TEST_ASSERT(be_act.query_complete);
+    TEST_ASSERT(!be_act.commit_xid_captured);
+    TEST_ASSERT_EQ(be_act.commit_xid, 0ULL);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* ============================================================================
  * main()
  * ============================================================================ */
 
@@ -2732,6 +3101,27 @@ int main(void)
     test_classify_do_is_write();
     test_classify_xa_start();
     test_classify_xa_commit();
+
+    /* 23) Commit-in-doubt: post-COMMIT GTID-token capture */
+    test_commit_xid_captured_on_commit_ok();
+    test_commit_xid_not_captured_without_gtid();
+    test_commit_pending_cleared_on_err();
+    test_build_commit_doubt_check_with_gtid();
+    test_build_commit_doubt_check_rejects_empty_gtid();
+    test_build_commit_doubt_check_rejects_bad_charset();
+
+    /* 24) Statement-compat profile hashes */
+    test_compat_profile_handshake_seeds_hashes();
+    test_compat_profile_distinct_role_db_hashes();
+    test_compat_profile_com_init_db_updates_db_hash();
+    test_compat_profile_tracked_set_updates_guc_hash();
+    test_compat_profile_user_variable_flips_unknown();
+    test_compat_profile_set_names_is_tracked();
+
+    /* 25) MySQL commit-in-doubt soundness guarantees */
+    test_handshake_does_not_advertise_multi_statements();
+    test_commit_forwarded_unchanged();
+    test_stale_gtid_does_not_resolve_lost_commit();
 
     printf("\n=== Summary ===\n");
     return test_summary();

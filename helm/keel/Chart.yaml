@@ -4,9 +4,9 @@ description: High-performance database connection pooler for PostgreSQL and MySQ
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-home: https://github.com/virtlabs-io/dbcp-keel
+home: https://github.com/virtlabs-io/keel
 sources:
-  - https://github.com/virtlabs-io/dbcp-keel
+  - https://github.com/virtlabs-io/keel
 maintainers:
   - name: virtlabs-io
     url: https://github.com/virtlabs-io
@@ -17,4 +17,4 @@ keywords:
   - mysql
   - proxy
   - io-uring
-icon: https://raw.githubusercontent.com/virtlabs-io/dbcp-keel/main/docs/logo.png
+icon: https://raw.githubusercontent.com/virtlabs-io/keel/main/docs/logo.png
