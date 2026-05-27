@@ -481,6 +481,9 @@ add_subdirectory(src/log)
 # SQL parser library
 add_subdirectory(src/sql)
 
+# Parser plugin registry and builtin parser plugins
+add_subdirectory(src/parser)
+
 # Core library (auth, config, router)
 add_subdirectory(src/core)
 

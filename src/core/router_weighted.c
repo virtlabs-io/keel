@@ -21,6 +21,7 @@
 #include "keel/core/ini.h"
 #include "keel/core/config_reload.h"
 #include "keel/core/scatter_2pc.h"
+#include "keel/parser/parser_registry.h"
 #include "keel/sql/query_tree.h"
 #include "keel/sql/sql_ast.h"
 #include "keel/sql/sql.h"
@@ -34,6 +35,26 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+
+static keel_qt_query_t* router_parse_postgresql_sql(keel_str_t sql,
+                                                    keel_parse_result_t* result)
+{
+    if (!result) return NULL;
+
+    const keel_parser_plugin_ops_t* ops = keel_parser_builtin_postgresql_sql();
+    keel_parse_input_t input = {
+        .data = (const uint8_t*)sql.data,
+        .len = sql.len,
+        .language = KEEL_LANG_SQL,
+        .dialect = KEEL_DIALECT_SQL_POSTGRESQL,
+    };
+
+    keel_parse_status_t st = ops->parse(&input, result);
+    if (st != KEEL_PARSE_OK) {
+        return NULL;
+    }
+    return keel_parse_result_legacy_qt(result);
+}
 
 /* ============================================================================
  * Default timing constants
@@ -1043,14 +1064,14 @@ keel_error_t keel_router_route_sql(keel_router_t* router,
         return KEEL_ERR_INVALID_ARG;
     }
     
-    /* Reset arena for this parse */
-    keel_arena_reset(router->temp_arena);
-    
-    /* Parse and analyze the query */
-    keel_qt_query_t* qt = keel_sql_analyze_full(sql, router->temp_arena);
-    
-    /* Route using Query Tree (may be NULL for parse errors) */
-    return keel_router_route(router, qt, session, decision);
+    /* Parse through the frontend-bound parser plugin contract. */
+    keel_parse_result_t parse;
+    keel_qt_query_t* qt = router_parse_postgresql_sql(sql, &parse);
+
+    /* Route using Query Tree bridge (may be NULL for parse errors). */
+    keel_error_t err = keel_router_route(router, qt, session, decision);
+    keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
+    return err;
 }
 
 /**
@@ -1110,25 +1131,30 @@ keel_error_t keel_router_route_sharded_sql_bound(keel_router_t* router,
         return KEEL_ERR_INVALID_ARG;
     }
 
-    keel_arena_reset(router->temp_arena);
-    keel_qt_query_t* qt = keel_sql_analyze_full(sql, router->temp_arena);
+    keel_parse_result_t parse;
+    keel_qt_query_t* qt = router_parse_postgresql_sql(sql, &parse);
     if (!qt || !qt->ast) {
+        keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
         return KEEL_ERR_SQL_PARSE;
     }
 
     keel_shard_key_t shard_key;
     keel_error_t err = keel_shard_extract_key_ast(qt->ast, rule, &shard_key);
     if (err != KEEL_OK) {
+        keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
         return err;
     }
 
     size_t shard_index = SIZE_MAX;
     err = keel_shard_map_key_bound(&shard_key, params, rule->shard_count, &shard_index);
     if (err != KEEL_OK) {
+        keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
         return err;
     }
 
-    return route_internal(router, qt, session, true, shard_index, decision);
+    err = route_internal(router, qt, session, true, shard_index, decision);
+    keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
+    return err;
 }
 
 /**
@@ -3635,10 +3661,13 @@ keel_error_t keel_router_dispatch_sql(keel_router_t*                   router,  
     }
 
     pthread_mutex_lock(&router->dispatch_mutex);
-    keel_arena_reset(router->temp_arena);
 
-    /* Parse once; reused for the SINGLE routing path. */
-    keel_qt_query_t* qt = keel_sql_analyze_full(sql, router->temp_arena);
+    keel_error_t result = KEEL_ERR_NOT_SUPPORTED;
+    keel_parse_result_t parse;
+
+    /* Parse once through the configured parser contract; reused for the
+     * SINGLE routing path and transitional sharding bridge. */
+    keel_qt_query_t* qt = router_parse_postgresql_sql(sql, &parse);
 
     /* ---------------------------------------------------------------------- */
     /* Fail-closed gate: WITH RECURSIVE across sharded tables.                */
@@ -3677,12 +3706,10 @@ keel_error_t keel_router_dispatch_sql(keel_router_t*                   router,  
             snprintf(out->reject_message, sizeof out->reject_message,
                 "WITH RECURSIVE across sharded tables is not supported "
                 "(silent-wrong-result risk); pin the session or run on a single shard");
-            pthread_mutex_unlock(&router->dispatch_mutex);
-            return KEEL_ERR_NOT_SUPPORTED;
+            result = KEEL_ERR_NOT_SUPPORTED;
+            goto dispatch_done;
         }
     }
-
-    keel_error_t result = KEEL_ERR_NOT_SUPPORTED;
 
     /* Iterate registered rules looking for the first non-UNSUPPORTED outcome. */
     for (size_t i = 0; i < router->shard_rule_count; i++) {
@@ -3950,6 +3977,7 @@ dispatch_done:
             }
         }
     }
+    keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
     pthread_mutex_unlock(&router->dispatch_mutex);
     return result;
 }
