@@ -17,6 +17,9 @@ jobs:
       contents: write
     env:
       HAS_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_PRIVATE_KEY != '' }}
+      # Pre-release tags (alpha / beta / rc) are allowed to publish unsigned
+      # artifacts with a warning; production tags still require a signing key.
+      IS_PRERELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || startsWith(github.ref_name, 'alpha-') || startsWith(github.ref_name, 'beta-') || startsWith(github.ref_name, 'rc-')) }}
 
     steps:
       - name: Checkout
@@ -114,12 +117,18 @@ jobs:
           done
 
       - name: Fail when signing is not configured for a tagged release
-        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true'
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true' && env.IS_PRERELEASE_TAG != 'true'
         run: |
           echo "::error::PACKAGE_SIGNING_PRIVATE_KEY secret is not configured." >&2
-          echo "::error::Tagged releases must publish signed artifacts; refusing to continue." >&2
+          echo "::error::Production tagged releases must publish signed artifacts; refusing to continue." >&2
           echo "::error::Configure the PACKAGE_SIGNING_PRIVATE_KEY (and optionally PACKAGE_SIGNING_PASSPHRASE) repository secret, or delete the tag." >&2
           exit 1
+
+      - name: Warn when signing is not configured (pre-release tag)
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true' && env.IS_PRERELEASE_TAG == 'true'
+        run: |
+          echo "::warning::PACKAGE_SIGNING_PRIVATE_KEY not configured; pre-release tag ${{ github.ref_name }} will publish UNSIGNED artifacts." >&2
+          echo "::warning::Configure the secret before tagging a production release." >&2
 
       - name: Warn when signing is not configured (non-tag build)
         if: ${{ !startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true' }}

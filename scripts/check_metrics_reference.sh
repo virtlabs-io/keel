@@ -67,20 +67,21 @@ is_allowlisted() {
 }
 
 missing_in_doc=()
-for n in "${code_names[@]}"; do
-    if ! printf '%s\n' "${doc_names[@]}" | grep -qxF "$n"; then
-        missing_in_doc+=("$n")
-    fi
-done
-
 missing_in_code=()
-for n in "${doc_names[@]}"; do
-    if ! printf '%s\n' "${code_names[@]}" | grep -qxF "$n"; then
-        if ! is_allowlisted "$n"; then
-            missing_in_code+=("$n")
-        fi
-    fi
-done
+if (( ${#code_names[@]} > 0 || ${#doc_names[@]} > 0 )); then
+    # Use comm against sorted, unique files instead of nested grep loops:
+    # the per-iteration `printf | grep` form is O(N*M) and forks ~N*M
+    # processes which races under parallel ctest -j load.
+    code_file=$(mktemp); doc_file=$(mktemp)
+    trap 'rm -f "$code_file" "$doc_file"' EXIT
+    printf '%s\n' "${code_names[@]}" | LC_ALL=C sort -u > "$code_file"
+    printf '%s\n' "${doc_names[@]}"  | LC_ALL=C sort -u > "$doc_file"
+    mapfile -t missing_in_doc < <(LC_ALL=C comm -23 "$code_file" "$doc_file")
+    mapfile -t doc_only       < <(LC_ALL=C comm -13 "$code_file" "$doc_file")
+    for n in "${doc_only[@]}"; do
+        is_allowlisted "$n" || missing_in_code+=("$n")
+    done
+fi
 
 status=0
 if (( ${#missing_in_doc[@]} > 0 )); then

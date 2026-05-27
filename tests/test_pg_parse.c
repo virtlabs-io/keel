@@ -44,7 +44,12 @@ static long long query_int(PGconn *conn, const char *sql) {
 int main(void) {
     const char *conninfo = "host=127.0.0.1 port=15432 user=postgres dbname=postgres";
     PGconn *conn = PQconnectdb(conninfo);
-    if (PQstatus(conn) != CONNECTION_OK) die(conn, "connect");
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "SKIP: no PostgreSQL on 127.0.0.1:15432 (%s)\n",
+                PQerrorMessage(conn));
+        PQfinish(conn);
+        return 77; /* CTest SKIP_RETURN_CODE */
+    }
 
     /* Setup */
     exec_ok(conn, "DROP TABLE IF EXISTS public.ssv_ugly_target");

@@ -2757,6 +2757,7 @@ if(KEEL_HAS_LIBPQ)
     add_test(NAME test_pg_parse COMMAND test_pg_parse)
     set_tests_properties(test_pg_parse PROPERTIES
         LABELS "e2e;integration"
+        SKIP_RETURN_CODE 77
         TIMEOUT 60)
 endif()
 
