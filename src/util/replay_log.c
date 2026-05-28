@@ -7,6 +7,7 @@
 
 #include "keel/util/encoding.h"
 #include "keel/util/util.h"
+#include "keel/mem/mem.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -71,7 +72,7 @@ keel_error_t keel_replay_log_open(const keel_replay_log_config_t* config,
     }
     *out = NULL;
 
-    keel_replay_log_t* log = calloc(1, sizeof *log);
+    keel_replay_log_t* log = keel_calloc(1, sizeof *log);
     if (!log) {
         return KEEL_ERR_NOMEM;
     }
@@ -82,7 +83,7 @@ keel_error_t keel_replay_log_open(const keel_replay_log_config_t* config,
 
     log->fp = fopen(config->path, "a");
     if (!log->fp) {
-        free(log);
+        keel_free(log);
         return KEEL_ERR_IO;
     }
 
@@ -203,5 +204,5 @@ void keel_replay_log_close(keel_replay_log_t* log)
         (void)keel_replay_log_flush(log);
         fclose(log->fp);
     }
-    free(log);
+    keel_free(log);
 }
