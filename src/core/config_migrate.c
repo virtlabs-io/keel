@@ -28,6 +28,7 @@
  */
 
 #include "keel/core/config_migrate.h"
+#include "keel/mem/mem.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -176,7 +177,7 @@ static int strbuf_reserve(strbuf_t* b, size_t need) {
     if (b->cap >= need) return 0;
     size_t cap = b->cap ? b->cap : 1024;
     while (cap < need) cap *= 2;
-    char* nd = (char*)realloc(b->data, cap);
+    char* nd = (char*)keel_realloc(b->data, cap);
     if (!nd) return -1;
     b->data = nd;
     b->cap  = cap;
@@ -283,28 +284,28 @@ keel_error_t keel_config_migrate(FILE* in, FILE* out) {
         size_t prelude_len  = strlen(prelude);
         strbuf_t out_buf = { 0 };
         if (strbuf_reserve(&out_buf, prelude_len + buf.len + 1) != 0) {
-            free(buf.data);
+            keel_free(buf.data);
             return KEEL_ERR_NOMEM;
         }
         memcpy(out_buf.data, prelude, prelude_len);
         memcpy(out_buf.data + prelude_len, buf.data, buf.len);
         out_buf.len = prelude_len + buf.len;
         out_buf.data[out_buf.len] = '\0';
-        free(buf.data);
+        keel_free(buf.data);
         buf = out_buf;
     }
 
     if (buf.len > 0) {
         if (fwrite(buf.data, 1, buf.len, out) != buf.len) {
-            free(buf.data);
+            keel_free(buf.data);
             return KEEL_ERR_IO;
         }
     }
-    free(buf.data);
+    keel_free(buf.data);
     return KEEL_OK;
 
 oom:
-    free(buf.data);
+    keel_free(buf.data);
     return KEEL_ERR_NOMEM;
 }
 

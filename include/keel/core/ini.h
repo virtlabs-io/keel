@@ -139,6 +139,27 @@ keel_duration_t keel_config_get_duration(const keel_config_t* config,
                                         keel_duration_t default_val);
 
 /**
+ * @brief Resolve a duration configuration value as an integer count of
+ *        **milliseconds**.
+ *
+ * Thin convenience wrapper around `keel_config_get_duration` for code
+ * that stores timeouts and intervals as `int64_t` / `uint32_t` ms (the
+ * predominant in-memory representation throughout the codebase).
+ * Accepts the same unit suffixes; a bare integer is interpreted as ms.
+ *
+ * @param config Parsed configuration handle.
+ * @param section Section name to search.
+ * @param key Key name within the section.
+ * @param default_ms Fallback in milliseconds when the key is absent or
+ *                   has an invalid unit suffix.
+ * @return Parsed duration in milliseconds, or `default_ms` on failure.
+ */
+int64_t keel_config_get_duration_ms(const keel_config_t* config,
+                                    const char* section,
+                                    const char* key,
+                                    int64_t default_ms);
+
+/**
  * @brief Resolve a configuration value as a byte count.
  *
  * Supported suffixes (case-insensitive) are:

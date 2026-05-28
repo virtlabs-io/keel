@@ -54,6 +54,7 @@ fi
 
 cat > "$cfg" <<EOF
 [keel]
+config_version = 2
 log_level = 0
 
 [worker_group.smoke]

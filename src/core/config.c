@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
 
@@ -458,6 +459,22 @@ keel_duration_t keel_config_get_duration(const keel_config_t* config,
 
     /* Unrecognized unit — reject instead of silently misinterpreting. */
     return default_val;
+}
+
+/**
+ * @brief Convenience wrapper returning a duration in milliseconds.
+ *
+ * Implemented as `keel_config_get_duration(... default_ms * 1ms) / 1ms`
+ * with a fast path that avoids the round-trip when the key is absent.
+ */
+int64_t keel_config_get_duration_ms(const keel_config_t* config,
+                                    const char* section,
+                                    const char* key,
+                                    int64_t default_ms) {
+    keel_duration_t sentinel = (keel_duration_t)INT64_MIN;
+    keel_duration_t ns = keel_config_get_duration(config, section, key, sentinel);
+    if (ns == sentinel) return default_ms;
+    return (int64_t)(ns / 1000000);
 }
 
 /**

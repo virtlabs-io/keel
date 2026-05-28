@@ -1352,11 +1352,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
 
     /* pool_wait_timeout_ms */
     {
-        int64_t new_wt = keel_config_get_int(config, section, "pool_wait_timeout_ms",
+        int64_t new_wt = keel_config_get_duration_ms(config, section, "pool_wait_timeout",
                                               (int64_t)wg->pool_wait_timeout_ms);
         if (new_wt >= 0 && (uint64_t)new_wt != wg->pool_wait_timeout_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] pool_wait_timeout_ms: %llu -> %lld",
+                "[%s] pool_wait_timeout: %llu -> %lld",
                 wg->name, (unsigned long long)wg->pool_wait_timeout_ms, (long long)new_wt);
             wg->pool_wait_timeout_ms = (uint64_t)new_wt;
             if (ecfg) ecfg->pool_wait_timeout_ms = wg->pool_wait_timeout_ms;
@@ -1366,13 +1366,12 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
 
     /* session_max_buffered_bytes */
     {
-        int64_t new_smb = keel_config_get_int(config, section,
-                                               "session_max_buffered_bytes",
+        int64_t new_smb = keel_config_get_bytes(config, section, "session_max_buffered",
                                                (int64_t)wg->session_max_buffered_bytes);
         if (new_smb == 0 || new_smb >= 4096) {
             if ((size_t)new_smb != wg->session_max_buffered_bytes) {
                 KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                    "[%s] session_max_buffered_bytes: %zu -> %lld",
+                    "[%s] session_max_buffered: %zu -> %lld",
                     wg->name, wg->session_max_buffered_bytes, (long long)new_smb);
                 wg->session_max_buffered_bytes = (size_t)new_smb;
                 if (ecfg) ecfg->session_max_buffered_bytes = wg->session_max_buffered_bytes;
@@ -1380,7 +1379,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
             }
         } else if (new_smb > 0) {
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                "[%s] session_max_buffered_bytes=%lld is below minimum 4096; "
+                "[%s] session_max_buffered=%lld is below minimum 4096; "
                 "use 0 (unlimited) or a value >= 4096",
                 wg->name, (long long)new_smb);
         }
@@ -1388,13 +1387,12 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
 
     /* backend_max_replay_bytes */
     {
-        int64_t new_mrb = keel_config_get_int(config, section,
-                                               "backend_max_replay_bytes",
+        int64_t new_mrb = keel_config_get_bytes(config, section, "backend_max_replay",
                                                (int64_t)wg->backend_max_replay_bytes);
         if (new_mrb == 0 || new_mrb >= 4096) {
             if ((size_t)new_mrb != wg->backend_max_replay_bytes) {
                 KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                    "[%s] backend_max_replay_bytes: %zu -> %lld",
+                    "[%s] backend_max_replay: %zu -> %lld",
                     wg->name, wg->backend_max_replay_bytes, (long long)new_mrb);
                 wg->backend_max_replay_bytes = (size_t)new_mrb;
                 if (ecfg) ecfg->backend_max_replay_bytes = wg->backend_max_replay_bytes;
@@ -1402,7 +1400,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
             }
         } else if (new_mrb > 0) {
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                "[%s] backend_max_replay_bytes=%lld is below minimum 4096; "
+                "[%s] backend_max_replay=%lld is below minimum 4096; "
                 "use 0 (unlimited) or a value >= 4096",
                 wg->name, (long long)new_mrb);
         }
@@ -1416,7 +1414,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         int64_t v;
 
         /* idle_timeout_ms */
-        v = keel_config_get_int(config, section, "idle_timeout_ms",
+        v = keel_config_get_duration_ms(config, section, "idle_timeout",
                                  (int64_t)wg->idle_timeout_ms);
         /* Also try human-readable key */
         const char* ts = keel_config_get_string(config, section,
@@ -1431,7 +1429,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
         if (v > 0 && (uint64_t)v != wg->idle_timeout_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] idle_timeout_ms: %llu -> %lld",
+                "[%s] idle_timeout: %llu -> %lld",
                 wg->name, (unsigned long long)wg->idle_timeout_ms, (long long)v);
             wg->idle_timeout_ms = (uint64_t)v;
             if (ecfg) ecfg->idle_timeout_ms = (uint32_t)v;
@@ -1448,7 +1446,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* connect_timeout_ms */
-        v = keel_config_get_int(config, section, "connect_timeout_ms",
+        v = keel_config_get_duration_ms(config, section, "connect_timeout",
                                  (int64_t)wg->connect_timeout_ms);
         ts = keel_config_get_string(config, section, "client_connect_timeout", NULL);
         if (ts) {
@@ -1461,7 +1459,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
         if (v > 0 && (uint64_t)v != wg->connect_timeout_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] connect_timeout_ms: %llu -> %lld",
+                "[%s] connect_timeout: %llu -> %lld",
                 wg->name, (unsigned long long)wg->connect_timeout_ms, (long long)v);
             wg->connect_timeout_ms = (uint64_t)v;
             if (ecfg) ecfg->connect_timeout_ms = (uint32_t)v;
@@ -1469,11 +1467,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* pool_prune_interval_ms */
-        v = keel_config_get_int(config, section, "pool_prune_interval_ms",
+        v = keel_config_get_duration_ms(config, section, "pool_prune_interval",
                                  (int64_t)wg->pool_prune_interval_ms);
         if (v > 0 && (uint32_t)v != wg->pool_prune_interval_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] pool_prune_interval_ms: %u -> %lld",
+                "[%s] pool_prune_interval: %u -> %lld",
                 wg->name, wg->pool_prune_interval_ms, (long long)v);
             wg->pool_prune_interval_ms = (uint32_t)v;
             if (ecfg) ecfg->pool_prune_interval_ms = (uint32_t)v;
@@ -1490,11 +1488,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* pool_refill_interval_ms */
-        v = keel_config_get_int(config, section, "pool_refill_interval_ms",
+        v = keel_config_get_duration_ms(config, section, "pool_refill_interval",
                                  (int64_t)wg->pool_refill_interval_ms);
         if (v >= 100 && (uint32_t)v != wg->pool_refill_interval_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] pool_refill_interval_ms: %u -> %lld",
+                "[%s] pool_refill_interval: %u -> %lld",
                 wg->name, wg->pool_refill_interval_ms, (long long)v);
             wg->pool_refill_interval_ms = (uint32_t)v;
             if (ecfg) ecfg->pool_refill_interval_ms = (uint32_t)v;
@@ -1510,11 +1508,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* pool_refill_backoff_ms */
-        v = keel_config_get_int(config, section, "pool_refill_backoff_ms",
+        v = keel_config_get_duration_ms(config, section, "pool_refill_backoff",
                                  (int64_t)wg->pool_refill_backoff_ms);
         if (v > 0 && (uint32_t)v != wg->pool_refill_backoff_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] pool_refill_backoff_ms: %u -> %lld",
+                "[%s] pool_refill_backoff: %u -> %lld",
                 wg->name, wg->pool_refill_backoff_ms, (long long)v);
             wg->pool_refill_backoff_ms = (uint32_t)v;
             if (ecfg) ecfg->pool_refill_backoff_ms = (uint32_t)v;
@@ -1530,11 +1528,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* pool_wait_timeout_ms */
-        v = keel_config_get_int(config, section, "pool_wait_timeout_ms",
+        v = keel_config_get_duration_ms(config, section, "pool_wait_timeout",
                                  (int64_t)wg->pool_wait_timeout_ms);
         if (v >= 0 && (uint64_t)v != wg->pool_wait_timeout_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] pool_wait_timeout_ms: %llu -> %lld",
+                "[%s] pool_wait_timeout: %llu -> %lld",
                 wg->name, (unsigned long long)wg->pool_wait_timeout_ms, (long long)v);
             wg->pool_wait_timeout_ms = (uint64_t)v;
             if (ecfg) ecfg->pool_wait_timeout_ms = (uint64_t)v;
@@ -1542,12 +1540,12 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         /* session_max_buffered_bytes */
-        v = keel_config_get_int(config, section, "session_max_buffered_bytes",
+        v = keel_config_get_bytes(config, section, "session_max_buffered",
                                  (int64_t)wg->session_max_buffered_bytes);
         if (v == 0 || v >= 4096) {
             if ((size_t)v != wg->session_max_buffered_bytes) {
                 KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                    "[%s] session_max_buffered_bytes: %zu -> %lld",
+                    "[%s] session_max_buffered: %zu -> %lld",
                     wg->name, wg->session_max_buffered_bytes, (long long)v);
                 wg->session_max_buffered_bytes = (size_t)v;
                 if (ecfg) ecfg->session_max_buffered_bytes = (size_t)v;
@@ -1555,18 +1553,18 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
             }
         } else {
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                "[%s] session_max_buffered_bytes=%lld is below minimum 4096; "
+                "[%s] session_max_buffered=%lld is below minimum 4096; "
                 "use 0 (unlimited) or a value >= 4096",
                 wg->name, (long long)v);
         }
 
         /* backend_max_replay_bytes */
-        v = keel_config_get_int(config, section, "backend_max_replay_bytes",
+        v = keel_config_get_bytes(config, section, "backend_max_replay",
                                  (int64_t)wg->backend_max_replay_bytes);
         if (v == 0 || v >= 4096) {
             if ((size_t)v != wg->backend_max_replay_bytes) {
                 KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                    "[%s] backend_max_replay_bytes: %zu -> %lld",
+                    "[%s] backend_max_replay: %zu -> %lld",
                     wg->name, wg->backend_max_replay_bytes, (long long)v);
                 wg->backend_max_replay_bytes = (size_t)v;
                 if (ecfg) ecfg->backend_max_replay_bytes = (size_t)v;
@@ -1574,7 +1572,7 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
             }
         } else {
             KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                "[%s] backend_max_replay_bytes=%lld is below minimum 4096; "
+                "[%s] backend_max_replay=%lld is below minimum 4096; "
                 "use 0 (unlimited) or a value >= 4096",
                 wg->name, (long long)v);
         }
@@ -1718,11 +1716,11 @@ static int reload_worker_group(keel_config_t* config, worker_group_t* wg) {
         }
 
         int64_t v;
-        v = keel_config_get_int(config, section, "rebalance_interval_ms",
+        v = keel_config_get_duration_ms(config, section, "rebalance_interval",
                                  (int64_t)wg->rebalance_interval_ms);
         if (v > 0 && (uint32_t)v != wg->rebalance_interval_ms) {
             KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
-                "[%s] rebalance_interval_ms: %u -> %lld",
+                "[%s] rebalance_interval: %u -> %lld",
                 wg->name, wg->rebalance_interval_ms, (long long)v);
             wg->rebalance_interval_ms = (uint32_t)v;
             ecfg->rebalance_interval_ms = (uint32_t)v;
@@ -3027,6 +3025,31 @@ int main(int argc, char** argv) {
         if (!config) {
             fprintf(stderr, "Warning: Failed to load config file: %s\n", opts.config_file);
         } else {
+            /* Schema version gate: refuse to start on a v1 (pre-rename) INI.
+             * The migrator subcommand (keel --migrate-config IN -o OUT)
+             * converts a v1 file to v2 in place. */
+            int64_t cfg_ver = keel_config_get_int(config, "keel", "config_version", 0);
+            if (cfg_ver != KEEL_CONFIG_SCHEMA_VERSION) {
+                fprintf(stderr,
+                        "keel: configuration schema mismatch in '%s'\n"
+                        "  found:    config_version = %lld\n"
+                        "  required: config_version = %d (in [keel] section)\n"
+                        "\n"
+                        "v2 renames unit-suffixed INI keys (idle_timeout_ms ->\n"
+                        "idle_timeout, session_max_buffered_bytes ->\n"
+                        "session_max_buffered, etc.) and moves the unit into the\n"
+                        "value (e.g. idle_timeout = 5m, session_max_buffered = 64KiB).\n"
+                        "\n"
+                        "To migrate an existing v1 config in place:\n"
+                        "  keel --migrate-config %s -o %s.v2\n",
+                        opts.config_file,
+                        (long long)cfg_ver,
+                        KEEL_CONFIG_SCHEMA_VERSION,
+                        opts.config_file, opts.config_file);
+                keel_config_free(config);
+                return 1;
+            }
+
             /* Compute the config file's directory so that hook script= paths
              * that are relative are resolved correctly regardless of CWD. */
             char config_dir[PATH_MAX] = {0};
@@ -3047,7 +3070,7 @@ int main(int argc, char** argv) {
             
             /* Graceful shutdown drain timeout */
             {
-                int64_t dt = keel_config_get_int(config, "keel", "shutdown_timeout_ms", 30000);
+                int64_t dt = keel_config_get_duration_ms(config, "keel", "shutdown_timeout", 30000);
                 if (dt >= 0) g_config.shutdown_timeout_ms = (uint32_t)dt;
             }
 
@@ -3133,7 +3156,7 @@ int main(int argc, char** argv) {
                 /* Optional operational tuning (sensible defaults applied above) */
                 {
                     int64_t v;
-                    v = keel_config_get_int(config, section, "idle_timeout_ms",
+                    v = keel_config_get_duration_ms(config, section, "idle_timeout",
                                             (int64_t)wg->idle_timeout_ms);
                     if (v > 0) wg->idle_timeout_ms = (uint64_t)v;
 
@@ -3151,7 +3174,7 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    v = keel_config_get_int(config, section, "connect_timeout_ms",
+                    v = keel_config_get_duration_ms(config, section, "connect_timeout",
                                             (int64_t)wg->connect_timeout_ms);
                     if (v > 0) wg->connect_timeout_ms = (uint64_t)v;
 
@@ -3169,38 +3192,38 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    v = keel_config_get_int(config, section, "pool_prune_interval_ms",
+                    v = keel_config_get_duration_ms(config, section, "pool_prune_interval",
                                             (int64_t)wg->pool_prune_interval_ms);
                     if (v > 0) wg->pool_prune_interval_ms = (uint32_t)v;
 
-                    v = keel_config_get_int(config, section, "pool_refill_interval_ms",
+                    v = keel_config_get_duration_ms(config, section, "pool_refill_interval",
                                             (int64_t)wg->pool_refill_interval_ms);
                     if (v >= 100) wg->pool_refill_interval_ms = (uint32_t)v;
 
-                    v = keel_config_get_int(config, section, "pool_refill_backoff_ms",
+                    v = keel_config_get_duration_ms(config, section, "pool_refill_backoff",
                                             (int64_t)wg->pool_refill_backoff_ms);
                     if (v > 0) wg->pool_refill_backoff_ms = (uint32_t)v;
 
                     v = keel_config_get_int(config, section, "pool_max_waiting", 0);
                     if (v >= 0) wg->pool_max_waiting = (uint32_t)v;
 
-                    v = keel_config_get_int(config, section, "pool_wait_timeout_ms", 0);
+                    v = keel_config_get_duration_ms(config, section, "pool_wait_timeout", 0);
                     if (v >= 0) wg->pool_wait_timeout_ms = (uint64_t)v;
 
-                    v = keel_config_get_int(config, section, "session_max_buffered_bytes", 0);
+                    v = keel_config_get_bytes(config, section, "session_max_buffered", 0);
                     if (v == 0 || v >= 4096)
                         wg->session_max_buffered_bytes = (size_t)v;
                     else if (v > 0)
                         KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                            "[%s] session_max_buffered_bytes=%lld below minimum 4096 — ignored",
+                            "[%s] session_max_buffered=%lld below minimum 4096 — ignored",
                             wg->name, (long long)v);
 
-                    v = keel_config_get_int(config, section, "backend_max_replay_bytes", 0);
+                    v = keel_config_get_bytes(config, section, "backend_max_replay", 0);
                     if (v == 0 || v >= 4096)
                         wg->backend_max_replay_bytes = (size_t)v;
                     else if (v > 0)
                         KEEL_LOG_ERROR(KEEL_LOG_CAT_CORE,
-                            "[%s] backend_max_replay_bytes=%lld below minimum 4096 — ignored",
+                            "[%s] backend_max_replay=%lld below minimum 4096 — ignored",
                             wg->name, (long long)v);
 
                     v = keel_config_get_int(config, section, "listen_backlog",
@@ -3218,7 +3241,7 @@ int main(int argc, char** argv) {
                     int64_t sqp = keel_config_get_int(config, section,
                                                       "sqpoll", 0);
                     wg->sqpoll = (sqp != 0);
-                    v = keel_config_get_int(config, section, "sqpoll_idle_ms", 1000);
+                    v = keel_config_get_duration_ms(config, section, "sqpoll_idle", 1000);
                     if (v > 0) wg->sqpoll_idle_ms = (uint32_t)v;
 
                     /* Prepared-statement pooling mode */
@@ -3274,8 +3297,7 @@ int main(int argc, char** argv) {
 
                     /* Sticky-primary TTL */
                     {
-                        int64_t spt = keel_config_get_int(config, section,
-                                                          "sticky_primary_ttl_ms", -1);
+                        int64_t spt = keel_config_get_duration_ms(config, section, "sticky_primary_ttl", -1);
                         if (spt >= 0)
                             wg->sticky_primary_ttl_ms = (uint32_t)spt;
                     }
@@ -3286,7 +3308,7 @@ int main(int argc, char** argv) {
                             config, section, "rebalance", "on");
                         wg->rebalance_enabled = (!rb || strcmp(rb, "off") != 0);
 
-                        v = keel_config_get_int(config, section, "rebalance_interval_ms",
+                        v = keel_config_get_duration_ms(config, section, "rebalance_interval",
                                                 (int64_t)wg->rebalance_interval_ms);
                         if (v > 0) wg->rebalance_interval_ms = (uint32_t)v;
 
@@ -3301,11 +3323,10 @@ int main(int argc, char** argv) {
 
                     /* Scatter-merge memory budget and spill directory */
                     {
-                        /* scatter_merge_max_mem_mb: memory limit in MiB (0 = default 32 MiB) */
-                        int64_t smm = keel_config_get_int(config, section,
-                                                           "scatter_merge_max_mem_mb", 0);
+                        /* scatter_merge_max_mem: memory limit, bytes (e.g. "32MiB"; 0 = default 32 MiB) */
+                        int64_t smm = keel_config_get_bytes(config, section, "scatter_merge_max_mem", 0);
                         if (smm > 0)
-                            wg->scatter_merge_max_mem_bytes = (size_t)smm * 1024U * 1024U;
+                            wg->scatter_merge_max_mem_bytes = (size_t)smm;
                         if (smm > 0)
                             wg->scatter_merge_enabled = true;
 
@@ -3400,10 +3421,10 @@ int main(int argc, char** argv) {
                         }
 
                         /* Timeouts */
-                        int64_t hs_timeout = keel_config_get_int(config, section, "tls_handshake_timeout_ms", 10000);
+                        int64_t hs_timeout = keel_config_get_duration_ms(config, section, "tls_handshake_timeout", 10000);
                         if (hs_timeout > 0) wg->tls_config.handshake_timeout_ms = (size_t)hs_timeout;
 
-                        int64_t read_timeout = keel_config_get_int(config, section, "tls_read_timeout_ms", 30000);
+                        int64_t read_timeout = keel_config_get_duration_ms(config, section, "tls_read_timeout", 30000);
                         if (read_timeout > 0) wg->tls_config.read_timeout_ms = (size_t)read_timeout;
                     }
 
@@ -3487,10 +3508,10 @@ int main(int argc, char** argv) {
                         }
 
                         /* Backend TLS timeouts */
-                        int64_t backend_hs_timeout = keel_config_get_int(config, section, "backend_tls_handshake_timeout_ms", 10000);
+                        int64_t backend_hs_timeout = keel_config_get_duration_ms(config, section, "backend_tls_handshake_timeout", 10000);
                         if (backend_hs_timeout > 0) wg->backend_tls_config.handshake_timeout_ms = (size_t)backend_hs_timeout;
 
-                        int64_t backend_read_timeout = keel_config_get_int(config, section, "backend_tls_read_timeout_ms", 30000);
+                        int64_t backend_read_timeout = keel_config_get_duration_ms(config, section, "backend_tls_read_timeout", 30000);
                         if (backend_read_timeout > 0) wg->backend_tls_config.read_timeout_ms = (size_t)backend_read_timeout;
                     }
                 }
@@ -3871,8 +3892,7 @@ int main(int argc, char** argv) {
                         wg->pool_max_connection_age_ms = (uint64_t)(secs * 1000.0);
                 }
                 {
-                    int64_t mcams = keel_config_get_int(config, section,
-                                                        "max_connection_age_ms", 0);
+                    int64_t mcams = keel_config_get_duration_ms(config, section, "max_connection_age", 0);
                     if (mcams > 0)
                         wg->pool_max_connection_age_ms = (uint64_t)mcams;
                 }
@@ -4320,8 +4340,7 @@ int main(int argc, char** argv) {
                 v = keel_config_get_string(config, "stats", "level", NULL);
                 if (v) g_config.stats_level_str = v;
                 
-                int64_t interval = keel_config_get_int(
-                    config, "stats", "log_interval_ms", 0);
+                int64_t interval = keel_config_get_duration_ms(config, "stats", "log_interval", 0);
                 if (interval > 0) g_config.stats_interval_ms = (uint32_t)interval;
 
                 g_config.hotpath_instr_mask =
@@ -4439,10 +4458,10 @@ int main(int argc, char** argv) {
                 int64_t port = keel_config_get_int(config, "cluster", "listen_port", 9100);
                 if (port > 0 && port <= 65535) g_cluster_cfg.listen_port = (uint16_t)port;
 
-                int64_t hb_int = keel_config_get_int(config, "cluster", "heartbeat_interval_ms", 1000);
+                int64_t hb_int = keel_config_get_duration_ms(config, "cluster", "heartbeat_interval", 1000);
                 if (hb_int > 0) g_cluster_cfg.heartbeat_interval_ms = (uint32_t)hb_int;
 
-                int64_t hb_to = keel_config_get_int(config, "cluster", "heartbeat_timeout_ms", 5000);
+                int64_t hb_to = keel_config_get_duration_ms(config, "cluster", "heartbeat_timeout", 5000);
                 if (hb_to > 0) g_cluster_cfg.heartbeat_timeout_ms = (uint32_t)hb_to;
 
                 int64_t ft = keel_config_get_int(config, "cluster", "failure_threshold", 3);
@@ -4493,8 +4512,7 @@ int main(int argc, char** argv) {
                         g_cluster_cfg.compress_codec = KEEL_CLUSTER_COMPRESS_NONE;
                 }
                 {
-                    int64_t thr = keel_config_get_int(
-                        config, "cluster", "compress_threshold_bytes", 256);
+                    int64_t thr = keel_config_get_bytes(config, "cluster", "compress_threshold", 256);
                     if (thr > 0 && thr <= KEEL_CLUSTER_MAX_PAYLOAD)
                         g_cluster_cfg.compress_threshold_bytes = (uint32_t)thr;
                 }
@@ -4589,13 +4607,13 @@ int main(int argc, char** argv) {
                 int64_t bs = keel_config_get_int(config, "tracing", "batch_size", g_trace_cfg.batch_size);
                 if (bs > 0) g_trace_cfg.batch_size = (uint32_t)bs;
 
-                int64_t fi = keel_config_get_int(config, "tracing", "flush_interval_ms", g_trace_cfg.flush_interval_ms);
+                int64_t fi = keel_config_get_duration_ms(config, "tracing", "flush_interval", g_trace_cfg.flush_interval_ms);
                 if (fi > 0) g_trace_cfg.flush_interval_ms = (uint32_t)fi;
 
                 int64_t rc = keel_config_get_int(config, "tracing", "ring_capacity", g_trace_cfg.ring_capacity);
                 if (rc > 0) g_trace_cfg.ring_capacity = (uint32_t)rc;
 
-                int64_t et = keel_config_get_int(config, "tracing", "export_timeout_ms", g_trace_cfg.export_timeout_ms);
+                int64_t et = keel_config_get_duration_ms(config, "tracing", "export_timeout", g_trace_cfg.export_timeout_ms);
                 if (et > 0) g_trace_cfg.export_timeout_ms = (uint32_t)et;
 
                 const char* proto = keel_config_get_string(config, "tracing", "protocol", NULL);
