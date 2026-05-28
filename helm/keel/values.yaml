@@ -47,7 +47,29 @@ securityContext:
 # Keel Configuration
 # ==============================================================================
 
-# -- Raw keel.ini content. Mounted as /etc/keel/keel.ini.
+# -- Configuration file format. One of "ini" or "yaml".
+# When unset, the chart picks "yaml" if `configYaml` is provided, otherwise
+# "ini" (the historical default, using the raw `config` block below).
+configFormat: ""
+
+# -- Structured YAML configuration. When non-empty, this map is rendered
+# verbatim into the ConfigMap as `keel.yaml`. Nested mappings flatten to the
+# INI form at runtime (e.g. `tls: { handshake_timeout: 5s }` is equivalent to
+# `tls_handshake_timeout = 5s`). Scalars support `${VAR}` env interpolation.
+# Leave empty (the default) to use the raw INI `config` block below.
+configYaml: {}
+  # keel:
+  #   log_level: 2
+  # worker_groups:
+  #   - name: default
+  #     protocol: postgres
+  #     bind_addr: 0.0.0.0
+  #     bind_port: 7432
+  #     servers:
+  #       - { name: primary, host: postgres, port: 5432, role: RW, weight: 100 }
+
+# -- Raw keel.ini content. Mounted as /etc/keel/keel.ini when
+# `configFormat` resolves to "ini" (the default unless `configYaml` is set).
 # Passwords should use env: or file: references — not inline secrets.
 config: |
   [keel]

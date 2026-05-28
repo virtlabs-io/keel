@@ -21,10 +21,13 @@
 #include "keel/mem/mem.h"
 #include "keel/log/log.h"
 
+#include "config_internal.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
 
@@ -294,6 +297,77 @@ void keel_config_free(keel_config_t* config) {
 }
 
 /* ============================================================================
+ * Internal Builder API (consumed by config_yaml.c / migrator / tests)
+ * ============================================================================ */
+
+keel_config_t* keel_config_create_empty(const char* path) {
+    keel_config_t* c = keel_calloc(1, sizeof(keel_config_t));
+    if (!c) return NULL;
+    if (path) {
+        c->path = keel_strdup(path);
+        if (!c->path) {
+            keel_free(c);
+            return NULL;
+        }
+    }
+    return c;
+}
+
+int keel_config_set(keel_config_t* config,
+                    const char* section,
+                    const char* key,
+                    const char* value) {
+    if (!config || !section || !*section || !key || !*key || !value) {
+        return -1;
+    }
+
+    /* Locate (or append) the named section. */
+    config_section_t* s = config->sections;
+    config_section_t* tail = NULL;
+    while (s) {
+        if (strcasecmp(s->name, section) == 0) break;
+        tail = s;
+        s = s->next;
+    }
+    if (!s) {
+        s = keel_calloc(1, sizeof(config_section_t));
+        if (!s) return -1;
+        s->name = keel_strdup(section);
+        if (!s->name) { keel_free(s); return -1; }
+        if (tail) tail->next = s;
+        else      config->sections = s;
+    }
+
+    /* Replace value if the key already exists in this section. */
+    for (struct config_entry* e = s->entries; e; e = e->next) {
+        if (strcasecmp(e->key, key) == 0) {
+            char* nv = keel_strdup(value);
+            if (!nv) return -1;
+            keel_free(e->value);
+            e->value = nv;
+            return 0;
+        }
+    }
+
+    /* Append (preserve insertion order so YAML round-trips read naturally). */
+    struct config_entry* e = keel_calloc(1, sizeof(struct config_entry));
+    if (!e) return -1;
+    e->key   = keel_strdup(key);
+    e->value = keel_strdup(value);
+    if (!e->key || !e->value) {
+        keel_free(e->key); keel_free(e->value); keel_free(e);
+        return -1;
+    }
+    /* Append at tail to keep insertion order; the INI loader prepends for
+     * historical reasons, but ordered append is what callers expect for
+     * iteration. find_entry is case-insensitive on first match either way. */
+    struct config_entry** link = &s->entries;
+    while (*link) link = &(*link)->next;
+    *link = e;
+    return 0;
+}
+
+/* ============================================================================
  * Value Getters
  * ============================================================================ */
 
@@ -412,6 +486,8 @@ bool keel_config_get_bool(const keel_config_t* config,
  * @brief Return a duration value normalized to nanoseconds.
  *
  * Supported suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`.
+ * A bare integer (no suffix) is interpreted as **milliseconds** — matches
+ * the v2 schema where the unit suffix has been removed from key names.
  */
 keel_duration_t keel_config_get_duration(const keel_config_t* config,
                                         const char* section,
@@ -421,29 +497,108 @@ keel_duration_t keel_config_get_duration(const keel_config_t* config,
     if (!str) {
         return default_val;
     }
-    
+
     char* end;
     double val = strtod(str, &end);
-    
-    /* Handle time suffixes */
-    if (*end) {
-        if (strcasecmp(end, "ns") == 0) {
-            return (keel_duration_t)val;
-        } else if (strcasecmp(end, "us") == 0) {
-            return (keel_duration_t)(val * 1000);
-        } else if (strcasecmp(end, "ms") == 0) {
-            return (keel_duration_t)(val * 1000000);
-        } else if (strcasecmp(end, "s") == 0 || *end == '\0') {
-            return (keel_duration_t)(val * 1000000000);
-        } else if (strcasecmp(end, "m") == 0) {
-            return (keel_duration_t)(val * 60 * 1000000000);
-        } else if (strcasecmp(end, "h") == 0) {
-            return (keel_duration_t)(val * 3600 * 1000000000);
+    if (end == str) {
+        return default_val;
+    }
+
+    /* Skip whitespace between number and unit. */
+    while (*end == ' ' || *end == '\t') end++;
+
+    if (*end == '\0') {
+        /* No suffix — bare integer is milliseconds in v2. */
+        return (keel_duration_t)(val * 1000000);
+    }
+    if (strcasecmp(end, "ns") == 0) {
+        return (keel_duration_t)val;
+    }
+    if (strcasecmp(end, "us") == 0) {
+        return (keel_duration_t)(val * 1000);
+    }
+    if (strcasecmp(end, "ms") == 0) {
+        return (keel_duration_t)(val * 1000000);
+    }
+    if (strcasecmp(end, "s") == 0) {
+        return (keel_duration_t)(val * 1000000000.0);
+    }
+    if (strcasecmp(end, "m") == 0) {
+        return (keel_duration_t)(val * 60.0 * 1000000000.0);
+    }
+    if (strcasecmp(end, "h") == 0) {
+        return (keel_duration_t)(val * 3600.0 * 1000000000.0);
+    }
+
+    /* Unrecognized unit — reject instead of silently misinterpreting. */
+    return default_val;
+}
+
+/**
+ * @brief Convenience wrapper returning a duration in milliseconds.
+ *
+ * Implemented as `keel_config_get_duration(... default_ms * 1ms) / 1ms`
+ * with a fast path that avoids the round-trip when the key is absent.
+ */
+int64_t keel_config_get_duration_ms(const keel_config_t* config,
+                                    const char* section,
+                                    const char* key,
+                                    int64_t default_ms) {
+    keel_duration_t sentinel = (keel_duration_t)INT64_MIN;
+    keel_duration_t ns = keel_config_get_duration(config, section, key, sentinel);
+    if (ns == sentinel) return default_ms;
+    return (int64_t)(ns / 1000000);
+}
+
+/**
+ * @brief Return a byte count parsed from a value with optional unit suffix.
+ *
+ * Supported suffixes (case-insensitive):
+ *   B, K/KB, KiB, M/MB, MiB, G/GB, GiB.
+ * A bare integer (no suffix) is interpreted as **bytes**.
+ */
+int64_t keel_config_get_bytes(const keel_config_t* config,
+                              const char* section,
+                              const char* key,
+                              int64_t default_val) {
+    const char* str = keel_config_get_string(config, section, key, NULL);
+    if (!str) {
+        return default_val;
+    }
+
+    char* end;
+    double val = strtod(str, &end);
+    if (end == str) {
+        return default_val;
+    }
+
+    while (*end == ' ' || *end == '\t') end++;
+
+    static const struct {
+        const char* suffix;
+        double      multiplier;
+    } units[] = {
+        { "",    1.0 },
+        { "B",   1.0 },
+        { "K",   1000.0 },
+        { "KB",  1000.0 },
+        { "KiB", 1024.0 },
+        { "M",   1000.0 * 1000.0 },
+        { "MB",  1000.0 * 1000.0 },
+        { "MiB", 1024.0 * 1024.0 },
+        { "G",   1000.0 * 1000.0 * 1000.0 },
+        { "GB",  1000.0 * 1000.0 * 1000.0 },
+        { "GiB", 1024.0 * 1024.0 * 1024.0 },
+    };
+
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        if (strcasecmp(end, units[i].suffix) == 0) {
+            return (int64_t)(val * units[i].multiplier);
         }
     }
-    
-    /* Default to seconds */
-    return (keel_duration_t)(val * 1000000000);
+
+    /* Unrecognized unit — reject. */
+    return default_val;
 }
 
 /* ============================================================================

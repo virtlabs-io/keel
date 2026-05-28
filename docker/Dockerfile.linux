@@ -53,6 +53,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang-format \
     # ── io_uring ───────────────────────────────────────────────────────────
     liburing-dev \
+    # ── YAML configuration parser (hard dep since config v2) ──────────────
+    libyaml-dev \
     # ── TLS / crypto ───────────────────────────────────────────────────────
     libssl-dev \
     ca-certificates \
@@ -196,6 +198,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     # ── io_uring support (Linux 5.6+) ──────────────────────────────────────
     liburing-dev \
+    # ── YAML configuration parser (hard dep since config v2) ──────────────
+    libyaml-dev \
     # ── TLS / authentication ───────────────────────────────────────────────
     libssl-dev \
     libldap2-dev \
@@ -225,6 +229,9 @@ COPY tests/           tests/
 COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/keel/     docker/keel/
+# docs/ is required by lint scripts (e.g. check_metrics_reference) that
+# enforce parity between registered metrics and docs/METRICS_REFERENCE.md.
+COPY docs/            docs/
 
 # Configure and build
 RUN cmake -B build-linux -G Ninja \
@@ -263,6 +270,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Runtime dependencies only (no headers, no build tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing2 \
+    libyaml-0-2 \
     libssl3 \
     libldap2 \
     ca-certificates \

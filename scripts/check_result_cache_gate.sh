@@ -53,6 +53,7 @@ run_check() {
 # ---------------------------------------------------------------------------
 cat > "$TMP/case1_bad.ini" <<'EOINI'
 [keel]
+config_version = 2
 listen_address = 127.0.0.1
 listen_port = 29321
 
@@ -76,6 +77,7 @@ fi
 # ---------------------------------------------------------------------------
 cat > "$TMP/case2_off.ini" <<'EOINI'
 [keel]
+config_version = 2
 listen_address = 127.0.0.1
 listen_port = 29322
 
@@ -98,6 +100,7 @@ fi
 # ---------------------------------------------------------------------------
 cat > "$TMP/case3_exp.ini" <<'EOINI'
 [keel]
+config_version = 2
 listen_address = 127.0.0.1
 listen_port = 29323
 experimental_features = true
@@ -121,6 +124,7 @@ fi
 # ---------------------------------------------------------------------------
 cat > "$TMP/case4_default.ini" <<'EOINI'
 [keel]
+config_version = 2
 listen_address = 127.0.0.1
 listen_port = 29324
 

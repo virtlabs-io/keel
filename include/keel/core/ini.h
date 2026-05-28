@@ -119,9 +119,13 @@ bool keel_config_get_bool(const keel_config_t* config,
 /**
  * @brief Resolve a configuration value as a duration.
  *
- * Supported suffixes are `ns`, `us`, `ms`, `s`, `m`, and `h`. Missing or
- * malformed values fall back to `default_val` so that callers can provide
- * subsystem-specific safe defaults.
+ * Supported suffixes are `ns`, `us`, `ms`, `s`, `m`, and `h`. A bare numeric
+ * value (no suffix) is interpreted as **milliseconds**, which matches the
+ * v2 INI/YAML schema where duration keys no longer carry a `_ms` suffix in
+ * the key name and the unit lives in the value instead.
+ *
+ * Missing or malformed values fall back to `default_val` so that callers can
+ * provide subsystem-specific safe defaults.
  *
  * @param config Parsed configuration handle.
  * @param section Section name to search.
@@ -133,6 +137,53 @@ keel_duration_t keel_config_get_duration(const keel_config_t* config,
                                         const char* section,
                                         const char* key,
                                         keel_duration_t default_val);
+
+/**
+ * @brief Resolve a duration configuration value as an integer count of
+ *        **milliseconds**.
+ *
+ * Thin convenience wrapper around `keel_config_get_duration` for code
+ * that stores timeouts and intervals as `int64_t` / `uint32_t` ms (the
+ * predominant in-memory representation throughout the codebase).
+ * Accepts the same unit suffixes; a bare integer is interpreted as ms.
+ *
+ * @param config Parsed configuration handle.
+ * @param section Section name to search.
+ * @param key Key name within the section.
+ * @param default_ms Fallback in milliseconds when the key is absent or
+ *                   has an invalid unit suffix.
+ * @return Parsed duration in milliseconds, or `default_ms` on failure.
+ */
+int64_t keel_config_get_duration_ms(const keel_config_t* config,
+                                    const char* section,
+                                    const char* key,
+                                    int64_t default_ms);
+
+/**
+ * @brief Resolve a configuration value as a byte count.
+ *
+ * Supported suffixes (case-insensitive) are:
+ *   - `B`                  — bytes (no scaling)
+ *   - `KB`  / `K`          — 1000 bytes        (decimal)
+ *   - `KiB`                — 1024 bytes        (binary)
+ *   - `MB`  / `M`          — 1000² bytes
+ *   - `MiB`                — 1024² bytes
+ *   - `GB`  / `G`          — 1000³ bytes
+ *   - `GiB`                — 1024³ bytes
+ *
+ * A bare numeric value (no suffix) is interpreted as **bytes**. Missing or
+ * malformed values fall back to `default_val`.
+ *
+ * @param config Parsed configuration handle.
+ * @param section Section name to search.
+ * @param key Key name within the section.
+ * @param default_val Fallback byte count when the key is absent or invalid.
+ * @return Parsed byte count, or `default_val` on failure.
+ */
+int64_t keel_config_get_bytes(const keel_config_t* config,
+                              const char* section,
+                              const char* key,
+                              int64_t default_val);
 
 /**
  * @brief Check whether a named section exists in the loaded configuration.

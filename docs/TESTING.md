@@ -49,7 +49,7 @@ sudo apt-get install -y build-essential cmake gcc-13 \
 #### Fedora/RHEL
 
 ```bash
-sudo dnf install cmake gcc openssl-devel liburing-devel
+sudo dnf install cmake gcc openssl-devel libyaml-devel liburing-devel
 ```
 
 #### macOS

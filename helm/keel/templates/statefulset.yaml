@@ -60,7 +60,7 @@ spec:
           args:
             - "keel"
             - "-c"
-            - "/etc/keel/keel.ini"
+            - {{ include "keel.configPath" . | quote }}
           env:
             # Downward API: use the pod name as the cluster node ID
             - name: KEEL_CLUSTER_NODE_ID

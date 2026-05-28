@@ -43,10 +43,10 @@ int keel_otlp_config_load(const keel_config_t* config,
     out_cfg->http.bearer_token = (token && token[0] != '\0') ? token : NULL;
 
     int64_t v;
-    v = keel_config_get_int(config, SECTION, "otlp_timeout_ms", 5000);
+    v = keel_config_get_duration_ms(config, SECTION, "otlp_timeout", 5000);
     if (v > 0 && v <= UINT32_MAX) out_cfg->http.timeout_ms = (uint32_t)v;
 
-    v = keel_config_get_int(config, SECTION, "otlp_interval_ms", 5000);
+    v = keel_config_get_duration_ms(config, SECTION, "otlp_interval", 5000);
     if (v > 0 && v <= UINT32_MAX) out_cfg->interval_ms = (uint32_t)v;
 
     v = keel_config_get_int(config, SECTION, "otlp_max_retries", 2);
@@ -55,7 +55,7 @@ int keel_otlp_config_load(const keel_config_t* config,
     v = keel_config_get_int(config, SECTION, "otlp_queue_capacity", 4);
     if (v > 0 && v <= UINT32_MAX) out_cfg->queue_capacity = (uint32_t)v;
 
-    v = keel_config_get_int(config, SECTION, "otlp_encode_buf_bytes", 65536);
+    v = keel_config_get_bytes(config, SECTION, "otlp_encode_buf", 65536);
     if (v > 0 && v <= UINT32_MAX) out_cfg->encode_buf_bytes = (uint32_t)v;
 
     *out_enabled = enabled && url && url[0] != '\0';

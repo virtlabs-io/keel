@@ -67,6 +67,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     # io_uring (Linux 5.6+)
     liburing-dev \
+    # YAML configuration parser (hard dep since config v2)
+    libyaml-dev \
     # TLS / SCRAM-SHA-256
     libssl-dev \
     ca-certificates \
@@ -137,6 +139,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Runtime-only packages (no headers, no compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing2 \
+    libyaml-0-2 \
     libssl3 \
     ca-certificates \
     # Wire-protocol compression runtimes

@@ -17,6 +17,8 @@ add_library(keelcore STATIC
     cloud_auth.c
     cluster.c
     config.c
+    config_migrate.c
+    config_yaml.c
     query_cache.c
     query_rules.c
     throttle.c
@@ -47,6 +49,15 @@ target_link_libraries(keelcore
     PUBLIC z
     PUBLIC m
 )
+
+# libyaml (hard dep since config v2): prefer the PkgConfig imported target
+# (carries include dirs + libs) but fall back to manual variables.
+if(TARGET PkgConfig::YAML)
+    target_link_libraries(keelcore PUBLIC PkgConfig::YAML)
+else()
+    target_include_directories(keelcore PUBLIC ${YAML_INCLUDE_DIRS})
+    target_link_libraries(keelcore PUBLIC ${YAML_LIBRARIES})
+endif()
 
 # OpenSSL for SCRAM-SHA-256 authentication
 find_package(OpenSSL)

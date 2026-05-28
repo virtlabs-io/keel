@@ -5,6 +5,23 @@ metadata:
   labels:
     {{- include "keel.labels" . | nindent 4 }}
 data:
+{{- if eq (include "keel.configFormat" .) "yaml" }}
+  keel.yaml: |
+{{- if .Values.configYaml }}
+    {{- toYaml .Values.configYaml | nindent 4 }}
+{{- else }}
+    {{- .Values.config | nindent 4 }}
+{{- end }}
+{{- if .Values.cluster.enabled }}
+    cluster:
+      enabled: true
+      listen_addr: 0.0.0.0
+      listen_port: {{ .Values.cluster.port }}
+      heartbeat_interval_ms: {{ .Values.cluster.heartbeatIntervalMs }}
+      heartbeat_timeout_ms: {{ .Values.cluster.heartbeatTimeoutMs }}
+      failure_threshold: {{ .Values.cluster.failureThreshold }}
+{{- end }}
+{{- else }}
   keel.ini: |
     {{- .Values.config | nindent 4 }}
     {{- if .Values.cluster.enabled }}
@@ -17,3 +34,4 @@ data:
     heartbeat_timeout_ms = {{ .Values.cluster.heartbeatTimeoutMs }}
     failure_threshold = {{ .Values.cluster.failureThreshold }}
     {{- end }}
+{{- end }}
