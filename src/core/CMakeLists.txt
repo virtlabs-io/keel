@@ -17,6 +17,7 @@ add_library(keelcore STATIC
     cloud_auth.c
     cluster.c
     config.c
+    config_migrate.c
     query_cache.c
     query_rules.c
     throttle.c

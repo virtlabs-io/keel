@@ -59,6 +59,7 @@
 #include "keel/mem/mem.h"
 #include "keel_error.h"
 #include "keel/core/ini.h"
+#include "keel/core/config_migrate.h"
 #include "keel/core/auth.h"
 #include "keel/log/log.h"
 #include "keel/log/log_plugin.h"
@@ -149,6 +150,8 @@ typedef struct options {
     bool            version;
     bool            strict_auth;   /**< --strict-auth: reject deprecated auth methods at startup */
     bool            check_config;  /**< --check-config: validate config file and exit */
+    const char*     migrate_in;    /**< --migrate-config IN: migrate INI config to v2 and exit */
+    const char*     migrate_out;   /**< --output OUT: destination for --migrate-config (default: stdout) */
 } options_t;
 
 static const struct option long_options[] = {
@@ -162,8 +165,10 @@ static const struct option long_options[] = {
     {"daemon",       no_argument,       NULL, 'd'},
     {"help",         no_argument,       NULL, 'h'},
     {"version",      no_argument,       NULL, 'V'},
-    {"strict-auth",  no_argument,       NULL, 1001},
-    {"check-config", no_argument,       NULL, 1002},
+    {"strict-auth",    no_argument,       NULL, 1001},
+    {"check-config",   no_argument,       NULL, 1002},
+    {"migrate-config", required_argument, NULL, 1003},
+    {"output",         required_argument, NULL, 'o'},
     {NULL, 0, NULL, 0}
 };
 
@@ -198,6 +203,9 @@ static void print_usage(const char* prog) {
     printf("  -V, --version             Show version information\n");
     printf("      --strict-auth         Reject deprecated auth methods (md5, trust) at startup\n");
     printf("      --check-config         Validate configuration file and exit (0=ok, 1=error)\n");
+    printf("      --migrate-config FILE  Migrate an INI config to the current schema (v%d) and exit\n",
+           KEEL_CONFIG_SCHEMA_VERSION);
+    printf("      --output FILE          Destination for --migrate-config (default: stdout)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  %s -c /etc/keel/keel.ini\n", prog);
@@ -277,7 +285,7 @@ static int parse_options(int argc, char** argv, options_t* opts) {
     opts->log_level = 2;    /* INFO */
     
     int c;
-    while ((c = getopt_long(argc, argv, "c:l:p:H:P:w:vdhV", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:l:p:H:P:w:o:vdhV", long_options, NULL)) != -1) {
         switch (c) {
         case 'c':
             opts->config_file = optarg;
@@ -314,6 +322,12 @@ static int parse_options(int argc, char** argv, options_t* opts) {
             break;
         case 1002:
             opts->check_config = true;
+            break;
+        case 1003:
+            opts->migrate_in = optarg;
+            break;
+        case 'o':
+            opts->migrate_out = optarg;
             break;
         case '?':
             return -1;
@@ -2976,6 +2990,19 @@ int main(int argc, char** argv) {
     
     if (opts.version) {
         print_version();
+        return 0;
+    }
+
+    if (opts.migrate_in) {
+        keel_error_t rc = keel_config_migrate_file(opts.migrate_in, opts.migrate_out);
+        if (rc != KEEL_OK) {
+            fprintf(stderr, "keel: --migrate-config: migration failed (%d)\n", (int)rc);
+            return 1;
+        }
+        if (opts.migrate_out && strcmp(opts.migrate_out, "-") != 0) {
+            fprintf(stderr, "keel: migrated %s -> %s (schema v%d)\n",
+                    opts.migrate_in, opts.migrate_out, KEEL_CONFIG_SCHEMA_VERSION);
+        }
         return 0;
     }
 

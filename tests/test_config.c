@@ -13,6 +13,7 @@
 
 #include "test_utils.h"
 #include "keel/core/ini.h"
+#include "keel/core/config_migrate.h"
 #include "keel/mem/mem.h"
 #include <stdio.h>
 #include <string.h>
@@ -732,6 +733,195 @@ static void test_config_keel_example(void) {
 }
 
 /* ============================================================================
+ * Migrator Tests (v1 -> v2)
+ * ============================================================================ */
+
+/**
+ * @brief Run `keel_config_migrate` on the given INI text and return the
+ *        migrated output as a heap-allocated NUL-terminated string.
+ *
+ * Caller frees with free(). Returns NULL on any error.
+ */
+static char* run_migrator(const char* input) {
+    FILE* in = fmemopen((void*)input, strlen(input), "r");
+    if (!in) return NULL;
+
+    char*  out_buf = NULL;
+    size_t out_sz  = 0;
+    FILE*  out     = open_memstream(&out_buf, &out_sz);
+    if (!out) { fclose(in); return NULL; }
+
+    keel_error_t rc = keel_config_migrate(in, out);
+    fclose(in);
+    fclose(out);
+    if (rc != KEEL_OK) { free(out_buf); return NULL; }
+    return out_buf;
+}
+
+static void test_config_migrate_renames_ms_keys(void) {
+    TEST_BEGIN("config migrate renames _ms keys");
+    const char* in =
+        "[keel]\n"
+        "log_level = 2\n"
+        "shutdown_timeout_ms = 30000\n"
+        "\n"
+        "[pool]\n"
+        "idle_timeout_ms = 300000\n"
+        "connect_timeout_ms = 5000\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "config_version = 2") != NULL);
+    TEST_ASSERT(strstr(out, "shutdown_timeout = 30000") != NULL);
+    TEST_ASSERT(strstr(out, "idle_timeout = 300000") != NULL);
+    TEST_ASSERT(strstr(out, "connect_timeout = 5000") != NULL);
+    /* Old names must be gone. */
+    TEST_ASSERT(strstr(out, "shutdown_timeout_ms") == NULL);
+    TEST_ASSERT(strstr(out, "idle_timeout_ms") == NULL);
+    TEST_ASSERT(strstr(out, "connect_timeout_ms") == NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_renames_bytes_keys(void) {
+    TEST_BEGIN("config migrate renames _bytes keys");
+    const char* in =
+        "[pool]\n"
+        "session_max_buffered_bytes = 4194304\n"
+        "backend_max_replay_bytes = 1048576\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "session_max_buffered = 4194304") != NULL);
+    TEST_ASSERT(strstr(out, "backend_max_replay = 1048576") != NULL);
+    TEST_ASSERT(strstr(out, "_bytes") == NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_renames_mb_key(void) {
+    TEST_BEGIN("config migrate renames scatter_merge_max_mem_mb");
+    const char* in = "[worker_group.g1]\nscatter_merge_max_mem_mb = 64\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "scatter_merge_max_mem = 64") != NULL);
+    TEST_ASSERT(strstr(out, "_mb") == NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_preserves_comments_and_whitespace(void) {
+    TEST_BEGIN("config migrate preserves comments and indentation");
+    const char* in =
+        "# top-level comment\n"
+        "[keel]\n"
+        "  # indented comment\n"
+        "    shutdown_timeout_ms   =   30000   # inline\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "# top-level comment") != NULL);
+    TEST_ASSERT(strstr(out, "  # indented comment") != NULL);
+    /* Leading whitespace preserved before the rewritten key. */
+    TEST_ASSERT(strstr(out, "    shutdown_timeout   =   30000   # inline") != NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_injects_keel_section(void) {
+    TEST_BEGIN("config migrate injects [keel] when missing");
+    const char* in = "[pool]\nidle_timeout_ms = 1000\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    /* [keel] must be present at the top with config_version. */
+    TEST_ASSERT(strncmp(out, "[keel]\nconfig_version = 2\n", 26) == 0);
+    /* Original [pool] section is preserved with the renamed key. */
+    TEST_ASSERT(strstr(out, "[pool]\nidle_timeout = 1000") != NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_normalizes_existing_version(void) {
+    TEST_BEGIN("config migrate normalizes existing config_version to 2");
+    const char* in =
+        "[keel]\n"
+        "config_version = 1\n"
+        "log_level = 2\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "config_version = 2") != NULL);
+    /* No double version line. */
+    const char* first = strstr(out, "config_version");
+    TEST_ASSERT_NOT_NULL(first);
+    TEST_ASSERT(strstr(first + 1, "config_version") == NULL);
+    /* No stray "config_version = 1". */
+    TEST_ASSERT(strstr(out, "config_version = 1") == NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_idempotent(void) {
+    TEST_BEGIN("config migrate is idempotent on v2 input");
+    const char* in =
+        "[keel]\n"
+        "config_version = 2\n"
+        "log_level = 2\n"
+        "shutdown_timeout = 30000\n"
+        "[pool]\n"
+        "idle_timeout = 5m\n";
+    char* once = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(once);
+    char* twice = run_migrator(once);
+    TEST_ASSERT_NOT_NULL(twice);
+    TEST_ASSERT_STR_EQ(once, twice);
+    free(once);
+    free(twice);
+    TEST_END();
+}
+
+static void test_config_migrate_leaves_unrelated_keys_alone(void) {
+    TEST_BEGIN("config migrate leaves unrelated keys alone");
+    const char* in =
+        "[keel]\n"
+        "log_level = 2\n"
+        "pool_size = 25\n"
+        "max_client_conn = 100\n"
+        "shard_key_hash = abs\n";
+    char* out = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT(strstr(out, "log_level = 2") != NULL);
+    TEST_ASSERT(strstr(out, "pool_size = 25") != NULL);
+    TEST_ASSERT(strstr(out, "max_client_conn = 100") != NULL);
+    TEST_ASSERT(strstr(out, "shard_key_hash = abs") != NULL);
+    free(out);
+    TEST_END();
+}
+
+static void test_config_migrate_output_is_v2_loadable(void) {
+    TEST_BEGIN("config migrate output round-trips through INI parser");
+    const char* in =
+        "[keel]\n"
+        "log_level = 3\n"
+        "shutdown_timeout_ms = 45000\n"
+        "[pool]\n"
+        "idle_timeout_ms = 120000\n"
+        "session_max_buffered_bytes = 65536\n";
+    char* migrated = run_migrator(in);
+    TEST_ASSERT_NOT_NULL(migrated);
+    TEST_ASSERT(create_test_config_file(migrated));
+    keel_config_t* cfg = keel_config_load(g_test_config_path);
+    TEST_ASSERT_NOT_NULL(cfg);
+    TEST_ASSERT_EQ(keel_config_get_int(cfg, "keel", "config_version", -1), 2);
+    /* Renamed duration key is now bare ms via _get_duration. */
+    keel_duration_t shutdown = keel_config_get_duration(cfg, "keel", "shutdown_timeout", 0);
+    TEST_ASSERT_EQ(shutdown, 45000LL * 1000 * 1000);  /* 45000 ms in ns */
+    keel_duration_t idle = keel_config_get_duration(cfg, "pool", "idle_timeout", 0);
+    TEST_ASSERT_EQ(idle, 120000LL * 1000 * 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(cfg, "pool", "session_max_buffered", -1), 65536);
+    keel_config_free(cfg);
+    cleanup_test_config_file();
+    free(migrated);
+    TEST_END();
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -768,7 +958,18 @@ int main(void) {
     
     /* Real-world tests */
     test_config_keel_example();
-    
+
+    /* Migrator tests (v1 -> v2) */
+    test_config_migrate_renames_ms_keys();
+    test_config_migrate_renames_bytes_keys();
+    test_config_migrate_renames_mb_key();
+    test_config_migrate_preserves_comments_and_whitespace();
+    test_config_migrate_injects_keel_section();
+    test_config_migrate_normalizes_existing_version();
+    test_config_migrate_idempotent();
+    test_config_migrate_leaves_unrelated_keys_alone();
+    test_config_migrate_output_is_v2_loadable();
+
     /* Cleanup */
     keel_mem_shutdown();
     
