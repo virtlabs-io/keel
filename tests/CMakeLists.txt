@@ -463,6 +463,17 @@ target_link_libraries(test_router PRIVATE
 target_link_options(test_router PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router COMMAND test_router)
 
+# Router explainer (read-only per-query simulation)
+add_executable(test_router_explain test_router_explain.c)
+target_link_libraries(test_router_explain PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_router_explain PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_router_explain COMMAND test_router_explain)
+set_tests_properties(test_router_explain PROPERTIES LABELS "core")
+
 # Router Plugin tests (pluggable routing, metadata cache, discovery)
 add_executable(test_router_plugin test_router_plugin.c)
 target_link_libraries(test_router_plugin PRIVATE 

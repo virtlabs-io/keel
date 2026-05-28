@@ -1015,19 +1015,20 @@ static size_t build_write_indices_for_shard(
  * 5. `select_server()` weighted selection.
  * 6. Optional failover to primary when no replica is available.
  */
-static keel_error_t route_internal(keel_router_t* router,
-                                   const keel_qt_query_t* qt,
-                                   const keel_route_session_t* session,
-                                   bool use_shard_filter,
-                                   size_t shard_index,
-                                   keel_route_decision_t* decision) {
+static keel_error_t route_internal_ex(keel_router_t* router,
+                                      const keel_qt_query_t* qt,
+                                      const keel_route_session_t* session,
+                                      bool use_shard_filter,
+                                      size_t shard_index,
+                                      keel_route_decision_t* decision,
+                                      bool simulate) {
     if (!router || !decision) {
         return KEEL_ERR_INVALID_ARG;
     }
 
     memset(decision, 0, sizeof(*decision));
     decision->shard_index = use_shard_filter ? shard_index : SIZE_MAX;
-    router->stats.total_routes++;
+    if (!simulate) router->stats.total_routes++;
 
     /* Commit-in-doubt is sacred: refuse to route any further query while
      * the session has an unresolved COMMIT outcome. The caller (engine) is
@@ -1047,7 +1048,7 @@ static keel_error_t route_internal(keel_router_t* router,
         decision->reason      = "session pinned";
         decision->reason_code = KEEL_ROUTE_REASON_PINNED_SESSION;
         decision->decision_factors |= KEEL_DF_SESSION_PINNED;
-        router->stats.pinned_routes++;
+        if (!simulate) router->stats.pinned_routes++;
         return KEEL_OK;
     }
 
@@ -1093,14 +1094,14 @@ static keel_error_t route_internal(keel_router_t* router,
                 selected = select_server(router, fallback_indices, fallback_count, false);
             }
             if (selected) {
-                router->stats.failover_routes++;
+                if (!simulate) router->stats.failover_routes++;
                 decision->reason      = use_shard_filter ? "single-shard failover to RW" : "failover to RW";
                 decision->reason_code = KEEL_ROUTE_REASON_FAILOVER_PRIMARY;
             }
         }
 
         if (selected) {
-            router->stats.read_routes++;
+            if (!simulate) router->stats.read_routes++;
             if (!decision->reason) {
                 decision->reason      = use_shard_filter ? "single-shard read query" : "read query";
                 decision->reason_code = KEEL_ROUTE_REASON_READ_SPLIT;
@@ -1121,7 +1122,7 @@ static keel_error_t route_internal(keel_router_t* router,
         }
 
         if (selected) {
-            router->stats.write_routes++;
+            if (!simulate) router->stats.write_routes++;
             if (session && session->in_transaction) {
                 decision->reason      = use_shard_filter ? "single-shard transaction" : "in transaction";
                 decision->reason_code = KEEL_ROUTE_REASON_IN_TRANSACTION;
@@ -1172,11 +1173,11 @@ static keel_error_t route_internal(keel_router_t* router,
         return KEEL_ERR_UNAVAILABLE;
     }
 
-    selected->routes++;
+    if (!simulate) selected->routes++;
     decision->server = &selected->config;
 
     /* Per-shard counter for single-shard routed queries */
-    if (use_shard_filter && shard_index < KEEL_SCATTER_MAX_SHARDS) {
+    if (!simulate && use_shard_filter && shard_index < KEEL_SCATTER_MAX_SHARDS) {
         router->stats.shard_single_routes[shard_index]++;
     }
 
@@ -1186,6 +1187,17 @@ static keel_error_t route_internal(keel_router_t* router,
                    decision->reason);
 
     return KEEL_OK;
+}
+
+/* Live-path wrapper: stats mutations enabled. */
+static keel_error_t route_internal(keel_router_t* router,
+                                   const keel_qt_query_t* qt,
+                                   const keel_route_session_t* session,
+                                   bool use_shard_filter,
+                                   size_t shard_index,
+                                   keel_route_decision_t* decision) {
+    return route_internal_ex(router, qt, session, use_shard_filter,
+                             shard_index, decision, /*simulate=*/false);
 }
 
 /**
@@ -1250,6 +1262,200 @@ keel_error_t keel_router_route_sql(keel_router_t* router,
     }
     keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
     return err;
+}
+
+/* ============================================================================
+ * Per-query route explainer (read-only simulation)
+ * ============================================================================ */
+
+static const char* server_role_name(keel_server_role_t r) {
+    switch ((int)r) {
+        case KEEL_SERVER_PRIMARY:    return "rw";
+        case KEEL_SERVER_REPLICA:    return "ro";
+        case KEEL_SERVER_STANDBY:    return "auto";
+        default:                     return "unknown";
+    }
+}
+
+static const char* server_health_name(keel_server_health_t h) {
+    switch ((int)h) {
+        case KEEL_HEALTH_UNKNOWN:     return "unknown";
+        case KEEL_HEALTH_UP:          return "healthy";
+        case KEEL_HEALTH_DEGRADED:    return "degraded";
+        case KEEL_HEALTH_DOWN:        return "down";
+        case KEEL_HEALTH_MAINTENANCE: return "maintenance";
+        default:                      return "unknown";
+    }
+}
+
+/* Fill the eligible-targets table for an explanation. Considers the same
+ * pool the live router would have considered (read-pool vs write-pool) and
+ * marks the row that matches `decision->server` as selected. Safe to call
+ * even when the decision returned an error (will produce an empty table). */
+static void explain_fill_targets(const keel_router_t*       router,
+                                 const keel_route_decision_t* decision,
+                                 keel_route_explanation_t*  out) {
+    if (!router || !out) return;
+    out->target_count = 0;
+
+    bool want_read = decision->is_read;
+    const char* selected_name =
+        (decision->server && decision->server->name)
+            ? decision->server->name
+            : NULL;
+
+    for (size_t i = 0; i < router->server_count
+         && out->target_count < KEEL_ROUTE_EXPLAIN_MAX_TARGETS; i++) {
+        const router_server_t* srv = &router->servers[i];
+        if (!srv->active) continue;
+
+        bool eligible;
+        if (decision->was_pinned) {
+            eligible = (selected_name && srv->name &&
+                        strcmp(srv->name, selected_name) == 0);
+        } else if (want_read) {
+            /* Read pool = replicas (healthy) + optional primary failover. */
+            eligible = (srv->config.role == KEEL_SERVER_REPLICA &&
+                        srv->config.health == KEEL_HEALTH_UP);
+            if (!eligible && router->config.failover_to_primary &&
+                srv->config.role == KEEL_SERVER_PRIMARY &&
+                srv->config.health == KEEL_HEALTH_UP) {
+                eligible = true;
+            }
+        } else {
+            /* Write pool = primary, healthy. */
+            eligible = (srv->config.role == KEEL_SERVER_PRIMARY &&
+                        srv->config.health == KEEL_HEALTH_UP);
+        }
+
+        keel_route_target_info_t* t = &out->targets[out->target_count++];
+        memset(t, 0, sizeof *t);
+        if (srv->name) {
+            strncpy(t->name, srv->name, sizeof t->name - 1);
+        }
+        if (srv->host) {
+            strncpy(t->host, srv->host, sizeof t->host - 1);
+        }
+        t->port         = srv->config.port;
+        t->role         = srv->config.role;
+        t->health       = srv->config.health;
+        t->weight       = srv->config.weight;
+        t->was_eligible = eligible;
+        t->was_selected = (selected_name && srv->name &&
+                           strcmp(srv->name, selected_name) == 0);
+    }
+}
+
+keel_error_t keel_router_explain_sql(keel_router_t*              router,
+                                     keel_str_t                  sql,
+                                     const keel_route_session_t* session,
+                                     keel_route_explanation_t*   out) {
+    if (!router || !out || !sql.data || sql.len == 0) {
+        return KEEL_ERR_INVALID_ARG;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->simulated = true;
+
+    size_t excerpt_len =
+        sql.len < sizeof(out->sql_excerpt) - 1
+            ? sql.len
+            : sizeof(out->sql_excerpt) - 1;
+    memcpy(out->sql_excerpt, sql.data, excerpt_len);
+    out->sql_excerpt[excerpt_len] = '\0';
+
+    /* Parse via the same plugin path the live routers use, then route under
+     * the dispatch mutex with simulate=true so no counter is bumped. */
+    keel_parse_result_t parse;
+    keel_qt_query_t* qt = router_parse_postgresql_sql(sql, &parse);
+
+    bool semantic_unsafe = (qt == NULL) ||
+        parse.status != KEEL_PARSE_OK ||
+        (qt->operation == KEEL_QT_OP_READ &&
+         parse.plan.safety != KEEL_SAFETY_SAFE_REPLICA) ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE);
+    out->parse_failed = (qt == NULL) || parse.status != KEEL_PARSE_OK;
+
+    const keel_qt_query_t* route_qt = semantic_unsafe &&
+        qt && qt->operation == KEEL_QT_OP_READ ? NULL : qt;
+
+    pthread_mutex_lock(&router->dispatch_mutex);
+    keel_error_t err = route_internal_ex(router, route_qt, session,
+                                         /*use_shard_filter=*/false,
+                                         SIZE_MAX, &out->decision,
+                                         /*simulate=*/true);
+    if (err == KEEL_OK && semantic_unsafe &&
+        out->decision.reason_code == KEEL_ROUTE_REASON_WRITE_REQUIRED) {
+        out->decision.reason = "semantic uncertainty requires RW";
+        out->decision.reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+        out->decision.decision_factors |= KEEL_DF_PARSE_FAILED;
+    }
+    explain_fill_targets(router, &out->decision, out);
+    pthread_mutex_unlock(&router->dispatch_mutex);
+
+    keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
+    return err;
+}
+
+size_t keel_route_explanation_to_json(const keel_route_explanation_t* exp,
+                                      uint64_t                        query_hash,
+                                      char*                           out,
+                                      size_t                          out_size) {
+    if (!out || out_size == 0) return 0;
+    if (!exp) {
+        int n = snprintf(out, out_size, "{\"error\":\"missing_explanation\"}");
+        return n > 0 ? (size_t)n : 0;
+    }
+
+    size_t pos = 0;
+    int n;
+
+    char sql_esc[512];
+    keel_json_escape(sql_esc, sizeof sql_esc, exp->sql_excerpt);
+
+    char decision_json[1024];
+    keel_route_decision_to_json(&exp->decision, query_hash,
+                                decision_json, sizeof decision_json);
+
+    n = snprintf(out + pos, out_size - pos,
+        "{\"simulated\":%s,"
+        "\"sql\":\"%s\","
+        "\"parse_failed\":%s,"
+        "\"decision\":%s,"
+        "\"eligible_targets\":[",
+        exp->simulated ? "true" : "false",
+        sql_esc,
+        exp->parse_failed ? "true" : "false",
+        decision_json);
+    if (n < 0) return 0;
+    pos += (size_t)n;
+    if (pos >= out_size) return pos;
+
+    for (size_t i = 0; i < exp->target_count && pos < out_size; i++) {
+        const keel_route_target_info_t* t = &exp->targets[i];
+        char name_esc[128], host_esc[256];
+        keel_json_escape(name_esc, sizeof name_esc, t->name);
+        keel_json_escape(host_esc, sizeof host_esc, t->host);
+        n = snprintf(out + pos, out_size - pos,
+            "%s{\"name\":\"%s\",\"host\":\"%s\",\"port\":%u,"
+            "\"role\":\"%s\",\"health\":\"%s\",\"weight\":%d,"
+            "\"selected\":%s,\"eligible\":%s}",
+            i == 0 ? "" : ",",
+            name_esc, host_esc, (unsigned)t->port,
+            server_role_name(t->role),
+            server_health_name(t->health),
+            t->weight,
+            t->was_selected ? "true" : "false",
+            t->was_eligible ? "true" : "false");
+        if (n < 0) break;
+        pos += (size_t)n;
+    }
+
+    if (pos < out_size) {
+        n = snprintf(out + pos, out_size - pos, "]}");
+        if (n > 0) pos += (size_t)n;
+    }
+    return pos;
 }
 
 /**

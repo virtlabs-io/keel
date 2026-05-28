@@ -299,6 +299,83 @@ size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
                                    char* out,
                                    size_t out_size);
 
+/* ============================================================================
+ * Per-query route explainer (read-only simulation)
+ * ============================================================================ */
+
+/** Maximum eligible-target rows surfaced by the explainer. */
+#define KEEL_ROUTE_EXPLAIN_MAX_TARGETS 16
+
+/** One row of the explainer's eligible-targets table. */
+typedef struct keel_route_target_info {
+    char                 name[64];   /**< Server identifier (NUL-terminated) */
+    char                 host[128];  /**< Hostname or IP */
+    uint16_t             port;       /**< Port */
+    keel_server_role_t   role;       /**< Primary / replica */
+    keel_server_health_t health;     /**< Current health */
+    int                  weight;     /**< Base weight */
+    bool                 was_selected; /**< True for the one row the router picked */
+    bool                 was_eligible; /**< True if it was in the candidate pool */
+} keel_route_target_info_t;
+
+/**
+ * @brief Full explanation of a hypothetical routing decision.
+ *
+ * Populated by @ref keel_router_explain_sql. The call is read-only: no
+ * stat counters are incremented, no scatter-write state is recorded, no
+ * locks beyond the dispatch mutex are held. The decision is computed
+ * against the *current* router state (server list, health, weights).
+ */
+typedef struct keel_route_explanation {
+    keel_route_decision_t    decision;             /**< Same shape as a live decision */
+    keel_route_target_info_t targets[KEEL_ROUTE_EXPLAIN_MAX_TARGETS];
+    size_t                   target_count;         /**< Entries in `targets[]` */
+    bool                     parse_failed;         /**< SQL did not parse cleanly */
+    bool                     simulated;            /**< Always true; for log clarity */
+    char                     sql_excerpt[256];     /**< Truncated input SQL */
+} keel_route_explanation_t;
+
+/**
+ * @brief Run the router against `sql` *without* mutating any stats or pools.
+ *
+ * The query is parsed, classified, and routed through the same code path
+ * `keel_router_route()` uses, but every counter increment is suppressed and
+ * the chosen server's `routes` count is not bumped. The eligible-target
+ * table reports every backend that *could* have been selected for this
+ * read/write class plus the one that was.
+ *
+ * @param router  Router handle (non-NULL).
+ * @param sql     SQL text to classify.
+ * @param session Optional session state (may be NULL → defaults).
+ * @param out     [out] Populated on @c KEEL_OK or when the decision returned
+ *                an error but a partial classification is available.
+ * @return @c KEEL_OK on success, @c KEEL_ERR_INVALID_ARG for bad inputs,
+ *         @c KEEL_ERR_UNAVAILABLE when no backend matched, or the error
+ *         returned by the router for that classification.
+ */
+keel_error_t keel_router_explain_sql(keel_router_t*              router,
+                                     keel_str_t                  sql,
+                                     const keel_route_session_t* session,
+                                     keel_route_explanation_t*   out);
+
+/**
+ * @brief Format an explanation as a JSON object (snprintf semantics).
+ *
+ * Schema (stable):
+ * ```
+ * {"simulated":true,"sql":"...","parse_failed":false,
+ *  "decision":{...keel_route_decision_to_json...},
+ *  "eligible_targets":[
+ *      {"name":"...","host":"...","port":N,"role":"rw|ro",
+ *       "health":"healthy|degraded|down|...","weight":N,
+ *       "selected":bool,"eligible":bool}, ...]}
+ * ```
+ */
+size_t keel_route_explanation_to_json(const keel_route_explanation_t* exp,
+                                      uint64_t                        query_hash,
+                                      char*                           out,
+                                      size_t                          out_size);
+
 /**
  * @brief Configuration knobs controlling router behavior and failure policy.
  */
