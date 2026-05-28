@@ -608,6 +608,59 @@ TEST(test_query_log_emit_no_tree)
 }
 
 /* ============================================================================
+ * Test: Query log emits route_reason + latency_us from session metadata
+ * ============================================================================ */
+
+TEST(test_query_log_emit_with_session_route_and_latency)
+{
+    keel_log_plugin_t* plugin = create_capture_plugin();
+    plugin->open(plugin, NULL);
+
+    keel_query_log_t qlog;
+    keel_query_log_config_t cfg = keel_query_log_config_default();
+    cfg.mode = KEEL_QUERY_LOG_ALL;
+    keel_query_log_init(&qlog, &cfg, plugin);
+
+    /* Stack-allocated session with a recorded route reason and a
+     * monotonic timestamp 5 ms in the past, so the logger should
+     * derive a latency of >= 5000 us. */
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    snprintf(session.last_route_reason, sizeof(session.last_route_reason),
+             "SHARD_SINGLE");
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    uint64_t now_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL +
+                      (uint64_t)now_ts.tv_nsec;
+    session.query_start_ns = now_ns - 5ULL * 1000ULL * 1000ULL; /* -5 ms */
+
+    keel_proto_query_t q = {
+        .sql   = { .data = "SELECT 1", .len = 8 },
+        .type  = KEEL_QUERY_SELECT,
+        .flags = KEEL_QUERY_FLAG_READ_ONLY,
+    };
+
+    s_capture_count = 0;
+    keel_query_log_emit(&qlog, &session, &q);
+
+    ASSERT_EQ(s_capture_count, 1);
+    ASSERT(s_last_record.route_reason != NULL);
+    ASSERT_STR_EQ(s_last_record.route_reason, "SHARD_SINGLE");
+    ASSERT(s_last_record.latency_us >= 5000);
+
+    /* And when no session is provided, neither field should be populated. */
+    s_capture_count = 0;
+    keel_query_log_emit(&qlog, NULL, &q);
+    ASSERT_EQ(s_capture_count, 1);
+    ASSERT(s_last_record.route_reason == NULL);
+    ASSERT_EQ((int)s_last_record.latency_us, 0);
+
+    keel_query_log_shutdown(&qlog);
+    plugin->close(plugin);
+    plugin->destroy(plugin);
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -637,6 +690,7 @@ int main(void)
     RUN_TEST(test_qt_snprint_select);
     RUN_TEST(test_query_log_emit_with_tree);
     RUN_TEST(test_query_log_emit_no_tree);
+    RUN_TEST(test_query_log_emit_with_session_route_and_latency);
 
     printf("\n  Results: %d passed, %d failed\n\n", tests_passed, tests_failed);
 

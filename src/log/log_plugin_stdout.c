@@ -166,6 +166,12 @@ static keel_error_t stdout_write(keel_log_plugin_t* p,
     if (rec->database) {
         fprintf(out, "db=%s ", rec->database);
     }
+    if (rec->route_reason) {
+        fprintf(out, "route=%s ", rec->route_reason);
+    }
+    if (rec->latency_us > 0) {
+        fprintf(out, "lat=%lluus ", (unsigned long long)rec->latency_us);
+    }
 
     /* Query text */
     if (rec->query && rec->query_len > 0) {

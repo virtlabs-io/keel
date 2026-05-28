@@ -5725,6 +5725,70 @@ static void serve_metrics_json(keel_admin_t *admin, int fd) {
     free(body); /* NOLINT(keel-syscall) */
 }
 
+/* ---- Rate-limit + size cap for /api/diagnostics/route_explain?sql= ----
+ *
+ * Reasoning: the simulation branch parses arbitrary client-supplied SQL
+ * through the live parser pipeline. Even though the call is non-destructive
+ * (no router state mutated), the parser is unbounded in CPU per byte. We
+ * therefore gate the surface with:
+ *   - a 4 KiB hard cap on the URL-encoded SQL value, returning 413 above it,
+ *   - a global token bucket (40 burst / 20 rps) covering all callers,
+ *     returning 429 when exhausted.
+ *
+ * Both limits apply only to the `?sql=` branch. The static taxonomy GET
+ * remains unrestricted. */
+#define KEEL_EXPLAIN_MAX_SQL_BYTES   4096u
+#define KEEL_EXPLAIN_RL_CAPACITY     40.0
+#define KEEL_EXPLAIN_RL_REFILL_PER_S 20.0
+
+static pthread_mutex_t s_explain_rl_mu     = PTHREAD_MUTEX_INITIALIZER;
+static double          s_explain_rl_tokens = KEEL_EXPLAIN_RL_CAPACITY;
+static uint64_t        s_explain_rl_last_ns = 0;
+
+static bool explain_rate_limit_allow(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+    pthread_mutex_lock(&s_explain_rl_mu);
+    if (s_explain_rl_last_ns == 0) s_explain_rl_last_ns = now;
+    double elapsed_s = (double)(now - s_explain_rl_last_ns) / 1.0e9;
+    s_explain_rl_last_ns = now;
+    s_explain_rl_tokens += elapsed_s * KEEL_EXPLAIN_RL_REFILL_PER_S;
+    if (s_explain_rl_tokens > KEEL_EXPLAIN_RL_CAPACITY)
+        s_explain_rl_tokens = KEEL_EXPLAIN_RL_CAPACITY;
+    bool allow = (s_explain_rl_tokens >= 1.0);
+    if (allow) s_explain_rl_tokens -= 1.0;
+    pthread_mutex_unlock(&s_explain_rl_mu);
+    return allow;
+}
+
+/* Returns the raw (un-decoded) length of the value associated with `key` in
+ * the URL query string of `buf`, or 0 if absent. Cheap pre-flight for the
+ * size cap before we copy / decode into a fixed buffer. */
+static size_t http_query_param_raw_len(const char* buf, const char* key) {
+    if (!buf || !key) return 0;
+    const char* q = strchr(buf, '?');
+    if (!q) return 0;
+    const char* line_end = strpbrk(q, " \r\n");
+    if (!line_end) line_end = q + strlen(q);
+    size_t klen = strlen(key);
+    const char* p = q + 1;
+    while (p < line_end) {
+        if ((size_t)(line_end - p) > klen &&
+            strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char* v = p + klen + 1;
+            const char* v_end = v;
+            while (v_end < line_end && *v_end != '&') v_end++;
+            return (size_t)(v_end - v);
+        }
+        const char* amp = memchr(p, '&', (size_t)(line_end - p));
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
 /* Percent-decode a query-string value in place. Returns the new length.
  * Stops at '&' or '\0'. Supports '+' → ' ' (form-style). */
 static size_t url_decode_inplace(char* s) {
@@ -5807,9 +5871,35 @@ static size_t http_query_param(const char* buf, const char* key,
  */
 static void serve_route_explain(keel_admin_t *admin, int fd, const char* req) {
     /* ---- Per-query simulation branch (`?sql=...`) ---- */
+    /* Pre-flight: reject oversized SQL with 413 before touching the parser. */
+    size_t raw_sql_len = http_query_param_raw_len(req, "sql");
+    if (raw_sql_len > KEEL_EXPLAIN_MAX_SQL_BYTES) {
+        const char *resp =
+            "HTTP/1.1 413 Payload Too Large\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 17\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "sql_too_large\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
     char sql_buf[4096];
     size_t sql_len = http_query_param(req, "sql", sql_buf, sizeof sql_buf);
     if (sql_len > 0) {
+        if (!explain_rate_limit_allow()) {
+            const char *resp =
+                "HTTP/1.1 429 Too Many Requests\r\n"
+                "Content-Type: text/plain\r\n"
+                "Retry-After: 1\r\n"
+                "Content-Length: 17\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "rate_limited\n";
+            safe_send(fd, resp, strlen(resp));
+            return;
+        }
         if (!admin->router) {
             const char *resp =
                 "HTTP/1.1 503 Service Unavailable\r\n"

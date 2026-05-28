@@ -170,6 +170,14 @@ static keel_error_t syslog_plugin_write(keel_log_plugin_t* p,
         off += snprintf(buf + off, sizeof(buf) - (size_t)off,
                         "db=%s ", rec->database);
     }
+    if (rec->route_reason) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                        "route=%s ", rec->route_reason);
+    }
+    if (rec->latency_us > 0) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                        "lat=%lluus ", (unsigned long long)rec->latency_us);
+    }
     if (rec->query && rec->query_len > 0) {
         off += snprintf(buf + off, sizeof(buf) - (size_t)off,
                         "query=\"%.*s\" ", (int)rec->query_len, rec->query);

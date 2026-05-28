@@ -109,6 +109,14 @@ typedef struct keel_log_record {
     /* Optional parsed tree representation */
     const char*         query_tree;     /**< Serialised parse tree  */
     size_t              query_tree_len; /**< Length of tree string  */
+
+    /* Optional per-query routing telemetry — populated by keel_query_log_emit
+     * when a session is available. `route_reason` is a static-storage name
+     * (e.g. "SHARD_SINGLE", "NORMAL"); plugins must NOT free it. `latency_us`
+     * is the wall time spent in the proxy for this query in microseconds; 0
+     * means unknown / not yet measurable. */
+    const char*         route_reason;
+    uint64_t            latency_us;
 } keel_log_record_t;
 
 /* ============================================================================
