@@ -453,7 +453,7 @@ jobs:
         run: |
           LCOV_MAJOR=$(lcov --version 2>&1 | grep -oP '\d+' | head -1)
           if [[ "${LCOV_MAJOR}" -ge 2 ]]; then
-            IGNORE_FLAGS="--ignore-errors source,negative,unused"
+            IGNORE_FLAGS="--ignore-errors source,negative,unused,mismatch"
           else
             IGNORE_FLAGS="--ignore-errors source --ignore-errors negative"
           fi
