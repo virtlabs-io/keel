@@ -191,5 +191,5 @@ Trigger manually from the Actions tab with an optional custom tag.
 
 - The runner image runs as a dedicated non-root `keel` user (`UID`/`GID` from `useradd -r`).
 - No compiler, headers, or build tools are present in the runner image.
-- Runtime dependencies are pinned to the Ubuntu 24.04 LTS versions of `liburing2`, `libssl3`, and `lua5.4`.
+- Runtime dependencies are pinned to the Ubuntu 24.04 LTS versions of `liburing2`, `libyaml-0-2`, `libssl3`, and `lua5.4`.
 - The `/run/keel/` directory for env-override INI fragments is writable by the `keel` user only via `tmpfs` mount (or pre-created with correct permissions).

@@ -60,6 +60,7 @@
 #include "keel_error.h"
 #include "keel/core/ini.h"
 #include "keel/core/config_migrate.h"
+#include "keel/core/config_yaml.h"
 #include "keel/core/auth.h"
 #include "keel/log/log.h"
 #include "keel/log/log_plugin.h"
@@ -152,6 +153,8 @@ typedef struct options {
     bool            check_config;  /**< --check-config: validate config file and exit */
     const char*     migrate_in;    /**< --migrate-config IN: migrate INI config to v2 and exit */
     const char*     migrate_out;   /**< --output OUT: destination for --migrate-config (default: stdout) */
+    const char*     convert_in;    /**< --convert-config IN: convert INI<->YAML (extension-driven) and exit */
+    const char*     convert_out;   /**< --output OUT: destination for --convert-config (required) */
 } options_t;
 
 static const struct option long_options[] = {
@@ -168,6 +171,7 @@ static const struct option long_options[] = {
     {"strict-auth",    no_argument,       NULL, 1001},
     {"check-config",   no_argument,       NULL, 1002},
     {"migrate-config", required_argument, NULL, 1003},
+    {"convert-config", required_argument, NULL, 1004},
     {"output",         required_argument, NULL, 'o'},
     {NULL, 0, NULL, 0}
 };
@@ -205,7 +209,9 @@ static void print_usage(const char* prog) {
     printf("      --check-config         Validate configuration file and exit (0=ok, 1=error)\n");
     printf("      --migrate-config FILE  Migrate an INI config to the current schema (v%d) and exit\n",
            KEEL_CONFIG_SCHEMA_VERSION);
-    printf("      --output FILE          Destination for --migrate-config (default: stdout)\n");
+    printf("      --convert-config FILE  Convert config between INI and YAML (format chosen by\n");
+    printf("                             output file's extension); requires --output and exits\n");
+    printf("      --output FILE          Destination for --migrate-config / --convert-config\n");
     printf("\n");
     printf("Examples:\n");
     printf("  %s -c /etc/keel/keel.ini\n", prog);
@@ -326,8 +332,12 @@ static int parse_options(int argc, char** argv, options_t* opts) {
         case 1003:
             opts->migrate_in = optarg;
             break;
+        case 1004:
+            opts->convert_in = optarg;
+            break;
         case 'o':
             opts->migrate_out = optarg;
+            opts->convert_out = optarg;
             break;
         case '?':
             return -1;
@@ -3004,6 +3014,34 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (opts.convert_in) {
+        if (!opts.convert_out) {
+            fprintf(stderr,
+                    "keel: --convert-config requires --output (-o) FILE; the target\n"
+                    "      format is inferred from the output file's extension\n"
+                    "      (.yaml/.yml -> YAML, anything else -> INI).\n");
+            return 1;
+        }
+        keel_config_format_t in_fmt  = keel_config_detect_format(opts.convert_in);
+        keel_config_format_t out_fmt = keel_config_detect_format(opts.convert_out);
+        if (in_fmt == out_fmt) {
+            fprintf(stderr,
+                    "keel: --convert-config: input and output have the same format "
+                    "(%s); nothing to do.\n",
+                    in_fmt == KEEL_CONFIG_FORMAT_YAML ? "YAML" : "INI");
+            return 1;
+        }
+        keel_error_t rc = (in_fmt == KEEL_CONFIG_FORMAT_INI)
+            ? keel_config_convert_ini_to_yaml(opts.convert_in, opts.convert_out)
+            : keel_config_convert_yaml_to_ini(opts.convert_in, opts.convert_out);
+        if (rc != KEEL_OK) {
+            fprintf(stderr, "keel: --convert-config: failed (%d)\n", (int)rc);
+            return 1;
+        }
+        fprintf(stderr, "keel: converted %s -> %s\n", opts.convert_in, opts.convert_out);
+        return 0;
+    }
+
     g_config.hotpath_instr_mask = build_hotpath_instr_mask_from_env();
 
     /* Apply CLI security overrides */
@@ -3021,7 +3059,7 @@ int main(int argc, char** argv) {
         printf("Configuration file: %s\n", opts.config_file);
         g_config.config_file = opts.config_file;
         
-        config = keel_config_load(opts.config_file);
+        config = keel_config_load_auto(opts.config_file);
         if (!config) {
             fprintf(stderr, "Warning: Failed to load config file: %s\n", opts.config_file);
         } else {

@@ -492,6 +492,17 @@ target_link_libraries(test_config PRIVATE
 target_link_options(test_config PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_config COMMAND test_config)
 
+# Configuration tests (YAML loader + converters)
+add_executable(test_config_yaml test_config_yaml.c)
+target_link_libraries(test_config_yaml PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_config_yaml PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_config_yaml COMMAND test_config_yaml)
+set_tests_properties(test_config_yaml PROPERTIES LABELS "core")
+
 # Issue 9 — Result Cache Must Remain Disabled: config-layer gate tests
 add_executable(test_result_cache_gate test_result_cache_gate.c)
 target_link_libraries(test_result_cache_gate PRIVATE

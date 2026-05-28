@@ -49,7 +49,7 @@ cd keel
 
 # Install dependencies (Ubuntu 24.04)
 sudo apt-get install -y build-essential cmake ninja-build pkg-config \
-  liburing-dev libssl-dev lua5.4 liblua5.4-dev python3 python3-dev \
+  liburing-dev libyaml-dev libssl-dev lua5.4 liblua5.4-dev python3 python3-dev \
   libzstd-dev libpam-dev libldap-dev lcov gcovr
 
 # Generate test certificates

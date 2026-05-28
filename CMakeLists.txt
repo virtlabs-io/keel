@@ -377,6 +377,27 @@ endif()
 # OpenSSL (for crypto and TLS)
 find_package(OpenSSL REQUIRED)
 
+# libyaml — YAML configuration loader (hard dep since config v2).
+# Discovered via pkg-config first (preferred — gives PkgConfig::YAML imported
+# target with include dirs + libs), then manual find_library fallback for
+# systems without a .pc file.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(YAML IMPORTED_TARGET yaml-0.1)
+endif()
+if(NOT YAML_FOUND)
+    find_library(YAML_LIBRARIES NAMES yaml)
+    find_path(YAML_INCLUDE_DIRS NAMES yaml.h)
+    if(YAML_LIBRARIES AND YAML_INCLUDE_DIRS)
+        set(YAML_FOUND TRUE)
+    endif()
+endif()
+if(NOT YAML_FOUND)
+    message(FATAL_ERROR "KEEL: libyaml (yaml-0.1) is required since config v2. "
+                        "Install with: apt install libyaml-dev  /  dnf install libyaml-devel  /  brew install libyaml")
+endif()
+message(STATUS "KEEL: Found libyaml: ${YAML_LIBRARIES}")
+
 # zstd — wire-protocol compression for cluster gossip (WAN / cross-region)
 find_library(ZSTD_LIBRARY NAMES zstd)
 find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
@@ -536,6 +557,7 @@ endif()
 # --- Configuration ---
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/etc/keel.ini.example
+    ${CMAKE_CURRENT_SOURCE_DIR}/etc/keel.yaml.example
     DESTINATION /etc/keel
 )
 
@@ -620,7 +642,7 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "adduser, openssl, ca-certificates")
+    "adduser, openssl, ca-certificates, libyaml-0-2")
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
     "logrotate")
 set(CPACK_DEBIAN_PACKAGE_SUGGESTS
@@ -632,7 +654,7 @@ set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
 
 # Mark configuration files so dpkg prompts on upgrade conflicts
 set(CPACK_DEBIAN_PACKAGE_CONFFILES
-    "/etc/keel/keel.ini.example\n/etc/logrotate.d/keel")
+    "/etc/keel/keel.ini.example\n/etc/keel/keel.yaml.example\n/etc/logrotate.d/keel")
 
 # --- Red Hat / Fedora (.rpm) ------------------------------------------------
 set(CPACK_RPM_PACKAGE_LICENSE "AGPL-3.0-only")
@@ -641,7 +663,7 @@ set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
 
 set(CPACK_RPM_PACKAGE_REQUIRES
-    "openssl, ca-certificates")
+    "openssl, ca-certificates, libyaml")
 set(CPACK_RPM_PACKAGE_SUGGESTS
     "logrotate, lua, python3")
 
@@ -661,6 +683,7 @@ set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
 # Mark config files so RPM preserves user edits
 set(CPACK_RPM_USER_FILELIST
     "%config(noreplace) /etc/keel/keel.ini.example"
+    "%config(noreplace) /etc/keel/keel.yaml.example"
     "%config(noreplace) /etc/logrotate.d/keel")
 
 include(CPack)

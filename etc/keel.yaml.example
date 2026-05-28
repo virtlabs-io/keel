@@ -1,0 +1,94 @@
+# =============================================================================
+# KEEL Configuration File (YAML form) — PostgreSQL example
+# Schema: v2
+# =============================================================================
+#
+# This file is the YAML equivalent of `etc/keel-pg.ini` and produces an
+# identical `keel_config_t` at runtime. KEEL auto-detects the format from the
+# file extension (.yaml / .yml -> YAML; anything else -> INI), or you can
+# convert losslessly in either direction:
+#
+#     keel --convert-config keel.yaml -o keel.ini
+#     keel --convert-config keel.ini  -o keel.yaml
+#
+# All scalar values accept `${VAR}` environment-variable interpolation
+# (escape a literal dollar sign with `$$`). Nested mappings flatten to their
+# joined form (`tls: { handshake_timeout: 5s }` is equivalent to the flat
+# `tls_handshake_timeout: 5s`), so structured grouping is purely cosmetic.
+#
+# See `docs/CONFIGURATION.md` for the full key reference.
+# =============================================================================
+
+keel:
+  log_level: 2
+  config_version: 2
+
+logging:
+  use_colors: true
+  log_database: true
+  log_username: true
+  log_dest: true
+  log_source: true
+  log_timestamps: true
+  query_log_mode: none
+  log_level: info
+  plugin: stdout
+
+stats:
+  level: basic
+
+admin:
+  users: admin
+  listen_port: 6433
+  listen_addr: 127.0.0.1
+  enabled: true
+
+prometheus:
+  port: 9101
+  listen_addr: 0.0.0.0
+  enabled: true
+
+worker_groups:
+  - name: test_cluster
+    server_password: postgres
+    server_user: postgres
+    failover_delay: 10s
+    probe_retries: 3
+    probe_timeout: 3s
+    probe_interval: 5s
+    probe: postgres
+    max_pool_size: 80
+    min_pool_size: 30
+    client_connect_timeout: 10s
+    client_idle_timeout: 5m
+    max_conns_per_worker: 5000
+    num_workers: 2
+    bind_port: 7432
+    bind_addr: 0.0.0.0
+    protocol: postgres
+    servers:
+      - name: replica2
+        host: pgsql-03
+        port: 5434
+        user: usr_test
+        password: qaz123
+        dbname: testdb
+        role: RO
+        weight: 100
+      - name: replica1
+        host: pgsql-02
+        port: 5433
+        user: usr_test
+        password: qaz123
+        dbname: testdb
+        role: RO
+        weight: 100
+      - name: primary
+        host: pgsql-01
+        port: 5432
+        user: usr_test
+        password: qaz123
+        dbname: testdb
+        role: RW
+        weight: 100
+

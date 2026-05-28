@@ -61,6 +61,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -111,6 +112,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -166,6 +168,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -222,6 +225,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -275,6 +279,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -351,6 +356,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \
@@ -628,6 +634,7 @@ jobs:
             ninja-build \
             pkg-config \
             liburing-dev \
+            libyaml-dev \
             libssl-dev \
             lua5.4 \
             liblua5.4-dev \

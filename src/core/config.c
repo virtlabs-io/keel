@@ -21,6 +21,8 @@
 #include "keel/mem/mem.h"
 #include "keel/log/log.h"
 
+#include "config_internal.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -292,6 +294,77 @@ void keel_config_free(keel_config_t* config) {
     
     keel_free(config->path);
     keel_free(config);
+}
+
+/* ============================================================================
+ * Internal Builder API (consumed by config_yaml.c / migrator / tests)
+ * ============================================================================ */
+
+keel_config_t* keel_config_create_empty(const char* path) {
+    keel_config_t* c = keel_calloc(1, sizeof(keel_config_t));
+    if (!c) return NULL;
+    if (path) {
+        c->path = keel_strdup(path);
+        if (!c->path) {
+            keel_free(c);
+            return NULL;
+        }
+    }
+    return c;
+}
+
+int keel_config_set(keel_config_t* config,
+                    const char* section,
+                    const char* key,
+                    const char* value) {
+    if (!config || !section || !*section || !key || !*key || !value) {
+        return -1;
+    }
+
+    /* Locate (or append) the named section. */
+    config_section_t* s = config->sections;
+    config_section_t* tail = NULL;
+    while (s) {
+        if (strcasecmp(s->name, section) == 0) break;
+        tail = s;
+        s = s->next;
+    }
+    if (!s) {
+        s = keel_calloc(1, sizeof(config_section_t));
+        if (!s) return -1;
+        s->name = keel_strdup(section);
+        if (!s->name) { keel_free(s); return -1; }
+        if (tail) tail->next = s;
+        else      config->sections = s;
+    }
+
+    /* Replace value if the key already exists in this section. */
+    for (struct config_entry* e = s->entries; e; e = e->next) {
+        if (strcasecmp(e->key, key) == 0) {
+            char* nv = keel_strdup(value);
+            if (!nv) return -1;
+            keel_free(e->value);
+            e->value = nv;
+            return 0;
+        }
+    }
+
+    /* Append (preserve insertion order so YAML round-trips read naturally). */
+    struct config_entry* e = keel_calloc(1, sizeof(struct config_entry));
+    if (!e) return -1;
+    e->key   = keel_strdup(key);
+    e->value = keel_strdup(value);
+    if (!e->key || !e->value) {
+        keel_free(e->key); keel_free(e->value); keel_free(e);
+        return -1;
+    }
+    /* Append at tail to keep insertion order; the INI loader prepends for
+     * historical reasons, but ordered append is what callers expect for
+     * iteration. find_entry is case-insensitive on first match either way. */
+    struct config_entry** link = &s->entries;
+    while (*link) link = &(*link)->next;
+    *link = e;
+    return 0;
 }
 
 /* ============================================================================

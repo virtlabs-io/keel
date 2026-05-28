@@ -558,18 +558,19 @@ KEEL logs a warning and falls back to userspace TLS silently when kTLS is unavai
 - **CMake** 3.25+
 - **C23 Compiler**: GCC 13+ or Clang 17+
 - **OpenSSL** (required — used for SCRAM-SHA-256 and TLS/mTLS)
+- **libyaml** (required — used by the v2 YAML configuration loader)
 - **liburing** (recommended on Linux — enables io_uring reactor)
 
 #### Ubuntu/Debian
 
 ```bash
-sudo apt-get install cmake gcc-13 libssl-dev liburing-dev
+sudo apt-get install cmake gcc-13 libssl-dev libyaml-dev liburing-dev
 ```
 
 #### Fedora/RHEL
 
 ```bash
-sudo dnf install cmake gcc openssl-devel liburing-devel
+sudo dnf install cmake gcc openssl-devel libyaml-devel liburing-devel
 ```
 
 ### Build Commands
