@@ -214,6 +214,17 @@ target_link_libraries(test_parser PRIVATE
 target_link_options(test_parser PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_parser COMMAND test_parser)
 
+# Parser plugin registry and builtin PostgreSQL semantic-plan contract
+add_executable(test_parser_registry test_parser_registry.c)
+target_link_libraries(test_parser_registry PRIVATE
+    test_utils
+    keelparser
+    Threads::Threads
+)
+target_link_options(test_parser_registry PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_parser_registry COMMAND test_parser_registry)
+set_tests_properties(test_parser_registry PROPERTIES LABELS "parser;core")
+
 # Admin SQL query language tests
 add_executable(test_admin_sql test_admin_sql.c)
 target_link_libraries(test_admin_sql PRIVATE

@@ -45,6 +45,7 @@ target_link_libraries(keelcore
     PUBLIC keelmem
     PUBLIC keelutil
     PUBLIC keelsql
+    PUBLIC keelparser
     PUBLIC keel_hook
     PUBLIC z
     PUBLIC m
