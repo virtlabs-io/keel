@@ -79,8 +79,12 @@ option(KEEL_BUILD_DOCS "Build documentation" OFF)
 option(KEEL_ENABLE_SYSTEM_STATS "Enable L3 system-level stats (/proc sampling)" ON)
 option(KEEL_ENABLE_TRACE "Enable L4 USDT probe points" OFF)
 option(KEEL_ENABLE_FULL_STATS "Enable L5 SQL fingerprint aggregation" OFF)
-option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" ON)
-option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" ON)
+option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" OFF)
+option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" OFF)
+# Default OFF since v0.2: scripting interpreters are an expanded attack surface
+# and runtime cost. The CI matrix builds two variants: 'core' (both OFF) and
+# 'full' (both ON). Distributors should ship the 'core' package by default and
+# offer 'full' as a separately-installed superset. See docs/BUILD_VARIANTS.md.
 option(KEEL_ENABLE_OTLP "Build OTLP metrics exporter (requires nanopb; off by default until v0.2-alpha lands)" OFF)
 
 # Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
@@ -631,7 +635,14 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "High-performance database connection pool
 set(CPACK_PACKAGE_DESCRIPTION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+# Build-variant suffix: 'core' = no scripting; 'full' = Lua and/or Python on.
+# Distributors and operators can tell at a glance which package they hold.
+if(KEEL_ENABLE_LUA OR KEEL_ENABLE_PYTHON)
+    set(KEEL_PACKAGE_VARIANT "full")
+else()
+    set(KEEL_PACKAGE_VARIANT "core")
+endif()
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${KEEL_PACKAGE_VARIANT}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 
 set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 set(CPACK_STRIP_FILES "bin/keel;bin/keel-cli")

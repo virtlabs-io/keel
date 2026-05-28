@@ -166,6 +166,13 @@ typedef struct keel_route_session {
     /* Feature 7: Multi-shard transaction coordination */
     bool                has_scatter_write;    /**< A scatter write was recorded for this tx */
     uint64_t            scatter_shards_mask;  /**< Bitmask of participating shard indices */
+
+    /* Commit-in-doubt is sacred: once an ambiguous commit is detected the
+     * session MUST NOT route any further query through the normal pipeline
+     * until the outcome of the prior COMMIT has been resolved (or surfaced
+     * to the client as an explicit failure). The engine mirrors this from
+     * `keel_session_flow_t::commit_in_doubt` before every routing call. */
+    bool                commit_in_doubt;
 } keel_route_session_t;
 
 /**
@@ -194,6 +201,12 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
     KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
     KEEL_ROUTE_REASON_SEMANTIC_UNSAFE,   /**< Read-looking SQL was not proven replica-safe */
+    KEEL_ROUTE_REASON_UNKNOWN_FUNCTION,  /**< SQL calls a function not in the metadata
+                                              cache; conservative policy forces primary. */
+    KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS,  /**< Session has an unresolved commit-in-doubt;
+                                              no new query may be routed until the
+                                              prior transaction outcome is determined.
+                                              See docs/CORRECTNESS_UNDER_FAILURE.md. */
     KEEL_ROUTE_REASON_COUNT,
 } keel_route_reason_t;
 
@@ -205,12 +218,67 @@ typedef enum keel_route_reason {
 const char* keel_route_reason_name(keel_route_reason_t r);
 
 /**
+ * @brief Bitmask of contributing factors behind a routing decision.
+ *
+ * The `reason_code` on `keel_route_decision_t` is the single dominant cause
+ * (the first one that short-circuits the decision). The `decision_factors`
+ * bitmask carries every condition that contributed, so logs and the
+ * `/api/diagnostics/route_explain` endpoint can say *why primary* in detail
+ * rather than collapsing every primary-only query into "WRITE_REQUIRED".
+ *
+ * The bitmask is intentionally redundant with `reason_code` for the
+ * single-cause case; new factors may be added without changing the dominant
+ * reason taxonomy. Values are sparse so new flags can slot in without
+ * renumbering.
+ */
+typedef enum keel_route_factor {
+    KEEL_DF_NONE                = 0,
+    KEEL_DF_IN_TRANSACTION      = (1u << 0),  /**< Session is inside BEGIN..COMMIT */
+    KEEL_DF_SESSION_PINNED      = (1u << 1),  /**< Session pinned to a specific server */
+    KEEL_DF_HAS_TEMP_TABLE      = (1u << 2),  /**< Session has temp tables */
+    KEEL_DF_STMT_CLASS_WRITE    = (1u << 3),  /**< Statement is a write (INSERT/UPDATE/...) */
+    KEEL_DF_STMT_CLASS_DDL      = (1u << 4),  /**< Statement is DDL */
+    KEEL_DF_STMT_CLASS_TXN_CTL  = (1u << 5),  /**< Statement is transaction control */
+    KEEL_DF_UNKNOWN_FUNCTION    = (1u << 6),  /**< SQL references a function not in
+                                                   the metadata cache (conservative) */
+    KEEL_DF_VOLATILE_FUNCTION   = (1u << 7),  /**< SQL references a VOLATILE function */
+    KEEL_DF_SECURITY_DEFINER    = (1u << 8),  /**< SQL references SECURITY DEFINER function */
+    KEEL_DF_WRITE_TRIGGER       = (1u << 9),  /**< Target has a write trigger */
+    KEEL_DF_WRITE_RULE          = (1u << 10), /**< Target has a write rule (view) */
+    KEEL_DF_PARSE_FAILED        = (1u << 11), /**< Parser failed or produced partial AST */
+    KEEL_DF_REPLICA_LAG         = (1u << 12), /**< Selected replicas exceed lag threshold */
+    KEEL_DF_NO_REPLICAS         = (1u << 13), /**< No healthy replicas available */
+    KEEL_DF_FAILOVER_FALLBACK   = (1u << 14), /**< Read fell back to primary */
+    KEEL_DF_STICKY_PRIMARY      = (1u << 15), /**< Within read-after-write TTL window */
+    KEEL_DF_COMMIT_IN_DOUBT     = (1u << 16), /**< Prior COMMIT outcome unresolved */
+    KEEL_DF_REPLICA_OK          = (1u << 17), /**< Proven safe for a replica */
+    KEEL_DF_USER_PINNED         = (1u << 18), /**< SET keel.route = primary */
+} keel_route_factor_t;
+
+/**
+ * @brief Format a `decision_factors` bitmask as a JSON array of stable names.
+ *
+ * The output is suitable for embedding into the value produced by
+ * `keel_route_decision_to_json()` or the admin diagnostics endpoint.
+ * Order is fixed (low bit first) for stable diffing in tests.
+ *
+ * @return Number of bytes that would have been written, snprintf semantics.
+ */
+size_t keel_route_factors_to_json_array(uint32_t factors,
+                                        char* out,
+                                        size_t out_size);
+
+/**
  * @brief Result object populated by routing functions.
  */
 typedef struct keel_route_decision {
     keel_route_server_t*  server;       /**< Selected server */
     const char*           reason;       /**< Human-readable reason string */
     keel_route_reason_t   reason_code;  /**< Typed reason code for programmatic use */
+    uint32_t              decision_factors; /**< Bitmask of `keel_route_factor_t`
+                                                 values that contributed to the
+                                                 decision; used by the
+                                                 route-explainer surface. */
     bool                  is_read;      /**< Query is read-only */
     bool                  was_pinned;   /**< Decision due to pinning */
     size_t                shard_index;  /**< Resolved shard for sharded routing */

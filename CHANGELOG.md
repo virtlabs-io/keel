@@ -12,6 +12,81 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ## [Unreleased]
 
+### Changed — Route-decision explainer, conservative function policy, commit-in-doubt gate
+
+These changes lay the groundwork for per-query route explainability and
+tighten the policies the router enforces by default. Behavioral changes are
+limited to *reason taxonomy* (no silent re-routing); existing decisions
+remain identical except for the reason code surfaced in logs and the
+`/api/diagnostics/route_explain` admin endpoint.
+
+- **New routing reason codes.** `keel_route_reason_t` gains
+  `KEEL_ROUTE_REASON_UNKNOWN_FUNCTION` (the SQL references a function not in
+  the metadata cache; conservative policy keeps it on primary) and
+  `KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS` (the session has an unresolved
+  commit-in-doubt; any further query is refused until the prior COMMIT
+  outcome is resolved). The previous catch-all `SEMANTIC_UNSAFE` reason for
+  the function-presence case is replaced by `UNKNOWN_FUNCTION` so logs
+  distinguish parse failure from unknown-function conservatism.
+- **Multi-factor explanation: `decision_factors` bitmask.** Every routing
+  decision now carries a bitmask of contributing factors (`KEEL_DF_*`) in
+  addition to the single dominant `reason_code`. `IN_TRANSACTION`,
+  `HAS_TEMP_TABLE`, `UNKNOWN_FUNCTION`, `PARSE_FAILED`, `FAILOVER_FALLBACK`,
+  `COMMIT_IN_DOUBT`, etc. are all stable names exposed in the JSON output.
+  `keel_route_factors_to_json_array()` is the public formatter;
+  `keel_route_decision_to_json()` embeds it under the `factors` key.
+- **Commit-in-doubt is sacred at the router level too.** A new
+  `commit_in_doubt` field on `keel_route_session_t` makes `route_internal()`
+  fail closed with `KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS` and
+  `KEEL_ERR_UNAVAILABLE` whenever the session still has an unresolved
+  prior COMMIT. The engine-level guard
+  (`keel_engine_flow_handle_commit_doubt()` in `src/engine/engine_flow.c`)
+  remains the primary surface for clients; the router check is defense in
+  depth for any non-engine caller (admin, tests, future shard re-router).
+  No ambiguous transaction is ever replayed after a backend disconnect:
+  when the in-doubt XID was never captured (`pending_commit_xid == 0`) the
+  session is closed with `KEEL_CIDR_NO_XID`; when a capture exists but no
+  RW pool is available the session is closed with `KEEL_CIDR_NO_RW_POOL`.
+- **Admin endpoint: `GET /api/diagnostics/route_explain`.** Returns a
+  stable JSON taxonomy of all routing reason codes and decision factors so
+  operators can map log events to their definitions without reading the
+  source. Static reference dump only; per-SQL simulation against the live
+  router is tracked in
+  [proposals/v0.2-alpha_route_explainer.md](proposals/v0.2-alpha_route_explainer.md).
+
+### Changed — Build variants: `core` and `full`
+
+Lua and Python hook interpreters are now off by default. The shipped
+package is the smaller `core` variant; operators who use scripting hooks
+opt into `full`.
+
+- `KEEL_ENABLE_LUA` and `KEEL_ENABLE_PYTHON` now default to `OFF` in
+  `CMakeLists.txt`. Existing source guards in `src/hook/lua_bridge.c` and
+  `src/hook/python_bridge.c` already provide no-op stubs when the
+  interpreters are absent, so the call-site contract is unchanged.
+- `CPACK_PACKAGE_FILE_NAME` now includes a variant suffix
+  (`keel-core-...` vs `keel-full-...`) so distributors can ship both side
+  by side.
+- `docker/build-linux.sh` honours `KEEL_VARIANT=core|full`
+  (default `core`); `docker/Dockerfile.linux` takes a `KEEL_VARIANT`
+  build-arg with the same meaning.
+- CI matrix builds and tests both variants in parallel
+  (`.github/workflows/ci.yml`).
+
+### Migration
+
+- **Operators reading `keel_route_decision_t.reason_code` in tests:** if
+  you matched on `KEEL_ROUTE_REASON_SEMANTIC_UNSAFE` for queries with
+  function calls, switch to `KEEL_ROUTE_REASON_UNKNOWN_FUNCTION`.
+- **Packagers:** the default produced package is now
+  `keel-core-<version>-...`. Existing pipelines that downloaded
+  `keel-<version>-...` must either pin the `core` suffix or build with
+  `-DKEEL_ENABLE_LUA=ON -DKEEL_ENABLE_PYTHON=ON` to keep the historical
+  full-feature artifact (now `keel-full-...`).
+- **Docker users:** `./docker/build-linux.sh test` continues to work; to
+  reproduce the previous (Lua + Python) image use
+  `KEEL_VARIANT=full ./docker/build-linux.sh test`.
+
 ### Changed — Scatter/Sharding fail-closed gating
 
 Before marketing sharding as a differentiator, the dispatcher now refuses

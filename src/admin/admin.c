@@ -5621,6 +5621,81 @@ static void serve_metrics_json(keel_admin_t *admin, int fd) {
 }
 
 /**
+ * @brief Serve the route-decision explainer taxonomy as JSON
+ *        (GET /api/diagnostics/route_explain).
+ *
+ * Returns a stable reference document describing every routing reason
+ * code and every contributing decision factor the router can emit. The
+ * payload is shape-compatible with the per-decision JSON produced by
+ * `keel_route_decision_to_json()` so operators can map a log entry's
+ * `reason_code` and `factors` array back to a description.
+ *
+ * No SQL is parsed or executed; this endpoint is a static taxonomy
+ * dump. Full per-query simulation against the live router is tracked as
+ * a follow-up in proposals/v0.2-alpha_route_explainer.md.
+ */
+static void serve_route_explain(keel_admin_t *admin, int fd) {
+    (void)admin;
+
+    char body[8192];
+    size_t pos = 0;
+    int n;
+
+    n = snprintf(body + pos, sizeof(body) - pos,
+        "{\n"
+        "  \"version\": 1,\n"
+        "  \"description\": \"Route decision explainer taxonomy. "
+        "The router emits one dominant reason_code per query and a "
+        "bitmask of contributing factors. See "
+        "keel_route_decision_to_json() for the per-decision schema.\",\n"
+        "  \"reason_codes\": [\n");
+    if (n > 0) pos += (size_t)n;
+
+    for (int r = 0; r < (int)KEEL_ROUTE_REASON_COUNT && pos < sizeof(body); ++r) {
+        const char* name = keel_route_reason_name((keel_route_reason_t)r);
+        n = snprintf(body + pos, sizeof(body) - pos,
+            "    {\"code\": %d, \"name\": \"%s\"}%s\n",
+            r, name,
+            (r + 1 < (int)KEEL_ROUTE_REASON_COUNT) ? "," : "");
+        if (n > 0) pos += (size_t)n;
+    }
+
+    if (pos >= sizeof(body) - 1024) {
+        const char *err =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        safe_send(fd, err, strlen(err));
+        return;
+    }
+
+    n = snprintf(body + pos, sizeof(body) - pos, "  ],\n  \"factors\": ");
+    if (n > 0) pos += (size_t)n;
+
+    /* All bits set so the helper enumerates every known factor name. */
+    pos += keel_route_factors_to_json_array(0xFFFFFFFFu,
+                                            body + pos,
+                                            sizeof(body) - pos);
+
+    if (pos < sizeof(body) - 4) {
+        n = snprintf(body + pos, sizeof(body) - pos, "\n}\n");
+        if (n > 0) pos += (size_t)n;
+    }
+
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n", pos);
+    safe_send(fd, hdr, (size_t)hl);
+    safe_send(fd, body, pos);
+}
+
+/**
  * @brief Serve the curated OTLP-aligned metric set in Prometheus text
  *        exposition format (GET /api/observability/metrics.prom).
  *
@@ -5734,6 +5809,7 @@ static void serve_metrics_prom(keel_admin_t *admin, int fd) {
  * - `GET /api/observability/exporter.json`
  * - `GET /api/observability/metrics.json`
  * - `GET /api/observability/metrics.prom`
+ * - `GET /api/diagnostics/route_explain`
  * - `GET /healthz`
  * - `GET /readyz`
  * - `GET /livez`
@@ -5861,6 +5937,9 @@ static void handle_prom_http(keel_admin_t *admin, int fd) {
     }
     else if (strncmp(buf, "GET /api/observability/metrics.prom", 35) == 0) {
         serve_metrics_prom(admin, fd);
+    }
+    else if (strncmp(buf, "GET /api/diagnostics/route_explain", 34) == 0) {
+        serve_route_explain(admin, fd);
     }
     else {
         const char *resp =

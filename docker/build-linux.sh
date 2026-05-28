@@ -18,6 +18,15 @@
 #   By default the image is built for your host architecture (arm64 on M-series
 #   Macs).  To cross-compile for linux/amd64 pass:
 #     KEEL_DOCKER_PLATFORM=linux/amd64 ./docker/build-linux.sh build
+#
+# Build variants:
+#   KEEL_VARIANT=core (default) — no Lua/Python scripting hooks (smaller,
+#                                  fewer dynamic dependencies, smaller attack
+#                                  surface).
+#   KEEL_VARIANT=full           — Lua 5.4 + Python 3 embedded for hook
+#                                  scripting. Use for plugin development.
+#   Example:
+#     KEEL_VARIANT=full ./docker/build-linux.sh test
 # =============================================================================
 set -euo pipefail
 
@@ -33,9 +42,18 @@ DOCKERFILE="${SCRIPT_DIR}/Dockerfile.linux"
 : "${KEEL_PUBLISH_IMAGE:=ghcr.io/virtlabs/keel}"
 : "${KEEL_PUBLISH_TAG:=latest}"
 : "${KEEL_PUBLISH_PLATFORMS:=linux/amd64,linux/arm64}"
+# KEEL_VARIANT selects the scripting feature set baked into the image:
+#   core  → no Lua/Python (default, smaller attack surface)
+#   full  → Lua 5.4 + Python 3 embedded
+: "${KEEL_VARIANT:=core}"
+case "${KEEL_VARIANT}" in
+    core|full) ;;
+    *) echo "ERROR: unknown KEEL_VARIANT='${KEEL_VARIANT}' (expected: core|full)" >&2; exit 2 ;;
+esac
 
 BUILD_ARGS=()
 [[ -n "${KEEL_DOCKER_PLATFORM}" ]] && BUILD_ARGS+=(--platform "${KEEL_DOCKER_PLATFORM}")
+BUILD_ARGS+=(--build-arg "KEEL_VARIANT=${KEEL_VARIANT}")
 
 _r='\033[0;31m'; _g='\033[0;32m'; _y='\033[1;33m'; _b='\033[0;34m'; _n='\033[0m'
 info()    { echo -e "${_b}[INFO]${_n}    $*"; }

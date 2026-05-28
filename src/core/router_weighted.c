@@ -99,8 +99,62 @@ const char* keel_route_reason_name(keel_route_reason_t r)
     case KEEL_ROUTE_REASON_DDL:               return "DDL";
     case KEEL_ROUTE_REASON_TRANSACTION_CTRL:  return "TRANSACTION_CTRL";
     case KEEL_ROUTE_REASON_SEMANTIC_UNSAFE:   return "SEMANTIC_UNSAFE";
+    case KEEL_ROUTE_REASON_UNKNOWN_FUNCTION:  return "UNKNOWN_FUNCTION";
+    case KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS:  return "COMMIT_AMBIGUOUS";
     default:                                  return "UNKNOWN";
     }
+}
+
+/* Factor name table: parallel array to the bit positions of
+ * `keel_route_factor_t`. NULL slots are reserved for future flags so the
+ * indices stay stable across versions. */
+static const char* const k_route_factor_names[32] = {
+    [0]  = "IN_TRANSACTION",
+    [1]  = "SESSION_PINNED",
+    [2]  = "HAS_TEMP_TABLE",
+    [3]  = "STMT_CLASS_WRITE",
+    [4]  = "STMT_CLASS_DDL",
+    [5]  = "STMT_CLASS_TXN_CTL",
+    [6]  = "UNKNOWN_FUNCTION",
+    [7]  = "VOLATILE_FUNCTION",
+    [8]  = "SECURITY_DEFINER",
+    [9]  = "WRITE_TRIGGER",
+    [10] = "WRITE_RULE",
+    [11] = "PARSE_FAILED",
+    [12] = "REPLICA_LAG",
+    [13] = "NO_REPLICAS",
+    [14] = "FAILOVER_FALLBACK",
+    [15] = "STICKY_PRIMARY",
+    [16] = "COMMIT_IN_DOUBT",
+    [17] = "REPLICA_OK",
+    [18] = "USER_PINNED",
+};
+
+size_t keel_route_factors_to_json_array(uint32_t factors,
+                                        char* out,
+                                        size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return 0;
+    }
+    size_t pos = 0;
+    int written = snprintf(out + pos, out_size - pos, "[");
+    if (written > 0) pos += (size_t)written;
+    bool first = true;
+    for (int i = 0; i < 32; ++i) {
+        if (!(factors & (1u << i)) || !k_route_factor_names[i]) continue;
+        if (pos >= out_size) break;
+        written = snprintf(out + pos, out_size - pos, "%s\"%s\"",
+                           first ? "" : ",",
+                           k_route_factor_names[i]);
+        if (written > 0) pos += (size_t)written;
+        first = false;
+    }
+    if (pos < out_size) {
+        written = snprintf(out + pos, out_size - pos, "]");
+        if (written > 0) pos += (size_t)written;
+    }
+    return pos;
 }
 
 size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
@@ -138,6 +192,10 @@ size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
         snprintf(shard, sizeof shard, "%zu", decision->shard_index);
     }
 
+    char factors_arr[512];
+    keel_route_factors_to_json_array(decision->decision_factors,
+                                     factors_arr, sizeof factors_arr);
+
     int n = snprintf(out, out_size,
         "{\"query_hash\":\"0x%016llx\","
         "\"route\":\"%s\","
@@ -146,7 +204,8 @@ size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
         "\"was_pinned\":%s,"
         "\"shard_index\":%s,"
         "\"reason_code\":\"%s\","
-        "\"reason\":\"%s\"}",
+        "\"reason\":\"%s\","
+        "\"factors\":%s}",
         (unsigned long long)query_hash,
         role,
         server_name,
@@ -154,7 +213,8 @@ size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
         decision->was_pinned ? "true" : "false",
         shard,
         keel_route_reason_name(decision->reason_code),
-        reason_text);
+        reason_text,
+        factors_arr);
     return n > 0 ? (size_t)n : 0;
 }
 
@@ -969,11 +1029,24 @@ static keel_error_t route_internal(keel_router_t* router,
     decision->shard_index = use_shard_filter ? shard_index : SIZE_MAX;
     router->stats.total_routes++;
 
+    /* Commit-in-doubt is sacred: refuse to route any further query while
+     * the session has an unresolved COMMIT outcome. The caller (engine) is
+     * responsible for surfacing the resolution to the client; routing here
+     * would risk side-effects on a fresh backend that the client cannot
+     * reconcile with the uncertain prior commit. */
+    if (session && session->commit_in_doubt) {
+        decision->reason      = "commit-in-doubt: prior COMMIT outcome unresolved";
+        decision->reason_code = KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS;
+        decision->decision_factors |= KEEL_DF_COMMIT_IN_DOUBT;
+        return KEEL_ERR_UNAVAILABLE;
+    }
+
     if (session && session->pinned_server) {
         decision->server      = session->pinned_server;
         decision->was_pinned  = true;
         decision->reason      = "session pinned";
         decision->reason_code = KEEL_ROUTE_REASON_PINNED_SESSION;
+        decision->decision_factors |= KEEL_DF_SESSION_PINNED;
         router->stats.pinned_routes++;
         return KEEL_OK;
     }
@@ -1031,6 +1104,10 @@ static keel_error_t route_internal(keel_router_t* router,
             if (!decision->reason) {
                 decision->reason      = use_shard_filter ? "single-shard read query" : "read query";
                 decision->reason_code = KEEL_ROUTE_REASON_READ_SPLIT;
+                decision->decision_factors |= KEEL_DF_REPLICA_OK;
+            } else {
+                /* Failover-to-primary case */
+                decision->decision_factors |= (KEEL_DF_NO_REPLICAS | KEEL_DF_FAILOVER_FALLBACK);
             }
         }
     } else {
@@ -1048,24 +1125,44 @@ static keel_error_t route_internal(keel_router_t* router,
             if (session && session->in_transaction) {
                 decision->reason      = use_shard_filter ? "single-shard transaction" : "in transaction";
                 decision->reason_code = KEEL_ROUTE_REASON_IN_TRANSACTION;
+                decision->decision_factors |= KEEL_DF_IN_TRANSACTION;
+            } else if (session && session->has_temp_tables) {
+                decision->reason      = "session has temp tables";
+                decision->reason_code = KEEL_ROUTE_REASON_HARD_PINNED;
+                decision->decision_factors |= KEEL_DF_HAS_TEMP_TABLE;
             } else if (qt && qt->operation == KEEL_QT_OP_TRANSACTION) {
                 decision->reason      = "transaction control";
                 decision->reason_code = KEEL_ROUTE_REASON_TRANSACTION_CTRL;
+                decision->decision_factors |= KEEL_DF_STMT_CLASS_TXN_CTL;
             } else if (qt && qt->operation == KEEL_QT_OP_DDL) {
                 decision->reason      = "DDL statement";
                 decision->reason_code = KEEL_ROUTE_REASON_DDL;
+                decision->decision_factors |= KEEL_DF_STMT_CLASS_DDL;
             } else if (qt && qt->func_count > 0) {
-                decision->reason      = "semantic uncertainty requires RW";
-                decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+                /* Conservative-by-default function policy: any function call
+                 * outside the pg_catalog allowlist forces primary. The richer
+                 * `keel_metadata_analyze_query()` path (router_plugin.c)
+                 * promotes this to VOLATILE / SECURITY_DEFINER / TRIGGER
+                 * once the function is known. */
+                decision->reason      = "unknown function call (conservative)";
+                decision->reason_code = KEEL_ROUTE_REASON_UNKNOWN_FUNCTION;
+                decision->decision_factors |= KEEL_DF_UNKNOWN_FUNCTION;
             } else if (qt && (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE)) {
                 decision->reason      = "partial parse requires RW";
                 decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+                decision->decision_factors |= KEEL_DF_PARSE_FAILED;
+            } else if (qt && qt->has_error) {
+                decision->reason      = "parse error requires RW";
+                decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+                decision->decision_factors |= KEEL_DF_PARSE_FAILED;
             } else if (qt && qt->operation == KEEL_QT_OP_WRITE) {
                 decision->reason      = use_shard_filter ? "single-shard write query" : "write query";
                 decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
+                decision->decision_factors |= KEEL_DF_STMT_CLASS_WRITE;
             } else {
                 decision->reason      = use_shard_filter ? "single-shard RW required" : "RW required";
                 decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
+                decision->decision_factors |= KEEL_DF_STMT_CLASS_WRITE;
             }
         }
     }
