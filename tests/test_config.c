@@ -342,10 +342,62 @@ static void test_config_get_duration(void) {
     /* Default for missing */
     keel_duration_t missing = keel_config_get_duration(config, "timeouts", "missing", 999);
     TEST_ASSERT_EQ(missing, 999);
-    
+
+    /* Bare integer (no suffix) is milliseconds in v2 schema. */
+    keel_duration_t plain = keel_config_get_duration(config, "timeouts", "plain_number", 0);
+    TEST_ASSERT_EQ(plain, 1000LL * 1000 * 1000);  /* 1000 ms = 1e9 ns */
+
     keel_config_free(config);
     cleanup_test_config_file();
-    
+
+    TEST_END();
+}
+
+/* ============================================================================
+ * Byte-Count Value Tests
+ * ============================================================================ */
+
+static void test_config_get_bytes(void) {
+    TEST_BEGIN("config get bytes");
+
+    const char* content =
+        "[sizes]\n"
+        "bare = 4096\n"
+        "explicit_b = 512B\n"
+        "decimal_kb = 1KB\n"
+        "binary_kib = 1KiB\n"
+        "decimal_mb = 2MB\n"
+        "binary_mib = 2MiB\n"
+        "decimal_gb = 3GB\n"
+        "binary_gib = 3GiB\n"
+        "short_k = 8K\n"
+        "short_m = 4M\n"
+        "with_space = 16 KiB\n"
+        "bogus = 12xq\n";
+
+    TEST_ASSERT(create_test_config_file(content));
+    keel_config_t* config = keel_config_load(g_test_config_path);
+    TEST_ASSERT_NOT_NULL(config);
+
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "bare",        -1), 4096);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "explicit_b",  -1), 512);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "decimal_kb",  -1), 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "binary_kib",  -1), 1024);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "decimal_mb",  -1), 2LL * 1000 * 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "binary_mib",  -1), 2LL * 1024 * 1024);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "decimal_gb",  -1), 3LL * 1000 * 1000 * 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "binary_gib",  -1), 3LL * 1024 * 1024 * 1024);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "short_k",     -1), 8LL * 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "short_m",     -1), 4LL * 1000 * 1000);
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "with_space",  -1), 16LL * 1024);
+    /* Unrecognized suffix falls back to default. */
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "bogus",       777), 777);
+    /* Missing key falls back to default. */
+    TEST_ASSERT_EQ(keel_config_get_bytes(config, "sizes", "missing",     42), 42);
+
+    keel_config_free(config);
+    cleanup_test_config_file();
+
     TEST_END();
 }
 
@@ -701,7 +753,8 @@ int main(void) {
     test_config_get_bool();
     test_config_get_float();
     test_config_get_duration();
-    
+    test_config_get_bytes();
+
     /* Section tests */
     test_config_has_section();
     test_config_iter_sections();

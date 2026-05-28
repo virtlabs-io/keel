@@ -412,6 +412,8 @@ bool keel_config_get_bool(const keel_config_t* config,
  * @brief Return a duration value normalized to nanoseconds.
  *
  * Supported suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`.
+ * A bare integer (no suffix) is interpreted as **milliseconds** — matches
+ * the v2 schema where the unit suffix has been removed from key names.
  */
 keel_duration_t keel_config_get_duration(const keel_config_t* config,
                                         const char* section,
@@ -421,29 +423,92 @@ keel_duration_t keel_config_get_duration(const keel_config_t* config,
     if (!str) {
         return default_val;
     }
-    
+
     char* end;
     double val = strtod(str, &end);
-    
-    /* Handle time suffixes */
-    if (*end) {
-        if (strcasecmp(end, "ns") == 0) {
-            return (keel_duration_t)val;
-        } else if (strcasecmp(end, "us") == 0) {
-            return (keel_duration_t)(val * 1000);
-        } else if (strcasecmp(end, "ms") == 0) {
-            return (keel_duration_t)(val * 1000000);
-        } else if (strcasecmp(end, "s") == 0 || *end == '\0') {
-            return (keel_duration_t)(val * 1000000000);
-        } else if (strcasecmp(end, "m") == 0) {
-            return (keel_duration_t)(val * 60 * 1000000000);
-        } else if (strcasecmp(end, "h") == 0) {
-            return (keel_duration_t)(val * 3600 * 1000000000);
+    if (end == str) {
+        return default_val;
+    }
+
+    /* Skip whitespace between number and unit. */
+    while (*end == ' ' || *end == '\t') end++;
+
+    if (*end == '\0') {
+        /* No suffix — bare integer is milliseconds in v2. */
+        return (keel_duration_t)(val * 1000000);
+    }
+    if (strcasecmp(end, "ns") == 0) {
+        return (keel_duration_t)val;
+    }
+    if (strcasecmp(end, "us") == 0) {
+        return (keel_duration_t)(val * 1000);
+    }
+    if (strcasecmp(end, "ms") == 0) {
+        return (keel_duration_t)(val * 1000000);
+    }
+    if (strcasecmp(end, "s") == 0) {
+        return (keel_duration_t)(val * 1000000000.0);
+    }
+    if (strcasecmp(end, "m") == 0) {
+        return (keel_duration_t)(val * 60.0 * 1000000000.0);
+    }
+    if (strcasecmp(end, "h") == 0) {
+        return (keel_duration_t)(val * 3600.0 * 1000000000.0);
+    }
+
+    /* Unrecognized unit — reject instead of silently misinterpreting. */
+    return default_val;
+}
+
+/**
+ * @brief Return a byte count parsed from a value with optional unit suffix.
+ *
+ * Supported suffixes (case-insensitive):
+ *   B, K/KB, KiB, M/MB, MiB, G/GB, GiB.
+ * A bare integer (no suffix) is interpreted as **bytes**.
+ */
+int64_t keel_config_get_bytes(const keel_config_t* config,
+                              const char* section,
+                              const char* key,
+                              int64_t default_val) {
+    const char* str = keel_config_get_string(config, section, key, NULL);
+    if (!str) {
+        return default_val;
+    }
+
+    char* end;
+    double val = strtod(str, &end);
+    if (end == str) {
+        return default_val;
+    }
+
+    while (*end == ' ' || *end == '\t') end++;
+
+    static const struct {
+        const char* suffix;
+        double      multiplier;
+    } units[] = {
+        { "",    1.0 },
+        { "B",   1.0 },
+        { "K",   1000.0 },
+        { "KB",  1000.0 },
+        { "KiB", 1024.0 },
+        { "M",   1000.0 * 1000.0 },
+        { "MB",  1000.0 * 1000.0 },
+        { "MiB", 1024.0 * 1024.0 },
+        { "G",   1000.0 * 1000.0 * 1000.0 },
+        { "GB",  1000.0 * 1000.0 * 1000.0 },
+        { "GiB", 1024.0 * 1024.0 * 1024.0 },
+    };
+
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        if (strcasecmp(end, units[i].suffix) == 0) {
+            return (int64_t)(val * units[i].multiplier);
         }
     }
-    
-    /* Default to seconds */
-    return (keel_duration_t)(val * 1000000000);
+
+    /* Unrecognized unit — reject. */
+    return default_val;
 }
 
 /* ============================================================================
