@@ -229,6 +229,9 @@ COPY tests/           tests/
 COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/keel/     docker/keel/
+# docs/ is required by lint scripts (e.g. check_metrics_reference) that
+# enforce parity between registered metrics and docs/METRICS_REFERENCE.md.
+COPY docs/            docs/
 
 # Configure and build
 RUN cmake -B build-linux -G Ninja \
