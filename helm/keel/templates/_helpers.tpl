@@ -58,3 +58,36 @@ Create the name of the service account to use.
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Effective configuration format ("ini" or "yaml"). Honours the explicit
+`.Values.configFormat` if set; otherwise picks "yaml" when the structured
+`.Values.configYaml` map is provided, falling back to "ini".
+*/}}
+{{- define "keel.configFormat" -}}
+{{- if .Values.configFormat -}}
+{{- .Values.configFormat | lower -}}
+{{- else if .Values.configYaml -}}
+yaml
+{{- else -}}
+ini
+{{- end -}}
+{{- end }}
+
+{{/*
+Basename of the config file inside the ConfigMap and the container.
+*/}}
+{{- define "keel.configFilename" -}}
+{{- if eq (include "keel.configFormat" .) "yaml" -}}
+keel.yaml
+{{- else -}}
+keel.ini
+{{- end -}}
+{{- end }}
+
+{{/*
+Absolute path of the config file inside the container.
+*/}}
+{{- define "keel.configPath" -}}
+/etc/keel/{{ include "keel.configFilename" . }}
+{{- end }}

@@ -91,6 +91,71 @@ jobs:
         run: ctest --test-dir build --output-on-failure -LE integration -j$(nproc)
 
   # ===========================================================================
+  # Config Format Matrix (INI vs YAML)
+  # ===========================================================================
+  # Verifies both supported config formats accept the canonical fixtures and
+  # produce identical runtime configs. Runs on every push/PR because it is
+  # cheap (one build, two short binary invocations per matrix entry).
+  config-formats:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [build-and-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [ini, yaml]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            liburing-dev libyaml-dev libssl-dev \
+            lua5.4 liblua5.4-dev python3 python3-dev ccache
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: config-formats-${{ runner.os }}
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_STANDARD=23 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DKEEL_ENABLE_TESTS=ON
+          cmake --build build -j$(nproc) --target keel test_config_yaml
+
+      - name: Validate fixture (${{ matrix.format }})
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.format }}" = "yaml" ]; then
+            build/src/main/keel --convert-config etc/keel-pg.ini -o /tmp/keel.yaml
+            CONFIG=/tmp/keel.yaml
+          else
+            CONFIG=etc/keel-pg.ini
+          fi
+          build/src/main/keel --check-config -c "$CONFIG"
+
+      - name: Round-trip equivalence (${{ matrix.format }})
+        run: |
+          set -euxo pipefail
+          # ini -> yaml -> ini  (and yaml -> ini -> yaml) must be lossless.
+          build/src/main/keel --convert-config etc/keel-pg.ini -o /tmp/a.yaml
+          build/src/main/keel --convert-config /tmp/a.yaml      -o /tmp/b.ini
+          build/src/main/keel --convert-config /tmp/b.ini       -o /tmp/c.yaml
+          build/src/main/keel --check-config -c /tmp/a.yaml
+          build/src/main/keel --check-config -c /tmp/b.ini
+          build/src/main/keel --check-config -c /tmp/c.yaml
+
+      - name: YAML loader unit tests
+        run: ctest --test-dir build -R test_config_yaml --output-on-failure
+
+  # ===========================================================================
   # AddressSanitizer + UndefinedBehaviorSanitizer
   # ===========================================================================
   sanitizer-asan:

@@ -2,15 +2,20 @@
 # =============================================================================
 # KEEL Docker Entrypoint
 # =============================================================================
-# Applies KEEL_* environment variable overrides to the INI config before
-# handing off to the keel binary.
+# Applies KEEL_* environment variable overrides to the config before handing
+# off to the keel binary. Supports both INI (.ini, default) and YAML
+# (.yaml / .yml) configuration files — the format is auto-detected from the
+# KEEL_CONFIG file extension. YAML inputs are converted to INI in /run/keel
+# so the env-override merge logic stays format-agnostic.
 #
 # Any KEEL_* variable is translated to an INI override using the pattern:
 #
 #   KEEL_<SECTION>_<KEY>=<value>  →  [section] key = value
 #
 # Special top-level overrides (no section prefix):
-#   KEEL_CONFIG        Path to the INI config file (default: /etc/keel/keel.ini)
+#   KEEL_CONFIG        Path to the config file (INI or YAML; default:
+#                      /etc/keel/keel.ini, falls back to /etc/keel/keel.yaml
+#                      if the INI form is absent).
 #   KEEL_LOG_LEVEL     [keel] log_level
 #
 # Worker-group config (e.g. KEEL_WG_MYDB_POOL_MODE=transaction):
@@ -36,6 +41,24 @@ OVERRIDE_FILE="/run/keel/env-overrides.ini"
 
 # Ensure runtime directory is writable (tmpfs in container)
 mkdir -p /run/keel
+
+# ─── Auto-detect config format & convert YAML→INI for the merge step ────────
+# The merge logic below appends an INI fragment built from KEEL_* env vars.
+# If the operator mounted a YAML config, we first convert it to INI so the
+# merge stays format-agnostic. When KEEL_CONFIG points at the default INI
+# path but only a YAML file is present (e.g. the image baked /etc/keel/
+# keel.yaml.example), fall back to it automatically.
+if [ ! -f "${KEEL_CONFIG}" ] && [ -f "/etc/keel/keel.yaml" ]; then
+    KEEL_CONFIG="/etc/keel/keel.yaml"
+fi
+
+case "${KEEL_CONFIG}" in
+    *.yaml|*.yml|*.YAML|*.YML)
+        CONVERTED_INI="/run/keel/from-yaml.ini"
+        /usr/local/bin/keel --convert-config "${KEEL_CONFIG}" -o "${CONVERTED_INI}" >/dev/null
+        KEEL_CONFIG="${CONVERTED_INI}"
+        ;;
+esac
 
 # ─── Build override file from KEEL_* environment variables ──────────────────
 

@@ -42,7 +42,7 @@ spec:
           args:
             - "keel"
             - "-c"
-            - "/etc/keel/keel.ini"
+            - {{ include "keel.configPath" . | quote }}
           {{- with .Values.env }}
           env:
             {{- toYaml . | nindent 12 }}
