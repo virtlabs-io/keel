@@ -55,8 +55,9 @@ holds the relevant rows, and forwards the query to that shard.
   threshold table) are supported per rule.
 - **Scatter fan-out**: queries without a shard predicate are automatically broadcast
   to all shards, with per-shard read/write split.
-- **Live migration**: shard rebalancing (move rows from shard A to shard B) is
-  supported with dual-write + read-from-new semantics, zero downtime.
+- **Controlled migration**: shard rebalancing (move rows from shard A to shard B)
+  uses dual-write + read-from-new semantics and requires an operator-tested
+  migration window.
 - **Hot-reload**: shard rules can be updated at runtime via SIGHUP without restarting
   the proxy.
 - **Observability**: Prometheus counters, admin SQL, per-shard routing stats.
@@ -240,10 +241,10 @@ KEEL horizontal sharding is the right choice when:
    correctly based solely on the SQL text. No ORM plugin, driver, or service-mesh
    annotation is required.
 
-6. **You need live rebalancing.** KEEL's `KEEL_SHARD_STATE_MIGRATING` allows adding a
-   new shard and progressively moving rows with zero downtime (dual-write + read-from-
-   new), compared to partition reattachment (which requires an exclusive lock) or
-   pg_repack.
+6. **You need controlled rebalancing.** KEEL's `KEEL_SHARD_STATE_MIGRATING` allows
+  adding a new shard and progressively moving rows with dual-write + read-from-new
+  semantics, compared to partition reattachment (which requires an exclusive lock)
+  or pg_repack.
 
 ---
 

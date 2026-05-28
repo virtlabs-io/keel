@@ -233,6 +233,42 @@ static void test_postgresql_invalid_and_empty_fail_closed(void)
     TEST_END();
 }
 
+static void assert_postgresql_not_replica_safe(const char* sql)
+{
+    const keel_parser_plugin_ops_t* ops = keel_parser_builtin_postgresql_sql();
+    keel_parse_result_t result;
+    keel_parse_input_t input = pg_input(sql);
+    keel_parse_status_t st = ops->parse(&input, &result);
+
+    TEST_ASSERT(st == KEEL_PARSE_OK ||
+                st == KEEL_PARSE_ERROR ||
+                st == KEEL_PARSE_UNSUPPORTED ||
+                st == KEEL_PARSE_RESOURCE_LIMIT);
+    TEST_ASSERT(!result.plan.safe_for_replica);
+    TEST_ASSERT(result.plan.safety != KEEL_SAFETY_SAFE_REPLICA);
+    TEST_ASSERT(result.plan.requires_primary ||
+                result.plan.requires_pinned_backend ||
+                result.plan.safety == KEEL_SAFETY_UNKNOWN_FAIL_CLOSED ||
+                result.plan.safety == KEEL_SAFETY_REJECT_REQUIRED);
+    keel_parse_result_free(ops, &result);
+}
+
+static void test_postgresql_semantic_hazards_fail_closed(void)
+{
+    TEST_BEGIN("postgresql_semantic_hazards_fail_closed");
+    assert_postgresql_not_replica_safe("SELECT nextval('order_id_seq')");
+    assert_postgresql_not_replica_safe("SELECT pg_catalog.nextval('order_id_seq')");
+    assert_postgresql_not_replica_safe("SELECT setval('order_id_seq', 10)");
+    assert_postgresql_not_replica_safe("SELECT pg_advisory_lock(42)");
+    assert_postgresql_not_replica_safe("SELECT function_that_writes()");
+    assert_postgresql_not_replica_safe("COPY users FROM STDIN");
+    assert_postgresql_not_replica_safe("CREATE TEMP TABLE t(id int)");
+    assert_postgresql_not_replica_safe("LISTEN events");
+    assert_postgresql_not_replica_safe("NOTIFY events");
+    assert_postgresql_not_replica_safe("DO $$ BEGIN PERFORM 1; END $$");
+    TEST_END();
+}
+
 int main(void)
 {
     test_register_lookup_builtin();
@@ -243,5 +279,6 @@ int main(void)
     test_postgresql_function_fails_to_primary();
     test_postgresql_session_and_txn_pin();
     test_postgresql_invalid_and_empty_fail_closed();
+    test_postgresql_semantic_hazards_fail_closed();
     return test_summary();
 }

@@ -49,6 +49,7 @@ add_library(keelutil STATIC
     net.c
     string.c
     buffer.c
+    replay_log.c
     string_view.c
     xxhash.c
 )

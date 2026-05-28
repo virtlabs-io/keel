@@ -24,6 +24,8 @@ CHAOS_USER="${CHAOS_USER:-postgres}"
 CHAOS_PASS="${CHAOS_PASS:-postgres}"
 FAULT_CONTAINER="${FAULT_CONTAINER:-chaos-fault-injector}"
 FAULT_IFACE="${FAULT_IFACE:-eth0}"
+SHARD0_CONTAINER="${SHARD0_CONTAINER:-chaos-shard0}"
+SHARD1_CONTAINER="${SHARD1_CONTAINER:-chaos-shard1}"
 SHARD0_HOST="${SHARD0_HOST:-172.30.1.10}"
 SHARD1_HOST="${SHARD1_HOST:-172.30.1.11}"
 SHARD_PORT=5432
@@ -38,6 +40,13 @@ SCENARIO="scatter_partition"
 die()  { echo "FAIL: $*" >&2; exit 1; }
 log()  { echo "[scatter-network-partition] $*"; }
 pass() { echo "PASS: $*"; }
+
+for container in "$SHARD0_CONTAINER" "$SHARD1_CONTAINER"; do
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        echo "SKIP: scatter shard container ${container} not running — start the scatter chaos stack first" >&2
+        exit 77
+    fi
+done
 
 scatter_sentinel_count() {
     PGPASSWORD="$CHAOS_PASS" timeout "$PARTITION_TIMEOUT_S" psql \

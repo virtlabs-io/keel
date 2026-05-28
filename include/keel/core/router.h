@@ -193,6 +193,7 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_ROLE_FLAPPING,     /**< Server role unstable, conservative routing */
     KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
     KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
+    KEEL_ROUTE_REASON_SEMANTIC_UNSAFE,   /**< Read-looking SQL was not proven replica-safe */
     KEEL_ROUTE_REASON_COUNT,
 } keel_route_reason_t;
 
@@ -214,6 +215,21 @@ typedef struct keel_route_decision {
     bool                  was_pinned;   /**< Decision due to pinning */
     size_t                shard_index;  /**< Resolved shard for sharded routing */
 } keel_route_decision_t;
+
+/**
+ * @brief Format a route decision as a compact JSON object for logs/admin APIs.
+ *
+ * The helper is protocol-neutral: it reports the selected backend, read/write
+ * class, pin state, shard index, and stable route reason code.  `query_hash`
+ * may be zero when the caller does not have a semantic-plan hash.
+ *
+ * @return Number of bytes that would have been written, excluding the trailing
+ *         NUL, matching `snprintf()` semantics.
+ */
+size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
+                                   uint64_t query_hash,
+                                   char* out,
+                                   size_t out_size);
 
 /**
  * @brief Configuration knobs controlling router behavior and failure policy.

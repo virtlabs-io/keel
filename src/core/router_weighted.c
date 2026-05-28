@@ -27,10 +27,12 @@
 #include "keel/sql/sql.h"
 #include "keel/mem/mem.h"
 #include "keel/log/log.h"
+#include "keel/util/encoding.h"
 #include "keel/util/util.h"
 
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -96,8 +98,64 @@ const char* keel_route_reason_name(keel_route_reason_t r)
     case KEEL_ROUTE_REASON_ROLE_FLAPPING:     return "ROLE_FLAPPING";
     case KEEL_ROUTE_REASON_DDL:               return "DDL";
     case KEEL_ROUTE_REASON_TRANSACTION_CTRL:  return "TRANSACTION_CTRL";
+    case KEEL_ROUTE_REASON_SEMANTIC_UNSAFE:   return "SEMANTIC_UNSAFE";
     default:                                  return "UNKNOWN";
     }
+}
+
+size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
+                                   uint64_t query_hash,
+                                   char* out,
+                                   size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return 0;
+    }
+
+    if (!decision) {
+        int n = snprintf(out, out_size, "{\"error\":\"missing_decision\"}");
+        return n > 0 ? (size_t)n : 0;
+    }
+
+    char server_name[128];
+    char reason_text[256];
+    keel_json_escape(server_name, sizeof server_name,
+                     decision->server ? decision->server->name : "");
+    keel_json_escape(reason_text, sizeof reason_text,
+                     decision->reason ? decision->reason : "");
+
+    const char* role = "unknown";
+    if (decision->server) {
+        role = decision->server->role == KEEL_SERVER_PRIMARY
+            ? "primary"
+            : "replica";
+    }
+
+    char shard[32];
+    if (decision->shard_index == SIZE_MAX) {
+        snprintf(shard, sizeof shard, "null");
+    } else {
+        snprintf(shard, sizeof shard, "%zu", decision->shard_index);
+    }
+
+    int n = snprintf(out, out_size,
+        "{\"query_hash\":\"0x%016llx\","
+        "\"route\":\"%s\","
+        "\"server\":\"%s\","
+        "\"is_read\":%s,"
+        "\"was_pinned\":%s,"
+        "\"shard_index\":%s,"
+        "\"reason_code\":\"%s\","
+        "\"reason\":\"%s\"}",
+        (unsigned long long)query_hash,
+        role,
+        server_name,
+        decision->is_read ? "true" : "false",
+        decision->was_pinned ? "true" : "false",
+        shard,
+        keel_route_reason_name(decision->reason_code),
+        reason_text);
+    return n > 0 ? (size_t)n : 0;
 }
 
 /* ============================================================================
@@ -718,13 +776,17 @@ static bool should_use_readonly(
         return false;
     }
     
-    /* Check Query Tree */
-    if (qt) {
-        return keel_qt_can_use_replica(qt);
+    if (!qt) {
+        return false;
     }
-    
-    /* No query tree - assume write */
-    return false;
+
+    if (qt->has_error ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE) ||
+        qt->func_count > 0) {
+        return false;
+    }
+
+    return keel_qt_can_use_replica(qt);
 }
 
 /**
@@ -992,6 +1054,12 @@ static keel_error_t route_internal(keel_router_t* router,
             } else if (qt && qt->operation == KEEL_QT_OP_DDL) {
                 decision->reason      = "DDL statement";
                 decision->reason_code = KEEL_ROUTE_REASON_DDL;
+            } else if (qt && qt->func_count > 0) {
+                decision->reason      = "semantic uncertainty requires RW";
+                decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+            } else if (qt && (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE)) {
+                decision->reason      = "partial parse requires RW";
+                decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
             } else if (qt && qt->operation == KEEL_QT_OP_WRITE) {
                 decision->reason      = use_shard_filter ? "single-shard write query" : "write query";
                 decision->reason_code = KEEL_ROUTE_REASON_WRITE_REQUIRED;
@@ -1067,9 +1135,22 @@ keel_error_t keel_router_route_sql(keel_router_t* router,
     /* Parse through the frontend-bound parser plugin contract. */
     keel_parse_result_t parse;
     keel_qt_query_t* qt = router_parse_postgresql_sql(sql, &parse);
+    bool semantic_unsafe = (qt == NULL) ||
+        parse.status != KEEL_PARSE_OK ||
+        (qt->operation == KEEL_QT_OP_READ &&
+         parse.plan.safety != KEEL_SAFETY_SAFE_REPLICA) ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE);
 
-    /* Route using Query Tree bridge (may be NULL for parse errors). */
-    keel_error_t err = keel_router_route(router, qt, session, decision);
+    const keel_qt_query_t* route_qt = semantic_unsafe &&
+        qt && qt->operation == KEEL_QT_OP_READ ? NULL : qt;
+
+    /* Route using Query Tree bridge (may be NULL for parse/semantic errors). */
+    keel_error_t err = keel_router_route(router, route_qt, session, decision);
+    if (err == KEEL_OK && semantic_unsafe && decision &&
+        decision->reason_code == KEEL_ROUTE_REASON_WRITE_REQUIRED) {
+        decision->reason = "semantic uncertainty requires RW";
+        decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+    }
     keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
     return err;
 }
@@ -1137,6 +1218,11 @@ keel_error_t keel_router_route_sharded_sql_bound(keel_router_t* router,
         keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
         return KEEL_ERR_SQL_PARSE;
     }
+    bool semantic_unsafe =
+        parse.status != KEEL_PARSE_OK ||
+        (qt->operation == KEEL_QT_OP_READ &&
+         parse.plan.safety != KEEL_SAFETY_SAFE_REPLICA) ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE);
 
     keel_shard_key_t shard_key;
     keel_error_t err = keel_shard_extract_key_ast(qt->ast, rule, &shard_key);
@@ -1152,7 +1238,14 @@ keel_error_t keel_router_route_sharded_sql_bound(keel_router_t* router,
         return err;
     }
 
-    err = route_internal(router, qt, session, true, shard_index, decision);
+    const keel_qt_query_t* route_qt = semantic_unsafe &&
+        qt->operation == KEEL_QT_OP_READ ? NULL : qt;
+    err = route_internal(router, route_qt, session, true, shard_index, decision);
+    if (err == KEEL_OK && semantic_unsafe && decision &&
+        decision->reason_code == KEEL_ROUTE_REASON_WRITE_REQUIRED) {
+        decision->reason = "semantic uncertainty requires RW";
+        decision->reason_code = KEEL_ROUTE_REASON_SEMANTIC_UNSAFE;
+    }
     keel_parse_result_free(keel_parser_builtin_postgresql_sql(), &parse);
     return err;
 }

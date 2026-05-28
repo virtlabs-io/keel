@@ -50,8 +50,10 @@ command -v pgbench >/dev/null 2>&1 || die "pgbench not found on PATH"
 command -v psql    >/dev/null 2>&1 || die "psql not found on PATH"
 
 for container in "$SHARD0_CONTAINER" "$SHARD1_CONTAINER"; do
-    docker inspect "$container" >/dev/null 2>&1 \
-        || die "Container ${container} not running — start the chaos stack first"
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        echo "SKIP: scatter shard container ${container} not running — start the scatter chaos stack first" >&2
+        exit 77
+    fi
 done
 
 PGPASSWORD="$CHAOS_PASS" psql \

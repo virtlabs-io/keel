@@ -61,3 +61,20 @@ does not become replica-safe.
 - The current query-tree bridge is transitional and should shrink as routers
   move to `keel_semantic_plan_t`.
 
+## Containment Rules
+
+External parser plugins are not production-supported until the ABI can enforce
+bounded behavior. The required contract is:
+
+| Limit | Required behavior |
+|-------|-------------------|
+| Parse time | Abort classification and fail closed when the budget expires. |
+| AST nodes | Stop building and return `KEEL_PARSE_RESOURCE_LIMIT`. |
+| Allocations | Use parser-local accounting; failure must leave router state untouched. |
+| Recursion depth | Reject deeply nested input before stack exhaustion. |
+| Output size | Bound semantic-plan and diagnostic payloads. |
+
+The router may consume a parser result only when `keel_semantic_plan_valid()` is
+true and the plan's safety level allows the requested backend class. Any plugin
+failure is a primary, pin, reject, or close decision, never a replica decision.
+

@@ -570,6 +570,56 @@ TEST(route_sql_directly) {
     keel_router_destroy(router);
 }
 
+TEST(route_sql_conservative_semantics_to_primary) {
+    keel_router_t* router = create_test_router();
+    ASSERT_NE(router, NULL);
+
+    const char* risky_sql[] = {
+        "SELECT refresh_customer_score(10)",
+        "SELECT nextval('order_id_seq')",
+        "SELECT pg_catalog.nextval('order_id_seq')",
+        "SELECT pg_advisory_lock(42)",
+        "DO $$ BEGIN PERFORM 1; END $$",
+        "COPY users FROM STDIN",
+    };
+
+    for (size_t i = 0; i < sizeof(risky_sql) / sizeof(risky_sql[0]); i++) {
+        keel_route_decision_t decision;
+        ASSERT_EQ(keel_router_route_sql(router,
+                                        (keel_str_t){ .data = risky_sql[i],
+                                                      .len = strlen(risky_sql[i]) },
+                                        NULL, &decision), KEEL_OK);
+        ASSERT_FALSE(decision.is_read);
+        ASSERT_NE(decision.server, NULL);
+        ASSERT_STR_EQ(decision.server->name, "primary");
+        if (i < 4) {
+            ASSERT_EQ(decision.reason_code, KEEL_ROUTE_REASON_SEMANTIC_UNSAFE);
+        }
+    }
+
+    keel_router_destroy(router);
+}
+
+TEST(route_decision_explain_json) {
+    keel_router_t* router = create_test_router();
+    ASSERT_NE(router, NULL);
+
+    keel_route_decision_t decision;
+    ASSERT_EQ(keel_router_route_sql(router,
+                                    KEEL_STR("SELECT nextval('order_id_seq')"),
+                                    NULL, &decision), KEEL_OK);
+
+    char json[512];
+    size_t len = keel_route_decision_to_json(&decision, 0x81ab, json, sizeof json);
+    ASSERT_TRUE(len > 0);
+    ASSERT_TRUE(strstr(json, "\"query_hash\":\"0x00000000000081ab\"") != NULL);
+    ASSERT_TRUE(strstr(json, "\"route\":\"primary\"") != NULL);
+    ASSERT_TRUE(strstr(json, "\"server\":\"primary\"") != NULL);
+    ASSERT_TRUE(strstr(json, "\"reason_code\":\"SEMANTIC_UNSAFE\"") != NULL);
+
+    keel_router_destroy(router);
+}
+
 /* ============================================================================
  * Statistics Tests
  * ============================================================================ */
@@ -779,6 +829,8 @@ int main(int argc, char* argv[]) {
     
     printf("\nSQL routing tests:\n");
     RUN_TEST(route_sql_directly);
+    RUN_TEST(route_sql_conservative_semantics_to_primary);
+    RUN_TEST(route_decision_explain_json);
     
     printf("\nStatistics tests:\n");
     RUN_TEST(router_statistics);

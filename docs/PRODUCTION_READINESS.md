@@ -4,17 +4,23 @@ This document separates the code that is ready for production hardening from
 features that are implemented but still under failure-mode validation, and from
 features that are aspirational or roadmap-only.
 
-## Production Support Status for v0.3-alpha
+For v0.4-alpha, the controlling contract is
+[Correctness Under Failure](CORRECTNESS_UNDER_FAILURE.md): when parser, session,
+transaction, or failover certainty is missing, KEEL must route conservatively,
+pin, reject, or close.
+
+## Production Support Status for v0.4-alpha
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize`
-and `experimental_features = false`.
+only after replay validation, and `experimental_features = false`.
 
 | Status | Features |
 |--------|----------|
-| Production candidate | PostgreSQL pool mode, PostgreSQL prepared-statement virtualization after replay validation, admin inspection and basic metrics |
-| Hardening | Smart routing, SSV, Patroni failover, transaction tracking |
-| Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
-| Aspirational | Result cache correctness guarantees |
+| Stable target | PostgreSQL proxy mode, PostgreSQL pool mode, admin inspection, Prometheus/OTLP observability |
+| Beta / hardening | Smart read routing, PostgreSQL prepared-statement virtualization, SSV, Patroni failover, transaction tracking |
+| Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, result cache, cluster compression |
+| Alpha | MySQL wire protocol and pooling |
+| Research | GraphQL, MCP, natural-language parsing |
 
 ## Maturity Levels
 
@@ -86,9 +92,12 @@ meant for deliberate feature evaluation with targeted tests and rollout controls
 | Backend dies before `ReadyForQuery` | Close or reject the backend; do not reuse without protocol-confirmed idle state. | `backend_close_*`, `proxy_backend_reuse_failure_total`, backend error class. | Pool/protocol cleanup tests plus commit-in-doubt tests. |
 | Client disconnects during COMMIT | Preserve commit-in-doubt sessions until outcome is resolved or explicitly surfaced. | `commit_in_doubt_*`, session/admin CID flag. | `test_drain_shutdown`, session engine CID tests. |
 | Replica lag exceeds threshold | Route conservatively to primary or reject according to policy; never serve a read known to violate the requested token. | route decision trace, sticky-primary counters, replica lag probe result. | Sticky-primary stable; token catch-up probes experimental. |
+| Parser error, partial parse, or unknown function | Route to primary or reject; never route to a replica without positive semantic proof. | `SEMANTIC_UNSAFE` route reason, parser status, semantic safety level. | `test_parser_registry`, `test_router`. |
+| Parser plugin resource limit or failure | Route to primary, reject, or close; do not trust partially populated plugin output. | parser status, plugin name, semantic safety level. | Parser plugin containment gates planned. |
 | Primary role changes mid-transaction | Keep the transaction pinned to its backend until completion or connection failure; do not silently replay the transaction elsewhere. | pin reason, backend close reason, failover event logs. | Failover tests plus transaction-pin invariants. |
 | `DISCARD` / cleanup fails | Close the backend; do not return it to idle lists. | `discard_all_failure`, `cleaning_timeout_total`, `backend_close_cleanup_*`. | Pool cleanup parser tests. |
 | Prepared-statement replay fails | Close/reject backend or surface protocol error; never forward queued client traffic after failed replay. | stmt replay counters, backend close reason, protocol error counter. | `test_pre_query_replay`, protocol-flow tests. |
+| Production incident must be reproducible | Write redacted NDJSON replay events with payload hashes, route reasons, semantic safety, state transitions, and CID outcomes. | `keel_replay_log_*`, replay artifact path, event count. | `test_replay_log`, chaos artifact archival. |
 | TLS renegotiation or TLS error | Close affected session; keep backend ownership invariants intact. | TLS failure counters, session close reason. | TLS security tests. |
 | Partial send | Resume through deferred-send infrastructure or close conservatively; never assume full write. | deferred-send counters and flow wait timings. | Reactor and pre-query replay tests. |
 | Partial recv | Parse only complete protocol frames; buffer fragments or treat malformed data as protocol error. | protocol desync counter. | split-protocol tests and plugin-flow tests. |
@@ -152,6 +161,9 @@ with real PostgreSQL workloads and real client drivers.
 | Reactor-blocking lint | `scripts/check_forbidden_blocking.sh` | `lint` |
 | Metric invariants — no per-request label cardinality, no hot-path allocations | `scripts/check_metrics_invariants.sh` | `lint` |
 | Metrics reference parity — every registered metric is documented in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md) and vice versa | `scripts/check_metrics_reference.sh` | `lint` |
+| Public-claim safety — forbid risky production promises in Markdown docs | `scripts/check_dangerous_marketing_claims.sh` | `lint` |
+| Chaos manifest — every release chaos scenario exists and data-corruption cases use sentinels | `scripts/check_chaos_manifest.sh` | `lint;hardening` |
+| Correctness gate manifest — deterministic proof/CID/replay gates are wired into CTest | `scripts/check_correctness_gates.sh` | `lint;hardening` |
 | Auth log safety — no auth material in log calls | `scripts/check_auth_log_safety.sh` | `gate;security` |
 | Result-cache experimental gate | `scripts/check_result_cache_gate.sh` | `gate` |
 

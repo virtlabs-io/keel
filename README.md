@@ -7,9 +7,9 @@
 [![codecov](https://codecov.io/gh/virtlabs-io/keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A high-performance, database-agnostic connection pooler written in modern C (C23) with native io_uring support, transaction pooling, intelligent routing, and full TLS support (frontend + backend). Supports both **PostgreSQL** and **MySQL** wire protocols. For `v0.3-alpha`, the recommended production deployment is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
+A correctness-first intelligent PostgreSQL proxy/pooler written in modern C (C23) with native io_uring support, transaction pooling, semantic routing, explicit state ownership, and full TLS support (frontend + backend). MySQL support exists, but it is not the first production baseline. For `v0.4-alpha`, the recommended production direction is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
 
-Quick Links: [Docs](docs/) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Benchmarks](bench/README.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
+Quick Links: [Docs](docs/) · [Correctness](docs/CORRECTNESS_UNDER_FAILURE.md) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Benchmarks](bench/README.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
 ## Overview
 

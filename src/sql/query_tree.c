@@ -18,6 +18,7 @@
 #include "keel/util/util.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -169,14 +170,31 @@ typedef struct {
     keel_qt_query_t*   query;
 } func_visitor_ctx_t;
 
+static bool str_eq_lit_ci(keel_str_t s, const char* lit)
+{
+    size_t len = strlen(lit);
+    return s.len == len && strncasecmp(s.data, lit, len) == 0;
+}
+
+static bool is_known_replica_safe_builtin(keel_str_t name)
+{
+    return str_eq_lit_ci(name, "avg") ||
+           str_eq_lit_ci(name, "bool_and") ||
+           str_eq_lit_ci(name, "bool_or") ||
+           str_eq_lit_ci(name, "count") ||
+           str_eq_lit_ci(name, "every") ||
+           str_eq_lit_ci(name, "max") ||
+           str_eq_lit_ci(name, "min") ||
+           str_eq_lit_ci(name, "sum");
+}
+
 /**
  * @brief AST visitor that collects every user-defined function call into the
  *        Query Tree's function-reference list.
  *
- * Built-in / catalog functions (e.g. `now()`, `count()`, `pg_catalog.*`)
- * are always safe for replicas and are therefore skipped.  We detect them by
- * checking whether the schema is `pg_catalog` or `information_schema`, or
- * whether the unqualified name is a well-known built-in.
+ * Only a tiny allow-list of replica-safe aggregate builtins is skipped here.
+ * Catalog-qualified calls are left to metadata-aware routing. Everything else
+ * is recorded so the router can fail closed when catalog proof is unavailable.
  *
  * The visitor records KEEL_SQL_NODE_EXPR_FUNC, KEEL_SQL_NODE_EXPR_AGGR
  * (aggregate calls) and KEEL_SQL_NODE_EXPR_WINDOW (window function calls).
@@ -199,12 +217,9 @@ static keel_sql_visit_result_t visit_functions(keel_sql_node_t* node, void* ctx)
         return KEEL_SQL_VISIT_CONTINUE;
     }
 
-    /* Skip known-safe catalog schemas */
-    if (fn->schema.len > 0) {
-        if (keel_str_eq(fn->schema, KEEL_STR("pg_catalog")) ||
-            keel_str_eq(fn->schema, KEEL_STR("information_schema"))) {
-            return KEEL_SQL_VISIT_CONTINUE;
-        }
+    /* Skip only functions with built-in merge/read-only semantics. */
+    if (is_known_replica_safe_builtin(fn->name)) {
+        return KEEL_SQL_VISIT_CONTINUE;
     }
 
     keel_qt_func_ref_t* ref = add_func_ref(c->builder, c->query);
@@ -712,6 +727,13 @@ keel_qt_query_t* keel_qt_build(keel_qt_builder_t* builder, keel_sql_node_t* ast)
     if (q && q->ast) {
         func_visitor_ctx_t fctx = { builder, q };
         keel_sql_ast_walk(q->ast, visit_functions, &fctx);
+
+        if (q->operation == KEEL_QT_OP_READ && q->func_count > 0) {
+            q->flags &= ~(uint32_t)(KEEL_QT_FLAG_READONLY |
+                                    KEEL_QT_FLAG_CACHEABLE |
+                                    KEEL_QT_FLAG_DETERMINISTIC);
+            q->flags |= KEEL_QT_FLAG_NEEDS_PRIMARY | KEEL_QT_FLAG_NO_CACHE;
+        }
     }
 
     return q;
@@ -726,6 +748,12 @@ keel_qt_query_t* keel_qt_build(keel_qt_builder_t* builder, keel_sql_node_t* ast)
  */
 bool keel_qt_can_use_replica(const keel_qt_query_t* qt) {
     if (!qt) return false;
+
+    if (qt->has_error ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE) ||
+        qt->func_count > 0) {
+        return false;
+    }
     
     /* If explicitly needs primary, no */
     if (qt->flags & KEEL_QT_FLAG_NEEDS_PRIMARY) {
