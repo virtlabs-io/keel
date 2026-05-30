@@ -33,6 +33,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <strings.h>   /* strcasestr */
@@ -402,9 +403,39 @@ int keel_http_send_response(int         fd,
         did_compress ? "Content-Encoding: gzip\r\n" : "");
 
     int rc = 0;
-    if (write(fd, header, (size_t)hlen) != hlen) { rc = -1; goto done; }
-    if (send_len > 0 && write(fd, send_body, send_len) != (ssize_t)send_len)
-        rc = -1;
+    /* write(2) on a stream socket may return a short count under buffer
+     * pressure (large body + slow consumer); loop until every byte has
+     * been delivered or a hard error occurs.  Without this loop the
+     * /metrics response gets silently truncated mid-stream and scrapers
+     * see arbitrary metrics disappear depending on where the cut lands. */
+    {
+        const uint8_t *p = (const uint8_t *)header;
+        size_t remaining = (size_t)hlen;
+        while (remaining > 0) {
+            ssize_t n = write(fd, p, remaining);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                rc = -1; goto done;
+            }
+            if (n == 0) { rc = -1; goto done; }
+            p += (size_t)n;
+            remaining -= (size_t)n;
+        }
+    }
+    if (send_len > 0) {
+        const uint8_t *p = (const uint8_t *)send_body;
+        size_t remaining = send_len;
+        while (remaining > 0) {
+            ssize_t n = write(fd, p, remaining);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                rc = -1; goto done;
+            }
+            if (n == 0) { rc = -1; goto done; }
+            p += (size_t)n;
+            remaining -= (size_t)n;
+        }
+    }
 
 done:
     keel_free(comp_buf);

@@ -102,13 +102,23 @@ static int connect_to(uint16_t port)
     return fd;
 }
 
-/* Read exactly @n bytes; returns -1 on error or if the peer closed early. */
+/* Read exactly @n bytes; returns -1 on error or if the peer closed early.
+ *
+ * noinline: when this is inlined into the mock backend handlers (which use
+ * fixed 8 KiB stack buffers) gcc's value-range analyzer loses the bound on
+ * `n - done` after the first successful read and emits a bogus
+ * -Wstringop-overflow on the read() fortify wrapper. Keeping the call frame
+ * pinned preserves the per-callsite size bound and silences the false
+ * positive without weakening any check. */
+__attribute__((noinline))
 static int read_exact(int fd, uint8_t *buf, size_t n)
 {
     size_t done = 0;
     while (done < n) {
-        ssize_t r = read(fd, buf + done, n - done);
+        size_t want = n - done;
+        ssize_t r = read(fd, buf + done, want);
         if (r <= 0) return -1;
+        if ((size_t)r > want) return -1; /* kernel contract: never above requested */
         done += (size_t)r;
     }
     return 0;
@@ -1935,8 +1945,8 @@ static void test_keel_binary_e2e(void)
          * then exec keel.  Closing inherited fds prevents io_uring rings and
          * other sockets from the parent's test harness leaking into keel. */
         for (int i = 3; i < 4096; i++) close(i); /* NOLINT(keel-syscall) */
-        freopen("/dev/null", "w", stdout); /* NOLINT(keel-syscall) */
-        freopen("/dev/null", "w", stderr); /* NOLINT(keel-syscall) */
+        if (!freopen("/dev/null", "w", stdout)) _exit(126); /* NOLINT(keel-syscall) */
+        if (!freopen("/dev/null", "w", stderr)) _exit(126); /* NOLINT(keel-syscall) */
         execl(binary, "keel", "-c", config_path, NULL);
         _exit(127);
     }
