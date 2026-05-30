@@ -115,6 +115,25 @@ typedef enum keel_route_strategy {
 } keel_route_strategy_t;
 
 /**
+ * @brief Session consistency mode for read routing.
+ */
+typedef enum keel_consistency_mode {
+    KEEL_CONSISTENCY_EVENTUAL = 0,       /**< Reads may use replicas without a write-position token. */
+    KEEL_CONSISTENCY_READ_YOUR_WRITES,   /**< Reads after writes require a proven position or primary. */
+    KEEL_CONSISTENCY_MONOTONIC,          /**< Reserved for future ordered-token routing. */
+    KEEL_CONSISTENCY_PRIMARY_ONLY,       /**< All reads use a write-capable server. */
+} keel_consistency_mode_t;
+
+/**
+ * @brief What to do when no replica has proven it reached the required token.
+ */
+typedef enum keel_stale_read_policy {
+    KEEL_STALE_READ_ROUTE_PRIMARY = 0,   /**< Conservative production default. */
+    KEEL_STALE_READ_WAIT,                /**< Reserved for reactor-owned catch-up waits. */
+    KEEL_STALE_READ_REJECT,              /**< Reject rather than using unproven replicas/primary fallback. */
+} keel_stale_read_policy_t;
+
+/**
  * @brief Router-visible health state for a backend server.
  */
 #ifndef KEEL_SERVER_HEALTH_DEFINED
@@ -140,6 +159,7 @@ typedef struct keel_route_server {
     const char*         host;       /**< Hostname or IP */
     uint16_t            port;       /**< Port number */
     keel_server_role_t   role;       /**< Primary or replica */
+    uint32_t            timeline_id;/**< PostgreSQL WAL timeline, 0 when unknown/N/A */
     int                 weight;     /**< Base weight (1-1000) */
     size_t              shard_id;   /**< Logical shard bucket for sharded routing */
     
@@ -173,6 +193,14 @@ typedef struct keel_route_session {
      * to the client as an explicit failure). The engine mirrors this from
      * `keel_session_flow_t::commit_in_doubt` before every routing call. */
     bool                commit_in_doubt;
+
+    /* v0.5-alpha read-your-writes routing. When true, read queries must not
+     * use replicas unless a future reactor-owned catch-up verifier proves the
+     * replica has reached required_consistency_token. The current production
+     * policy is conservative primary fallback. */
+    bool                requires_consistent_read;
+    char                required_consistency_token[128];
+    uint32_t            required_timeline_id;
 } keel_route_session_t;
 
 /**
@@ -201,6 +229,7 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
     KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
     KEEL_ROUTE_REASON_SEMANTIC_UNSAFE,   /**< Read-looking SQL was not proven replica-safe */
+    KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY, /**< RYW/monotonic token forced primary fallback */
     KEEL_ROUTE_REASON_UNKNOWN_FUNCTION,  /**< SQL calls a function not in the metadata
                                               cache; conservative policy forces primary. */
     KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS,  /**< Session has an unresolved commit-in-doubt;
@@ -253,6 +282,7 @@ typedef enum keel_route_factor {
     KEEL_DF_COMMIT_IN_DOUBT     = (1u << 16), /**< Prior COMMIT outcome unresolved */
     KEEL_DF_REPLICA_OK          = (1u << 17), /**< Proven safe for a replica */
     KEEL_DF_USER_PINNED         = (1u << 18), /**< SET keel.route = primary */
+    KEEL_DF_CONSISTENCY_TOKEN   = (1u << 19), /**< Session carries required LSN/GTID */
 } keel_route_factor_t;
 
 /**
@@ -409,6 +439,14 @@ typedef struct keel_router_config {
      * `scatter_merge = on`; see docs/PRODUCTION_READINESS.md.
      */
     bool                scatter_merge_enabled;
+
+    /* Consistency policy. v0.5-alpha production support is intentionally
+     * conservative: READ_YOUR_WRITES + ROUTE_PRIMARY. WAIT/REJECT are kept in
+     * the typed config surface but remain future reactor-owned behaviors. */
+    keel_consistency_mode_t consistency_mode;
+    uint64_t            max_replica_lag_bytes;
+    uint32_t            max_replica_catchup_ms;
+    keel_stale_read_policy_t stale_read_policy;
 
 } keel_router_config_t;
 

@@ -5310,6 +5310,32 @@ static void pgf_captured_fe_pin_effects(void* vctx,
     }
 }
 
+static bool pg_lsn_token_is_safe(const char* value)
+{
+    if (!value || value[0] == '\0')
+        return false;
+
+    bool saw_slash = false;
+    bool saw_left = false;
+    bool saw_right = false;
+    for (const char* p = value; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (*p == '/') {
+            if (saw_slash || !saw_left)
+                return false;
+            saw_slash = true;
+            continue;
+        }
+        if (!isxdigit(ch))
+            return false;
+        if (saw_slash)
+            saw_right = true;
+        else
+            saw_left = true;
+    }
+    return saw_slash && saw_left && saw_right;
+}
+
 /* ---- capture_consistency_token: inline SELECT pg_current_wal_lsn() ---- */
 
 /**
@@ -5329,7 +5355,9 @@ static void pgf_captured_fe_pin_effects(void* vctx,
  *        'C' CommandComplete   → skip
  *        'E' ErrorResponse     → log and return -1
  *        'Z' ReadyForQuery     → end of response, break loop
- *   3. Copy the LSN string into out->value.
+ *   3. Copy the LSN string into out->value. If a future privileged probe
+ *      supplies a second DataRow column, it is parsed as out->timeline_id;
+ *      the unprivileged write-path query leaves timeline_id as 0.
  *
  * **Deferred capture pattern**: The caller (keel_engine_flow_on_be_data) sets
  * `capture_lsn_pending` during forward processing of the FE message; the
@@ -5351,7 +5379,6 @@ static int pgf_capture_consistency_token(void* vctx, int be_fd,
 
     keel_time_t t_start = keel_time_now();
 
-    /* Build simple query: SELECT pg_current_wal_lsn() */
     const char* sql = "SELECT pg_current_wal_lsn()";
     uint8_t qbuf[64];
     size_t sl    = strlen(sql) + 1;
@@ -5420,19 +5447,36 @@ static int pgf_capture_consistency_token(void* vctx, int be_fd,
         if (mtype == 'D' && !lsn_found && body_len >= 7) {
             /* DataRow: int16 ncols | per-col: int32 col_len + col_data */
             uint16_t ncols = (uint16_t)(((uint16_t)body[0] << 8) | body[1]);
-            if (ncols == 1) {
-                int32_t col_len = (int32_t)rd32(body + 2);
-                if (col_len > 0 &&
-                    col_len < (int32_t)KEEL_CONSISTENCY_TOKEN_MAX &&
-                    (uint32_t)(6 + col_len) <= body_len) {
-                    memcpy(out->value, body + 6, (size_t)col_len);
-                    out->value[col_len] = '\0';
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-                    out->captured_at_ns =
-                        (uint64_t)ts.tv_sec * 1000000000ULL
-                        + (uint64_t)ts.tv_nsec;
-                    lsn_found = true;
+            if (ncols >= 1) {
+                uint32_t pos = 2;
+                for (uint16_t col = 0; col < ncols && pos + 4 <= body_len; col++) {
+                    int32_t col_len = (int32_t)rd32(body + pos);
+                    pos += 4;
+                    if (col_len < 0)
+                        continue;
+                    if (pos + (uint32_t)col_len > body_len)
+                        return -1;
+                    if (col == 0 &&
+                        col_len > 0 &&
+                        col_len < (int32_t)KEEL_CONSISTENCY_TOKEN_MAX) {
+                        memcpy(out->value, body + pos, (size_t)col_len);
+                        out->value[col_len] = '\0';
+                        struct timespec ts;
+                        clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+                        out->captured_at_ns =
+                            (uint64_t)ts.tv_sec * 1000000000ULL
+                            + (uint64_t)ts.tv_nsec;
+                        lsn_found = true;
+                    } else if (col == 1 && col_len > 0 && col_len < 16) {
+                        char timeline_buf[16];
+                        memcpy(timeline_buf, body + pos, (size_t)col_len);
+                        timeline_buf[col_len] = '\0';
+                        char* end = NULL;
+                        unsigned long tl = strtoul(timeline_buf, &end, 10);
+                        if (end && *end == '\0' && tl <= UINT32_MAX)
+                            out->timeline_id = (uint32_t)tl;
+                    }
+                    pos += (uint32_t)col_len;
                 }
             }
         }
@@ -5496,6 +5540,10 @@ static int pgf_replica_reached_token(void* vctx, int replica_fd,
         return 0;
     }
 
+    if (!pg_lsn_token_is_safe(token->value)) {
+        return -1;
+    }
+
     /* Apply socket-level send/recv timeouts so a slow replica cannot block
      * the calling thread indefinitely.  timeout_ms == 0 means "use the
      * system default" (i.e. we do not override it). */
@@ -5526,10 +5574,18 @@ static int pgf_replica_reached_token(void* vctx, int replica_fd,
     /* Use COALESCE so this also works on the primary (where
      * pg_last_wal_replay_lsn() returns NULL because it is not in recovery). */
     char sql[512];
-    snprintf(sql, sizeof(sql),
-             "SELECT COALESCE(pg_last_wal_replay_lsn(),"
-             " pg_current_wal_lsn()) >= '%s'::pg_lsn",
-             token->value);
+    if (token->timeline_id != 0) {
+        snprintf(sql, sizeof(sql),
+                 "SELECT ((SELECT timeline_id FROM pg_control_checkpoint()) = %u)"
+                 " AND COALESCE(pg_last_wal_replay_lsn(),"
+                 " pg_current_wal_lsn()) >= '%s'::pg_lsn",
+                 token->timeline_id, token->value);
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "SELECT COALESCE(pg_last_wal_replay_lsn(),"
+                 " pg_current_wal_lsn()) >= '%s'::pg_lsn",
+                 token->value);
+    }
 
     uint8_t qbuf[576];
     size_t sl    = strlen(sql) + 1;

@@ -234,11 +234,8 @@ typedef struct keel_session_flow {
     uint8_t  indoubt_check_result;
 
     /** When a write/DDL query is forwarded to the backend, this flag records
-     *  that a consistency token would be useful after query completion.  The
-     *  worker no longer performs inline token capture because the legacy
-     *  implementation temporarily switched the backend fd to blocking and
-     *  ran a protocol round trip on the reactor thread. */
-    bool     capture_lsn_pending;  /**< Async LSN/GTID capture wanted after query_complete */
+     *  that a consistency token must be captured after query completion. */
+    bool     capture_lsn_pending;  /**< LSN/GTID capture required after query_complete */
     bool     txn_had_writes;       /**< True if a write/DDL was forwarded inside an
                                     *   explicit BEGIN…COMMIT transaction.  Defers LSN
                                     *   capture marker to the COMMIT's query_complete so

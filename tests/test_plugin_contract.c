@@ -461,18 +461,22 @@ static int test_pg_capture_consistency_token(void) {
     TEST_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
 
     /* Build minimal PG response: only the DataRow matters for the scanner.
-     * DataRow ('D'):
-     *   1 byte type = 'D'
-     *   4 bytes int32_be message_length = 4+2+4+9 = 19
-     *   2 bytes int16_be ncols = 1
+      * DataRow ('D'):
+      *   1 byte type = 'D'
+      *   4 bytes int32_be message_length = 4+2+(4+9)+(4+1) = 24
+      *   2 bytes int16_be ncols = 2
      *   4 bytes int32_be col_len = 9
      *   9 bytes data = "0/16B3740"
+      *   4 bytes int32_be col_len = 1
+      *   1 byte data = "7"
      */
     static const uint8_t fake_response[] = {
         /* RowDescription stub (ignored by scanner — just needs to precede DataRow) */
         'T', 0,0,0,6, 0,0,
         /* DataRow */
-        'D', 0,0,0,19,  0,1,  0,0,0,9,  '0','/','1','6','B','3','7','4','0',
+          'D', 0,0,0,24,  0,2,
+          0,0,0,9,  '0','/','1','6','B','3','7','4','0',
+          0,0,0,1,  '7',
         /* CommandComplete: "SELECT 1\0" = 9 bytes body → msglen = 4+9 = 13 */
         'C', 0,0,0,13, 'S','E','L','E','C','T',' ','1','\0',
         /* ReadyForQuery */
@@ -487,6 +491,7 @@ static int test_pg_capture_consistency_token(void) {
 
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_STR_EQ(tok.value, "0/16B3740");
+    TEST_ASSERT_EQ(tok.timeline_id, 7u);
     TEST_ASSERT(tok.captured_at_ns != 0);
     return 0;
 }
@@ -541,6 +546,24 @@ static int test_pg_replica_reached_token(void) {
         close(sv[0]);
         TEST_ASSERT_EQ(rc, 0);
         TEST_ASSERT(reached);
+    }
+
+    /* Sub-test C: invalid PG LSN token fails closed before query construction */
+    {
+        int sv[2];
+        TEST_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        close(sv[1]);
+
+        keel_consistency_token_t tok;
+        memset(&tok, 0, sizeof(tok));
+        strncpy(tok.value, "0/16B3740';SELECT", sizeof(tok.value) - 1);
+
+        bool reached = true;
+        int rc = keel_proto_flow_postgres.replica_reached_token(
+                     NULL, sv[0], &tok, 0, &reached);
+        close(sv[0]);
+        TEST_ASSERT_EQ(rc, -1);
+        TEST_ASSERT(!reached);
     }
     return 0;
 }

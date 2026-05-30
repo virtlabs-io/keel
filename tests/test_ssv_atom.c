@@ -196,7 +196,7 @@ static void test_ttl_expired(void)
 
 static void test_ttl_no_token(void)
 {
-    TEST_BEGIN("TTL with no token => false");
+    TEST_BEGIN("TTL with no write timestamp => true");
 
     keel_ssv_atom_t atoms[KEEL_SSV_CK__COUNT];
     keel_ssv_consistency_init(atoms);
@@ -204,6 +204,27 @@ static void test_ttl_no_token(void)
     uint64_t now = 1000000000ULL;
     /* No write => replica is fine (ttl_ok returns true) */
     TEST_ASSERT(keel_ssv_consistency_ttl_ok(atoms, now, 100));
+
+    TEST_END();
+}
+
+static void test_ttl_timestamp_only(void)
+{
+    TEST_BEGIN("TTL timestamp-only sticky fallback");
+
+    keel_ssv_atom_t atoms[KEEL_SSV_CK__COUNT];
+    keel_ssv_consistency_init(atoms);
+
+    uint64_t write_ns = 1000000000ULL;
+    keel_ssv_consistency_set_write_ts(atoms, write_ns);
+
+    TEST_ASSERT(!keel_ssv_consistency_has_write_lsn(atoms));
+    TEST_ASSERT(!keel_ssv_consistency_ttl_ok(atoms,
+                                             write_ns + 50000000ULL,
+                                             100));
+    TEST_ASSERT(keel_ssv_consistency_ttl_ok(atoms,
+                                            write_ns + 200000000ULL,
+                                            100));
 
     TEST_END();
 }
@@ -230,9 +251,10 @@ static void test_ssv_requires_primary(void)
 
     TEST_ASSERT(keel_ssv_requires_primary(atoms, now, 100));
 
-    /* Advance time past TTL. */
+    /* Advance time past TTL. Exact tokens do not expire without a
+     * reactor-owned replica catch-up proof. */
     uint64_t later = now + 200000000ULL; /* 200ms later */
-    TEST_ASSERT(!keel_ssv_requires_primary(atoms, later, 100));
+    TEST_ASSERT(keel_ssv_requires_primary(atoms, later, 100));
 
     TEST_END();
 }
@@ -354,6 +376,7 @@ int main(void)
     test_ttl_within();
     test_ttl_expired();
     test_ttl_no_token();
+    test_ttl_timestamp_only();
     test_ssv_requires_primary();
     test_ssv_needs_discard();
     test_opaque_init();

@@ -55,6 +55,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -397,6 +398,10 @@ static inline void engine_annotate_scatter_result(
  * reads from asynchronous replicas. */
 #ifndef KEEL_STICKY_PRIMARY_TTL_MS
 #define KEEL_STICKY_PRIMARY_TTL_MS 100
+#endif
+
+#ifndef KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS
+#define KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS 50
 #endif
 
 /**
@@ -952,6 +957,76 @@ static bool backend_needs_state_sync(const keel_session_flow_t* sf,
            be_conn && session->state_profile &&
            be_conn->current_state_hash != session->state_hash &&
            session->state_hash != 0;
+}
+
+static int capture_consistency_token_after_write(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    const keel_proto_flow_vtable_t* flow)
+{
+    if (!sf || !session || !flow || !flow->capture_consistency_token ||
+        session->server_fd < 0) {
+        return -1;
+    }
+
+    int fd = session->server_fd;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+
+    struct timeval saved_rcv = {0, 0};
+    struct timeval saved_snd = {0, 0};
+    socklen_t optlen = sizeof(saved_rcv);
+    bool have_rcv = (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                                &saved_rcv, &optlen) == 0);
+    optlen = sizeof(saved_snd);
+    bool have_snd = (getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                                &saved_snd, &optlen) == 0);
+
+    struct timeval tv = {
+        .tv_sec = KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS / 1000,
+        .tv_usec = (KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS % 1000) * 1000,
+    };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if ((flags & O_NONBLOCK) != 0 &&
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking) */
+        if (have_rcv)
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                             &saved_rcv, sizeof(saved_rcv));
+        if (have_snd)
+            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                             &saved_snd, sizeof(saved_snd));
+        return -1;
+    }
+
+    keel_consistency_token_t token;
+    memset(&token, 0, sizeof(token));
+    int rc = flow->capture_consistency_token(sf->ctx, fd, &token);
+
+    if ((flags & O_NONBLOCK) != 0)
+        (void)fcntl(fd, F_SETFL, flags);
+    if (have_rcv)
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                         &saved_rcv, sizeof(saved_rcv));
+    if (have_snd)
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                         &saved_snd, sizeof(saved_snd));
+
+    if (rc != 0 || token.value[0] == '\0') {
+        return -1;
+    }
+
+    if (token.captured_at_ns == 0)
+        token.captured_at_ns = engine_now_ns();
+    sf->last_write_token = token;
+    sf->last_write_ns = token.captured_at_ns;
+    keel_ssv_consistency_set_token(sf->consistency_atoms, &token);
+    if (flow->notify_write_lsn)
+        flow->notify_write_lsn(sf->ctx, token.value);
+    return 0;
 }
 
 /* ============================================================================
@@ -2211,28 +2286,30 @@ copy_scan_done:
                         (act.route_hint == KEEL_FROUTE_REPLICA);
                     if (!explicit_read_only_tx &&
                         route == KEEL_FROUTE_REPLICA &&
-                        sf->sticky_primary_ttl_ms > 0 && sf->last_write_ns != 0) {
+                        sf->last_write_ns != 0) {
                         uint64_t now = engine_now_ns();
                         uint64_t ttl_ms = sf->sticky_primary_ttl_ms
                                             ? sf->sticky_primary_ttl_ms
                                             : KEEL_STICKY_PRIMARY_TTL_MS;
-                        /* SSV consistency atom carries the same TTL window.
-                         * If the atom says the write is still recent we force
-                         * primary; when the TTL expires we clear both the
-                         * legacy timestamp AND the atom so future reads are
-                         * free to route to replicas. */
-                        if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
-                                                         now, ttl_ms)) {
-                            /* Reactor-safe fallback: do not run inline replica
-                             * catch-up probes from the worker. While the sticky
-                             * window is active, route reads to primary. */
+                        if (keel_ssv_requires_primary(sf->consistency_atoms,
+                                                      now, (uint32_t)ttl_ms)) {
+                            /* Reactor-safe fallback: a real LSN/GTID token must
+                             * not be expired by time alone. Route to primary
+                             * until a future async verifier proves a replica is
+                             * caught up. */
+                            route = KEEL_FROUTE_PRIMARY;
+                            if (worker->stats_ctx)
+                                KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
+                        } else if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
+                                                                now, (uint32_t)ttl_ms)) {
+                            /* Timestamp-only legacy fallback for local writes
+                             * where no exact token has been captured yet. */
                             route = KEEL_FROUTE_PRIMARY;
                             if (worker->stats_ctx)
                                 KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
                         } else {
-                            /* TTL expired — clear timestamp and atoms */
+                            /* TTL expired for a timestamp-only sticky marker. */
                             sf->last_write_ns = 0;
-                            keel_ssv_consistency_clear(sf->consistency_atoms);
                         }
                     }
                 } /* KEEL_TIER_HAS_ROUTING */
@@ -3439,8 +3516,12 @@ copy_scan_done:
                     /* Send blocked — defer remainder to io_uring.
                      * Stamp write time eagerly (the send WILL complete). */
                     if (KEEL_TIER_HAS_ROUTING(sf->mode) &&
-                        (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL)))
-                        sf->last_write_ns = engine_now_ns();
+                        (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL))) {
+                        uint64_t write_ns = engine_now_ns();
+                        sf->last_write_ns = write_ns;
+                        keel_ssv_consistency_set_write_ts(sf->consistency_atoms,
+                                                          write_ns);
+                    }
                     if (act.effect & KEEL_QE_UNKNOWN_STATE)
                         keel_ssv_opaque_set_unknown(sf->opaque_atoms);
 
@@ -3504,8 +3585,12 @@ be_forward_done:
              * that read-after-write queries within the TTL window are
              * routed to the primary. */
             if (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL)) {
-                if (KEEL_TIER_HAS_ROUTING(sf->mode))
-                    sf->last_write_ns = engine_now_ns();
+                if (KEEL_TIER_HAS_ROUTING(sf->mode)) {
+                    uint64_t write_ns = engine_now_ns();
+                    sf->last_write_ns = write_ns;
+                    keel_ssv_consistency_set_write_ts(sf->consistency_atoms,
+                                                      write_ns);
+                }
 
                 /* Cache write invalidation: save a copy of the write query so
                  * that query_complete can parse it to evict affected table entries
@@ -5313,13 +5398,29 @@ fe_forward_done: ;
          * Core returns to L7 mode for the next query. */
         session->fast_forward_mode = 0;
 
-        /* Phase 5 consistency token capture is intentionally not performed
-         * inline here. The old path temporarily cleared O_NONBLOCK and ran a
-         * protocol query on the worker reactor, which can stall unrelated
-         * sessions. Correctness is preserved by sticky-primary routing during
-         * the TTL window; async token capture can be reintroduced as its own
-         * reactor-owned pre-query state machine. */
-        sf->capture_lsn_pending = false;
+        if (sf->capture_lsn_pending) {
+            if (capture_consistency_token_after_write(sf, session, flow) != 0) {
+                if (session->backend_conn) {
+                    session->backend_conn->protocol_desync = true;
+                    if (session->backend_conn->pool) {
+                        backend_pool_discard(session->backend_conn->pool,
+                                             session->backend_conn,
+                                             BACKEND_CLOSE_REASON_PROTOCOL_ERROR);
+                    } else if (session->server_fd >= 0) {
+                        close(session->server_fd);
+                    }
+                    session->backend_conn = NULL;
+                    session->backend_generation = 0;
+                    session->server_fd = -1;
+                } else if (session->server_fd >= 0) {
+                    close(session->server_fd);
+                    session->server_fd = -1;
+                }
+                sf->capture_lsn_pending = false;
+                return KEEL_FLOW_ERROR;
+            }
+            sf->capture_lsn_pending = false;
+        }
 
         /*
          * FIX: Use protocol's authoritative backend_reuse_gate() instead of

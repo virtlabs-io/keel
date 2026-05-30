@@ -1095,18 +1095,22 @@ After `ReadyForQuery` confirms a write/DDL, the engine:
 
 **Sticky-Primary Routing** (`engine_flow.c` — FE query path):
 
-The time-based sticky-primary check now uses the consistency atom TTL:
+The time-based sticky-primary check is now a fallback for sessions without an
+exact write-position token:
 
 ```c
-if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms, now, ttl_ms)) {
+if (keel_ssv_requires_primary(sf->consistency_atoms, now, ttl_ms)) {
+    route = KEEL_FROUTE_PRIMARY;   // token present → force primary
+} else if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms, now, ttl_ms)) {
     route = KEEL_FROUTE_PRIMARY;   // TTL active → force primary
 } else {
-    sf->last_write_ns = 0;         // TTL expired → clear
-    keel_ssv_consistency_clear(sf->consistency_atoms);
+    sf->last_write_ns = 0;         // timestamp-only TTL expired
 }
 ```
 
-`keel_ssv_consistency_ttl_ok()` checks whether `(now_ns - captured_at_ns) >= ttl_ms * 1e6`.  Returns `true` when the TTL has expired (replica is safe), `false` when the write is still recent (primary required).
+`keel_ssv_consistency_ttl_ok()` checks only whether a timestamp-only sticky
+window has expired. Exact LSN/GTID tokens are handled by
+`keel_ssv_requires_primary()` and do not expire by wall-clock time alone.
 
 **Unknown-State DISCARD ALL** (`engine_flow.c` — pool return path):
 
@@ -1129,7 +1133,7 @@ Two new helpers centralize consistency-aware decisions for callers outside `engi
 
 | Function | Signature | Purpose |
 |----------|-----------|---------|
-| `keel_ssv_requires_primary()` | `(const atoms[3], now_ns, ttl_ms) → bool` | Returns `true` if the session has a recent write LSN whose TTL hasn't expired — primary routing required |
+| `keel_ssv_requires_primary()` | `(const atoms[3], now_ns, ttl_ms) → bool` | Returns `true` if the session has an unsatisfied write-position token — primary routing required |
 | `keel_ssv_needs_discard()` | `(const atoms[3]) → bool` | Returns `true` if the session has unknown/unmodellable state — DISCARD ALL required on pool return |
 
 ### 22.7 Test Coverage
@@ -1144,7 +1148,7 @@ Two new helpers centralize consistency-aware decisions for callers outside `engi
 | `test_no_token` | Empty state correctly reports no write LSN |
 | `test_unknown_state` | Set/has/clear lifecycle for the unknown-state flag |
 | `test_ttl_within` | TTL still active → `ttl_ok` returns false (primary required) |
-| `test_ttl_expired` | TTL expired → `ttl_ok` returns true (replica safe) |
+| `test_ttl_expired` | Timestamp-only TTL expired → `ttl_ok` returns true |
 | `test_ttl_no_token` | No token → `ttl_ok` returns true (no write to protect) |
 | `test_ssv_requires_primary` | End-to-end `keel_ssv_requires_primary()` with recent and expired writes |
 | `test_ssv_needs_discard` | `keel_ssv_needs_discard()` reflects unknown-state flag |

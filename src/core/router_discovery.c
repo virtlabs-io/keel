@@ -798,6 +798,7 @@ keel_error_t keel_discovery_apply(
             }
             
             keel_router_set_server_health(router, srv->name, health);
+            existing->timeline_id = (uint32_t)(srv->timeline > 0 ? srv->timeline : 0);
 
             /* Update role if changed (e.g. after a failover / promotion). */
             {
@@ -879,6 +880,7 @@ keel_error_t keel_discovery_apply(
                 .host = srv->host,
                 .port = srv->port,
                 .role = srv->is_primary ? KEEL_SERVER_PRIMARY : KEEL_SERVER_REPLICA,
+                .timeline_id = (uint32_t)(srv->timeline > 0 ? srv->timeline : 0),
                 .weight = 100,
                 .health = srv->health,
             };

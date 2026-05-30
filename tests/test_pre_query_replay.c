@@ -8,6 +8,7 @@
 #include "keel/engine/engine_flow.h"
 #include "keel/engine/backend_pool.h"
 #include "keel/session/session.h"
+#include "keel/session/ssv_atom.h"
 #include "keel/session/state_profile.h"
 #include "keel/protocol/protocol_flow.h"
 #include "keel/mem/mem.h"
@@ -135,6 +136,11 @@ typedef struct fake_replay_ctx {
     uint64_t replay_hash;
     int cleanup_mode;
     size_t cleanup_calls;
+    keel_consistency_token_t capture_token;
+    int capture_rc;
+    size_t capture_calls;
+    size_t notify_calls;
+    char notified_lsn[KEEL_CONSISTENCY_TOKEN_MAX];
 } fake_replay_ctx_t;
 
 enum {
@@ -293,13 +299,139 @@ static int fake_get_stmt_replay(void* ctx,
     return 0;
 }
 
+static int fake_capture_consistency_token(void* ctx, int be_fd,
+                                          keel_consistency_token_t* out)
+{
+    fake_replay_ctx_t* rctx = (fake_replay_ctx_t*)ctx;
+    if (!rctx || !out || be_fd < 0)
+        return -1;
+    rctx->capture_calls++;
+    if (rctx->capture_rc != 0)
+        return rctx->capture_rc;
+    *out = rctx->capture_token;
+    return 0;
+}
+
+static void fake_notify_write_lsn(void* ctx, const char* lsn)
+{
+    fake_replay_ctx_t* rctx = (fake_replay_ctx_t*)ctx;
+    if (!rctx || !lsn)
+        return;
+    rctx->notify_calls++;
+    snprintf(rctx->notified_lsn, sizeof(rctx->notified_lsn), "%s", lsn);
+}
+
 static const keel_proto_flow_vtable_t s_fake_replay_vt = {
     .frame_len = fake_frame_len,
     .on_be_msg = fake_on_be_msg,
     .build_cleanup = fake_build_cleanup,
     .drain_cleanup_response = fake_drain_cleanup_response,
     .get_stmt_replay = fake_get_stmt_replay,
+    .capture_consistency_token = fake_capture_consistency_token,
+    .notify_write_lsn = fake_notify_write_lsn,
 };
+
+static void test_post_write_capture_success_updates_ssv(void)
+{
+    TEST_BEGIN("ryw: post-write capture stores token in session state");
+
+    int be_sv[2] = { -1, -1 };
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = fe_sv[0];
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    snprintf(rctx.capture_token.value, sizeof(rctx.capture_token.value),
+             "0/CAFEBABE");
+    rctx.capture_token.captured_at_ns = 123456789ULL;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.capture_lsn_pending = true;
+
+    uint8_t bebuf[64];
+    size_t n = 0;
+    n += build_command_complete_tag(bebuf + n, "UPDATE 1");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_OK);
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
+    TEST_ASSERT_EQ(rctx.capture_calls, 1u);
+    TEST_ASSERT_EQ(rctx.notify_calls, 1u);
+    TEST_ASSERT_STR_EQ(rctx.notified_lsn, "0/CAFEBABE");
+    TEST_ASSERT_STR_EQ(sf.last_write_token.value, "0/CAFEBABE");
+    TEST_ASSERT_STR_EQ(keel_ssv_consistency_get_lsn(sf.consistency_atoms),
+                       "0/CAFEBABE");
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms),
+                   123456789ULL);
+
+    if (session.server_fd < 0)
+        be_sv[0] = -1;
+    close_pair(be_sv);
+    close_pair(fe_sv);
+    TEST_END();
+}
+
+static void test_post_write_capture_failure_fails_closed(void)
+{
+    TEST_BEGIN("ryw: post-write capture failure fails closed");
+
+    int be_sv[2] = { -1, -1 };
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = fe_sv[0];
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    rctx.capture_rc = -1;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.capture_lsn_pending = true;
+
+    uint8_t bebuf[64];
+    size_t n = 0;
+    n += build_command_complete_tag(bebuf + n, "UPDATE 1");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
+    TEST_ASSERT_EQ(rctx.capture_calls, 1u);
+    TEST_ASSERT_EQ(rctx.notify_calls, 0u);
+    TEST_ASSERT_EQ(sf.last_write_token.value[0], '\0');
+    TEST_ASSERT_EQ(keel_ssv_consistency_has_write_lsn(sf.consistency_atoms), false);
+    TEST_ASSERT_EQ(session.server_fd, -1);
+
+    be_sv[0] = -1;
+    close_pair(be_sv);
+    close_pair(fe_sv);
+    TEST_END();
+}
 
 static void test_flag_lifecycle_and_forward_on_rfq(void)
 {
@@ -1744,6 +1876,8 @@ int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
 
+    test_post_write_capture_success_updates_ssv();
+    test_post_write_capture_failure_fails_closed();
     test_flag_lifecycle_and_forward_on_rfq();
     test_absorb_without_rfq();
     test_partial_then_completion();

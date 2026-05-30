@@ -99,6 +99,7 @@ const char* keel_route_reason_name(keel_route_reason_t r)
     case KEEL_ROUTE_REASON_DDL:               return "DDL";
     case KEEL_ROUTE_REASON_TRANSACTION_CTRL:  return "TRANSACTION_CTRL";
     case KEEL_ROUTE_REASON_SEMANTIC_UNSAFE:   return "SEMANTIC_UNSAFE";
+    case KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY: return "CONSISTENCY_PRIMARY";
     case KEEL_ROUTE_REASON_UNKNOWN_FUNCTION:  return "UNKNOWN_FUNCTION";
     case KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS:  return "COMMIT_AMBIGUOUS";
     default:                                  return "UNKNOWN";
@@ -128,6 +129,7 @@ static const char* const k_route_factor_names[32] = {
     [16] = "COMMIT_IN_DOUBT",
     [17] = "REPLICA_OK",
     [18] = "USER_PINNED",
+    [19] = "CONSISTENCY_TOKEN",
 };
 
 size_t keel_route_factors_to_json_array(uint32_t factors,
@@ -311,6 +313,10 @@ keel_router_config_t keel_router_config_default(void) {
         .query_timeout = KEEL_MSEC(KEEL_DEFAULT_QUERY_TIMEOUT_MS),
         /* Scatter is experimental; operators must opt in per worker group. */
         .scatter_merge_enabled = false,
+        .consistency_mode = KEEL_CONSISTENCY_READ_YOUR_WRITES,
+        .max_replica_lag_bytes = 16ULL * 1024ULL * 1024ULL,
+        .max_replica_catchup_ms = 50,
+        .stale_read_policy = KEEL_STALE_READ_ROUTE_PRIMARY,
     };
 }
 
@@ -820,10 +826,19 @@ static bool should_use_readonly(
     if (!router->config.read_write_split) {
         return false;
     }
+
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_PRIMARY_ONLY) {
+        return false;
+    }
     
     /* Session is pinned? */
     if (session && session->pinned_server) {
         return false;  /* Will use pinned server regardless */
+    }
+
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+        session && session->requires_consistent_read) {
+        return false;
     }
     
     /* In a transaction? Must stick to same server */
@@ -847,6 +862,41 @@ static bool should_use_readonly(
     }
 
     return keel_qt_can_use_replica(qt);
+}
+
+static bool query_is_replica_safe_read(const keel_qt_query_t* qt)
+{
+    if (!qt) {
+        return false;
+    }
+    if (qt->has_error ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE) ||
+        qt->func_count > 0) {
+        return false;
+    }
+    return keel_qt_can_use_replica(qt);
+}
+
+static bool consistency_forces_primary(
+    const keel_router_t* router,
+    const keel_qt_query_t* qt,
+    const keel_route_session_t* session
+) {
+    if (!router || !query_is_replica_safe_read(qt)) {
+        return false;
+    }
+    if (session && session->pinned_server) {
+        return false;
+    }
+    if (session && (session->in_transaction || session->has_temp_tables)) {
+        return false;
+    }
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_PRIMARY_ONLY) {
+        return true;
+    }
+    return router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+           session &&
+           session->requires_consistent_read;
 }
 
 /**
@@ -1052,6 +1102,18 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         return KEEL_OK;
     }
 
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+        router->config.stale_read_policy == KEEL_STALE_READ_REJECT &&
+        session && session->requires_consistent_read &&
+        !session->in_transaction && !session->has_temp_tables &&
+        query_is_replica_safe_read(qt)) {
+        decision->is_read = true;
+        decision->reason = "consistent read rejected: no replica catch-up proof";
+        decision->reason_code = KEEL_ROUTE_REASON_LAG_EXCEEDED;
+        decision->decision_factors |= KEEL_DF_CONSISTENCY_TOKEN;
+        return KEEL_ERR_UNAVAILABLE;
+    }
+
     /* Feature 7: Cross-transaction shard validation.
      * If a scatter write was recorded for this transaction and we are now
      * routing a single-shard query, reject it if the target shard was not
@@ -1070,8 +1132,13 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         return KEEL_ERR_SHARD_CROSS_TX;
     }
 
+    bool force_primary_for_consistency =
+        consistency_forces_primary(router, qt, session);
     bool is_read = should_use_readonly(router, qt, session);
-    decision->is_read = is_read;
+    if (force_primary_for_consistency) {
+        is_read = false;
+    }
+    decision->is_read = is_read || force_primary_for_consistency;
 
     router_server_t* selected = NULL;
 
@@ -1122,8 +1189,25 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         }
 
         if (selected) {
-            if (!simulate) router->stats.write_routes++;
-            if (session && session->in_transaction) {
+            if (!simulate) {
+                if (force_primary_for_consistency)
+                    router->stats.read_routes++;
+                else
+                    router->stats.write_routes++;
+            }
+            if (force_primary_for_consistency) {
+                if (session && session->required_timeline_id != 0 &&
+                    selected->config.timeline_id != 0 &&
+                    session->required_timeline_id != selected->config.timeline_id) {
+                    decision->reason      = "consistency token timeline is stale";
+                    decision->reason_code = KEEL_ROUTE_REASON_TIMELINE_STALE;
+                } else {
+                    decision->reason      = "consistency token requires primary";
+                    decision->reason_code = KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY;
+                }
+                decision->decision_factors |=
+                    (KEEL_DF_CONSISTENCY_TOKEN | KEEL_DF_STICKY_PRIMARY);
+            } else if (session && session->in_transaction) {
                 decision->reason      = use_shard_filter ? "single-shard transaction" : "in transaction";
                 decision->reason_code = KEEL_ROUTE_REASON_IN_TRANSACTION;
                 decision->decision_factors |= KEEL_DF_IN_TRANSACTION;
