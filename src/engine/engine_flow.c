@@ -2357,6 +2357,17 @@ copy_scan_done:
                         worker->router, sql_str, NULL, NULL, is_write, &dr);
 
                     if (derr == KEEL_OK) {
+                        /* Cache the dispatch reason on the session so the
+                         * query logger picks it up on the next emit. */
+                        if (session) {
+                            const char* reason =
+                                (dr.kind == KEEL_DISPATCH_SCATTER) ? "SHARD_SCATTER"
+                              : (dr.kind == KEEL_DISPATCH_SINGLE)  ? "SHARD_SINGLE"
+                              :                                       "ROUTED";
+                            snprintf(session->last_route_reason,
+                                     sizeof session->last_route_reason,
+                                     "%s", reason);
+                        }
                         /* === HOOK: AFTER_ROUTE ===
                          * Routing decision is final; dispatch kind and shard
                          * index(es) are available.  Hooks can veto execution

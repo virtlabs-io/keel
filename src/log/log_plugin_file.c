@@ -215,6 +215,8 @@ static keel_error_t file_write(keel_log_plugin_t* p,
     if (rec->dst_addr)  fprintf(priv->fp, "dst=%s:%u ", rec->dst_addr, (unsigned)rec->dst_port);
     if (rec->username)  fprintf(priv->fp, "user=%s ", rec->username);
     if (rec->database)  fprintf(priv->fp, "db=%s ", rec->database);
+    if (rec->route_reason) fprintf(priv->fp, "route=%s ", rec->route_reason);
+    if (rec->latency_us > 0) fprintf(priv->fp, "lat=%lluus ", (unsigned long long)rec->latency_us);
 
     /* Query text */
     if (rec->query && rec->query_len > 0) {

@@ -42,11 +42,31 @@ jobs:
 
   # ===========================================================================
   # Build + Unit Tests (Release with debug info)
+  #
+  # Matrix builds both feature-set variants:
+  #   * core — no Lua/Python scripting hooks (the default shipped build)
+  #   * full — Lua 5.4 + Python 3 embedded for hook scripting
+  #
+  # Both must pass for the gate to be green. The shipped package on releases
+  # is the 'core' build; 'full' is published as a separate suffix.
   # ===========================================================================
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [lint-memory-policy, lint-blocking-hotpath]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: core
+            lua: "OFF"
+            python: "OFF"
+          - name: full
+            lua: "ON"
+            python: "ON"
+
+    name: build-and-test (${{ matrix.variant.name }})
 
     steps:
       - name: Checkout
@@ -72,7 +92,7 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: build-and-test-${{ runner.os }}
+          key: build-and-test-${{ matrix.variant.name }}-${{ runner.os }}
 
       - name: Configure
         run: |
@@ -82,7 +102,9 @@ jobs:
             -DCMAKE_C_STANDARD=23 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DKEEL_ENABLE_TESTS=ON \
-            -DKEEL_ENABLE_HARDENING=ON
+            -DKEEL_ENABLE_HARDENING=ON \
+            -DKEEL_ENABLE_LUA=${{ matrix.variant.lua }} \
+            -DKEEL_ENABLE_PYTHON=${{ matrix.variant.python }}
 
       - name: Build
         run: cmake --build build -j$(nproc)

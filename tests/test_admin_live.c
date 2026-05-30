@@ -378,6 +378,7 @@ static const char *const mutation_cmds[] = {
     "SET pool_max_size=10",
     "FLUSH QUERY CACHE",
     "EXPLAIN SHARD PLAN FOR SELECT 1",
+    "EXPLAIN ROUTE FOR SELECT 1",
     NULL
 };
 

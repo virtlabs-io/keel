@@ -185,6 +185,9 @@ run_scenario() {
     if [[ $rc -eq 0 ]]; then
         pass "${name} (${elapsed}s)"
         PASS=$((PASS + 1))
+    elif [[ $rc -eq 77 ]]; then
+        warn "${name} — skipped (${elapsed}s)"
+        SKIP=$((SKIP + 1))
     elif [[ $rc -eq 124 ]]; then
         fail "${name} — TIMED OUT after ${CHAOS_TIMEOUT}s"
         FAIL=$((FAIL + 1))
@@ -241,6 +244,8 @@ ALL_SCENARIOS=(
     "role-flapping"
     "replica-lag-threshold"
     "timeline-invalidation"
+    "scatter-backend-mid-scatter"
+    "scatter-network-partition"
 )
 
 if [[ $# -gt 0 ]]; then

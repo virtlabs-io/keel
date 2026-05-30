@@ -52,6 +52,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#include <inttypes.h>
 
 /* ============================================================================
  * Thread-local Trace Context
@@ -478,6 +479,12 @@ void keel_log_record_write_json(FILE* out, const keel_log_record_t* rec) {
         json_escape_str(escaped, sizeof(escaped), rec->query_tree, rec->query_tree_len);
         fprintf(out, ",\"query_tree\":\"%s\"", escaped);
     }
+
+    /* Routing telemetry */
+    if (rec->route_reason)
+        fprintf(out, ",\"route_reason\":\"%s\"", rec->route_reason);
+    if (rec->latency_us > 0)
+        fprintf(out, ",\"latency_us\":%" PRIu64, rec->latency_us);
 
     /* Trace correlation (thread-local) */
     const char* tid = keel_log_get_trace_id();

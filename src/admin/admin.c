@@ -2595,6 +2595,109 @@ static void show_shard_plan(keel_admin_t *admin, pgbuf_t *b, const char *sql_tex
         keel_dispatch_result_cleanup(&dr);
 }
 
+/**
+ * @brief EXPLAIN ROUTE FOR '<sql>' — show the per-query routing decision
+ *        and the candidate target list against the live router state.
+ *
+ * Read-only: runs `keel_router_explain_sql()` which suppresses all stat
+ * mutations. Returns one row per eligible/selected backend with the
+ * resolved read/write class, reason code, and decision factors.
+ */
+static void show_route_plan(keel_admin_t *admin, pgbuf_t *b, const char *sql_text) {
+    if (!admin->router) {
+        pg_error(b, "No router attached. Call keel_admin_set_router() first.");
+        return;
+    }
+    if (!sql_text || sql_text[0] == '\0') {
+        pg_error(b, "EXPLAIN ROUTE FOR requires a SQL argument");
+        return;
+    }
+
+    /* Strip leading whitespace and optional surrounding quotes — matches
+     * the EXPLAIN SHARD PLAN FOR convention. */
+    const char *src = sql_text;
+    while (*src == ' ') src++;
+    char unquoted[4096];
+    size_t slen = strlen(src);
+    if (slen >= 2 && src[0] == '\'' && src[slen - 1] == '\'') {
+        size_t inner = slen - 2;
+        if (inner >= sizeof(unquoted)) {
+            pg_error(b, "SQL argument too long for EXPLAIN ROUTE");
+            return;
+        }
+        memcpy(unquoted, src + 1, inner);
+        unquoted[inner] = '\0';
+        src = unquoted;
+    }
+
+    keel_str_t sql = { .data = src, .len = strlen(src) };
+    keel_route_explanation_t exp;
+    keel_error_t err = keel_router_explain_sql(admin->router, sql, NULL, &exp);
+
+    /* Header row carrying the decision; per-target rows follow. */
+    const char *cols[] = {
+        "row", "server", "role", "health", "weight",
+        "eligible", "selected", "reason_code", "is_read"
+    };
+    pg_row_desc(b, cols, 9);
+
+    char wbuf[16], port_unused[16];
+    (void)port_unused;
+    int nrows = 0;
+
+    /* Decision summary row */
+    {
+        const char *server_name =
+            exp.decision.server && exp.decision.server->name
+                ? exp.decision.server->name : "-";
+        char err_str[24];
+        snprintf(err_str, sizeof err_str, "%d", err);
+        const char *vals[] = {
+            "DECISION",
+            server_name,
+            exp.decision.server
+                ? (exp.decision.server->role == KEEL_SERVER_PRIMARY ? "rw" : "ro")
+                : "-",
+            err == KEEL_OK ? "ok" : err_str,
+            "-",
+            "-",
+            "-",
+            keel_route_reason_name(exp.decision.reason_code),
+            exp.decision.is_read ? "true" : "false",
+        };
+        pg_data_row(b, vals, 9);
+        nrows++;
+    }
+
+    /* One row per candidate target. */
+    for (size_t i = 0; i < exp.target_count; i++) {
+        const keel_route_target_info_t *t = &exp.targets[i];
+        snprintf(wbuf, sizeof wbuf, "%d", t->weight);
+        const char *role =
+            (t->role == KEEL_SERVER_PRIMARY) ? "rw" :
+            (t->role == KEEL_SERVER_REPLICA) ? "ro" : "auto";
+        const char *health =
+            (t->health == KEEL_HEALTH_UP)       ? "healthy"  :
+            (t->health == KEEL_HEALTH_DEGRADED) ? "degraded" :
+            (t->health == KEEL_HEALTH_DOWN)     ? "down"     : "unknown";
+        const char *vals[] = {
+            "TARGET",
+            t->name,
+            role,
+            health,
+            wbuf,
+            t->was_eligible ? "true" : "false",
+            t->was_selected ? "true" : "false",
+            "-",
+            "-",
+        };
+        pg_data_row(b, vals, 9);
+        nrows++;
+    }
+
+    pg_cmd_complete(b, nrows);
+}
+
 static void show_rebalance(keel_admin_t *admin, pgbuf_t *b) {
     const keel_engine_config_t *cfg = keel_engine_get_config(admin->engine);
     uint32_t nw = keel_engine_get_num_workers(admin->engine);
@@ -4507,6 +4610,8 @@ static void handle_admin_pg(keel_admin_t *admin, int fd) {
             show_cid_sessions(admin, out);
         else if (strncasecmp(query, "EXPLAIN SHARD PLAN FOR ", 23) == 0)
             show_shard_plan(admin, out, query + 23);
+        else if (strncasecmp(query, "EXPLAIN ROUTE FOR ", 18) == 0)
+            show_route_plan(admin, out, query + 18);
         else if (strcasecmp(query, "SHOW CLUSTER") == 0)
             show_cluster(admin, out);
         else if (strcasecmp(query, "SHOW CLUSTER CONFIG") == 0)
@@ -5620,6 +5725,301 @@ static void serve_metrics_json(keel_admin_t *admin, int fd) {
     free(body); /* NOLINT(keel-syscall) */
 }
 
+/* ---- Rate-limit + size cap for /api/diagnostics/route_explain?sql= ----
+ *
+ * Reasoning: the simulation branch parses arbitrary client-supplied SQL
+ * through the live parser pipeline. Even though the call is non-destructive
+ * (no router state mutated), the parser is unbounded in CPU per byte. We
+ * therefore gate the surface with:
+ *   - a 4 KiB hard cap on the URL-encoded SQL value, returning 413 above it,
+ *   - a global token bucket (40 burst / 20 rps) covering all callers,
+ *     returning 429 when exhausted.
+ *
+ * Both limits apply only to the `?sql=` branch. The static taxonomy GET
+ * remains unrestricted. */
+#define KEEL_EXPLAIN_MAX_SQL_BYTES   4096u
+#define KEEL_EXPLAIN_RL_CAPACITY     40.0
+#define KEEL_EXPLAIN_RL_REFILL_PER_S 20.0
+
+static pthread_mutex_t s_explain_rl_mu     = PTHREAD_MUTEX_INITIALIZER;
+static double          s_explain_rl_tokens = KEEL_EXPLAIN_RL_CAPACITY;
+static uint64_t        s_explain_rl_last_ns = 0;
+
+static bool explain_rate_limit_allow(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+    pthread_mutex_lock(&s_explain_rl_mu);
+    if (s_explain_rl_last_ns == 0) s_explain_rl_last_ns = now;
+    double elapsed_s = (double)(now - s_explain_rl_last_ns) / 1.0e9;
+    s_explain_rl_last_ns = now;
+    s_explain_rl_tokens += elapsed_s * KEEL_EXPLAIN_RL_REFILL_PER_S;
+    if (s_explain_rl_tokens > KEEL_EXPLAIN_RL_CAPACITY)
+        s_explain_rl_tokens = KEEL_EXPLAIN_RL_CAPACITY;
+    bool allow = (s_explain_rl_tokens >= 1.0);
+    if (allow) s_explain_rl_tokens -= 1.0;
+    pthread_mutex_unlock(&s_explain_rl_mu);
+    return allow;
+}
+
+/* Returns the raw (un-decoded) length of the value associated with `key` in
+ * the URL query string of `buf`, or 0 if absent. Cheap pre-flight for the
+ * size cap before we copy / decode into a fixed buffer. */
+static size_t http_query_param_raw_len(const char* buf, const char* key) {
+    if (!buf || !key) return 0;
+    const char* q = strchr(buf, '?');
+    if (!q) return 0;
+    const char* line_end = strpbrk(q, " \r\n");
+    if (!line_end) line_end = q + strlen(q);
+    size_t klen = strlen(key);
+    const char* p = q + 1;
+    while (p < line_end) {
+        if ((size_t)(line_end - p) > klen &&
+            strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char* v = p + klen + 1;
+            const char* v_end = v;
+            while (v_end < line_end && *v_end != '&') v_end++;
+            return (size_t)(v_end - v);
+        }
+        const char* amp = memchr(p, '&', (size_t)(line_end - p));
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+/* Percent-decode a query-string value in place. Returns the new length.
+ * Stops at '&' or '\0'. Supports '+' → ' ' (form-style). */
+static size_t url_decode_inplace(char* s) {
+    char* w = s;
+    char* r = s;
+    while (*r && *r != '&') {
+        if (*r == '+') {
+            *w++ = ' ';
+            r++;
+        } else if (*r == '%' && r[1] && r[2]) {
+            int hi = (r[1] >= '0' && r[1] <= '9') ? r[1] - '0'
+                  : (r[1] >= 'a' && r[1] <= 'f') ? r[1] - 'a' + 10
+                  : (r[1] >= 'A' && r[1] <= 'F') ? r[1] - 'A' + 10 : -1;
+            int lo = (r[2] >= '0' && r[2] <= '9') ? r[2] - '0'
+                  : (r[2] >= 'a' && r[2] <= 'f') ? r[2] - 'a' + 10
+                  : (r[2] >= 'A' && r[2] <= 'F') ? r[2] - 'A' + 10 : -1;
+            if (hi < 0 || lo < 0) {
+                *w++ = *r++;
+            } else {
+                *w++ = (char)((hi << 4) | lo);
+                r += 3;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+    return (size_t)(w - s);
+}
+
+/* Return a pointer to the value of the query-string parameter `key` inside the
+ * HTTP request-line `buf` (e.g. "GET /foo?sql=SELECT+1&pinned=1 HTTP/1.1\r\n"),
+ * copying it (percent-decoded) into `out` up to `out_size-1` bytes. Returns
+ * the decoded length or 0 if not found. */
+static size_t http_query_param(const char* buf, const char* key,
+                               char* out, size_t out_size) {
+    if (!buf || !key || !out || out_size == 0) return 0;
+    const char* q = strchr(buf, '?');
+    if (!q) return 0;
+    const char* line_end = strpbrk(q, " \r\n");
+    if (!line_end) line_end = q + strlen(q);
+
+    size_t klen = strlen(key);
+    const char* p = q + 1;
+    while (p < line_end) {
+        if ((size_t)(line_end - p) > klen &&
+            strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char* v = p + klen + 1;
+            const char* v_end = v;
+            while (v_end < line_end && *v_end != '&') v_end++;
+            size_t copy = (size_t)(v_end - v);
+            if (copy >= out_size) copy = out_size - 1;
+            memcpy(out, v, copy);
+            out[copy] = '\0';
+            return url_decode_inplace(out);
+        }
+        const char* amp = memchr(p, '&', (size_t)(line_end - p));
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Serve the route-decision explainer taxonomy as JSON
+ *        (GET /api/diagnostics/route_explain).
+ *
+ * Returns a stable reference document describing every routing reason
+ * code and every contributing decision factor the router can emit. The
+ * payload is shape-compatible with the per-decision JSON produced by
+ * `keel_route_decision_to_json()` so operators can map a log entry's
+ * `reason_code` and `factors` array back to a description.
+ *
+ * When the request includes a `?sql=<urlencoded-SQL>` query-string the
+ * handler instead runs `keel_router_explain_sql()` against the live
+ * router and returns the per-query explanation as JSON. Optional flags:
+ *   pinned=1, in_txn=1, has_temp=1, cid=1
+ *
+ * No router state is mutated: the simulation is read-only.
+ */
+static void serve_route_explain(keel_admin_t *admin, int fd, const char* req) {
+    /* ---- Per-query simulation branch (`?sql=...`) ---- */
+    /* Pre-flight: reject oversized SQL with 413 before touching the parser. */
+    size_t raw_sql_len = http_query_param_raw_len(req, "sql");
+    if (raw_sql_len > KEEL_EXPLAIN_MAX_SQL_BYTES) {
+        const char *resp =
+            "HTTP/1.1 413 Payload Too Large\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 17\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "sql_too_large\n";
+        safe_send(fd, resp, strlen(resp));
+        return;
+    }
+
+    char sql_buf[4096];
+    size_t sql_len = http_query_param(req, "sql", sql_buf, sizeof sql_buf);
+    if (sql_len > 0) {
+        if (!explain_rate_limit_allow()) {
+            const char *resp =
+                "HTTP/1.1 429 Too Many Requests\r\n"
+                "Content-Type: text/plain\r\n"
+                "Retry-After: 1\r\n"
+                "Content-Length: 17\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "rate_limited\n";
+            safe_send(fd, resp, strlen(resp));
+            return;
+        }
+        if (!admin->router) {
+            const char *resp =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 20\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "router_not_attached\n";
+            safe_send(fd, resp, strlen(resp));
+            return;
+        }
+
+        char flag[8];
+        keel_route_session_t session = {0};
+        if (http_query_param(req, "pinned", flag, sizeof flag) > 0 &&
+            flag[0] == '1') {
+            /* No pinned_server pointer available here; surface only as a
+             * factor by reporting in_transaction (closest user-tunable
+             * approximation). Pinned-server simulation requires the live
+             * session and is out of scope for the HTTP shim. */
+            session.in_transaction = true;
+        }
+        if (http_query_param(req, "in_txn", flag, sizeof flag) > 0 &&
+            flag[0] == '1') {
+            session.in_transaction = true;
+        }
+        if (http_query_param(req, "has_temp", flag, sizeof flag) > 0 &&
+            flag[0] == '1') {
+            session.has_temp_tables = true;
+        }
+        if (http_query_param(req, "cid", flag, sizeof flag) > 0 &&
+            flag[0] == '1') {
+            /* Read-only simulation: this `commit_in_doubt` flag is set on a
+             * stack-local route session that never reaches the engine commit
+             * state machine. It only influences the explainer's hypothetical
+             * decision (verifies the COMMIT_AMBIGUOUS branch fires). */
+            session.commit_in_doubt = true; /* NOLINT(keel-metrics) */
+        }
+
+        keel_route_explanation_t exp;
+        keel_str_t sql_str = { .data = sql_buf, .len = sql_len };
+        (void)keel_router_explain_sql(admin->router, sql_str, &session, &exp);
+
+        char body[8192];
+        size_t body_len = keel_route_explanation_to_json(&exp, 0,
+                                                         body, sizeof body);
+        char hdr[256];
+        int hl = snprintf(hdr, sizeof hdr,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n", body_len);
+        safe_send(fd, hdr, (size_t)hl);
+        safe_send(fd, body, body_len);
+        return;
+    }
+
+    /* ---- Static taxonomy branch (no `?sql=`) ---- */
+    (void)admin;
+
+    char body[8192];
+    size_t pos = 0;
+    int n;
+
+    n = snprintf(body + pos, sizeof(body) - pos,
+        "{\n"
+        "  \"version\": 1,\n"
+        "  \"description\": \"Route decision explainer taxonomy. "
+        "The router emits one dominant reason_code per query and a "
+        "bitmask of contributing factors. See "
+        "keel_route_decision_to_json() for the per-decision schema.\",\n"
+        "  \"reason_codes\": [\n");
+    if (n > 0) pos += (size_t)n;
+
+    for (int r = 0; r < (int)KEEL_ROUTE_REASON_COUNT && pos < sizeof(body); ++r) {
+        const char* name = keel_route_reason_name((keel_route_reason_t)r);
+        n = snprintf(body + pos, sizeof(body) - pos,
+            "    {\"code\": %d, \"name\": \"%s\"}%s\n",
+            r, name,
+            (r + 1 < (int)KEEL_ROUTE_REASON_COUNT) ? "," : "");
+        if (n > 0) pos += (size_t)n;
+    }
+
+    if (pos >= sizeof(body) - 1024) {
+        const char *err =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        safe_send(fd, err, strlen(err));
+        return;
+    }
+
+    n = snprintf(body + pos, sizeof(body) - pos, "  ],\n  \"factors\": ");
+    if (n > 0) pos += (size_t)n;
+
+    /* All bits set so the helper enumerates every known factor name. */
+    pos += keel_route_factors_to_json_array(0xFFFFFFFFu,
+                                            body + pos,
+                                            sizeof(body) - pos);
+
+    if (pos < sizeof(body) - 4) {
+        n = snprintf(body + pos, sizeof(body) - pos, "\n}\n");
+        if (n > 0) pos += (size_t)n;
+    }
+
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n", pos);
+    safe_send(fd, hdr, (size_t)hl);
+    safe_send(fd, body, pos);
+}
+
 /**
  * @brief Serve the curated OTLP-aligned metric set in Prometheus text
  *        exposition format (GET /api/observability/metrics.prom).
@@ -5734,6 +6134,7 @@ static void serve_metrics_prom(keel_admin_t *admin, int fd) {
  * - `GET /api/observability/exporter.json`
  * - `GET /api/observability/metrics.json`
  * - `GET /api/observability/metrics.prom`
+ * - `GET /api/diagnostics/route_explain`
  * - `GET /healthz`
  * - `GET /readyz`
  * - `GET /livez`
@@ -5861,6 +6262,9 @@ static void handle_prom_http(keel_admin_t *admin, int fd) {
     }
     else if (strncmp(buf, "GET /api/observability/metrics.prom", 35) == 0) {
         serve_metrics_prom(admin, fd);
+    }
+    else if (strncmp(buf, "GET /api/diagnostics/route_explain", 34) == 0) {
+        serve_route_explain(admin, fd, buf);
     }
     else {
         const char *resp =

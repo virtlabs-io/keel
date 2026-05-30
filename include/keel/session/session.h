@@ -342,6 +342,12 @@ typedef struct keel_session {
     int                 last_error;
     char                error_msg[256];
 
+    /* Last routing decision taken for this session (cached so the query
+     * logger can emit it without re-parsing). Updated whenever the engine
+     * calls into the router; empty string means no routing has occurred
+     * yet on this session. */
+    char                last_route_reason[32];
+
     /* TLS peer info (mTLS) — populated after TLS handshake if peer cert present */
     bool                tls_peer_has_cert;
     char                tls_peer_subject[256];

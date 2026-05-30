@@ -463,6 +463,17 @@ target_link_libraries(test_router PRIVATE
 target_link_options(test_router PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router COMMAND test_router)
 
+# Router explainer (read-only per-query simulation)
+add_executable(test_router_explain test_router_explain.c)
+target_link_libraries(test_router_explain PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_router_explain PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_router_explain COMMAND test_router_explain)
+set_tests_properties(test_router_explain PROPERTIES LABELS "core")
+
 # Router Plugin tests (pluggable routing, metadata cache, discovery)
 add_executable(test_router_plugin test_router_plugin.c)
 target_link_libraries(test_router_plugin PRIVATE 
@@ -2487,6 +2498,18 @@ target_link_options(test_encoding PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_encoding COMMAND test_encoding)
 set_tests_properties(test_encoding PROPERTIES LABELS "util" TIMEOUT 30)
 
+# Durable operational replay log
+add_executable(test_replay_log test_replay_log.c)
+target_link_libraries(test_replay_log PRIVATE
+    test_utils
+    keelutil
+    keelmem
+    Threads::Threads
+)
+target_link_options(test_replay_log PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_replay_log COMMAND test_replay_log)
+set_tests_properties(test_replay_log PROPERTIES LABELS "util;hardening" TIMEOUT 30)
+
 # NUMA topology and NUMA-aware allocator
 add_executable(test_numa test_numa.c)
 target_link_libraries(test_numa PRIVATE
@@ -2566,7 +2589,7 @@ add_custom_target(test-util
         DEPENDS test_mem test_util test_string_view test_ringbuf
             test_xxhash test_log test_query_log test_stats_alignment
             test_histogram test_ndjson_log
-            test_buffer test_string_hash test_encoding test_numa
+            test_buffer test_string_hash test_encoding test_replay_log test_numa
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running util module tests"
     USES_TERMINAL
@@ -2651,7 +2674,7 @@ add_custom_target(test-hardening
             test_tls_splice_matrix test_session_hooks_matrix
             test_crash_recovery_matrix test_pre_query_replay
             test_dual_protocol_matrix test_invariant_model
-            test_mem_safety
+            test_mem_safety test_replay_log
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running production-hardening tests (Spec §1-§5 Phase A/B)"
     USES_TERMINAL
@@ -2735,6 +2758,41 @@ set_tests_properties(check_metrics_reference PROPERTIES
 )
 
 # =============================================================================
+# v0.4-alpha correctness messaging gate.
+# Prevents public Markdown docs from reintroducing broad production claims that
+# conflict with the conservative correctness-under-failure contract.
+# =============================================================================
+add_test(
+    NAME  check_dangerous_marketing_claims
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_dangerous_marketing_claims.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_dangerous_marketing_claims PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
+add_test(
+    NAME  check_chaos_manifest
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_chaos_manifest.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_chaos_manifest PROPERTIES
+    LABELS "lint;hardening"
+    TIMEOUT 30
+)
+
+add_test(
+    NAME  check_correctness_gates
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_correctness_gates.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_correctness_gates PROPERTIES
+    LABELS "lint;hardening"
+    TIMEOUT 30
+)
+
+# =============================================================================
 # Issue 9 — Result Cache gate: validate binary-level config rejection.
 # Runs the keel binary with --check-config to verify that result_cache=on
 # is rejected without experimental_features=true.
@@ -2814,6 +2872,7 @@ add_custom_target(build_tests DEPENDS
     test_concurrency_stress
     test_config
     test_result_cache_gate
+    test_replay_log
     test_config_reload
     test_conn_lifecycle
     test_connpool

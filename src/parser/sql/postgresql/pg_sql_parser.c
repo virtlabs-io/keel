@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 typedef struct pg_sql_result_private {
     keel_arena_t* arena;
@@ -33,6 +34,59 @@ static uint64_t hash_table_refs(const keel_qt_query_t* qt)
         }
     }
     return h;
+}
+
+static bool is_ident_byte(uint8_t c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '_';
+}
+
+static bool sql_contains_function_call(const uint8_t* data,
+                                       size_t len,
+                                       const char* name)
+{
+    size_t name_len = strlen(name);
+    if (!data || name_len == 0 || len < name_len) return false;
+
+    for (size_t i = 0; i + name_len <= len; i++) {
+        if (i > 0 && is_ident_byte(data[i - 1])) {
+            continue;
+        }
+        if (strncasecmp((const char*)data + i, name, name_len) != 0) {
+            continue;
+        }
+        size_t j = i + name_len;
+        if (j < len && is_ident_byte(data[j])) {
+            continue;
+        }
+        while (j < len && (data[j] == ' ' || data[j] == '\t' ||
+                           data[j] == '\r' || data[j] == '\n')) {
+            j++;
+        }
+        if (j < len && data[j] == '(') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mark_hazardous_function_plan(keel_semantic_plan_t* plan,
+                                         const char* reason)
+{
+    if (!plan) return;
+    plan->semantic_class = KEEL_SEM_EXTERNAL_EFFECT;
+    plan->is_read_only = false;
+    plan->may_write = true;
+    plan->requires_primary = true;
+    plan->safe_for_replica = false;
+    plan->cacheable = false;
+    plan->calls_function = true;
+    plan->external_side_effects_possible = true;
+    plan->safety = KEEL_SAFETY_PRIMARY_REQUIRED;
+    plan_reason(plan, reason);
 }
 
 static void classify_plan_from_qt(const keel_qt_query_t* qt,
@@ -189,6 +243,12 @@ static keel_parse_status_t pg_sql_parse(const keel_parse_input_t* input,
     result->ast = priv->qt->ast;
     result->plugin_private = priv;
     classify_plan_from_qt(priv->qt, &result->plan);
+    if (sql_contains_function_call(input->data, input->len, "nextval") ||
+        sql_contains_function_call(input->data, input->len, "setval") ||
+        sql_contains_function_call(input->data, input->len, "pg_advisory_lock")) {
+        mark_hazardous_function_plan(&result->plan,
+            "PostgreSQL function has side effects; route conservatively");
+    }
     result->status = KEEL_PARSE_OK;
     return result->status;
 }

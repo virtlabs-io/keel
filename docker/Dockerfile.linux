@@ -233,14 +233,24 @@ COPY docker/keel/     docker/keel/
 # enforce parity between registered metrics and docs/METRICS_REFERENCE.md.
 COPY docs/            docs/
 
+# Build-time variant selector. KEEL_VARIANT=core (default) builds without
+# Lua/Python scripting hooks; KEEL_VARIANT=full enables both. Override with:
+#   docker build --build-arg KEEL_VARIANT=full ...
+ARG KEEL_VARIANT=core
+
 # Configure and build
-RUN cmake -B build-linux -G Ninja \
+RUN if [ "$KEEL_VARIANT" = "full" ]; then \
+        KEEL_SCRIPTING_FLAGS="-DKEEL_ENABLE_LUA=ON -DKEEL_ENABLE_PYTHON=ON"; \
+    else \
+        KEEL_SCRIPTING_FLAGS="-DKEEL_ENABLE_LUA=OFF -DKEEL_ENABLE_PYTHON=OFF"; \
+    fi && \
+    echo "[KEEL] Build variant: $KEEL_VARIANT  ($KEEL_SCRIPTING_FLAGS)" && \
+    cmake -B build-linux -G Ninja \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DKEEL_USE_IOURING=ON \
         -DKEEL_USE_EPOLL=ON \
         -DKEEL_ENABLE_TESTS=ON \
-        -DKEEL_ENABLE_LUA=ON \
-        -DKEEL_ENABLE_PYTHON=ON \
+        $KEEL_SCRIPTING_FLAGS \
     && cmake --build build-linux
 
 # Quick sanity check

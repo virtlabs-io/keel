@@ -364,6 +364,25 @@ void keel_query_log_emit(keel_query_log_t* qlog,
     rec.message     = msg;
     rec.message_len = (size_t)(n > 0 ? n : 0);
 
+    /* Routing telemetry: pull from the session cache populated by the engine
+     * at dispatch time, and derive wall-clock latency from query_start_ns.
+     * Both are best-effort — empty / zero means "not measured this iteration". */
+    if (session) {
+        if (session->last_route_reason[0] != '\0') {
+            rec.route_reason = session->last_route_reason;
+        }
+        if (session->query_start_ns > 0) {
+            struct timespec now_ts;
+            if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
+                uint64_t now_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL +
+                                  (uint64_t)now_ts.tv_nsec;
+                if (now_ns > session->query_start_ns) {
+                    rec.latency_us = (now_ns - session->query_start_ns) / 1000ULL;
+                }
+            }
+        }
+    }
+
     /* Query tree serialization (optional — requires full parse) */
     char tree_buf[4096];
     keel_arena_t* tree_arena = NULL;

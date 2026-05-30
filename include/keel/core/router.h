@@ -166,6 +166,13 @@ typedef struct keel_route_session {
     /* Feature 7: Multi-shard transaction coordination */
     bool                has_scatter_write;    /**< A scatter write was recorded for this tx */
     uint64_t            scatter_shards_mask;  /**< Bitmask of participating shard indices */
+
+    /* Commit-in-doubt is sacred: once an ambiguous commit is detected the
+     * session MUST NOT route any further query through the normal pipeline
+     * until the outcome of the prior COMMIT has been resolved (or surfaced
+     * to the client as an explicit failure). The engine mirrors this from
+     * `keel_session_flow_t::commit_in_doubt` before every routing call. */
+    bool                commit_in_doubt;
 } keel_route_session_t;
 
 /**
@@ -193,6 +200,13 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_ROLE_FLAPPING,     /**< Server role unstable, conservative routing */
     KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
     KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
+    KEEL_ROUTE_REASON_SEMANTIC_UNSAFE,   /**< Read-looking SQL was not proven replica-safe */
+    KEEL_ROUTE_REASON_UNKNOWN_FUNCTION,  /**< SQL calls a function not in the metadata
+                                              cache; conservative policy forces primary. */
+    KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS,  /**< Session has an unresolved commit-in-doubt;
+                                              no new query may be routed until the
+                                              prior transaction outcome is determined.
+                                              See docs/CORRECTNESS_UNDER_FAILURE.md. */
     KEEL_ROUTE_REASON_COUNT,
 } keel_route_reason_t;
 
@@ -204,16 +218,163 @@ typedef enum keel_route_reason {
 const char* keel_route_reason_name(keel_route_reason_t r);
 
 /**
+ * @brief Bitmask of contributing factors behind a routing decision.
+ *
+ * The `reason_code` on `keel_route_decision_t` is the single dominant cause
+ * (the first one that short-circuits the decision). The `decision_factors`
+ * bitmask carries every condition that contributed, so logs and the
+ * `/api/diagnostics/route_explain` endpoint can say *why primary* in detail
+ * rather than collapsing every primary-only query into "WRITE_REQUIRED".
+ *
+ * The bitmask is intentionally redundant with `reason_code` for the
+ * single-cause case; new factors may be added without changing the dominant
+ * reason taxonomy. Values are sparse so new flags can slot in without
+ * renumbering.
+ */
+typedef enum keel_route_factor {
+    KEEL_DF_NONE                = 0,
+    KEEL_DF_IN_TRANSACTION      = (1u << 0),  /**< Session is inside BEGIN..COMMIT */
+    KEEL_DF_SESSION_PINNED      = (1u << 1),  /**< Session pinned to a specific server */
+    KEEL_DF_HAS_TEMP_TABLE      = (1u << 2),  /**< Session has temp tables */
+    KEEL_DF_STMT_CLASS_WRITE    = (1u << 3),  /**< Statement is a write (INSERT/UPDATE/...) */
+    KEEL_DF_STMT_CLASS_DDL      = (1u << 4),  /**< Statement is DDL */
+    KEEL_DF_STMT_CLASS_TXN_CTL  = (1u << 5),  /**< Statement is transaction control */
+    KEEL_DF_UNKNOWN_FUNCTION    = (1u << 6),  /**< SQL references a function not in
+                                                   the metadata cache (conservative) */
+    KEEL_DF_VOLATILE_FUNCTION   = (1u << 7),  /**< SQL references a VOLATILE function */
+    KEEL_DF_SECURITY_DEFINER    = (1u << 8),  /**< SQL references SECURITY DEFINER function */
+    KEEL_DF_WRITE_TRIGGER       = (1u << 9),  /**< Target has a write trigger */
+    KEEL_DF_WRITE_RULE          = (1u << 10), /**< Target has a write rule (view) */
+    KEEL_DF_PARSE_FAILED        = (1u << 11), /**< Parser failed or produced partial AST */
+    KEEL_DF_REPLICA_LAG         = (1u << 12), /**< Selected replicas exceed lag threshold */
+    KEEL_DF_NO_REPLICAS         = (1u << 13), /**< No healthy replicas available */
+    KEEL_DF_FAILOVER_FALLBACK   = (1u << 14), /**< Read fell back to primary */
+    KEEL_DF_STICKY_PRIMARY      = (1u << 15), /**< Within read-after-write TTL window */
+    KEEL_DF_COMMIT_IN_DOUBT     = (1u << 16), /**< Prior COMMIT outcome unresolved */
+    KEEL_DF_REPLICA_OK          = (1u << 17), /**< Proven safe for a replica */
+    KEEL_DF_USER_PINNED         = (1u << 18), /**< SET keel.route = primary */
+} keel_route_factor_t;
+
+/**
+ * @brief Format a `decision_factors` bitmask as a JSON array of stable names.
+ *
+ * The output is suitable for embedding into the value produced by
+ * `keel_route_decision_to_json()` or the admin diagnostics endpoint.
+ * Order is fixed (low bit first) for stable diffing in tests.
+ *
+ * @return Number of bytes that would have been written, snprintf semantics.
+ */
+size_t keel_route_factors_to_json_array(uint32_t factors,
+                                        char* out,
+                                        size_t out_size);
+
+/**
  * @brief Result object populated by routing functions.
  */
 typedef struct keel_route_decision {
     keel_route_server_t*  server;       /**< Selected server */
     const char*           reason;       /**< Human-readable reason string */
     keel_route_reason_t   reason_code;  /**< Typed reason code for programmatic use */
+    uint32_t              decision_factors; /**< Bitmask of `keel_route_factor_t`
+                                                 values that contributed to the
+                                                 decision; used by the
+                                                 route-explainer surface. */
     bool                  is_read;      /**< Query is read-only */
     bool                  was_pinned;   /**< Decision due to pinning */
     size_t                shard_index;  /**< Resolved shard for sharded routing */
 } keel_route_decision_t;
+
+/**
+ * @brief Format a route decision as a compact JSON object for logs/admin APIs.
+ *
+ * The helper is protocol-neutral: it reports the selected backend, read/write
+ * class, pin state, shard index, and stable route reason code.  `query_hash`
+ * may be zero when the caller does not have a semantic-plan hash.
+ *
+ * @return Number of bytes that would have been written, excluding the trailing
+ *         NUL, matching `snprintf()` semantics.
+ */
+size_t keel_route_decision_to_json(const keel_route_decision_t* decision,
+                                   uint64_t query_hash,
+                                   char* out,
+                                   size_t out_size);
+
+/* ============================================================================
+ * Per-query route explainer (read-only simulation)
+ * ============================================================================ */
+
+/** Maximum eligible-target rows surfaced by the explainer. */
+#define KEEL_ROUTE_EXPLAIN_MAX_TARGETS 16
+
+/** One row of the explainer's eligible-targets table. */
+typedef struct keel_route_target_info {
+    char                 name[64];   /**< Server identifier (NUL-terminated) */
+    char                 host[128];  /**< Hostname or IP */
+    uint16_t             port;       /**< Port */
+    keel_server_role_t   role;       /**< Primary / replica */
+    keel_server_health_t health;     /**< Current health */
+    int                  weight;     /**< Base weight */
+    bool                 was_selected; /**< True for the one row the router picked */
+    bool                 was_eligible; /**< True if it was in the candidate pool */
+} keel_route_target_info_t;
+
+/**
+ * @brief Full explanation of a hypothetical routing decision.
+ *
+ * Populated by @ref keel_router_explain_sql. The call is read-only: no
+ * stat counters are incremented, no scatter-write state is recorded, no
+ * locks beyond the dispatch mutex are held. The decision is computed
+ * against the *current* router state (server list, health, weights).
+ */
+typedef struct keel_route_explanation {
+    keel_route_decision_t    decision;             /**< Same shape as a live decision */
+    keel_route_target_info_t targets[KEEL_ROUTE_EXPLAIN_MAX_TARGETS];
+    size_t                   target_count;         /**< Entries in `targets[]` */
+    bool                     parse_failed;         /**< SQL did not parse cleanly */
+    bool                     simulated;            /**< Always true; for log clarity */
+    char                     sql_excerpt[256];     /**< Truncated input SQL */
+} keel_route_explanation_t;
+
+/**
+ * @brief Run the router against `sql` *without* mutating any stats or pools.
+ *
+ * The query is parsed, classified, and routed through the same code path
+ * `keel_router_route()` uses, but every counter increment is suppressed and
+ * the chosen server's `routes` count is not bumped. The eligible-target
+ * table reports every backend that *could* have been selected for this
+ * read/write class plus the one that was.
+ *
+ * @param router  Router handle (non-NULL).
+ * @param sql     SQL text to classify.
+ * @param session Optional session state (may be NULL → defaults).
+ * @param out     [out] Populated on @c KEEL_OK or when the decision returned
+ *                an error but a partial classification is available.
+ * @return @c KEEL_OK on success, @c KEEL_ERR_INVALID_ARG for bad inputs,
+ *         @c KEEL_ERR_UNAVAILABLE when no backend matched, or the error
+ *         returned by the router for that classification.
+ */
+keel_error_t keel_router_explain_sql(keel_router_t*              router,
+                                     keel_str_t                  sql,
+                                     const keel_route_session_t* session,
+                                     keel_route_explanation_t*   out);
+
+/**
+ * @brief Format an explanation as a JSON object (snprintf semantics).
+ *
+ * Schema (stable):
+ * ```
+ * {"simulated":true,"sql":"...","parse_failed":false,
+ *  "decision":{...keel_route_decision_to_json...},
+ *  "eligible_targets":[
+ *      {"name":"...","host":"...","port":N,"role":"rw|ro",
+ *       "health":"healthy|degraded|down|...","weight":N,
+ *       "selected":bool,"eligible":bool}, ...]}
+ * ```
+ */
+size_t keel_route_explanation_to_json(const keel_route_explanation_t* exp,
+                                      uint64_t                        query_hash,
+                                      char*                           out,
+                                      size_t                          out_size);
 
 /**
  * @brief Configuration knobs controlling router behavior and failure policy.
