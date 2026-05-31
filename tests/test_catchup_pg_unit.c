@@ -321,6 +321,7 @@ static void test_apply_backoff_escalation(void)
         TEST_ASSERT_EQ(snap.probes_failed_total, (uint64_t)(i + 1));
 
         /* Inspect the backoff state via the internal header. */
+        extern struct keel_catchup_manager;  /* opaque already typedef'd */
         keel_catchup_probe_socket_t* slot = &m->sockets[2];
         TEST_ASSERT_EQ(slot->backoff_current_ms, expected_ms[i]);
         TEST_ASSERT_EQ(slot->backoff_until_ns,
@@ -383,6 +384,210 @@ static void test_cache_put_short_circuits_enqueue(void)
 /* ==========================================================================
  * main
  * ==========================================================================*/
+
+/* ==========================================================================
+ * pg_probe_encode_query — wire bytes for the 'Q' (Query) message
+ * ==========================================================================*/
+static void test_encode_query(void)
+{
+    TEST_BEGIN("pg_probe_encode_query: framing + safety gate");
+
+    uint8_t buf[512];
+    size_t  len = 0;
+
+    /* Happy path. */
+    TEST_ASSERT_EQ(pg_probe_encode_query(buf, sizeof buf, "0/16B3740", &len), 0);
+    TEST_ASSERT_EQ(buf[0], 'Q');
+    /* Body length field encodes (4 + sql + NUL) in big-endian. */
+    uint32_t body_len = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16)
+                     | ((uint32_t)buf[3] <<  8) |  (uint32_t)buf[4];
+    TEST_ASSERT_EQ((size_t)body_len + 1, len);
+    /* The encoded SQL must contain the LSN literally and be NUL-terminated. */
+    const char* sql = (const char*)(buf + 5);
+    TEST_ASSERT(strstr(sql, "'0/16B3740'::pg_lsn") != NULL);
+    TEST_ASSERT(strstr(sql, "pg_last_wal_replay_lsn() IS NULL") != NULL);
+    TEST_ASSERT_EQ(buf[len - 1], (uint8_t)'\0');
+
+    /* Rejects unsafe LSN — defence-in-depth against injection. */
+    TEST_ASSERT_EQ(pg_probe_encode_query(buf, sizeof buf, "0/0';DROP", &len), -1);
+    TEST_ASSERT_EQ(pg_probe_encode_query(buf, sizeof buf, "", &len), -1);
+    TEST_ASSERT_EQ(pg_probe_encode_query(buf, sizeof buf, NULL, &len), -1);
+
+    /* Rejects truncation when cap is tiny. */
+    uint8_t tiny[10];
+    TEST_ASSERT_EQ(pg_probe_encode_query(tiny, sizeof tiny, "0/0", &len), -1);
+
+    /* NULL outputs. */
+    TEST_ASSERT_EQ(pg_probe_encode_query(NULL, sizeof buf, "0/0", &len), -1);
+    TEST_ASSERT_EQ(pg_probe_encode_query(buf, sizeof buf, "0/0", NULL), -1);
+    TEST_END();
+}
+
+/* ==========================================================================
+ * pg_probe_parse_message — recognises the PG reply subset we care about
+ * ==========================================================================*/
+
+/** Build a framed PG backend message of @p type into @p out. */
+static size_t make_msg(uint8_t* out, uint8_t type,
+                       const uint8_t* body, size_t body_len)
+{
+    out[0] = type;
+    /* body_len field includes its own 4 bytes. */
+    uint32_t len_field = (uint32_t)(body_len + 4);
+    out[1] = (uint8_t)(len_field >> 24);
+    out[2] = (uint8_t)(len_field >> 16);
+    out[3] = (uint8_t)(len_field >>  8);
+    out[4] = (uint8_t)(len_field      );
+    if (body && body_len) memcpy(out + 5, body, body_len);
+    return 1 + 4 + body_len;
+}
+
+/** Build a DataRow ('D') carrying a single 1-byte text column. */
+static size_t make_datarow_bool(uint8_t* out, char value)
+{
+    uint8_t body[2 + 4 + 1];
+    body[0] = 0; body[1] = 1;             /* ncols = 1 */
+    body[2] = 0; body[3] = 0; body[4] = 0; body[5] = 1;  /* col_len = 1 */
+    body[6] = (uint8_t)value;             /* 't' or 'f' */
+    return make_msg(out, 'D', body, sizeof body);
+}
+
+/** Build a DataRow with a SQL NULL column (col_len = -1). */
+static size_t make_datarow_null(uint8_t* out)
+{
+    uint8_t body[2 + 4];
+    body[0] = 0; body[1] = 1;             /* ncols = 1 */
+    /* col_len = -1 = 0xFFFFFFFF */
+    body[2] = 0xFF; body[3] = 0xFF; body[4] = 0xFF; body[5] = 0xFF;
+    return make_msg(out, 'D', body, sizeof body);
+}
+
+static void test_parse_message(void)
+{
+    TEST_BEGIN("pg_probe_parse_message: recognises subset, ignores noise");
+
+    uint8_t buf[256];
+    pg_probe_parse_status_t st;
+    bool result = false, valid = false;
+    size_t n;
+
+    /* Empty / short. */
+    n = pg_probe_parse_message(buf, 0, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_NEED_MORE);
+    TEST_ASSERT_EQ(n,  (size_t)0);
+    n = pg_probe_parse_message(buf, 3, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_NEED_MORE);
+
+    /* RowDescription ignored. */
+    uint8_t fake_T_body[6] = {0, 0, 0, 0, 0, 0};
+    size_t tlen = make_msg(buf, 'T', fake_T_body, sizeof fake_T_body);
+    valid = false;
+    n = pg_probe_parse_message(buf, tlen, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+    TEST_ASSERT_EQ(n,  tlen);
+    TEST_ASSERT(!valid);  /* DataRow flag must NOT be set by RowDescription */
+
+    /* DataRow with 't' (true). */
+    size_t dlen = make_datarow_bool(buf, 't');
+    result = false; valid = false;
+    n = pg_probe_parse_message(buf, dlen, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+    TEST_ASSERT_EQ(n,  dlen);
+    TEST_ASSERT(valid);
+    TEST_ASSERT(result);
+
+    /* DataRow with 'f' (false). */
+    dlen = make_datarow_bool(buf, 'f');
+    result = true; valid = false;
+    n = pg_probe_parse_message(buf, dlen, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+    TEST_ASSERT(valid);
+    TEST_ASSERT(!result);
+
+    /* DataRow with SQL NULL → treated as not-reached. */
+    dlen = make_datarow_null(buf);
+    result = true; valid = false;
+    n = pg_probe_parse_message(buf, dlen, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+    TEST_ASSERT(valid);
+    TEST_ASSERT(!result);
+
+    /* CommandComplete ignored. */
+    n = make_msg(buf, 'C', (const uint8_t*)"SELECT 1", 9);
+    n = pg_probe_parse_message(buf, n, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+
+    /* ReadyForQuery → DONE. */
+    n = make_msg(buf, 'Z', (const uint8_t*)"I", 1);
+    n = pg_probe_parse_message(buf, n, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_DONE);
+
+    /* ErrorResponse → ERROR. */
+    n = make_msg(buf, 'E', (const uint8_t*)"S\0FATAL\0", 8);
+    n = pg_probe_parse_message(buf, n, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_ERROR);
+
+    /* Unknown type — tolerated. */
+    n = make_msg(buf, 'A', NULL, 0);
+    n = pg_probe_parse_message(buf, n, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_CONSUMED);
+
+    /* Malformed: body_len < 4. */
+    buf[0] = 'D';
+    buf[1] = 0; buf[2] = 0; buf[3] = 0; buf[4] = 3;
+    n = pg_probe_parse_message(buf, 5, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_ERROR);
+
+    /* Header present but body truncated. */
+    dlen = make_datarow_bool(buf, 't');
+    n = pg_probe_parse_message(buf, dlen - 1, &st, &result, &valid);
+    TEST_ASSERT_EQ(st, PG_PARSE_NEED_MORE);
+    TEST_END();
+}
+
+/* ==========================================================================
+ * Streaming a full probe reply through parse_message one byte at a time
+ * ==========================================================================*/
+static void test_parse_message_stream(void)
+{
+    TEST_BEGIN("pg_probe_parse_message: T+D+C+Z stream byte-by-byte");
+
+    uint8_t stream[512];
+    size_t  off = 0;
+    uint8_t T_body[6] = {0, 0, 0, 0, 0, 0};
+    off += make_msg(stream + off, 'T', T_body, sizeof T_body);
+    off += make_datarow_bool(stream + off, 't');
+    off += make_msg(stream + off, 'C', (const uint8_t*)"SELECT 1", 9);
+    off += make_msg(stream + off, 'Z', (const uint8_t*)"I", 1);
+
+    /* Drain the stream one byte at a time to mimic a slow TCP read. */
+    uint8_t recv_buf[512];
+    size_t  have = 0;
+    bool result = false, valid = false;
+    bool done = false;
+    int  msgs_consumed = 0;
+
+    for (size_t fed = 0; fed < off && !done; fed++) {
+        recv_buf[have++] = stream[fed];
+        for (;;) {
+            pg_probe_parse_status_t st;
+            size_t n = pg_probe_parse_message(recv_buf, have, &st,
+                                              &result, &valid);
+            if (st == PG_PARSE_NEED_MORE) break;
+            TEST_ASSERT(st != PG_PARSE_ERROR);
+            msgs_consumed++;
+            memmove(recv_buf, recv_buf + n, have - n);
+            have -= n;
+            if (st == PG_PARSE_DONE) { done = true; break; }
+        }
+    }
+    TEST_ASSERT(done);
+    TEST_ASSERT_EQ(msgs_consumed, 4);
+    TEST_ASSERT(valid);
+    TEST_ASSERT(result);
+    TEST_END();
+}
+
 int main(void)
 {
     test_pg_lsn_parse();
@@ -393,5 +598,8 @@ int main(void)
     test_release_satisfied();
     test_apply_backoff_escalation();
     test_cache_put_short_circuits_enqueue();
+    test_encode_query();
+    test_parse_message();
+    test_parse_message_stream();
     return test_summary();
 }

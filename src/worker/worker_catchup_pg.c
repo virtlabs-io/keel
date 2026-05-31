@@ -295,32 +295,10 @@ static void pg_probe_on_connect(struct backend_conn* conn, bool success, void* u
 static int pg_probe_build_query(pg_probe_ctx_t* ctx,
                                 const keel_consistency_token_t* token)
 {
-    char sql[256];
-    int n;
-    if (!pg_lsn_token_is_safe(token->value)) {
+    if (pg_probe_encode_query(ctx->send_buf, sizeof ctx->send_buf,
+                              token->value, &ctx->send_len) < 0) {
         return -1;
     }
-    /* Single SELECT that returns 't' on both:
-     *   - the primary (pg_last_wal_replay_lsn() IS NULL there); or
-     *   - a replica that has replayed at least the requested LSN.
-     * Otherwise returns 'f'. We don't filter by timeline_id here —
-     * pg_token_satisfied_by() enforces the same-timeline rule when
-     * releasing waiters. */
-    n = snprintf(sql, sizeof sql,
-                 "SELECT (pg_last_wal_replay_lsn() IS NULL)"
-                 " OR (pg_last_wal_replay_lsn() >= '%s'::pg_lsn);",
-                 token->value);
-    if (n < 0 || (size_t)n >= sizeof sql) return -1;
-
-    size_t sql_len = (size_t)n;
-    size_t total   = 1 + 4 + sql_len + 1;
-    if (total > sizeof ctx->send_buf) return -1;
-
-    ctx->send_buf[0] = 'Q';
-    keel_be32_put(ctx->send_buf + 1, (uint32_t)(4 + sql_len + 1));
-    memcpy(ctx->send_buf + 5, sql, sql_len);
-    ctx->send_buf[5 + sql_len] = '\0';
-    ctx->send_len = total;
     ctx->send_off = 0;
     return 0;
 }
@@ -396,7 +374,7 @@ static void pg_probe_post_recv(pg_probe_ctx_t* ctx)
 
 /** Try to consume one framed PG message from the head of recv_buf.
  *  Returns:
- *    >0  bytes consumed (recv_buf updated by caller)
+ *    >0  bytes consumed (caller slides the buffer)
  *     0  not enough data yet
  *    -1  protocol error (caller should fail the probe)
  *
@@ -406,55 +384,17 @@ static void pg_probe_post_recv(pg_probe_ctx_t* ctx)
 static ssize_t pg_probe_consume_one(pg_probe_ctx_t* ctx, bool* out_done)
 {
     *out_done = false;
-    if (ctx->recv_have < 5) return 0;
-
-    uint8_t type = ctx->recv_buf[0];
-    uint32_t body_len = keel_be32_get(ctx->recv_buf + 1);
-    if (body_len < 4 || body_len > sizeof ctx->recv_buf) return -1;
-    size_t total = 1 + body_len;
-    if (ctx->recv_have < total) return 0;
-
-    const uint8_t* body = ctx->recv_buf + 5;
-    uint32_t body_payload_len = body_len - 4;
-
-    switch (type) {
-    case 'T':  /* RowDescription — ignore. */
-    case 'C':  /* CommandComplete — ignore. */
-    case 'N':  /* NoticeResponse — ignore. */
-    case 'S':  /* ParameterStatus — ignore. */
-        break;
-
-    case 'D': {  /* DataRow — extract bool. */
-        if (body_payload_len < 2) return -1;
-        uint16_t ncols = (uint16_t)((body[0] << 8) | body[1]);
-        if (ncols != 1) return -1;
-        if (body_payload_len < 6) return -1;
-        int32_t col_len = (int32_t)keel_be32_get(body + 2);
-        if (col_len < 0 || (uint32_t)(6 + col_len) > body_payload_len) {
-            /* NULL is acceptable: treat as not-reached. */
-            ctx->last_result = false;
-            ctx->last_result_valid = true;
-            break;
-        }
-        if (col_len >= 1) {
-            ctx->last_result = (body[6] == 't');
-            ctx->last_result_valid = true;
-        }
-        break;
+    pg_probe_parse_status_t st;
+    size_t consumed = pg_probe_parse_message(ctx->recv_buf, ctx->recv_have,
+                                             &st, &ctx->last_result,
+                                             &ctx->last_result_valid);
+    switch (st) {
+    case PG_PARSE_NEED_MORE: return 0;
+    case PG_PARSE_ERROR:     return -1;
+    case PG_PARSE_DONE:      *out_done = true; return (ssize_t)consumed;
+    case PG_PARSE_CONSUMED:  return (ssize_t)consumed;
     }
-
-    case 'Z':  /* ReadyForQuery — round complete. */
-        *out_done = true;
-        break;
-
-    case 'E':  /* ErrorResponse. */
-        return -1;
-
-    default:
-        /* Unknown message; tolerate (e.g., NotificationResponse 'A'). */
-        break;
-    }
-    return (ssize_t)total;
+    return -1;
 }
 
 static void pg_probe_on_recv(void* userdata, int result)
