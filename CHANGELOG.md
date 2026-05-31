@@ -29,8 +29,8 @@ already in tree to support it.)
 - **New stats.** Two `uint64_t` counters on `keel_worker_t.stats`:
   - `wait_catchup_consulted_total` — total token-bearing reads consulted.
   - `wait_catchup_degraded_to_primary` — subset that were degraded to primary.
-- **Tests.** 8 unit tests (`tests/test_engine_catchup_consult.c`) cover the predicate exhaustively (NULL guards, in-txn skip, no-token skip, WARN/FAIL policies, etc.). Patch 2d-5 adds a live-PostgreSQL e2e (`tests/test_engine_catchup_consult_pg_e2e.c`) that captures the live primary's WAL LSN via `libpq` (`SELECT pg_current_wal_lsn()`), feeds it to the helper, and asserts the WAIT_CATCHUP+degrade verdict plus exact LSN echo plus the in-transaction negative case. Skips gracefully when no PG primary is reachable.
-- **Full regression.** 138/138 ctest green (including the new live e2e).
+- **Tests.** 8 unit tests (`tests/test_engine_catchup_consult.c`) cover the predicate exhaustively (NULL guards, in-txn skip, no-token skip, WARN/FAIL policies, etc.). Patch 2d-5 adds a live-PostgreSQL e2e (`tests/test_engine_catchup_consult_pg_e2e.c`) that captures the live primary's WAL LSN via `libpq` (`SELECT pg_current_wal_lsn()`), feeds it to the helper, and asserts the WAIT_CATCHUP+degrade verdict plus exact LSN echo plus the in-transaction negative case. A matching live-MySQL e2e (`tests/test_engine_catchup_consult_my_e2e.c`) captures `@@global.gtid_executed` from the live primary via the `mysql` CLI and asserts the same contract for the GTID token path. Both e2es skip gracefully when no primary is reachable.
+- **Full regression.** 139/139 ctest green (including the two new live e2es).
 
 ### Added — Failover-manager track (proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md §3-§4)
 
