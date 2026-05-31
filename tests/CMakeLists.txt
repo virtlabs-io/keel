@@ -458,6 +458,46 @@ target_link_libraries(test_catchup_pg_mock PRIVATE
 target_link_options(test_catchup_pg_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_catchup_pg_mock COMMAND test_catchup_pg_mock)
 
+# Catch-up PG probe state machine — live-PostgreSQL e2e through the full
+# backend_async_start (TCP + SCRAM-SHA-256 + optional TLS) + probe round
+# (Phase 2b-test, part 4). Skips when no PG cluster is reachable.
+# Set KEEL_TEST_PG_HOST1/PORT1 (primary) and KEEL_TEST_PG_HOST2/PORT2
+# (replica), or start docker/compose/pg-streaming.yml.
+# Uses libpq for the primary-LSN oracle (SCRAM-SHA-256 capable) — the
+# probe SM itself goes through KEEL's own backend_async_start.
+find_package(PostgreSQL QUIET)
+if(PostgreSQL_FOUND)
+    add_executable(test_catchup_pg_e2e test_catchup_pg_e2e.c)
+    target_link_libraries(test_catchup_pg_e2e PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_worker_new
+        keelcore
+        keel_engine_flow
+        keel_session
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keelsql
+        keelstats
+        keel_arch_common
+        keel_arch_platform
+        keelmem
+        keelutil
+        OpenSSL::Crypto
+        PostgreSQL::PostgreSQL
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    target_link_options(test_catchup_pg_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_catchup_pg_e2e COMMAND test_catchup_pg_e2e)
+    set_tests_properties(test_catchup_pg_e2e PROPERTIES
+        LABELS "e2e;catchup;integration"
+        TIMEOUT 60)
+else()
+    message(STATUS "libpq not found — skipping test_catchup_pg_e2e (install postgresql-dev / libpq-dev)")
+endif()
+
 # Stress / fuzz tests for router dispatch and connpool (Tier 6 / Feature 15+)
 add_executable(test_router_stress test_router_stress.c)
 target_link_libraries(test_router_stress PRIVATE
