@@ -649,6 +649,16 @@ target_link_libraries(test_router PRIVATE
 target_link_options(test_router PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router COMMAND test_router)
 
+# Router WAIT_CATCHUP emission (Patch 2d-2): stale_read_policy=wait path
+add_executable(test_router_wait_catchup test_router_wait_catchup.c)
+target_link_libraries(test_router_wait_catchup PRIVATE
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_router_wait_catchup PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_router_wait_catchup COMMAND test_router_wait_catchup)
+set_tests_properties(test_router_wait_catchup PROPERTIES LABELS "core;catchup")
+
 # Failover-manager tests (cluster epoch, fencing, degraded mode, timeline)
 add_executable(test_failover_manager test_failover_manager.c)
 target_link_libraries(test_failover_manager PRIVATE

@@ -368,19 +368,6 @@ keel_router_t* keel_router_create(const keel_router_config_t* config) {
     router->config = config ? *config : keel_router_config_default();
     router->rand_seed = (unsigned int)time(NULL);
 
-    /* `KEEL_STALE_READ_WAIT` is reserved in the public enum but the
-     * reactor-owned catch-up loop is not implemented yet. Silently
-     * accepting it would mask the absence of real WAIT semantics and
-     * give operators false confidence. Degrade to ROUTE_PRIMARY (the
-     * conservative production default) and log once. */
-    if (router->config.stale_read_policy == KEEL_STALE_READ_WAIT) {
-        KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
-            "stale_read_policy=WAIT is not implemented in this build; "
-            "falling back to ROUTE_PRIMARY. Set stale_read_policy=reject "
-            "to fail closed instead.");
-        router->config.stale_read_policy = KEEL_STALE_READ_ROUTE_PRIMARY;
-    }
-    
     /* Create temporary arena for query parsing */
     router->temp_arena = keel_arena_create(4096);
     if (!router->temp_arena) {
@@ -1155,6 +1142,39 @@ static bool consistency_forces_primary(
 }
 
 /**
+ * @brief Should the router emit a WAIT_CATCHUP decision for this request?
+ *
+ * True when the operator picked `stale_read_policy=wait` AND the session
+ * carries a consistency token (`requires_consistent_read` + non-empty
+ * `required_consistency_token.value`). The actual replica-safety check
+ * is done by the caller via `consistency_forces_primary()` — this helper
+ * only encodes the policy precondition that flips the consistency path
+ * from primary-fallback to park-and-probe.
+ *
+ * Returning true does not by itself emit WAIT_CATCHUP: the read path also
+ * needs an eligible replica. If no replica is available the routing logic
+ * falls back to the legacy primary path with `KEEL_DF_NO_REPLICAS`.
+ */
+static bool should_wait_for_catchup(
+    const keel_router_t* router,
+    const keel_route_session_t* session)
+{
+    if (!router || !session) {
+        return false;
+    }
+    if (router->config.stale_read_policy != KEEL_STALE_READ_WAIT) {
+        return false;
+    }
+    if (router->config.consistency_mode != KEEL_CONSISTENCY_READ_YOUR_WRITES) {
+        return false;
+    }
+    if (!session->requires_consistent_read) {
+        return false;
+    }
+    return session->required_consistency_token.value[0] != '\0';
+}
+
+/**
  * @brief Build the read-routing candidate list.
  *
  * @return Number of indices written to `out_indices`.
@@ -1421,6 +1441,22 @@ static keel_error_t route_internal_ex(keel_router_t* router,
     bool force_primary_for_consistency =
         consistency_forces_primary(router, qt, session);
     bool is_read = should_use_readonly(router, qt, session);
+
+    /* WAIT-policy escape hatch: when the operator picked
+     * `stale_read_policy=wait` and the session has a consistency token, do
+     * NOT force primary. Instead the read path will select a candidate
+     * replica and emit `KEEL_ROUTE_REASON_WAIT_CATCHUP`; the engine then
+     * parks the session in the per-worker catch-up manager (see
+     * keel/engine/catchup.h) until a probe proves the replica reached the
+     * token. If no eligible replica exists this collapses to the legacy
+     * primary fallback. */
+    bool wait_catchup_mode = false;
+    if (force_primary_for_consistency && should_wait_for_catchup(router, session)) {
+        force_primary_for_consistency = false;
+        is_read                       = true;
+        wait_catchup_mode             = true;
+    }
+
     if (force_primary_for_consistency) {
         is_read = false;
     }
@@ -1436,6 +1472,28 @@ static keel_error_t route_internal_ex(keel_router_t* router,
 
         if (read_count > 0) {
             selected = select_server(router, read_indices, read_count, true);
+        }
+
+        if (wait_catchup_mode && selected && selected->config.role != KEEL_SERVER_PRIMARY) {
+            /* Replica picked, but session must be parked until it catches
+             * up to the token. The engine consumes wait_server_index +
+             * wait_token + wait_max_ms and enqueues a waiter; on REACHED
+             * the original SQL is re-dispatched against this same replica.
+             * If `selected` is the primary (added via primary_read_weight
+             * when no replica is eligible) fall through to the normal
+             * read/fallback path — there is nothing to wait for. */
+            size_t srv_idx = (size_t)(selected - router->servers);
+            decision->server             = NULL;
+            decision->wait_server_index  = srv_idx;
+            decision->wait_token         = session->required_consistency_token;
+            decision->wait_max_ms        = router->config.max_replica_catchup_ms;
+            decision->reason             = "consistent read: parked until replica reaches token";
+            decision->reason_code        = KEEL_ROUTE_REASON_WAIT_CATCHUP;
+            decision->decision_factors  |= (KEEL_DF_WAIT_CATCHUP | KEEL_DF_CONSISTENCY_TOKEN);
+            if (!simulate) {
+                router->stats.read_routes++;
+            }
+            return KEEL_OK;
         }
 
         if (!selected && router->config.failover_to_primary) {
