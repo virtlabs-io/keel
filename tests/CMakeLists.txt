@@ -715,6 +715,26 @@ else()
     message(STATUS "libpq not found — skipping test_engine_catchup_consult_pg_e2e")
 endif()
 
+# Engine catchup-consult live MySQL e2e (Patch 2d-5, MySQL parity):
+# captures a real GTID set from the live primary via the `mysql` CLI
+# and exercises the consult helper. Skips at runtime when no MySQL
+# primary is reachable or `mysql` CLI is missing.
+add_executable(test_engine_catchup_consult_my_e2e test_engine_catchup_consult_my_e2e.c)
+target_link_libraries(test_engine_catchup_consult_my_e2e PRIVATE
+    keel_engine_flow
+    keelcore
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_engine_catchup_consult_my_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_engine_catchup_consult_my_e2e COMMAND test_engine_catchup_consult_my_e2e)
+set_tests_properties(test_engine_catchup_consult_my_e2e PROPERTIES
+    LABELS "e2e;engine;catchup;integration"
+    TIMEOUT 30)
+
 # Failover-manager tests (cluster epoch, fencing, degraded mode, timeline)
 add_executable(test_failover_manager test_failover_manager.c)
 target_link_libraries(test_failover_manager PRIVATE
