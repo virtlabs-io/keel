@@ -416,50 +416,36 @@ static void* probe_thread(void* arg)
 
                     /* Critical: if this server is detected as RW but no other
                      * server is currently RW, just rebuild indices.  If another
-                     * server WAS RW, trigger failover to handle the demotion. */
+                     * server is already RW (from config or from a previous
+                     * resolve), do NOT trigger a failover during initial
+                     * discovery — that causes AB-BA oscillation when the
+                     * cluster has two primaries (split-brain or stale state).
+                     * Demote this server to RO instead; an operator-driven
+                     * topology change can promote it via a real role flip,
+                     * which is handled by the normal role-change branch above. */
                     if (result.detected_role == KEEL_SERVER_ROLE_RW) {
-                        size_t old_rw_idx = SIZE_MAX;
+                        size_t existing_rw_idx = SIZE_MAX;
                         for (size_t s = 0; s < pool->count; s++) {
                             if (s != i && pool->servers[s].role == KEEL_SERVER_ROLE_RW) {
-                                old_rw_idx = s;
+                                existing_rw_idx = s;
                                 break;
                             }
                         }
 
-                        if (old_rw_idx != SIZE_MAX) {
+                        if (existing_rw_idx != SIZE_MAX) {
                             KEEL_LOG_WARN(KEEL_LOG_CAT_PROBE,
-                                    "probe: detected RW at server[%zu] %s:%u "
-                                    "conflicts with existing RW server[%zu] %s:%u "
-                                    "— triggering initial failover",
+                                    "probe: server[%zu] %s:%u detected RW but "
+                                    "server[%zu] %s:%u is already RW — keeping "
+                                    "server[%zu] as RO (avoids AB-BA failover "
+                                    "during initial discovery; investigate "
+                                    "possible split-brain)",
                                     i, server->host, server->port,
-                                    old_rw_idx,
-                                    pool->servers[old_rw_idx].host,
-                                    pool->servers[old_rw_idx].port);
-
-                            /* Brief delay to let other servers also resolve */
-                            if (mgr->config.failover_delay_ms > 0) {
-                                uint32_t init_delay = mgr->config.failover_delay_ms / 2;
-                                if (init_delay < 1000) init_delay = 1000;
-                                KEEL_LOG_INFO(KEEL_LOG_CAT_PROBE,
-                                        "probe: waiting %ums before initial failover",
-                                        init_delay);
-                                usleep(init_delay * 1000u);
-                            }
-
-                            /* Re-verify */
-                            keel_probe_check_t verify;
-                            mgr->ops->check(ctx, server, &verify);
-                            if (verify.health == KEEL_HEALTH_UP &&
-                                verify.detected_role == KEEL_SERVER_ROLE_RW)
-                            {
-                                perform_failover(mgr, old_rw_idx, i);
-                            } else {
-                                KEEL_LOG_WARN(KEEL_LOG_CAT_PROBE,
-                                        "probe: initial failover aborted — "
-                                        "re-verify failed (health=%s, role=%d)",
-                                        keel_health_status_str(verify.health),
-                                        verify.detected_role);
-                            }
+                                    existing_rw_idx,
+                                    pool->servers[existing_rw_idx].host,
+                                    pool->servers[existing_rw_idx].port,
+                                    i);
+                            server->role = KEEL_SERVER_ROLE_RO;
+                            keel_server_pool_rebuild_indices(pool);
                         } else {
                             /* No conflict — just rebuild indices */
                             keel_server_pool_rebuild_indices(pool);

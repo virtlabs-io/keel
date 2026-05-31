@@ -4969,12 +4969,31 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                   worker->id,
                                   einfo.sqlstate ? einfo.sqlstate : "?");
                 }
-                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
-                    "W%u: backend error class=%d sqlstate=%s msg=%s",
-                    worker->id,
-                    (int)einfo.error_class,
-                    einfo.sqlstate ? einfo.sqlstate : "?",
-                    einfo.message ? einfo.message : "?");
+                /* Connection-fatal errors are operator-actionable → WARN.
+                 * Pure client-side query errors (syntax/permission/constraint
+                 * — SQLSTATE class 22/23/42) are user mistakes routinely
+                 * forwarded to the client; logging them at WARN floods the
+                 * log on every typo. Demote those to INFO. */
+                const char* ss = einfo.sqlstate;
+                bool client_side_error = ss && (
+                    strncmp(ss, "22", 2) == 0 ||  /* data exception */
+                    strncmp(ss, "23", 2) == 0 ||  /* integrity constraint */
+                    strncmp(ss, "42", 2) == 0);   /* syntax / access rule */
+                if (einfo.connection_ok && client_side_error) {
+                    KEEL_LOG_INFO(KEEL_LOG_CAT_CONN,
+                        "W%u: backend error class=%d sqlstate=%s msg=%s",
+                        worker->id,
+                        (int)einfo.error_class,
+                        ss ? ss : "?",
+                        einfo.message ? einfo.message : "?");
+                } else {
+                    KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                        "W%u: backend error class=%d sqlstate=%s msg=%s",
+                        worker->id,
+                        (int)einfo.error_class,
+                        ss ? ss : "?",
+                        einfo.message ? einfo.message : "?");
+                }
             }
             /* Error response — do not cache this result */
             if (sf->cache_pending) {
