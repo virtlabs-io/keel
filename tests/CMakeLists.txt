@@ -441,6 +441,23 @@ target_link_libraries(test_catchup_pg_unit PRIVATE
 target_link_options(test_catchup_pg_unit PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_catchup_pg_unit COMMAND test_catchup_pg_unit)
 
+# Catch-up PG probe state machine — socketpair-mock end-to-end of the
+# full QUERY round through a real reactor (Phase 2b-test, part 3).
+add_executable(test_catchup_pg_mock test_catchup_pg_mock.c)
+target_link_libraries(test_catchup_pg_mock PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_pg_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_pg_mock COMMAND test_catchup_pg_mock)
+
 # Stress / fuzz tests for router dispatch and connpool (Tier 6 / Feature 15+)
 add_executable(test_router_stress test_router_stress.c)
 target_link_libraries(test_router_stress PRIVATE

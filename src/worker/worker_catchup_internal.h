@@ -200,6 +200,27 @@ void keel_catchup_pg_drive(struct keel_catchup_manager* m,
 void keel_catchup_pg_close(struct keel_catchup_manager* m,
                            size_t server_index);
 
+/**
+ * @brief Test-only hook: inject a pre-authenticated probe socket for
+ *        one server, bypassing CONNECT + SCRAM.
+ *
+ * Allocates the per-server probe context, takes ownership of @p fd
+ * (the manager will close it on destroy), registers it with the
+ * worker's reactor, and parks the SM in `READY` so the very next
+ * `keel_catchup_pg_drive` call goes straight to QUERY_SEND.
+ *
+ * Intended exclusively for socketpair-based unit tests of the PG
+ * probe round (see tests/test_catchup_pg_mock.c). Production code
+ * MUST NOT call this — it skips authentication.
+ *
+ * @return 0 on success, -1 on allocation failure or bad inputs.
+ *
+ * Defined in worker_catchup_pg.c.
+ */
+int keel_catchup_pg_test_inject_ready(struct keel_catchup_manager* m,
+                                      size_t server_index,
+                                      int fd);
+
 #ifdef __cplusplus
 }
 #endif

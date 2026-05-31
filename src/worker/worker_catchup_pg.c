@@ -192,6 +192,43 @@ void keel_catchup_pg_close(struct keel_catchup_manager* m, size_t server_index)
     ctx->state = PG_PROBE_INIT;
 }
 
+/* Test-only: inject a pre-authenticated probe socket.
+ * MUST NOT be called from production code — it skips authentication. */
+int keel_catchup_pg_test_inject_ready(struct keel_catchup_manager* m,
+                                      size_t server_index,
+                                      int fd)
+{
+    if (!m || server_index >= KEEL_MAX_SERVERS || fd < 0) return -1;
+    if (!m->worker || !m->worker->reactor) return -1;
+
+    keel_catchup_probe_socket_t* slot = &m->sockets[server_index];
+    if (slot->probe_state) return -1;  /* already wired */
+
+    pg_probe_ctx_t* ctx = keel_calloc(1, sizeof *ctx);
+    if (!ctx) return -1;
+    ctx->conn = keel_calloc(1, sizeof *ctx->conn);
+    if (!ctx->conn) { keel_free(ctx); return -1; }
+
+    ctx->mgr          = m;
+    ctx->server_index = server_index;
+    ctx->state        = PG_PROBE_READY;
+    ctx->pool         = NULL;  /* unused on the test path */
+    ctx->conn->fd     = fd;
+
+    slot->probe_state      = ctx;
+    slot->probe_state_free = pg_probe_ctx_free;
+    slot->fd               = fd;
+    slot->opened_ns        = (uint64_t)keel_time_now();
+
+    if (keel_reactor_register_fd(m->worker->reactor, fd) < 0) {
+        slot->probe_state = NULL;
+        slot->fd          = -1;
+        pg_probe_ctx_free(ctx);
+        return -1;
+    }
+    return 0;
+}
+
 /* ============================================================================
  * State transitions
  * ============================================================================ */
