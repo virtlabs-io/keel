@@ -76,6 +76,67 @@ positive proof, not absence of obvious writes.
 | MySQL | Hardening | Keep parity tests, but do not position as the first production baseline. |
 | GraphQL, MCP, natural language parsing | Research | Design and experiments only. |
 
+## Read-Your-Writes Consistency and Stale-Read Policy
+
+KEEL tracks the last write performed by a session as a
+`keel_consistency_token_t` (either a PostgreSQL WAL LSN or a MySQL GTID
+set, stored on the per-session `sf->last_write_token`). When a
+`consistency_mode = read_your_writes` router is configured, every
+token-bearing read is classified by the router before server selection.
+
+### stale_read_policy = warn (default)
+
+The router selects the best replica, notes that the replica may be
+behind, logs a WARNING, and routes normally. No client-visible impact.
+
+### stale_read_policy = fail
+
+The router rejects the query with a routing error when the replica
+cannot be confirmed as caught up. The session must retry.
+
+### stale_read_policy = wait (safe-degrade)
+
+The router emits `KEEL_ROUTE_REASON_WAIT_CATCHUP`. The intended behavior
+is to park the session and wait up to `max_replica_catchup_ms` for the
+replica to catch up, then re-dispatch.
+
+When the full async-park + resume continuation is not yet active (which
+depends on the build configuration), the engine falls back to a
+**safe-degrade** path: it consults
+`keel_engine_should_degrade_to_primary_on_wait()` and, when the router
+would emit WAIT_CATCHUP, **routes the read to the primary** rather than
+parking the session. This preserves RYW correctness at the cost of
+marginal extra primary load.
+
+The correctness rule is:
+
+```text
+If the replica is behind and stale_read_policy=wait,
+route to primary. Never return stale data to a RYW session.
+```
+
+The safe-degrade path is visible via two operator-facing counters on
+the Prometheus `/metrics` endpoint and in `SHOW STATS`:
+
+| Stat name | Description |
+|---|---|
+| `wait_catchup_consulted_total` | Total token-bearing reads that triggered a router consultation |
+| `wait_catchup_degraded_to_primary_total` | Subset that were degraded to primary (router said WAIT_CATCHUP) |
+
+A non-zero `wait_catchup_degraded_to_primary_total` is expected and
+correct when operating in safe-degrade mode. It is **not** an error —
+it means the RYW guarantee is being upheld via primary routing. If the
+ratio `degraded / consulted` is high, consider increasing
+`max_replica_catchup_ms`, reducing replication lag, or using
+`stale_read_policy = warn` to allow slightly stale reads.
+
+### in_transaction invariant
+
+RYW token evaluation and the WAIT_CATCHUP path are **skipped** when
+`session->in_transaction` is true. Inside a transaction the session is
+already pinned to a backend and the routing path does not re-select;
+token evaluation on a mid-transaction read would be incorrect.
+
 ## Ownership Rules
 
 Exactly one subsystem owns each stateful object at a time:

@@ -1124,6 +1124,26 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
         pg_data_row(b, row1, 2); nrows++;
     }
 
+    /* Consistent-read catch-up observability (Patch 2d-4) */
+    {
+        uint64_t consulted_agg = 0, degraded_agg = 0;
+        uint32_t nw2 = keel_engine_get_num_workers(admin->engine);
+        for (uint32_t i = 0; i < nw2; i++) {
+            const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
+            if (w) {
+                consulted_agg += w->stats.wait_catchup_consulted_total;
+                degraded_agg  += w->stats.wait_catchup_degraded_to_primary;
+            }
+        }
+        char vbuf2[32];
+        const char *rc[] = { "wait_catchup_consulted_total",
+                              fmt_u64(vbuf,  sizeof(vbuf),  consulted_agg) };
+        pg_data_row(b, rc, 2); nrows++;
+        const char *rd[] = { "wait_catchup_degraded_to_primary_total",
+                              fmt_u64(vbuf2, sizeof(vbuf2), degraded_agg) };
+        pg_data_row(b, rd, 2); nrows++;
+    }
+
     /* Uptime */
     {
         double up = (double)snap.uptime_ns / 1.0e9;
@@ -5271,6 +5291,34 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
                     (unsigned long long)atomic_load_explicit(&ts->export_batches, memory_order_relaxed));
             }
         }
+    }
+
+    /* Consistent-read catch-up observability (Patch 2d-4).
+     * These counters live on worker->stats as plain uint64_t (not in
+     * keel_stats_ctx_t) because they are incremented only on the
+     * token-bearing replica-read path, which is infrequent enough that
+     * avoiding the stats-ctx lookup is not worth the added coupling.
+     * We aggregate them here with a direct worker walk. */
+    {
+        uint64_t consulted_agg = 0, degraded_agg = 0;
+        fprintf(f, "# HELP keel_wait_catchup_consulted_total Token-bearing replica reads that triggered a router wait-catchup consultation\n");
+        fprintf(f, "# TYPE keel_wait_catchup_consulted_total counter\n");
+        fprintf(f, "# HELP keel_wait_catchup_degraded_to_primary_total Reads degraded to primary because router emitted WAIT_CATCHUP safe-degrade path\n");
+        fprintf(f, "# TYPE keel_wait_catchup_degraded_to_primary_total counter\n");
+        for (uint32_t i = 0; i < nw; i++) {
+            const keel_worker_t *w = keel_engine_get_worker(admin->engine, i);
+            if (!w) continue;
+            fprintf(f, "keel_wait_catchup_consulted_total{worker=\"%u\"} %llu\n",
+                    i, (unsigned long long)w->stats.wait_catchup_consulted_total);
+            fprintf(f, "keel_wait_catchup_degraded_to_primary_total{worker=\"%u\"} %llu\n",
+                    i, (unsigned long long)w->stats.wait_catchup_degraded_to_primary);
+            consulted_agg += w->stats.wait_catchup_consulted_total;
+            degraded_agg  += w->stats.wait_catchup_degraded_to_primary;
+        }
+        fprintf(f, "keel_wait_catchup_consulted_total %llu\n",
+                (unsigned long long)consulted_agg);
+        fprintf(f, "keel_wait_catchup_degraded_to_primary_total %llu\n",
+                (unsigned long long)degraded_agg);
     }
 
     /* Router sharding metrics — emitted when a router is attached */

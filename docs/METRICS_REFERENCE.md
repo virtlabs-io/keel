@@ -685,6 +685,30 @@ Conventions:
 | `keel_proxy_orphaned_transactions_total` | counter | Sessions closed with open backend transaction |
 | `keel_proxy_state_desync_total` | counter | Protocol state desynchronization events |
 
+### keel_wait_catchup_*
+
+Emitted by the engine's `stale_read_policy=wait` consultation path
+(Patch 2d-4). Both counters are aggregated across workers; per-worker
+labeled lines (`{worker="N"}`) are also emitted before the aggregate
+line.
+
+| Metric | Type | Description |
+|---|---|---|
+| `keel_wait_catchup_consulted_total` | counter | Token-bearing replica reads that triggered a router WAIT_CATCHUP consultation |
+| `keel_wait_catchup_degraded_to_primary_total` | counter | Reads degraded to primary because the router emitted WAIT_CATCHUP (non-zero only when `stale_read_policy=wait` and a session carries a RYW token) |
+
+**Operational note:** In normal operation `keel_wait_catchup_consulted_total`
+grows with every token-bearing read that could be served by a replica, and
+`keel_wait_catchup_degraded_to_primary_total / keel_wait_catchup_consulted_total`
+is the safe-degrade ratio. A ratio close to 1.0 means replicas are
+consistently behind the RYW token — either the replica lag is high or
+`max_replica_catchup_ms` is too tight. A ratio of 0.0 means the engine
+never had to degrade (normal when all replicas are close to the primary).
+
+When the async-park + resume path is enabled, the degrade counter will drop
+toward 0 as the engine waits up to `max_replica_catchup_ms` for a replica
+to catch up before falling back.
+
 ### proxy_*
 
 | Metric | Type | Description |
