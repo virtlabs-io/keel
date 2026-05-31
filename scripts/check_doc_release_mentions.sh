@@ -16,7 +16,6 @@ paths=(
     "$root/examples"
     "$root/monitoring"
     "$root/man"
-    "$root/proposals"
     "$root/tests/chaos"
 )
 

@@ -2598,7 +2598,24 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             act->be_payload_len = len;
             return 0;
         }
-        if (ver != PG_PROTOCOL_V3) { act->type = KEEL_FE_ACT_ERROR; return -1; }
+        if (ver != PG_PROTOCOL_V3) {
+            /* Unsupported protocol version — send ErrorResponse then close */
+            uint8_t* ep = ctx->handshake_buf;
+            *ep++ = 'E';
+            uint8_t* elenp = ep; ep += 4;
+            *ep++ = 'S'; memcpy(ep, "FATAL\0", 6); ep += 6;
+            *ep++ = 'V'; memcpy(ep, "FATAL\0", 6); ep += 6;
+            *ep++ = 'C'; memcpy(ep, "08P01\0", 6); ep += 6;
+            static const char emsg[] = "unsupported frontend protocol version\0";
+            memcpy(ep, emsg, sizeof(emsg)); ep += sizeof(emsg);
+            *ep++ = 0;
+            wr32(elenp, (uint32_t)(ep - elenp));
+            ctx->handshake_len    = (size_t)(ep - ctx->handshake_buf);
+            act->type             = KEEL_FE_ACT_AUTH_REJECT;
+            act->fe_response      = ctx->handshake_buf;
+            act->fe_response_len  = ctx->handshake_len;
+            return 0;
+        }
 
         /* Parse StartupMessage parameters */
         uint32_t ml = rd32(data);

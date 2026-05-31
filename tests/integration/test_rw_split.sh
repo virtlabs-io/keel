@@ -238,6 +238,25 @@ if ! pg_proxy "SELECT 1" &>/dev/null; then
 fi
 ok "Proxy reachable at $PROXY_HOST:$PROXY_PORT"
 
+# If PRIMARY_HOST is still the default service name (not an IP) and we're
+# managing the stack, try to resolve container IPs via docker inspect so the
+# stats-validation backends are reachable from the host.
+if [[ "$MANAGE_STACK" == "1" && "$PRIMARY_HOST" == "pgsql-01" ]]; then
+    _p1=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' e2e-pgsql-01 2>/dev/null) || true
+    _p2=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' e2e-pgsql-02 2>/dev/null) || true
+    _p3=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' e2e-pgsql-03 2>/dev/null) || true
+    if [[ -n "$_p1" && -n "$_p2" && -n "$_p3" ]]; then
+        PRIMARY_HOST="$_p1"
+        REPLICA1_HOST="$_p2"
+        REPLICA2_HOST="$_p3"
+        BACKEND_USER=postgres
+        BACKEND_PASS=postgres
+        ALL_HOSTS="$PRIMARY_HOST $REPLICA1_HOST $REPLICA2_HOST"
+        REPLICA_HOSTS="$REPLICA1_HOST $REPLICA2_HOST"
+        warn "Resolved backend IPs from Docker: primary=$PRIMARY_HOST replicas=$REPLICA1_HOST $REPLICA2_HOST"
+    fi
+fi
+
 # Check each backend is reachable directly
 for host in $ALL_HOSTS; do
     if pg_direct "$host" "SELECT 1" &>/dev/null; then
@@ -246,7 +265,7 @@ for host in $ALL_HOSTS; do
     else
         fail "Cannot connect directly to backend ${host}"
         echo "  Stats-based validation requires direct access to each backend."
-        exit 1
+        exit 77
     fi
 done
 

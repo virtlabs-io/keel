@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import time
 
-import psycopg2
 import pytest
+
+psycopg2 = pytest.importorskip("psycopg2", reason="psycopg2 not installed — skipping streaming tests")
 
 pytestmark = [pytest.mark.streaming, pytest.mark.timeout(300)]
 

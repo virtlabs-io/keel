@@ -296,9 +296,9 @@ class ResilienceSuite(SuiteRunner):
             ok = self._auth(c)
             self.assert_true(ok, "startup failed")
 
-            # Trigger an error
+            # Trigger an error — drain until ReadyForQuery so the wire is clean
             c.send(pg_query("SELECT * FROM this_table_does_not_exist_keel_test"))
-            msgs = c.recv_until({ord("Z"), ord("E")})
+            msgs = c.recv_until({ord("Z")})
             types = {m[0] for m in msgs}
             self.assert_in(ord("E"), types, "Expected ErrorResponse for bad query")
 

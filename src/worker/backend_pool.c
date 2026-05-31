@@ -2164,43 +2164,59 @@ static void refill_async_complete(struct backend_conn* conn, bool success, void*
 int backend_pool_refill_one(backend_pool_t* pool)
 {
     if (!pool) return 0;
-    
+
+    pthread_mutex_lock(&pool->lock);
+
     /* Exponential backoff on consecutive refill failures.
      * Prevents log flooding and CPU waste when the backend is unreachable.
      * Starts at 1s, doubles up to 30s.  Resets on first successful connect. */
     if (pool->refill_backoff_until > 0) {
         uint64_t now = get_time_ms();
-        if (now < pool->refill_backoff_until) return 0;
+        if (now < pool->refill_backoff_until) {
+            pthread_mutex_unlock(&pool->lock);
+            return 0;
+        }
         pool->refill_backoff_until = 0;  /* Backoff expired, retry */
     }
-    
+
     /* Only refill if there are waiters or we're below min_connections */
     size_t idle_count = 0;
     for (backend_conn_t* c = pool->clean_list; c; c = c->next) idle_count++;
     for (backend_conn_t* c = pool->idle_list; c; c = c->next) idle_count++;
-    
+
     bool need_refill = (pool->wait_queue_head != NULL) ||
                        (idle_count + pool->active_count < pool->config.min_connections);
-    if (!need_refill) return 0;
-    
+    if (!need_refill) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
     /* Reactor must be set for async connect — no synchronous fallback */
-    if (!pool->reactor) return 0;
-    
-    /* Async path: find ONE closed slot and start async connect */
+    if (!pool->reactor) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
+    /* Async path: find ONE closed slot and start async connect.
+     * Unlock before backend_async_start — async I/O must not hold pool->lock. */
     for (size_t i = 0; i < pool->total_count; i++) {
         backend_conn_t* conn = &pool->connections[i];
         backend_conn_state_t expected = BACKEND_CONN_CLOSED;
         if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
+            pthread_mutex_unlock(&pool->lock);
             int rc = backend_async_start(pool, conn, pool->reactor,
                                          refill_async_complete, pool);
             if (rc < 0) {
-                /* Failed to start async connect */
+                /* Failed to start async connect — return slot to CLOSED. */
+                pthread_mutex_lock(&pool->lock);
                 backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, false);
+                pthread_mutex_unlock(&pool->lock);
                 return 0;
             }
             return 1;  /* Async connect in progress */
         }
     }
+    pthread_mutex_unlock(&pool->lock);
     return 0;
 }
 
@@ -2237,7 +2253,9 @@ void backend_pool_async_warmup(backend_pool_t* pool)
             int rc = backend_async_start(pool, conn, pool->reactor,
                                          refill_async_complete, pool);
             if (rc < 0) {
+                pthread_mutex_lock(&pool->lock);
                 backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, false);
+                pthread_mutex_unlock(&pool->lock);
                 break;
             }
             kicked++;

@@ -24,8 +24,9 @@ from __future__ import annotations
 import urllib.error
 import urllib.request
 
-import psycopg2
 import pytest
+
+psycopg2 = pytest.importorskip("psycopg2", reason="psycopg2 not installed — skipping patroni tests")
 
 pytestmark = [pytest.mark.patroni, pytest.mark.timeout(600)]
 

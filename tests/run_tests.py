@@ -59,12 +59,16 @@ Environment variables
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -696,6 +700,121 @@ SUITE_DESCRIPTIONS = {
 }
 
 # ---------------------------------------------------------------------------
+# Managed KEEL proxy for protocol/resilience/regression suites
+# ---------------------------------------------------------------------------
+
+def _find_keel_binary(build_dir: Optional[Path], hint: Optional[str]) -> Optional[Path]:
+    """Locate the keel binary: hint > build_dir > well-known dirs > PATH."""
+    if hint:
+        p = Path(hint)
+        return p if p.is_file() else None
+    candidates: list[Path] = []
+    if build_dir:
+        candidates.append(build_dir / "src" / "main" / "keel")
+    for d in ("build-asan", "build", "build-tsan", "build-coverage"):
+        candidates.append(REPO_ROOT / d / "src" / "main" / "keel")
+    for p in candidates:
+        if p.is_file():
+            return p
+    found = shutil.which("keel")
+    return Path(found) if found else None
+
+
+@contextlib.contextmanager
+def _managed_keel_proxy(
+    binary: Path,
+    pg_host: str,
+    pg_port: int,
+    pg_user: str,
+    pg_password: str,
+    pg_database: str,
+):
+    """
+    Start a temporary KEEL proxy (trust auth) pointing at the given PostgreSQL
+    backend, yield the proxy port, and shut it down on exit.  Sets KEEL_HOST
+    and KEEL_PORT environment variables so suite modules pick them up.
+    """
+    # Allocate a free port.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+        _s.bind(("127.0.0.1", 0))
+        proxy_port: int = _s.getsockname()[1]
+
+    config_text = (
+        f"[keel]\n"
+        f"config_version = 2\n"
+        f"log_level = 0\n"
+        f"\n"
+        f"[worker_group.test]\n"
+        f"bind_addr = 127.0.0.1\n"
+        f"bind_port = {proxy_port}\n"
+        f"num_workers = 1\n"
+        f"max_pool_size = 10\n"
+        f"min_pool_size = 0\n"
+        f"auth_method = trust\n"
+        f"server_user = {pg_user}\n"
+        f"server_password = {pg_password}\n"
+        f"\n"
+        f"[worker_group.test.servers]\n"
+        f"primary = host={pg_host} port={pg_port} dbname={pg_database} "
+        f"role=primary weight=100\n"
+    )
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".ini", prefix="keel_run_tests_", delete=False
+    )
+    try:
+        tmp.write(config_text)
+        tmp.close()
+        config_path = tmp.name
+
+        proc_env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0"}
+        proc = subprocess.Popen(
+            [str(binary), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=proc_env,
+        )
+
+        # Wait up to 10 s for the proxy port to accept connections.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            proc.terminate()
+            proc.wait(timeout=5)
+            raise RuntimeError(
+                f"KEEL did not start within 10 s on port {proxy_port}"
+            )
+
+        old_host = os.environ.get("KEEL_HOST")
+        old_port = os.environ.get("KEEL_PORT")
+        os.environ["KEEL_HOST"] = "127.0.0.1"
+        os.environ["KEEL_PORT"] = str(proxy_port)
+        info(f"  KEEL proxy started on port {proxy_port} (PID {proc.pid})")
+        try:
+            yield proxy_port
+        finally:
+            if old_host is not None:
+                os.environ["KEEL_HOST"] = old_host
+            else:
+                os.environ.pop("KEEL_HOST", None)
+            if old_port is not None:
+                os.environ["KEEL_PORT"] = old_port
+            else:
+                os.environ.pop("KEEL_PORT", None)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
 # Python suite runner helper
 # ---------------------------------------------------------------------------
 _SUITE_MODULE_MAP: dict[str, str] = {
@@ -794,6 +913,13 @@ INTEGRATION_SCRIPTS = [
     "test-mysql-pxc.sh",
     "test_rw_split.sh",
 ]
+
+# Per-script timeout overrides (seconds).  Scripts not listed here use the
+# default 600 s.  test_rw_split.sh needs extra time for Docker startup (up to
+# 120 s) plus a 300 s pgbench load phase.
+_INTEGRATION_TIMEOUTS: dict[str, int] = {
+    "test_rw_split.sh": 900,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -954,6 +1080,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="PID of the running keel proxy (needed for RSS/FD checks in soak suite).",
     )
     p.add_argument(
+        "--keel-binary",
+        metavar="PATH",
+        default=None,
+        help="Path to the keel binary used for protocol/resilience/regression suites. "
+             "If omitted, auto-detected from --build-dir or well-known build directories. "
+             "Set to 'none' to disable auto-start (tests run against whatever KEEL_PORT points to).",
+    )
+    p.add_argument(
+        "--pg-host",
+        default=os.environ.get("KEEL_PG_HOST", os.environ.get("PGHOST", "127.0.0.1")),
+        metavar="HOST",
+        help="PostgreSQL backend host for the managed proxy (default: 127.0.0.1).",
+    )
+    p.add_argument(
+        "--pg-port",
+        type=int,
+        default=int(os.environ.get("KEEL_PG_PORT", os.environ.get("PGPORT", "5432"))),
+        metavar="PORT",
+        help="PostgreSQL backend port for the managed proxy (default: 5432).",
+    )
+    p.add_argument(
+        "--pg-user",
+        default=os.environ.get("KEEL_PG_USER", os.environ.get("PGUSER", "postgres")),
+        metavar="USER",
+        help="PostgreSQL backend user for the managed proxy (default: postgres).",
+    )
+    p.add_argument(
+        "--pg-password",
+        default=os.environ.get("KEEL_PG_PASSWORD", os.environ.get("PGPASSWORD", "postgres")),
+        metavar="PASS",
+        help="PostgreSQL backend password for the managed proxy (default: postgres).",
+    )
+    p.add_argument(
+        "--pg-database",
+        default=os.environ.get("KEEL_PG_DATABASE", os.environ.get("PGDATABASE", "postgres")),
+        metavar="DB",
+        help="PostgreSQL backend database for the managed proxy (default: postgres).",
+    )
+    p.add_argument(
         "--chaos-iface",
         default="lo",
         metavar="IFACE",
@@ -1049,7 +1214,8 @@ def main() -> int:
         for script in scripts:
             r = SuiteResult(f"integration/{script}")
             info(f"Suite: integration/{script}")
-            run_integration(r, script, args.dry_run)
+            timeout = _INTEGRATION_TIMEOUTS.get(script, 600)
+            run_integration(r, script, args.dry_run, timeout=timeout)
             results.append(r)
             (ok if r.status == "passed" else error)(
                 f"integration/{script} → {r.status} ({r.duration:.1f}s)"
@@ -1135,29 +1301,50 @@ def main() -> int:
         (ok if r.status == "passed" else error)(
             f"throughput → {r.status} ({r.duration:.1f}s)")
 
-    if "protocol" in selected_suites:
-        r = SuiteResult("protocol")
-        info("Suite: protocol (wire-protocol compliance + fuzzing)")
-        _run_python_suite("protocol", r, args.dry_run, **_py_common)
-        results.append(r)
-        (ok if r.status == "passed" else error)(
-            f"protocol → {r.status} ({r.duration:.1f}s)")
+    # Suites that require a live KEEL proxy.  Auto-start one unless the user
+    # has already pointed KEEL_PORT at a running instance or disabled auto-start.
+    _proxy_suites = {"protocol", "resilience", "regression"}
+    _need_proxy   = bool(set(selected_suites) & _proxy_suites)
+    _keel_binary: Optional[Path] = None
+    _auto_start   = False
+    if _need_proxy and (args.keel_binary or "").lower() != "none":
+        _keel_binary = _find_keel_binary(build_dir, args.keel_binary)
+        # Only auto-start if KEEL_PORT is not already explicitly set by the caller.
+        _auto_start = (_keel_binary is not None
+                       and "KEEL_PORT" not in os.environ
+                       and not args.dry_run)
+        if _keel_binary and not _auto_start:
+            info(f"  KEEL_PORT already set to {os.environ.get('KEEL_PORT')} — skipping auto-start")
+        elif not _keel_binary:
+            warn("  No keel binary found — protocol/resilience/regression tests will run against KEEL_PORT (default: 5432)")
 
-    if "resilience" in selected_suites:
-        r = SuiteResult("resilience")
-        info("Suite: resilience (error path & fault injection)")
-        _run_python_suite("resilience", r, args.dry_run, **_py_common)
+    def _run_proxy_suite(name: str, desc: str) -> None:
+        r = SuiteResult(name)
+        info(f"Suite: {name} ({desc})")
+        _run_python_suite(name, r, args.dry_run, **_py_common)
         results.append(r)
-        (ok if r.status == "passed" else error)(
-            f"resilience → {r.status} ({r.duration:.1f}s)")
+        (ok if r.status == "passed" else error)(f"{name} → {r.status} ({r.duration:.1f}s)")
 
-    if "regression" in selected_suites:
-        r = SuiteResult("regression")
-        info("Suite: regression (correctness vs. live proxy)")
-        _run_python_suite("regression", r, args.dry_run, **_py_common)
-        results.append(r)
-        (ok if r.status == "passed" else error)(
-            f"regression → {r.status} ({r.duration:.1f}s)")
+    def _run_proxy_suites_block() -> None:
+        if "protocol" in selected_suites:
+            _run_proxy_suite("protocol", "wire-protocol compliance + fuzzing")
+        if "resilience" in selected_suites:
+            _run_proxy_suite("resilience", "error path & fault injection")
+        if "regression" in selected_suites:
+            _run_proxy_suite("regression", "correctness vs. live proxy")
+
+    if _auto_start and _keel_binary is not None:
+        with _managed_keel_proxy(
+            _keel_binary,
+            args.pg_host,
+            args.pg_port,
+            args.pg_user,
+            args.pg_password,
+            args.pg_database,
+        ):
+            _run_proxy_suites_block()
+    else:
+        _run_proxy_suites_block()
 
     if "chaos-py" in selected_suites:
         r = SuiteResult("chaos-py")
