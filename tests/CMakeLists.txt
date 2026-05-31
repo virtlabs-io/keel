@@ -429,6 +429,35 @@ target_include_directories(test_connpool_stress PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_link_options(test_connpool_stress PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_connpool_stress COMMAND test_connpool_stress)
 
+# Regression torture: observer-thread + waiter wakeup invariant
+# Pins the ACTIVE_WITHOUT_OWNER race that surfaced when adding a new
+# observer pthread (failover_manager) alongside the worker pool.
+add_executable(test_pool_observer_race test_pool_observer_race.c)
+target_include_directories(test_pool_observer_race PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_pool_observer_race PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keel_proto_flow_registry
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_pool_observer_race PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_pool_observer_race COMMAND test_pool_observer_race)
+
 # Connection pool exhaustion and wait-queue tests
 add_executable(test_connpool_exhaust test_connpool_exhaust.c)
 target_link_libraries(test_connpool_exhaust PRIVATE
