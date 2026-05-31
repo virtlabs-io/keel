@@ -31,6 +31,8 @@
 #include "keel/engine/catchup.h"
 #include "worker_catchup_internal.h"
 
+#include "keel/engine/backend_pool.h"
+#include "keel/engine/worker.h"
 #include "keel/log/log.h"
 #include "keel/mem/mem.h"
 #include "keel/util/util.h"
@@ -389,15 +391,31 @@ void keel_catchup_manager_tick(keel_catchup_manager_t* m, uint64_t now_ns)
     /* Drive the per-server probe state machine for every server that has
      * at least one parked waiter. We iterate the wait list once, marking
      * which server indices have been visited so the same server is not
-     * driven twice in one tick. TODO(Patch 2c): also dispatch to the
-     * MySQL probe driver based on the server's protocol. */
+     * driven twice in one tick. Dispatch is keyed on the backend pool's
+     * `protocol` field so a mixed-protocol worker drives PG and MySQL
+     * pools through their respective state machines. */
     bool driven[KEEL_MAX_SERVERS] = {0};
     for (keel_catchup_waiter_t* w = m->head; w; w = w->next) {
         if (w->server_index >= KEEL_MAX_SERVERS) continue;
         if (driven[w->server_index]) continue;
         if (m->sockets[w->server_index].backoff_until_ns > now_ns) continue;
         driven[w->server_index] = true;
-        keel_catchup_pg_drive(m, w->server_index, now_ns);
+
+        const char* proto = NULL;
+        if (m->worker && m->worker->server_pools &&
+            w->server_index < m->worker->server_pool_count &&
+            m->worker->server_pools[w->server_index])
+        {
+            proto = m->worker->server_pools[w->server_index]->config.protocol;
+        }
+        if (proto && strcmp(proto, "mysql") == 0) {
+            keel_catchup_my_drive(m, w->server_index, now_ns);
+        } else {
+            /* Default to PostgreSQL when protocol is NULL or unknown:
+             * the only existing test/production drivers are PG and
+             * MySQL, and PG is the historical default. */
+            keel_catchup_pg_drive(m, w->server_index, now_ns);
+        }
     }
 }
 

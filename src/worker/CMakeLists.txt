@@ -16,6 +16,7 @@
 #   migration.c            — Inter-worker session migration (FD passing + state)
 #   worker_catchup.c       — Reactor-owned replica catch-up wait list (Phase 2)
 #   worker_catchup_pg.c    — PostgreSQL reactor-async catch-up probe SM (Phase 2b)
+#   worker_catchup_my.c    — MySQL reactor-async catch-up probe SM (Phase 2c)
 # =============================================================================
 
 add_library(keel_worker_new STATIC
@@ -26,6 +27,7 @@ add_library(keel_worker_new STATIC
     migration.c
     worker_catchup.c
     worker_catchup_pg.c
+    worker_catchup_my.c
 )
 
 target_include_directories(keel_worker_new

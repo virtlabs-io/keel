@@ -458,6 +458,73 @@ target_link_libraries(test_catchup_pg_mock PRIVATE
 target_link_options(test_catchup_pg_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_catchup_pg_mock COMMAND test_catchup_pg_mock)
 
+# Catch-up MySQL probe state machine — pure helper unit tests (Phase 2c).
+# Does not require a running MySQL.
+add_executable(test_catchup_my_unit test_catchup_my_unit.c)
+target_link_libraries(test_catchup_my_unit PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_my_unit PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_unit COMMAND test_catchup_my_unit)
+
+# Catch-up MySQL probe state machine — socketpair-mock end-to-end of
+# the full QUERY round through a real reactor (Phase 2c).
+add_executable(test_catchup_my_mock test_catchup_my_mock.c)
+target_link_libraries(test_catchup_my_mock PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_my_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_mock COMMAND test_catchup_my_mock)
+
+# Catch-up MySQL probe state machine — live-MySQL e2e through the full
+# backend_async_start (TCP + caching_sha2_password / mysql_native_password
+# + optional TLS) + probe round (Phase 2c). Skips when no MySQL replica
+# is reachable or `mysql` CLI is missing.
+# Set KEEL_TEST_MY_HOST2/PORT2 (replica) or start
+# docker/compose/mysql-replication.yml (defaults 127.0.0.1:3307).
+add_executable(test_catchup_my_e2e test_catchup_my_e2e.c)
+target_link_libraries(test_catchup_my_e2e PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_catchup_my_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_e2e COMMAND test_catchup_my_e2e)
+set_tests_properties(test_catchup_my_e2e PROPERTIES
+    LABELS "e2e;catchup;integration"
+    TIMEOUT 60)
+
 # Catch-up PG probe state machine — live-PostgreSQL e2e through the full
 # backend_async_start (TCP + SCRAM-SHA-256 + optional TLS) + probe round
 # (Phase 2b-test, part 4). Skips when no PG cluster is reachable.

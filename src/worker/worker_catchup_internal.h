@@ -221,6 +221,37 @@ int keel_catchup_pg_test_inject_ready(struct keel_catchup_manager* m,
                                       size_t server_index,
                                       int fd);
 
+/**
+ * @brief Drive the MySQL probe state machine for one server.
+ *
+ * Mirrors `keel_catchup_pg_drive`: idempotent, non-blocking, returns
+ * immediately if a probe is in flight, in backoff, or there are no
+ * parked waiters. Defined in worker_catchup_my.c.
+ */
+void keel_catchup_my_drive(struct keel_catchup_manager* m,
+                           size_t server_index,
+                           uint64_t now_ns);
+
+/**
+ * @brief Tear down the MySQL probe socket for one server.
+ *
+ * Mirrors `keel_catchup_pg_close`. Safe to call when nothing is
+ * allocated. Defined in worker_catchup_my.c.
+ */
+void keel_catchup_my_close(struct keel_catchup_manager* m,
+                           size_t server_index);
+
+/**
+ * @brief Test-only hook: inject a pre-authenticated MySQL probe socket
+ *        for one server, bypassing CONNECT + handshake.
+ *
+ * Mirrors `keel_catchup_pg_test_inject_ready`. Production code MUST
+ * NOT call this. Defined in worker_catchup_my.c.
+ */
+int keel_catchup_my_test_inject_ready(struct keel_catchup_manager* m,
+                                      size_t server_index,
+                                      int fd);
+
 #ifdef __cplusplus
 }
 #endif
