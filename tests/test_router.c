@@ -704,9 +704,9 @@ TEST(read_your_writes_routes_primary) {
     keel_route_session_t session;
     memset(&session, 0, sizeof(session));
     session.requires_consistent_read = true;
-    snprintf(session.required_consistency_token,
-             sizeof(session.required_consistency_token), "0/ABCD1234");
-    session.required_timeline_id = 1;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
 
     keel_route_decision_t decision;
     keel_error_t err = keel_router_route_sql(
@@ -740,9 +740,9 @@ TEST(read_your_writes_reports_stale_timeline) {
     keel_route_session_t session;
     memset(&session, 0, sizeof(session));
     session.requires_consistent_read = true;
-    snprintf(session.required_consistency_token,
-             sizeof(session.required_consistency_token), "0/ABCD1234");
-    session.required_timeline_id = 1;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
 
     keel_route_decision_t decision;
     keel_error_t err = keel_router_route_sql(
@@ -790,9 +790,9 @@ TEST(read_your_writes_reject_policy_fails_closed) {
     keel_route_session_t session;
     memset(&session, 0, sizeof(session));
     session.requires_consistent_read = true;
-    snprintf(session.required_consistency_token,
-             sizeof(session.required_consistency_token), "0/ABCD1234");
-    session.required_timeline_id = 1;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
 
     keel_route_decision_t decision;
     keel_error_t err = keel_router_route_sql(

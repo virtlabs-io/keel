@@ -104,6 +104,7 @@ const char* keel_route_reason_name(keel_route_reason_t r)
     case KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS:  return "COMMIT_AMBIGUOUS";
     case KEEL_ROUTE_REASON_OLD_PRIMARY_FENCED:return "OLD_PRIMARY_FENCED";
     case KEEL_ROUTE_REASON_DEGRADED_MODE:     return "DEGRADED_MODE";
+    case KEEL_ROUTE_REASON_WAIT_CATCHUP:      return "WAIT_CATCHUP";
     default:                                  return "UNKNOWN";
     }
 }
@@ -1481,9 +1482,9 @@ static keel_error_t route_internal_ex(keel_router_t* router,
                     router->stats.write_routes++;
             }
             if (force_primary_for_consistency) {
-                if (session && session->required_timeline_id != 0 &&
+                if (session && session->required_consistency_token.timeline_id != 0 &&
                     selected->config.timeline_id != 0 &&
-                    session->required_timeline_id != selected->config.timeline_id) {
+                    session->required_consistency_token.timeline_id != selected->config.timeline_id) {
                     /* Failover-manager: consistency token was minted on a
                      * different PG timeline than the current primary. If
                      * the operator opted into `stale_read_policy=REJECT`,

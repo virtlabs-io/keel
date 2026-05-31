@@ -285,7 +285,7 @@ TEST(timeline_mismatch_rejects_consistent_read) {
     /* Session requires a different timeline than what the primary is on. */
     keel_route_session_t s;
     memset(&s, 0, sizeof(s));
-    s.required_timeline_id = 5;   /* stale: primary advanced to 7 */
+    s.required_consistency_token.timeline_id = 5;   /* stale: primary advanced to 7 */
     keel_route_decision_t d;
     keel_error_t err = keel_router_route(router, qt, &s, &d);
     ASSERT_EQ(err, KEEL_ERR_UNAVAILABLE);
@@ -293,7 +293,7 @@ TEST(timeline_mismatch_rejects_consistent_read) {
     ASSERT_EQ(d.server, NULL);
 
     /* Same setup but matching timelines: must succeed. */
-    s.required_timeline_id = 7;
+    s.required_consistency_token.timeline_id = 7;
     keel_qt_query_t* qt2 = keel_sql_analyze_full(
         KEEL_STR("SELECT * FROM t WHERE id = 1"), arena);
     ASSERT_EQ(keel_router_route(router, qt2, &s, &d), KEEL_OK);

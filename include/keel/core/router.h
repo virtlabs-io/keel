@@ -86,6 +86,7 @@
 #include "keel/core/ini.h"
 #include "keel/sql/query_tree.h"
 #include "keel/core/scatter_store.h" /* keel_sort_key_t, KEEL_SCATTER_MAX_ORDER_KEYS */
+#include "keel/plugin/plugin_types.h" /* keel_consistency_token_t */
 
 /* Compatibility aliases for server roles */
 #define KEEL_SERVER_PRIMARY  KEEL_SERVER_ROLE_RW
@@ -376,11 +377,13 @@ typedef struct keel_route_session {
 
     /* v0.5-alpha read-your-writes routing. When true, read queries must not
      * use replicas unless a future reactor-owned catch-up verifier proves the
-     * replica has reached required_consistency_token. The current production
-     * policy is conservative primary fallback. */
-    bool                requires_consistent_read;
-    char                required_consistency_token[128];
-    uint32_t            required_timeline_id;
+     * replica has reached required_consistency_token. Under
+     * `stale_read_policy = wait` the engine parks the session in the
+     * per-worker catch-up manager until a probe proves the candidate replica
+     * has reached `required_consistency_token` (see keel/engine/catchup.h);
+     * other policies fall back to primary or reject. */
+    bool                     requires_consistent_read;
+    keel_consistency_token_t required_consistency_token; /**< token (.value/.timeline_id/.captured_at_ns) */
 } keel_route_session_t;
 
 /**
@@ -423,6 +426,12 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_DEGRADED_MODE,     /**< Cluster is in degraded mode
                                               (no PRIMARY observed); routing
                                               refused per failover policy. */
+    KEEL_ROUTE_REASON_WAIT_CATCHUP,      /**< RYW read deferred: session must park
+                                              in the worker catch-up manager until
+                                              the candidate replica reaches the
+                                              session's required token. The decision
+                                              carries `wait_server_index`, `wait_token`,
+                                              and `wait_max_ms`; `server` is NULL. */
     KEEL_ROUTE_REASON_COUNT,
 } keel_route_reason_t;
 
@@ -474,6 +483,9 @@ typedef enum keel_route_factor {
                                                    because it is DEMOTED/DRAINING. */
     KEEL_DF_DEGRADED_MODE       = (1u << 21), /**< Router is in degraded mode
                                                    (no PRIMARY observed). */
+    KEEL_DF_WAIT_CATCHUP        = (1u << 22), /**< Read deferred to worker catch-up
+                                                   manager until replica reaches
+                                                   the required token. */
 } keel_route_factor_t;
 
 /**
@@ -503,6 +515,13 @@ typedef struct keel_route_decision {
     bool                  is_read;      /**< Query is read-only */
     bool                  was_pinned;   /**< Decision due to pinning */
     size_t                shard_index;  /**< Resolved shard for sharded routing */
+
+    /* Populated only when `reason_code == KEEL_ROUTE_REASON_WAIT_CATCHUP`.
+     * The engine must park the session in the worker catch-up manager using
+     * these fields; `server` is NULL until the waiter resumes with REACHED. */
+    size_t                   wait_server_index; /**< Index into worker server_pools[] */
+    keel_consistency_token_t wait_token;        /**< Token to wait for */
+    uint32_t                 wait_max_ms;       /**< Upper bound for parking */
 } keel_route_decision_t;
 
 /**
