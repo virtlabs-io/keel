@@ -56,6 +56,7 @@
 #include "keel/core/cluster.h"
 #include "keel/core/config_reload.h"
 #include "keel/probe/probe.h"
+#include "keel/failover/failover_manager.h"
 #include "keel/mem/mem.h"
 #include "keel_error.h"
 #include "keel/core/ini.h"
@@ -1036,6 +1037,7 @@ typedef struct worker_group {
     int                 listen_fd;
     keel_engine_t*       engine;
     keel_probe_manager_t* probe_mgr;
+    keel_failover_manager_t* failover_mgr;
     keel_hook_registry_t* hook_registry;
 
     /* Prepared-statement pooling strategy */
@@ -1831,6 +1833,7 @@ static void worker_group_defaults(worker_group_t* g) {
     g->listen_fd  = -1;
     g->engine     = NULL;
     g->probe_mgr  = NULL;
+    g->failover_mgr = NULL;
     g->ps_mode    = KEEL_PS_MODE_VIRTUALIZE;
     g->runtime_mode = KEEL_TIER_POOL;
     g->experimental_features = false;
@@ -2377,6 +2380,10 @@ static void cleanup_startup_failure(keel_config_t* config, bool tls_initialized)
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         worker_group_t* wg = &g_groups[gi];
 
+        if (wg->failover_mgr) {
+            keel_failover_manager_destroy(wg->failover_mgr);
+            wg->failover_mgr = NULL;
+        }
         if (wg->probe_mgr) {
             keel_probe_manager_destroy(wg->probe_mgr);
             wg->probe_mgr = NULL;
@@ -5644,6 +5651,34 @@ int main(int argc, char** argv) {
                        wg->probe_cfg.interval_ms, wg->probe_cfg.timeout_ms,
                        wg->probe_cfg.retries);
             }
+
+            /* Active failover-manager detector loop. Reconciles probe-driven
+             * role changes into the router's cluster epoch so sessions
+             * observe topology drift (degraded-mode exit, timeline checks).
+             * Skip when router is absent — publish_primary would be a no-op
+             * and the extra thread only adds scheduling pressure. */
+            if (wg->router) {
+                keel_failover_manager_config_t fmcfg = {
+                    .detection_interval_ms = wg->failover_cfg.detection_interval_ms
+                                              ? wg->failover_cfg.detection_interval_ms : 500,
+                    .failure_threshold     = wg->failover_cfg.failure_threshold
+                                              ? wg->failover_cfg.failure_threshold : 3,
+                    .promotion_grace_ms    = wg->failover_cfg.promotion_grace_ms
+                                              ? wg->failover_cfg.promotion_grace_ms : 3000,
+                    .old_primary_fencing   = wg->failover_cfg.old_primary_fencing_required,
+                };
+                wg->failover_mgr = keel_failover_manager_create(
+                    &fmcfg,
+                    wg->probe_mgr,
+                    keel_engine_get_server_pool(wg->engine),
+                    wg->engine,
+                    wg->router);
+                if (wg->failover_mgr) {
+                    printf("  [%s] Failover-mgr: interval=%ums threshold=%u grace=%ums\n",
+                           wg->name, fmcfg.detection_interval_ms,
+                           fmcfg.failure_threshold, fmcfg.promotion_grace_ms);
+                }
+            }
         }
     }
 
@@ -5681,6 +5716,13 @@ int main(int argc, char** argv) {
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         if (g_groups[gi].probe_mgr)
             keel_probe_manager_start(g_groups[gi].probe_mgr);
+    }
+
+    /* Start failover-manager detector threads (after probe threads so the
+     * initial probe state is being populated when the detector wakes up) */
+    for (size_t gi = 0; gi < g_num_groups; gi++) {
+        if (g_groups[gi].failover_mgr)
+            keel_failover_manager_start(g_groups[gi].failover_mgr);
     }
     
     /* Register stats dump callback on first engine */
@@ -5895,6 +5937,14 @@ int main(int argc, char** argv) {
         g_cluster = NULL;
     }
     
+    /* Stop failover managers first (they reference probe state + router) */
+    for (size_t gi = 0; gi < g_num_groups; gi++) {
+        if (g_groups[gi].failover_mgr) {
+            keel_failover_manager_destroy(g_groups[gi].failover_mgr);
+            g_groups[gi].failover_mgr = NULL;
+        }
+    }
+
     /* Stop probe managers */
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         keel_probe_manager_destroy(g_groups[gi].probe_mgr);
