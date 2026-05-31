@@ -424,6 +424,23 @@ target_link_libraries(test_catchup_waitlist PRIVATE
 target_link_options(test_catchup_waitlist PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_catchup_waitlist COMMAND test_catchup_waitlist)
 
+# Catch-up PG probe state machine — pure helpers + manager-helper unit
+# tests (Phase 2b-test). Does not require a running Postgres.
+add_executable(test_catchup_pg_unit test_catchup_pg_unit.c)
+target_link_libraries(test_catchup_pg_unit PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_pg_unit PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_pg_unit COMMAND test_catchup_pg_unit)
+
 # Stress / fuzz tests for router dispatch and connpool (Tier 6 / Feature 15+)
 add_executable(test_router_stress test_router_stress.c)
 target_link_libraries(test_router_stress PRIVATE

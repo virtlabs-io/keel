@@ -49,6 +49,7 @@
  */
 
 #include "worker_catchup_internal.h"
+#include "worker_catchup_pg_helpers.h"
 
 #include "keel/engine/backend_connect.h"
 #include "keel/engine/backend_pool.h"
@@ -109,66 +110,14 @@ typedef struct pg_probe_ctx {
 
 /* ============================================================================
  * LSN parsing and token comparison
- * ============================================================================ */
-
-/** Parse a PostgreSQL LSN string ("HHHH/LLLLLLLL") into a uint64_t.
- *  Returns false on malformed input. */
-static bool pg_lsn_parse(const char* s, uint64_t* out)
-{
-    if (!s || !*s || !out) return false;
-    uint32_t hi = 0, lo = 0;
-    int n = sscanf(s, "%x/%x", &hi, &lo);
-    if (n != 2) return false;
-    *out = ((uint64_t)hi << 32) | lo;
-    return true;
-}
-
-/** Compare two LSN tokens. Returns -1/0/1. Treats unparseable tokens as 0
- *  so callers don't silently misorder. Different timeline_ids are also
- *  ordered by their numeric value so the picker is deterministic. */
-static int pg_token_compare(const keel_consistency_token_t* a,
-                            const keel_consistency_token_t* b)
-{
-    if (a->timeline_id != b->timeline_id) {
-        return (a->timeline_id < b->timeline_id) ? -1 : 1;
-    }
-    uint64_t la = 0, lb = 0;
-    pg_lsn_parse(a->value, &la);
-    pg_lsn_parse(b->value, &lb);
-    if (la == lb) return 0;
-    return (la < lb) ? -1 : 1;
-}
-
-/** A waiter token is satisfied when (same timeline) and (waiter LSN <= reached LSN). */
-static bool pg_token_satisfied_by(const keel_consistency_token_t* waiter,
-                                  const keel_consistency_token_t* reached)
-{
-    if (waiter->timeline_id != reached->timeline_id) return false;
-    uint64_t lw = 0, lr = 0;
-    if (!pg_lsn_parse(waiter->value, &lw))  return false;
-    if (!pg_lsn_parse(reached->value, &lr)) return false;
-    return lw <= lr;
-}
-
-/** Validate that an LSN string contains only the characters we accept,
- *  defending against injection into the parameterless Q message. */
-static bool pg_lsn_token_is_safe(const char* value)
-{
-    if (!value || value[0] == '\0') return false;
-    bool saw_slash = false, saw_left = false, saw_right = false;
-    for (const char* p = value; *p; p++) {
-        unsigned char ch = (unsigned char)*p;
-        if (*p == '/') {
-            if (saw_slash || !saw_left) return false;
-            saw_slash = true;
-            continue;
-        }
-        if (!isxdigit(ch)) return false;
-        if (saw_slash) saw_right = true;
-        else           saw_left  = true;
-    }
-    return saw_slash && saw_left && saw_right;
-}
+ * ============================================================================
+ *
+ * The pure helpers (`pg_lsn_parse`, `pg_token_compare`,
+ * `pg_token_satisfied_by`, `pg_lsn_token_is_safe`) live in
+ * worker_catchup_pg_helpers.h so the unit tests can include them
+ * without dragging in the reactor / backend_async_start / log
+ * dependencies of the full state machine.
+ */
 
 /* ============================================================================
  * Forward declarations
