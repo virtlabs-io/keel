@@ -981,7 +981,19 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
                 }
                 backend_pool_mark_borrowed(conn);
                 conn->needs_sync = false;
-                POOL_STAT_INC(pool, pool_borrow_exact_state_match);
+                /* If this backend has named prepared statements from a different
+                 * session, the engine must run full protocol cleanup (DISCARD ALL)
+                 * before forwarding the new session's first message — otherwise
+                 * a Parse() reusing one of those statement names hits
+                 * "prepared statement already exists". */
+                if (conn->stmt_set_hash != 0) {
+                    conn->needs_full_cleanup = true;
+                    conn->stmt_set_hash      = 0;
+                    backend_pool_reset_stmt_profile(conn);
+                    POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                } else {
+                    POOL_STAT_INC(pool, pool_borrow_exact_state_match);
+                }
                 pool_record_borrow_result(pool, BORROW_RESULT_SUCCESS);
                 pool->active_count++;
                 pthread_mutex_unlock(&pool->lock);

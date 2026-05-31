@@ -3536,15 +3536,15 @@ copy_scan_done:
                  *   1. Payload fits in one TCP segment (no short-send risk)
                  *   2. Not a no-response command (needs recv to chain with)
                  *   3. Not COPY data (needs FE recv, not BE recv)
-                 *   4. Not pipelined extended protocol (continues loop)
+                 *   4. Not extended protocol (Parse/Bind/Execute batches are
+                 *      already pipelined and need exact ordering semantics)
                  *   5. Not a jumbo message (needs FE continuation)
                  */
                 {
                     bool want_wait_be = !act.no_response
                         && !(act.msg_kind == KEEL_MSG_KIND_COPY
                              && act.be_payload_len > 0 && act.be_payload[0] == 'd')
-                        && !(act.msg_kind == KEEL_MSG_KIND_EXTENDED
-                             && !(act.pin_clear & KEEL_FPIN_EXTENDED_PROTO))
+                        && act.msg_kind != KEEL_MSG_KIND_EXTENDED
                         && !jumbo_msg;
 
                     if (want_wait_be && act.be_payload_len <= 65536) {
@@ -4737,9 +4737,18 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)
                 {
+                    /* Replay failed mid-stream.  The backend's prepared
+                     * statement state is now ambiguous: a "duplicate stmt"
+                     * error means the offending Parse left a stmt resident,
+                     * while a syntax error means no stmt was created.  We
+                     * cannot reliably tell from here, so quarantine the
+                     * backend and force it to be destroyed by close_session
+                     * rather than risk pooling a connection that still
+                     * carries leftover "S_*" definitions. */
                     session->backend_conn->stmt_set_hash = 0;
                     memset(&session->backend_conn->stmt_profile, 0,
                            sizeof(session->backend_conn->stmt_profile));
+                    session->backend_conn->protocol_desync = true;
                 }
                 sf->stmt_replay_count       = 0;
                 sf->stmt_replay_rfq_pending = false;
@@ -5653,8 +5662,22 @@ fe_forward_done: ;
                     memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                     be->current_state_hash  = 0xFFFFFFFFFFFFFFFFULL;  /* sentinel → DISCARD ALL */
                 } else {
-                    /* No prepared stmts (or ANONYMOUS) — clear hash so backend
-                     * can go to clean_list (or get DISCARD ALL if SET vars exist) */
+                    /* No prepared stmts pin from this session (or ANONYMOUS).
+                     *
+                     * If the backend still carries a non-zero stmt_set_hash,
+                     * those statements were prepared by a *previous* session
+                     * whose ownership we did not inherit (e.g. this session
+                     * borrowed the backend for a non-PS command before any
+                     * Parse).  Clearing the hash without cleanup would lie
+                     * to the next borrower: a fresh session would receive
+                     * a backend that still has "S_1" defined, and its first
+                     * Parse("S_1", ...) would fail with "prepared statement
+                     * already exists".  Force a DISCARD ALL via the cleanup
+                     * sentinel so the backend returns to the clean list with
+                     * no leftover named statements. */
+                    if (be->stmt_set_hash != 0) {
+                        be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                    }
                     be->stmt_set_hash = 0;
                     memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }

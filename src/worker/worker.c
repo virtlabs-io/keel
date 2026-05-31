@@ -1741,10 +1741,17 @@ static bool prepare_backend_stmt_state_for_close_return(keel_session_flow_t* flo
 
     const keel_proto_flow_vtable_t* vt = flow->flow;
     if (!(flow->pins & KEEL_FPIN_PREPARED_STMT)) {
+        if (be_conn->stmt_set_hash != 0) {
+            be_conn->current_state_hash = UINT64_MAX;
+            be_conn->stmt_set_hash = 0;
+            memset(&be_conn->stmt_profile, 0, sizeof(be_conn->stmt_profile));
+        }
         return true;
     }
 
     if (flow->ps_mode == KEEL_PS_MODE_ANONYMOUS) {
+        if (be_conn->stmt_set_hash != 0)
+            be_conn->current_state_hash = UINT64_MAX;
         be_conn->stmt_set_hash = 0;
         memset(&be_conn->stmt_profile, 0, sizeof(be_conn->stmt_profile));
         return true;

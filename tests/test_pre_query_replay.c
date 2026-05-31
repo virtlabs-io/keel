@@ -63,6 +63,76 @@ static size_t build_simple_query(uint8_t* buf, const char* sql)
     return 1 + 4 + sql_len;
 }
 
+static size_t build_startup(uint8_t* buf, const char* user, const char* db)
+{
+    uint8_t* p = buf + 4;
+    wr32(p, 0x00030000);
+    p += 4;
+    memcpy(p, "user", 5);
+    p += 5;
+    size_t user_len = strlen(user);
+    memcpy(p, user, user_len + 1);
+    p += user_len + 1;
+    memcpy(p, "database", 9);
+    p += 9;
+    size_t db_len = strlen(db);
+    memcpy(p, db, db_len + 1);
+    p += db_len + 1;
+    *p++ = '\0';
+    wr32(buf, (uint32_t)(p - buf));
+    return (size_t)(p - buf);
+}
+
+static size_t build_named_parse(uint8_t* buf, const char* name, const char* sql)
+{
+    size_t name_len = strlen(name);
+    size_t sql_len = strlen(sql);
+    size_t body_len = name_len + 1 + sql_len + 1 + 2;
+    buf[0] = 'P';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(buf + 5, name, name_len + 1);
+    memcpy(buf + 5 + name_len + 1, sql, sql_len + 1);
+    buf[5 + name_len + 1 + sql_len + 1] = 0;
+    buf[5 + name_len + 1 + sql_len + 2] = 0;
+    return 1 + 4 + body_len;
+}
+
+static size_t build_bind(uint8_t* buf, const char* portal, const char* stmt)
+{
+    size_t portal_len = strlen(portal);
+    size_t stmt_len = strlen(stmt);
+    size_t body_len = portal_len + 1 + stmt_len + 1 + 2 + 2 + 2;
+    uint8_t* p = buf + 5;
+    buf[0] = 'B';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(p, portal, portal_len + 1);
+    p += portal_len + 1;
+    memcpy(p, stmt, stmt_len + 1);
+    p += stmt_len + 1;
+    p[0] = 0; p[1] = 0; p += 2;
+    p[0] = 0; p[1] = 0; p += 2;
+    p[0] = 0; p[1] = 0;
+    return 1 + 4 + body_len;
+}
+
+static size_t build_execute(uint8_t* buf, const char* portal)
+{
+    size_t portal_len = strlen(portal);
+    size_t body_len = portal_len + 1 + 4;
+    buf[0] = 'E';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(buf + 5, portal, portal_len + 1);
+    wr32(buf + 5 + portal_len + 1, 0);
+    return 1 + 4 + body_len;
+}
+
+static size_t build_extended_msg(uint8_t* buf, uint8_t type)
+{
+    buf[0] = type;
+    wr32(buf + 1, 4);
+    return 5;
+}
+
 static size_t build_parse_complete(uint8_t* buf)
 {
     buf[0] = '1';
@@ -501,6 +571,58 @@ static void test_fe_read_does_not_stamp_sticky_primary(void)
     TEST_ASSERT(!keel_ssv_consistency_has_write_lsn(sf.consistency_atoms));
     TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
 
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_extended_sync_does_not_use_linked_send(void)
+{
+    TEST_BEGIN("extended protocol: Sync waits for backend without linked send");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 17;
+    worker.ps_mode = KEEL_PS_MODE_TRACKING;
+    worker.runtime_mode = KEEL_TIER_POOL;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    keel_session_flow_t sf;
+    TEST_ASSERT_EQ(keel_session_flow_init(&sf, VT, &session), 0);
+
+    uint8_t startup[256];
+    keel_fe_action_t startup_act;
+    size_t startup_len = build_startup(startup, "testuser", "testdb");
+    TEST_ASSERT_EQ(VT->on_fe_msg(sf.ctx, startup, startup_len, &startup_act), KEEL_OK);
+    sf.phase = KEEL_PHASE_READY;
+    session.state = KEEL_SESSION_READY;
+
+    uint8_t msg[512];
+    size_t n = 0;
+    n += build_named_parse(msg + n, "stmtcache_deadbeef", "SELECT 1");
+    n += build_bind(msg + n, "", "stmtcache_deadbeef");
+    n += build_execute(msg + n, "");
+    n += build_extended_msg(msg + n, 'S');
+
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.linked_send_len, 0u);
+
+    uint8_t got[512];
+    ssize_t nr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT_EQ(nr, (ssize_t)n);
+    TEST_ASSERT(memcmp(got, msg, n) == 0);
+
+    if (VT->destroy_context)
+        VT->destroy_context(sf.ctx);
+    session.plugin_state = NULL;
     close_pair(be_sv);
     TEST_END();
 }
@@ -2054,6 +2176,7 @@ int main(void)
     test_fe_tokenless_ddl_stamps_sticky_primary();
     test_fe_write_capture_pending_preserves_tokenless_stickiness();
     test_fe_read_does_not_stamp_sticky_primary();
+    test_extended_sync_does_not_use_linked_send();
     test_post_write_capture_success_updates_ssv();
     test_post_write_capture_failure_fails_closed();
     test_flag_lifecycle_and_forward_on_rfq();
