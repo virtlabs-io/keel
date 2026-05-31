@@ -14,6 +14,7 @@
 add_library(keel_engine_flow STATIC
     engine_flow.c
     engine_scatter.c
+    engine_catchup_bridge.c
     invariant.c
     session_flow_pins.c
     state_machine.c
