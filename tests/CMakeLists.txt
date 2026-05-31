@@ -413,6 +413,10 @@ add_executable(test_catchup_waitlist test_catchup_waitlist.c)
 target_link_libraries(test_catchup_waitlist PRIVATE
     test_utils
     keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
     keelmem
     keelutil
     Threads::Threads

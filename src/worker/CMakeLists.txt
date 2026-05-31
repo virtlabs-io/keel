@@ -15,6 +15,7 @@
 #   frontend_tls_async.c   — Non-blocking frontend TLS handshake (OpenSSL BIO)
 #   migration.c            — Inter-worker session migration (FD passing + state)
 #   worker_catchup.c       — Reactor-owned replica catch-up wait list (Phase 2)
+#   worker_catchup_pg.c    — PostgreSQL reactor-async catch-up probe SM (Phase 2b)
 # =============================================================================
 
 add_library(keel_worker_new STATIC
@@ -24,6 +25,7 @@ add_library(keel_worker_new STATIC
     frontend_tls_async.c
     migration.c
     worker_catchup.c
+    worker_catchup_pg.c
 )
 
 target_include_directories(keel_worker_new

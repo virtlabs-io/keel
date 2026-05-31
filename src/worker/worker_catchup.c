@@ -29,8 +29,8 @@
  */
 
 #include "keel/engine/catchup.h"
+#include "worker_catchup_internal.h"
 
-#include "keel/engine/engine.h"   /* KEEL_MAX_SERVERS */
 #include "keel/log/log.h"
 #include "keel/mem/mem.h"
 #include "keel/util/util.h"
@@ -40,95 +40,8 @@
 #include <string.h>
 #include <unistd.h>            /* close() */
 
-/* ============================================================================
- * Tunables (compile-time)
- * ============================================================================ */
-
-/** Maximum probe-result cache entries per manager. Small on purpose:
- *  catch-up tokens churn quickly, and a linear scan stays cheaper than a
- *  hash table at this size. */
-#ifndef KEEL_CATCHUP_CACHE_SLOTS
-#define KEEL_CATCHUP_CACHE_SLOTS 128
-#endif
-
-/* ============================================================================
- * Internal types
- * ============================================================================ */
-
-/** One parked session. Owned by the manager's intrusive doubly-linked list. */
-struct keel_catchup_waiter {
-    keel_catchup_waiter_t*   next;
-    keel_catchup_waiter_t*   prev;
-
-    struct keel_session*     session;
-    size_t                   server_index;
-    keel_consistency_token_t token;
-
-    uint64_t                 enqueued_ns;
-    uint64_t                 deadline_ns;
-
-    keel_catchup_resume_cb   resume;
-    void*                    userdata;
-
-    /* True once the resume callback has fired (or is in the middle of
-     * firing). Guards against double-release races between the tick loop
-     * and an explicit keel_catchup_cancel(). */
-    bool                     released;
-};
-
-/** Cached result for "did server S reach token T?" with a TTL. */
-typedef struct cache_entry {
-    /* `server_index == SIZE_MAX` means slot is empty. */
-    size_t                   server_index;
-    keel_consistency_token_t token;
-    bool                     reached;
-    uint64_t                 expires_ns;
-} cache_entry_t;
-
-/** Per-server probe socket state (Patches 2b/2c populate the rest). */
-typedef struct probe_socket {
-    int      fd;                     /**< -1 = not currently open */
-    uint64_t opened_ns;
-    uint64_t last_use_ns;
-    /* Exponential-backoff window for reopening after failure. */
-    uint64_t backoff_until_ns;
-    uint32_t backoff_current_ms;     /**< 0 until first failure */
-    /* Probe state machine pointer reserved for 2b/2c (kept opaque here
-     * to avoid pulling protocol headers into this scaffold). */
-    void*    probe_state;
-} probe_socket_t;
-
-struct keel_catchup_manager {
-    struct keel_worker*    worker;       /* may be NULL (unit tests) */
-    keel_catchup_config_t  cfg;
-
-    /* Intrusive wait list — head/tail for O(1) enqueue, linear scan for
-     * tick. Size cap enforced via `waiters_active`. */
-    keel_catchup_waiter_t* head;
-    keel_catchup_waiter_t* tail;
-    size_t                 waiters_active;
-    size_t                 waiters_high_water;
-
-    /* Per-server probe-socket cache. Indexed directly by server index. */
-    probe_socket_t         sockets[KEEL_MAX_SERVERS];
-
-    /* Tiny TTL-bounded probe-result cache. Linear scan is fine at this
-     * size and is dominated by L1 cache hits. */
-    cache_entry_t          cache[KEEL_CATCHUP_CACHE_SLOTS];
-    size_t                 cache_next_evict;  /* round-robin replacement */
-
-    /* Aggregate counters. The worker's stats_ctx mirrors these via
-     * KEEL_STAT_INC; the local copies make standalone unit tests
-     * possible without a stats context. */
-    uint64_t enqueued_total;
-    uint64_t fulfilled_total;
-    uint64_t timeout_total;
-    uint64_t cancelled_total;
-    uint64_t probes_issued_total;
-    uint64_t probes_succeeded_total;
-    uint64_t probes_failed_total;
-    uint64_t cache_hits_total;
-};
+/* Type aliases for the still-internal cache_entry name used below. */
+typedef keel_catchup_cache_entry_t cache_entry_t;
 
 /* ============================================================================
  * Small helpers
@@ -248,10 +161,89 @@ static void cache_insert(keel_catchup_manager_t* m,
     victim->expires_ns = now_ns + (uint64_t)m->cfg.cache_ttl_ms * 1000000ULL;
 }
 
-/* Quiet -Wunused-function until 2b wires it. */
-__attribute__((unused)) static void (*cache_insert_keepalive)(
-    keel_catchup_manager_t*, size_t, const keel_consistency_token_t*,
-    bool, uint64_t) = cache_insert;
+/* ============================================================================
+ * Helpers exported to per-protocol probe state machines (internal header)
+ * ============================================================================ */
+
+void keel_catchup_cache_put(struct keel_catchup_manager* m,
+                            size_t server_index,
+                            const keel_consistency_token_t* token,
+                            bool reached,
+                            uint64_t now_ns)
+{
+    if (!m || !token || server_index >= KEEL_MAX_SERVERS) return;
+    cache_insert(m, server_index, token, reached, now_ns);
+}
+
+struct keel_catchup_waiter* keel_catchup_first_waiter_for(
+    struct keel_catchup_manager* m, size_t server_index)
+{
+    if (!m) return NULL;
+    for (keel_catchup_waiter_t* w = m->head; w; w = w->next) {
+        if (w->server_index == server_index) return w;
+    }
+    return NULL;
+}
+
+bool keel_catchup_pick_probe_token(
+    struct keel_catchup_manager* m,
+    size_t server_index,
+    int (*compare)(const keel_consistency_token_t*,
+                   const keel_consistency_token_t*),
+    keel_consistency_token_t* out_token)
+{
+    if (!m || !compare || !out_token) return false;
+    const keel_consistency_token_t* best = NULL;
+    for (keel_catchup_waiter_t* w = m->head; w; w = w->next) {
+        if (w->server_index != server_index) continue;
+        if (!best || compare(&w->token, best) > 0) {
+            best = &w->token;
+        }
+    }
+    if (!best) return false;
+    *out_token = *best;
+    return true;
+}
+
+size_t keel_catchup_release_satisfied(
+    struct keel_catchup_manager* m,
+    size_t server_index,
+    const keel_consistency_token_t* reached_token,
+    uint64_t now_ns,
+    bool (*is_satisfied_by)(const keel_consistency_token_t*,
+                            const keel_consistency_token_t*))
+{
+    (void)now_ns;
+    if (!m || !reached_token || !is_satisfied_by) return 0;
+    size_t released = 0;
+    keel_catchup_waiter_t* w = m->head;
+    while (w) {
+        keel_catchup_waiter_t* next = w->next;
+        if (w->server_index == server_index &&
+            is_satisfied_by(&w->token, reached_token)) {
+            release_waiter(m, w, KEEL_CATCHUP_REACHED);
+            released++;
+        }
+        w = next;
+    }
+    return released;
+}
+
+void keel_catchup_apply_backoff(struct keel_catchup_manager* m,
+                                size_t server_index,
+                                uint64_t now_ns)
+{
+    if (!m || server_index >= KEEL_MAX_SERVERS) return;
+    keel_catchup_probe_socket_t* s = &m->sockets[server_index];
+    uint32_t next_ms = s->backoff_current_ms
+        ? s->backoff_current_ms * 2u
+        : (m->cfg.probe_backoff_initial_ms ? m->cfg.probe_backoff_initial_ms : 50u);
+    uint32_t cap = m->cfg.probe_backoff_max_ms ? m->cfg.probe_backoff_max_ms : 30000u;
+    if (next_ms > cap) next_ms = cap;
+    s->backoff_current_ms = next_ms;
+    s->backoff_until_ns   = now_ns + (uint64_t)next_ms * 1000000ULL;
+    m->probes_failed_total++;
+}
 
 /* ============================================================================
  * Public API — lifecycle
@@ -288,10 +280,14 @@ void keel_catchup_manager_destroy(keel_catchup_manager_t* m)
         release_waiter(m, m->head, KEEL_CATCHUP_CANCELLED);
     }
 
-    /* Close any open probe sockets. Use libc close (probe sockets are not
-     * tracked by the reactor in 2a; once 2b registers them, this loop
-     * will also keel_reactor_unregister_fd() them). */
+    /* Tear down per-server PG probe state (closes fd, destroys synthetic
+     * pool, frees probe ctx). Safe to call when nothing is allocated. */
     for (size_t i = 0; i < KEEL_MAX_SERVERS; i++) {
+        keel_catchup_pg_close(m, i);
+        if (m->sockets[i].probe_state && m->sockets[i].probe_state_free) {
+            m->sockets[i].probe_state_free(m->sockets[i].probe_state);
+            m->sockets[i].probe_state = NULL;
+        }
         if (m->sockets[i].fd >= 0) {
             close(m->sockets[i].fd);  /* NOLINT(keel-syscall) */
             m->sockets[i].fd = -1;
@@ -390,9 +386,19 @@ void keel_catchup_manager_tick(keel_catchup_manager_t* m, uint64_t now_ns)
         }
     }
 
-    /* TODO(Patch 2b/2c): drive probe state machines for every distinct
-     * server_index that has at least one parked waiter and is not
-     * currently in backoff. */
+    /* Drive the per-server probe state machine for every server that has
+     * at least one parked waiter. We iterate the wait list once, marking
+     * which server indices have been visited so the same server is not
+     * driven twice in one tick. TODO(Patch 2c): also dispatch to the
+     * MySQL probe driver based on the server's protocol. */
+    bool driven[KEEL_MAX_SERVERS] = {0};
+    for (keel_catchup_waiter_t* w = m->head; w; w = w->next) {
+        if (w->server_index >= KEEL_MAX_SERVERS) continue;
+        if (driven[w->server_index]) continue;
+        if (m->sockets[w->server_index].backoff_until_ns > now_ns) continue;
+        driven[w->server_index] = true;
+        keel_catchup_pg_drive(m, w->server_index, now_ns);
+    }
 }
 
 /* ============================================================================
