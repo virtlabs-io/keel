@@ -12,6 +12,26 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ## [Unreleased]
 
+### Added — Consistent-read catch-up track, Patch 2d-4 / 2d-5
+
+Wires the `stale_read_policy=wait` router verdict (Patch 2d-2) into the
+engine read path with a **safe-degrade** semantics for v0.5-alpha. When
+a session carries a `keel_consistency_token_t` (RYW) and the router would
+emit `KEEL_ROUTE_REASON_WAIT_CATCHUP` against the candidate replica, the
+engine logs the verdict, bumps two new per-worker counters, and routes
+the query to the primary instead. (The full async-park + reactor-thread
+resume continuation that re-dispatches against the now-caught-up replica
+remains a v0.5-beta deliverable; the enqueue bridge from Patch 2d-3 is
+already in tree to support it.)
+
+- **New helper.** `bool keel_engine_should_degrade_to_primary_on_wait(router, qt, token, in_transaction, &decision)` in `include/keel/engine/catchup_consult.h` / `src/engine/engine_catchup_consult.c`. Returns `true` iff the router's verdict is `WAIT_CATCHUP`.
+- **Engine wiring.** `keel_engine_flow_on_fe_data()` (`src/engine/engine_flow.c`) parses the SQL via `keel_sql_analyze_full` with a 64 KiB scratch arena **only on the token-bearing replica-read path** (no overhead for the common case), then consults the helper just before the `FROUTE_READ → switch (route)` dispatch.
+- **New stats.** Two `uint64_t` counters on `keel_worker_t.stats`:
+  - `wait_catchup_consulted_total` — total token-bearing reads consulted.
+  - `wait_catchup_degraded_to_primary` — subset that were degraded to primary.
+- **Tests.** 8 unit tests (`tests/test_engine_catchup_consult.c`) cover the predicate exhaustively (NULL guards, in-txn skip, no-token skip, WARN/FAIL policies, etc.). Patch 2d-5 adds a live-PostgreSQL e2e (`tests/test_engine_catchup_consult_pg_e2e.c`) that captures the live primary's WAL LSN via `libpq` (`SELECT pg_current_wal_lsn()`), feeds it to the helper, and asserts the WAIT_CATCHUP+degrade verdict plus exact LSN echo plus the in-transaction negative case. Skips gracefully when no PG primary is reachable.
+- **Full regression.** 138/138 ctest green (including the new live e2e).
+
 ### Added — Failover-manager track (proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md §3-§4)
 
 Brings the v0.5-alpha *failover manager* into the router as a first-class
