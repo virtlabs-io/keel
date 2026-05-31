@@ -7,7 +7,7 @@
 [![codecov](https://codecov.io/gh/virtlabs-io/keel/graph/badge.svg)](https://codecov.io/gh/virtlabs-io/keel)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A correctness-first intelligent PostgreSQL proxy/pooler written in modern C (C23) with native io_uring support, transaction pooling, semantic routing, explicit state ownership, and full TLS support (frontend + backend). MySQL support exists, but it is not the first production baseline. For `v0.4-alpha`, the recommended production direction is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
+A correctness-first intelligent PostgreSQL proxy/pooler written in modern C (C23) with native io_uring support, transaction pooling, semantic routing, explicit state ownership, and full TLS support (frontend + backend). MySQL support exists, but it is not the first production baseline. The recommended production direction is conservative: **PostgreSQL in `pool` mode**, with higher-level routing and cluster features enabled deliberately rather than assumed by default.
 
 Quick Links: [Docs](docs/) · [Correctness](docs/CORRECTNESS_UNDER_FAILURE.md) · [Production Readiness](docs/PRODUCTION_READINESS.md) · [Docker](docs/DOCKER.md) · [Testing](docs/TESTING.md) · [Benchmarks](bench/README.md) · [Scatter-Merge](docs/SCATTER_MERGE.md) · [Sharding](docs/SHARDING.md) · [Session Context](docs/SESSION_CONTEXT.md) · [Runtime Modes](docs/RUNTIME_MODES.md) · [Cluster Compression](docs/CLUSTER_WIRE_COMPRESSION.md)
 
@@ -23,7 +23,7 @@ KEEL is a lightweight database connection pooler designed for high-throughput, l
 - **Multi-protocol** — PostgreSQL and MySQL from the same binary
 - **Transaction pooling** — connections returned to the pool after each transaction
 
-## Production Support Status for v0.3-alpha
+## Production Support Status
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize` and `experimental_features = false`.
 
@@ -34,7 +34,7 @@ Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize
 | **Experimental** | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
 | **Aspirational** | Result cache correctness guarantees |
 
-`smart` and `full` remain useful tiers, but they are not the default production recommendation for `v0.3-alpha`. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
+`smart` and `full` remain useful tiers, but they are not the default production recommendation. Promote them only when the corresponding failure-mode and observability gates in [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) are satisfied for your deployment.
 
 ## Feature Status
 
@@ -51,7 +51,7 @@ For the full maturity inventory, failure-mode matrix, and failover semantics,
 see [PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md). New production
 claims should be added there before feature docs or UI copy are expanded.
 
-### Production Profiles (v0.3-alpha)
+### Production Profiles
 
 `pool` is now the default runtime tier and only production-safe defaults are enabled by default.
 
@@ -367,7 +367,7 @@ primary = host=db.local port=5432 dbname=app user=app password=secret role=RW we
 
 #### Scenario 2: PostgreSQL with Read/Write Splitting + Patroni HA
 
-This profile is in the **hardening** bucket for `v0.3-alpha`. Use it only when
+This profile is in the **hardening** bucket. Use it only when
 you need read/write routing and have validated failover behavior in your own environment.
 
 ```ini
@@ -536,8 +536,8 @@ KEEL logs a warning and falls back to userspace TLS silently when kTLS is unavai
 
 | OS | Arch | Status |
 |----|------|--------|
-| Ubuntu 22.04 LTS | x86_64, arm64 | ✅ CI + Docker release image |
-| Ubuntu 24.04 LTS | x86_64, arm64 | ✅ CI (primary) + Docker release image |
+| Ubuntu 22.04 LTS | x86_64, arm64 | ✅ CI + Docker image |
+| Ubuntu 24.04 LTS | x86_64, arm64 | ✅ CI (primary) + Docker image |
 | Debian 12 (Bookworm) | x86_64 | ✅ Validated |
 | RHEL / Rocky Linux 9 | x86_64 | ✅ RPM package tested |
 | Fedora 40 | x86_64 | ✅ Validated |

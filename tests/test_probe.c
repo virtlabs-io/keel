@@ -341,10 +341,12 @@ static void test_probe_tcp_connect_null_safety(void) {
     TEST_BEGIN("probe TCP connect: NULL host handled");
 
     char errbuf[256] = {0};
-    /* Some implementations tolerate NULL host (loopback), others reject it —
-     * we just require it doesn't crash and returns an error code.             */
+    /* Some implementations tolerate NULL host (loopback) and may successfully
+     * connect if a server is running on that port; others reject NULL host with
+     * an error. We just require it doesn't crash — any rc is acceptable.       */
     int rc = keel_probe_tcp_connect(NULL, 5432, 200, errbuf, sizeof(errbuf));
-    TEST_ASSERT(rc < 0 || rc == 0); /* either error or success — not a crash */
+    if (rc >= 0) { close(rc); } /* avoid fd leak when loopback succeeds */
+    (void)rc;
 
     TEST_END();
 }

@@ -1,11 +1,11 @@
 # Security Policy
 
-## Supported Versions
+## Supported Branches
 
-| Version | Supported |
-|---------|-----------|
-| alpha-0.3.0 (current) | ✅ Active |
-| < alpha-0.3.0 | ❌ Not supported |
+| Branch class | Supported |
+|--------------|-----------|
+| Current development branch | ✅ Active |
+| Historical development branches | ❌ Not supported unless explicitly listed in release notes |
 
 ## Reporting a Vulnerability
 

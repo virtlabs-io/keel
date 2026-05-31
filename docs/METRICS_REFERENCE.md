@@ -1,7 +1,7 @@
 # KEEL Metrics Reference
 
 This document is the operator-facing reference for every metric KEEL
-exports in v0.2-alpha. It is the source of truth for dashboards, alert
+exports. It is the source of truth for dashboards, alert
 rules, and capacity planning.
 
 The reference is **gated by CI** (`check_metrics_reference`): every
@@ -40,12 +40,12 @@ observability proposal):
 | Attribute | Value | Source |
 |---|---|---|
 | `service.name` | `keel` | encoder constant |
-| `service.version` | `0.2.0-alpha` | encoder constant |
+| `service.version` | build version string | encoder constant |
 | `telemetry.sdk.name` | `keel-otlp` | encoder constant |
 | `telemetry.sdk.language` | `c` | encoder constant |
 
 Optional operator-supplied attributes (`keel.instance.id`,
-`keel.cluster.name`, `keel.node.name`) are not emitted in v0.2-alpha
+`keel.cluster.name`, `keel.node.name`) are not emitted by the current exporter
 and will land with the wider deployment-metadata work.
 
 ## 3. Cumulative temporality
@@ -64,7 +64,7 @@ or the standard cumulative-to-delta processor (OTel collector).
 > snapshots and must not be interpreted as data corruption.
 
 This disclaimer applies to **every** exported histogram family.
-v0.2-alpha exports no histograms by default (`KEEL_TIER_FULL` is gated
+The current default exporter emits no histograms (`KEEL_TIER_FULL` is gated
 out at compile time); the disclaimer is reproduced here so it is in
 place the moment the histogram tier is enabled.
 
@@ -87,7 +87,7 @@ All metrics in section 5.1–5.8 are emitted on every worker, summed by
 the aggregator before export. None carry dynamic per-request labels —
 KEEL enforces zero label cardinality on the hot path (invariant I15).
 
-`Enabled` reflects the default state at v0.2-alpha release.
+`Enabled` reflects the default export state.
 
 ### 5.1 Sessions
 
@@ -439,7 +439,7 @@ Conventions:
   as a single unlabeled aggregate line. Operators can scrape either,
   depending on whether they want worker-level breakdown.
 - `proxy_*` aliases exist for a subset of the families and are kept for
-  backwards compatibility with dashboards built against pre-v0.2-alpha
+  backwards compatibility with existing dashboards built against earlier
   KEEL.
 - Tables below are generated from `src/admin/admin.c` by
   `scripts/extract_metrics_metadata.py` and enforced by
@@ -717,9 +717,8 @@ Conventions:
 
 ## 7. Metrics planned for later tiers
 
-The following metric families are specified in
-`proposals/v0.2-alpha_observability.md` but are **not** exported in
-v0.2-alpha. They will surface as the relevant subsystems land:
+The following metric families are specified by the observability design but are
+**not** exported yet. They will surface as the relevant subsystems land:
 
 - `keel.pool.wait.duration` (histogram) — backend pool wait queue time
 - `keel.pool.scan.duration` (histogram) — backend selection scan time

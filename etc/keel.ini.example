@@ -867,6 +867,59 @@ probe_retries = 3
 failover_delay = 2000
 
 
+# -----------------------------------------------------------------------------
+# Failover-manager policy (v0.5-alpha).
+#
+# These keys live in a dedicated `[failover]` sub-section, one per worker
+# group. They control how the router reacts to primary flips observed via
+# the Patroni probe or the SQL discovery path. Defaults are conservative:
+# the old primary is fenced (no traffic) and in-flight transactions fail.
+#
+# See docs/PRODUCTION_READINESS.md §"Failover Semantics" for the full
+# behavioural contract.
+# -----------------------------------------------------------------------------
+#
+# [failover]
+#
+# Source of authority for role decisions.
+#   native   — KEEL's own probes + observation hooks (default).
+#   patroni  — Trust Patroni HTTP role responses verbatim.
+#   maxscale — Trust MaxScale role announcements (MySQL).
+# failover_provider = native
+#
+# How often the failover detector wakes up to evaluate cluster state.
+# failover_detection_interval = 2s
+#
+# Consecutive failures before the detector treats a primary as gone.
+# failover_failure_threshold = 3
+#
+# Grace period after detecting a flip before accepting writes against the
+# new primary. Set to 0 for "as soon as the probe confirms read_only=0".
+# failover_promotion_grace = 1s
+#
+# When true (default), the prior primary is moved to role-state DEMOTED
+# and filtered out of the rw/ro index arrays. Routing rejects with
+# OLD_PRIMARY_FENCED and DEGRADED_MODE rather than risking split-brain.
+# failover_old_primary_fencing_required = true
+#
+# When false (default), KEEL never retries a write whose outcome is
+# unknown (commit-in-doubt). Setting to true loosens this — use only if
+# the workload is idempotent.
+# failover_allow_ambiguous_write_retry = false
+#
+# Read-path policy during a flip window:
+#   reject    — error out reads until a new primary is elected.
+#   degraded  — keep serving from any healthy replica (default).
+#   stale_ok  — also serve from the demoted ex-primary (UNSAFE).
+# failover_read_during_failover = degraded
+#
+# Transaction-path policy during a flip window:
+#   fail     — abort in-flight transactions (default; safest).
+#   hold     — block until the new primary is elected, then fail if grace expires.
+#   continue — keep the transaction pinned to the demoted node (UNSAFE).
+# failover_transaction_during_failover = fail
+
+
 # =============================================================================
 # [worker_group.<name>.servers]  -- Back-end server list
 #

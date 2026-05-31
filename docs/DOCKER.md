@@ -32,9 +32,8 @@ docker run --rm \
 
 | Tag | Description |
 |-----|-------------|
-| `latest` | Latest release (main branch) |
-| `1.2.3` | Specific semver release |
-| `1.2` | Latest patch release on 1.2.x |
+| `latest` | Default published image |
+| `<tag>` | Immutable tag listed in the container registry or release notes |
 | `sha-abc1234` | Specific commit |
 
 Supported platforms: **linux/amd64**, **linux/arm64**

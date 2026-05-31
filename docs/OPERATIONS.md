@@ -111,9 +111,9 @@ The Helm chart defaults to a `RollingUpdate` deployment strategy with
 `maxSurge: 1` and `maxUnavailable: 0`, so upgrades are zero-downtime by default.
 
 ```bash
-# Upgrade to a new version
+# Upgrade to a new image tag
 helm upgrade keel helm/keel/ \
-  --set image.tag=alpha-0.4.0 \
+  --set image.tag=<image-tag> \
   --atomic \
   --timeout 5m
 ```
@@ -146,7 +146,7 @@ drain completes.
 ```bash
 # 1. Download the new binary to a staging path
 curl -Lo /usr/local/bin/keel.new \
-  https://github.com/virtlabs-io/keel/releases/download/alpha-0.4.0/keel-linux-amd64
+  https://github.com/virtlabs-io/keel/releases/download/<release-tag>/keel-linux-amd64
 
 # 2. Verify the SHA256 and GPG signature (see docs/RELEASE_SIGNING.md)
 sha256sum -c SHA256SUMS
@@ -551,7 +551,7 @@ keel_query_cache_stats(worker->query_cache, &s);
 ```
 
 An admin command (`SHOW CACHE STATS`) and corresponding Prometheus metrics are
-planned but not yet exposed in this release.
+planned but not yet exposed.
 
 ### Manual Flush
 
@@ -561,7 +561,7 @@ To flush all cache entries for a given worker's cache programmatically:
 keel_query_cache_flush(worker->query_cache);
 ```
 
-A `FLUSH QUERY CACHE` admin-socket command is planned for a future release.
+A `FLUSH QUERY CACHE` admin-socket command is planned for a future iteration.
 
 ### Known Limitations
 

@@ -1,6 +1,6 @@
 # KEEL — Known Limitations
 
-> Status: 2026-05-26 — branch `v0.3-alpha`
+> Status: current functional limitation inventory
 > Source of truth for production maturity: [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
 > This document tracks functional limitations exposed by the e2e suite; it is
 > not a production-readiness statement.
@@ -106,7 +106,7 @@ Limitations are grouped by subsystem:
 
 ### 1.1 Recursive Common Table Expressions (CTEs)
 
-**Status (v0.3-alpha):** **fail-closed.** `keel_router_dispatch_sql()` now
+**Status:** **fail-closed.** `keel_router_dispatch_sql()` now
 rejects any `WITH RECURSIVE` statement that touches a registered shard table
 with `KEEL_ERR_NOT_SUPPORTED`; the engine surfaces a PostgreSQL `ErrorResponse`
 with SQLSTATE `0A000` (`feature_not_supported`) and a `ReadyForQuery`, so the
@@ -373,7 +373,7 @@ result to be a tree of sub-dispatches rather than a single result.
 **Status.** All three previously-failing tests now pass. The OFFSET is
 applied post-merge in [src/engine/engine_scatter.c](../src/engine/engine_scatter.c)
 (`apply_limit`); the originally-cited bug was actually a missing seed
-fixture in `TestOrderLimitOffset` (xfail removed in commit `c4c5089`).
+fixture in `TestOrderLimitOffset`.
 
 Original analysis retained below for archaeology.
 

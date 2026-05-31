@@ -4,12 +4,11 @@ This document separates the code that is ready for production hardening from
 features that are implemented but still under failure-mode validation, and from
 features that are aspirational or roadmap-only.
 
-For v0.4-alpha, the controlling contract is
-[Correctness Under Failure](CORRECTNESS_UNDER_FAILURE.md): when parser, session,
+The controlling contract is [Correctness Under Failure](CORRECTNESS_UNDER_FAILURE.md): when parser, session,
 transaction, or failover certainty is missing, KEEL must route conservatively,
 pin, reject, or close.
 
-## Production Support Status for v0.4-alpha
+## Production Support Status
 
 Recommended deployment mode: `mode = pool` with `prepared_statement = virtualize`
 only after replay validation, and `experimental_features = false`.
@@ -17,9 +16,9 @@ only after replay validation, and `experimental_features = false`.
 | Status | Features |
 |--------|----------|
 | Stable target | PostgreSQL proxy mode, PostgreSQL pool mode, admin inspection, Prometheus/OTLP observability |
-| Beta / hardening | Smart read routing, PostgreSQL prepared-statement virtualization, SSV, Patroni failover, transaction tracking |
+| Hardening | Smart read routing, PostgreSQL prepared-statement virtualization, SSV, Patroni failover, transaction tracking |
 | Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, result cache, cluster compression |
-| Alpha | MySQL wire protocol and pooling |
+| Hardening | MySQL wire protocol and pooling |
 | Research | GraphQL, MCP, natural-language parsing |
 
 ## Maturity Levels
@@ -43,7 +42,7 @@ only after replay validation, and `experimental_features = false`.
 | Session-context virtualization / SSV | Hardening | State/profile hashing is implemented; semantic GUC coverage and consistency-token capture require continued protocol-level tests. |
 | Sticky-primary read-after-write | Stable | Sticky window is conservative and reactor-safe. |
 | WAL LSN / GTID replica catch-up probes | Experimental | Token parsing/storage exists; live replica catch-up probes must remain reactor-owned before production promotion. |
-| Automatic failover and role detection | Hardening | Routing changes are implemented; deterministic behavior under Patroni failover, split-brain windows, timeline switches, stale replicas, and role flapping remains a required test gate. |
+| Automatic failover and role detection | Stable for native/Patroni-observed flips; MySQL Group Replication / Galera promotion orchestration remains experimental | Per-router monotonic cluster epoch fences old primary (`DEMOTED` role-state, filtered out of `rw/ro` indices); decisions surface `OLD_PRIMARY_FENCED` / `DEGRADED_MODE` reasons. See [Failover Semantics](#failover-semantics) below. |
 | Horizontal sharding and scatter-merge | Experimental | Gated at dispatch behind `scatter_merge = on` per worker group (default `off`); scatter-eligible queries are rejected with SQLSTATE `0A000` until opted in. Recursive CTEs over sharded tables always fail closed with `0A000` (see [LIMITATIONS §1.1](LIMITATIONS.md#11-recursive-common-table-expressions-ctes)). Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
 | Multi-shard 2PC | Experimental | Requires commit-in-doubt and crash-recovery matrix validation before production promotion. |
 | TLS/mTLS | Stable | kTLS acceleration is hardening because kernel and cipher compatibility vary by deployment. |
@@ -55,7 +54,7 @@ only after replay validation, and `experimental_features = false`.
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |
 
-## Production-Supported Profiles (v0.3-alpha)
+## Production-Supported Profiles
 
 Default profile (enabled without opt-in):
 
@@ -110,6 +109,21 @@ meant for deliberate feature evaluation with targeted tests and rollout controls
 
 KEEL must prefer deterministic refusal over ambiguous replay:
 
+- **Cluster epoch & fencing.** Every router owns a monotonic
+  `keel_cluster_epoch_t` plus a `pthread_mutex_t epoch_mu`. The first time
+  a new primary is observed (either by the Patroni probe or the SQL
+  discovery path calling `keel_router_observe_primary()`), the epoch is
+  bumped under the lock, the observed node is promoted to
+  `KEEL_ROLE_STATE_PRIMARY`, and the prior primary is moved to
+  `KEEL_ROLE_STATE_DEMOTED`. `rebuild_indices()` then drops `DEMOTED` and
+  `DRAINING` nodes from the `rw/ro/wo` index arrays, so a fenced ex-primary
+  cannot serve any traffic — routing rejects with
+  `KEEL_ROUTE_REASON_OLD_PRIMARY_FENCED`.
+- **Degraded mode.** When `failover_old_primary_fencing_required = true`
+  (default) and no eligible RW node remains, the router sets
+  `degraded_mode = true` and rejects writes with
+  `KEEL_ROUTE_REASON_DEGRADED_MODE` instead of routing to the fenced node.
+  Reads honour the per-worker `failover_read_during_failover` policy.
 - Patroni failover: role changes rebuild routing indices and drain idle
   connections to the old role; in-flight transactions stay on their current
   backend until completion, failure, or commit-in-doubt handling.
@@ -117,9 +131,18 @@ KEEL must prefer deterministic refusal over ambiguous replay:
   ambiguous; never route writes to more than one primary candidate.
 - Stale replicas: sticky-primary is the stable fallback. Token-gated replica
   routing remains experimental until replica probes are fully reactor-owned.
+  `stale_read_policy = wait` is **reserved** — `keel_router_create()` logs
+  a WARN and degrades it to `route_primary`; use `reject` for fail-closed
+  RYW.
 - Timeline switch: stale LSN/GTID gates must be invalidated on timeline change.
 - Role flapping: health probes should dampen routing changes and avoid
   reconnect storms; closed slots refill asynchronously with backoff.
+- **MySQL GTID visibility.** On the first authenticated MySQL probe per
+  backend, KEEL issues `SELECT @@gtid_mode, @@enforce_gtid_consistency` and
+  emits a one-shot WARN (deduped per `host:port`) if GTID is disabled or
+  not enforced. Failover behavior remains the same; the warning surfaces
+  misconfigurations that would silently lose write-after-read guarantees
+  during a flip.
 
 ## Operator Inspection Contract
 
@@ -147,9 +170,9 @@ counters and reconcile against the close total without double-counting.
 
 ---
 
-## Release Gates
+## Readiness Gates
 
-A release is **blocked** until every gate below passes.  Unit and integration
+Production promotion is **blocked** until every gate below passes. Unit and integration
 tests alone are not sufficient — production readiness requires long soak tests
 with real PostgreSQL workloads and real client drivers.
 
@@ -162,7 +185,7 @@ with real PostgreSQL workloads and real client drivers.
 | Metric invariants — no per-request label cardinality, no hot-path allocations | `scripts/check_metrics_invariants.sh` | `lint` |
 | Metrics reference parity — every registered metric is documented in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md) and vice versa | `scripts/check_metrics_reference.sh` | `lint` |
 | Public-claim safety — forbid risky production promises in Markdown docs | `scripts/check_dangerous_marketing_claims.sh` | `lint` |
-| Chaos manifest — every release chaos scenario exists and data-corruption cases use sentinels | `scripts/check_chaos_manifest.sh` | `lint;hardening` |
+| Chaos manifest — every required chaos scenario exists and data-corruption cases use sentinels | `scripts/check_chaos_manifest.sh` | `lint;hardening` |
 | Correctness gate manifest — deterministic proof/CID/replay gates are wired into CTest | `scripts/check_correctness_gates.sh` | `lint;hardening` |
 | Auth log safety — no auth material in log calls | `scripts/check_auth_log_safety.sh` | `gate;security` |
 | Result-cache experimental gate | `scripts/check_result_cache_gate.sh` | `gate` |
@@ -172,16 +195,16 @@ Run all lint + gate tests:
 ctest --test-dir build -L "lint|gate" --output-on-failure
 ```
 
-### Release artifact signing (required for every tagged release)
+### Artifact signing (required for every tagged build)
 
-Tagged releases (`refs/tags/*`) **must** publish signed artifacts. The
+Tagged builds (`refs/tags/*`) **must** publish signed artifacts. The
 `package-linux` workflow hard-fails when `PACKAGE_SIGNING_PRIVATE_KEY`
-is not configured for a tagged build — an unsigned tagged release is not
-a valid release. Non-tag branch/PR builds may produce unsigned artifacts
+is not configured for a tagged build — an unsigned tagged build is not
+a valid production artifact. Non-tag branch/PR builds may produce unsigned artifacts
 for development only and must not be promoted. Operator setup and key
 management procedure: [docs/RELEASE_SIGNING.md](RELEASE_SIGNING.md).
 
-### Driver-level torture suite (required before each release)
+### Driver-level torture suite (required before production promotion)
 
 The **PostgreSQL Protocol Torture Suite** (`tests/suites/suite_torture.py`)
 must pass against a real PostgreSQL backend with every supported client driver:
@@ -206,7 +229,7 @@ Run the torture suite:
 python tests/suites/suite_torture.py --verbose --soak 3600
 ```
 
-A release **must not** be tagged if I11 fails at `--soak 3600` (1-hour soak).
+A production artifact **must not** be tagged if I11 fails at `--soak 3600` (1-hour soak).
 
 ### Soak pass criteria
 

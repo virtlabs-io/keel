@@ -928,8 +928,17 @@ keel_error_t keel_discovery_apply(
         disc->last_primary = keel_strdup(new_primary);
 
         pthread_mutex_unlock(&disc->mutex);
+
+        /* Failover-manager: feed the primary observation through so the
+         * router bumps its cluster epoch and fences any prior primary
+         * per the configured `failover.old_primary_fencing_required`. */
+        keel_router_observe_primary(router, new_primary, (uint32_t)new_tl);
+    } else {
+        /* No primary in the topology snapshot — signal degraded mode so
+         * the router can refuse traffic per [failover] policy. */
+        keel_router_observe_primary(router, NULL, 0);
     }
-    
+
     return KEEL_OK;
 }
 

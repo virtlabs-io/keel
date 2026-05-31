@@ -80,7 +80,7 @@ Resource attributes attached to every export:
 
 All counters are exported with **cumulative temporality** (OTel
 `AGGREGATION_TEMPORALITY_CUMULATIVE`). Gauges are exported as the
-current snapshot value. Histograms are not exported in this release
+current snapshot value. Histograms are not exported by the current OTLP path
 (reserved for `KEEL_TIER_FULL`).
 
 No dynamic per-request labels are emitted — KEEL enforces zero label
@@ -169,7 +169,7 @@ The exporter is designed to fail safely:
 Measured by `tests/test_otlp_overhead_bench.c` (60 s timeout, CI
 gate):
 
-| Operation | Budget | Measured (Linux x86-64, release build) |
+| Operation | Budget | Measured (Linux x86-64, optimized build) |
 |---|---|---|
 | Snapshot project + protobuf encode | 200 µs | ~41 µs |
 | `keel_otlp_exporter_submit` (queue insert) | 50 µs | 96 ns |
@@ -191,6 +191,4 @@ scrape endpoint and admin surfaces are not affected.
 - [docs/ADMIN_SQL.md](ADMIN_SQL.md) — admin SQL/HTTP/JSON surface.
 - [docs/TRACING.md](TRACING.md) — distributed tracing pipeline.
 - [docs/PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) —
-  observability maturity and release gates.
-- `proposals/v0.2-alpha_observability.md` — design rationale and
-  invariants for the observability subsystem.
+  observability maturity and readiness gates.

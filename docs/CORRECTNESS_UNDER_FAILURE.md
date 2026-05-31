@@ -1,7 +1,6 @@
 # Correctness Under Failure
 
-This document is the v0.4-alpha correctness contract. KEEL's first production
-story is not feature breadth; it is conservative PostgreSQL proxying and pooling
+This document is the correctness contract. KEEL's production story is not feature breadth; it is conservative PostgreSQL proxying and pooling
 that fails closed when routing, state, parser, or failover certainty is missing.
 
 KEEL should be positioned as:
@@ -64,17 +63,17 @@ positive proof, not absence of obvious writes.
 
 ## Stability Tiers
 
-| Area | v0.4-alpha tier | Release rule |
+| Area | Current maturity | Operational rule |
 |------|-----------------|--------------|
 | PostgreSQL proxy mode | Stable target | Must pass protocol, TLS, auth, and drain gates. |
 | PostgreSQL pool mode | Stable target | Backend reuse requires protocol-confirmed idle state. |
-| Smart read routing | Beta | Replica routing only after semantic safety and session cleanliness checks. |
-| Prepared statement virtualization | Beta | Requires lifecycle tracking and invalidation tests per deployment. |
+| Smart read routing | Hardening | Replica routing only after semantic safety and session cleanliness checks. |
+| Prepared statement virtualization | Hardening | Requires lifecycle tracking and invalidation tests per deployment. |
 | Session virtualization | Experimental | Must not be a default production promise. |
 | Sharding and scatter-gather | Experimental | Opt-in only, fail closed when disabled or ambiguous. |
 | Multi-shard transactions | Experimental | Blocked on commit-in-doubt crash-recovery coverage. |
 | Result cache | Experimental | Disabled by default and gated by `experimental_features`. |
-| MySQL | Alpha | Keep parity tests, but do not position as the first production baseline. |
+| MySQL | Hardening | Keep parity tests, but do not position as the first production baseline. |
 | GraphQL, MCP, natural language parsing | Research | Design and experiments only. |
 
 ## Ownership Rules
@@ -102,7 +101,7 @@ clean or the backend is closed. Cleanup failure is a close reason, not a warning
 ## State Machines
 
 The canonical state-machine reference is [STATE_MODEL.md](STATE_MODEL.md). For
-v0.4-alpha release review, the minimum state-machine diagrams and invariants are:
+readiness review, the minimum state-machine diagrams and invariants are:
 
 ```text
 Frontend:    startup -> auth -> ready -> parse -> bind -> execute -> sync -> ready
@@ -121,7 +120,7 @@ observable reason code when it closes or rejects work.
 
 ## Prepared Statement Lifecycle
 
-Prepared-statement virtualization remains beta until the runtime tracks and tests:
+Prepared-statement virtualization remains in hardening until the runtime tracks and tests:
 
 ```text
 client statement name
@@ -184,7 +183,7 @@ route.
 
 ## Chaos and Replay Requirements
 
-v0.4-alpha work should prioritize deterministic tests for:
+Correctness work should prioritize deterministic tests for:
 
 - extended PostgreSQL protocol recovery: Parse/Bind/Execute, unnamed statements,
   named statements, portals, cursor fetch, Sync recovery, ErrorResponse recovery,
@@ -235,7 +234,7 @@ safe degradation, and fail-closed behavior. Avoid claims that imply uninterrupte
 upgrades, invisible failover, complete statelessness, universal SQL coverage, or
 self-proving correctness.
 
-## Release Gate Command
+## Correctness Gate Command
 
 Run deterministic correctness gates with:
 

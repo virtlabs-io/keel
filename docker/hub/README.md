@@ -7,11 +7,11 @@ high-performance database connection pooler and proxy.
 
 | Tag | Base image | Size |
 |-----|-----------|------|
-| `latest`, `X.Y.Z`, `X.Y`, `X`, `debian`, `X.Y.Z-debian` | `debian:bookworm-slim` | ~120 MB |
-| `ubuntu`, `X.Y.Z-ubuntu`, `X.Y-ubuntu` | `ubuntu:24.04` | ~140 MB |
-| `alpine`, `X.Y.Z-alpine`, `X.Y-alpine` | `alpine:3.20` | ~40 MB |
+| `latest`, `debian`, immutable Debian tags | `debian:bookworm-slim` | ~120 MB |
+| `ubuntu`, immutable Ubuntu tags | `ubuntu:24.04` | ~140 MB |
+| `alpine`, immutable Alpine tags | `alpine:3.20` | ~40 MB |
 
-`latest` always tracks the most recent stable release on the **Debian** base.
+`latest` tracks the default stable image on the **Debian** base.
 
 ## Quick start
 

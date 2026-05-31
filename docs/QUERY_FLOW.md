@@ -439,7 +439,7 @@ The protocol vtable returns a `route_hint` with each query action:
 
 **File:** `src/engine/engine_flow.c`
 
-After a write query, subsequent reads from the same session are forced to the primary for a configurable TTL (default `KEEL_STICKY_PRIMARY_TTL_MS`) when no exact write-position token has been captured. If the session carries a real LSN/GTID token, v0.5-alpha keeps routing reads to primary until a reactor-owned catch-up verifier can prove a replica has reached that token:
+After a write query, subsequent reads from the same session are forced to the primary for a configurable TTL (default `KEEL_STICKY_PRIMARY_TTL_MS`) when no exact write-position token has been captured. If the session carries a real LSN/GTID token, KEEL keeps routing reads to primary until a reactor-owned catch-up verifier can prove a replica has reached that token:
 
 ```c
 if (route == KEEL_FROUTE_REPLICA && sf->last_write_ns != 0) {

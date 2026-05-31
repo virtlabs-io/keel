@@ -463,6 +463,17 @@ target_link_libraries(test_router PRIVATE
 target_link_options(test_router PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router COMMAND test_router)
 
+# Failover-manager tests (cluster epoch, fencing, degraded mode, timeline)
+add_executable(test_failover_manager test_failover_manager.c)
+target_link_libraries(test_failover_manager PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_failover_manager PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_failover_manager COMMAND test_failover_manager)
+set_tests_properties(test_failover_manager PROPERTIES LABELS "core")
+
 # Router explainer (read-only per-query simulation)
 add_executable(test_router_explain test_router_explain.c)
 target_link_libraries(test_router_explain PRIVATE
@@ -2726,10 +2737,10 @@ set_tests_properties(check_forbidden_blocking PROPERTIES
 )
 
 # =============================================================================
-# v0.2-alpha observability — metrics invariants gate.
+# Observability metrics invariants gate.
 # Forbids ad-hoc mutation of state-machine fields whose transitions feed
 # reason-coded metrics (backend close_reason, commit_in_doubt/commit_in_flight).
-# See proposals/v0.2-alpha_observability.md §27/§28.
+# See the observability proposal invariants.
 # =============================================================================
 add_test(
     NAME  check_metrics_invariants
@@ -2742,7 +2753,7 @@ set_tests_properties(check_metrics_invariants PROPERTIES
 )
 
 # =============================================================================
-# v0.2-alpha observability §26 — User-facing metrics reference parity gate.
+# User-facing metrics reference parity gate.
 # Ensures every metric registered in keel_prom_format.c's metadata table is
 # documented in docs/METRICS_REFERENCE.md, and vice versa, so the operator
 # reference cannot drift out of sync with the actual exported metric set.
@@ -2758,7 +2769,7 @@ set_tests_properties(check_metrics_reference PROPERTIES
 )
 
 # =============================================================================
-# v0.4-alpha correctness messaging gate.
+# Correctness messaging gate.
 # Prevents public Markdown docs from reintroducing broad production claims that
 # conflict with the conservative correctness-under-failure contract.
 # =============================================================================
@@ -2768,6 +2779,16 @@ add_test(
             ${CMAKE_SOURCE_DIR}
 )
 set_tests_properties(check_dangerous_marketing_claims PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
+add_test(
+    NAME  check_doc_release_mentions
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_doc_release_mentions.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_doc_release_mentions PROPERTIES
     LABELS "lint"
     TIMEOUT 30
 )

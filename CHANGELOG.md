@@ -12,6 +12,78 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 
 ## [Unreleased]
 
+### Added — Failover-manager track (proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md §3-§4)
+
+Brings the v0.5-alpha *failover manager* into the router as a first-class
+subsystem and closes the §3 (PG/Patroni) and §4 (MySQL GTID) deliverables.
+Behavior is opt-in via the new `[failover]` per-worker section; defaults are
+conservative (fence old primary, fail in-flight transactions).
+
+- **Per-router cluster epoch.** `keel_router_t` now owns a monotonic
+  `keel_cluster_epoch_t` plus a `pthread_mutex_t epoch_mu`. Each detected
+  primary flip increments the epoch under the lock so all subsequent
+  routing decisions observe a single, totally-ordered view of the cluster
+  generation. Public API: `keel_router_get_cluster_epoch()`.
+- **Role-state axis.** New `keel_node_role_state_t` enum
+  (`UNKNOWN/PRIMARY/REPLICA/UNHEALTHY/DRAINING/DEMOTED`) is **orthogonal**
+  to the existing `keel_server_health_t` and `keel_server_role_t`.
+  `rebuild_indices()` filters `DEMOTED`/`DRAINING` nodes out of `rw/ro/wo`
+  index arrays so fenced ex-primaries cannot serve any traffic. Public
+  API: `keel_router_set_node_role_state()`, `keel_router_get_node_role_state()`,
+  `keel_node_role_state_name()`.
+- **Observation hook.** `keel_router_observe_primary(router, host, port)`
+  is invoked by the Patroni probe ([src/core/router_plugin.c](src/core/router_plugin.c))
+  and the SQL discovery path ([src/core/router_discovery.c](src/core/router_discovery.c))
+  whenever a new primary is observed. On a flip it bumps the epoch,
+  promotes the observed node to `PRIMARY`, demotes the prior primary to
+  `DEMOTED` (fenced; no traffic) and sets `config.role` so future
+  `rebuild_indices()` calls place servers in the correct index arrays.
+- **Routing gates.** `route_internal_ex()` now hard-rejects any decision
+  with `KEEL_ROUTE_REASON_OLD_PRIMARY_FENCED` (factor `KEEL_DF_NODE_FENCED`)
+  when the candidate node is `DEMOTED`, and with
+  `KEEL_ROUTE_REASON_DEGRADED_MODE` (factor `KEEL_DF_DEGRADED_MODE`) when
+  the router is in degraded mode and no eligible RW node exists. The
+  timeline-mismatch gate (RYW with no caught-up replica) now hard-rejects
+  only when `stale_read_policy == KEEL_STALE_READ_REJECT`; otherwise it
+  falls through to the existing `ROUTE_PRIMARY` fallback.
+- **`stale_read_policy = wait` documented as reserved.** The reactor-owned
+  catch-up loop is not implemented in this build; `keel_router_create()`
+  logs a WARN and degrades `WAIT` → `ROUTE_PRIMARY`. Operators wanting
+  fail-closed behavior should set `stale_read_policy = reject`.
+- **MySQL GTID startup probe.** `src/probe/probe_mysql.c` issues
+  `SELECT @@gtid_mode, @@enforce_gtid_consistency` on the first successful
+  authenticated probe per backend and emits a one-shot WARN (deduped per
+  `host:port` per process via a 32-slot table) if GTID is disabled or not
+  enforced. Probe results continue to flow normally; the warning is
+  visibility-only.
+- **`[failover]` per-worker-group config.** New keys parsed in
+  [src/main/main.c](src/main/main.c):
+  `failover_provider` (`native|patroni|maxscale`),
+  `failover_detection_interval`, `failover_failure_threshold`,
+  `failover_promotion_grace`, `failover_old_primary_fencing_required`
+  (default `true`), `failover_allow_ambiguous_write_retry` (default
+  `false`), `failover_read_during_failover` (`reject|degraded|stale_ok`,
+  default `degraded`), `failover_transaction_during_failover`
+  (`fail|hold|continue`, default `fail`).
+- **Tests.** New unit suite [tests/test_failover_manager.c](tests/test_failover_manager.c)
+  (10 tests) covers epoch monotonicity, primary-flip fencing, degraded-mode
+  rejection, role-state transitions, and the WAIT-policy degradation. New
+  Docker-backed integration test
+  [tests/integration/test-mysql-gtid-failover.sh](tests/integration/test-mysql-gtid-failover.sh)
+  exercises end-to-end failover against a real MySQL primary + 2 replicas
+  with GTID catch-up assertion (not registered with ctest; run manually or
+  in CI when Docker is available).
+
+### Migration — Failover
+
+- **Operators with `stale_read_policy = wait` in INI:** routing will log a
+  WARN at startup and degrade to `route_primary` until the reactor-owned
+  WAIT path lands. Set `stale_read_policy = reject` if you need
+  fail-closed RYW.
+- **Operators parsing routing JSON:** two new `reason_code` values
+  (`OLD_PRIMARY_FENCED`, `DEGRADED_MODE`) and two new `factors` entries
+  (`NODE_FENCED`, `DEGRADED_MODE`) may appear in route-explain output.
+
 ### Changed — Route-decision explainer, conservative function policy, commit-in-doubt gate
 
 These changes lay the groundwork for per-query route explainability and

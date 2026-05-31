@@ -87,7 +87,7 @@ prepared_statement = virtualize
 **Intelligent routing with observability:**
 ```ini
 [worker-group:main]
-mode = smart   # hardening tier for v0.2-alpha
+mode = smart   # hardening tier
 query_log = all
 ```
 
@@ -201,8 +201,8 @@ backend with zero pooling sophistication.
                                        SMART               FULL
 ```
 
-**When in doubt, start with `pool`.** For `v0.2-alpha`, that is the recommended
-production tier. Move to `smart` or `full` only after you have validated the
+**When in doubt, start with `pool`.** That is the recommended production tier.
+Move to `smart` or `full` only after you have validated the
 higher-tier behavior you need in your environment.
 
 ---

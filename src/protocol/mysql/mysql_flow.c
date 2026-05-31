@@ -2770,12 +2770,17 @@ static int myf_get_stmt_replay(void*     vctx,
                                 uint32_t* stmt_count_out,
                                 uint64_t* hash_out) {
     my_flow_ctx_t* ctx = vctx;
-    *replay_buf_out = NULL;
-    *replay_len_out = 0;
-    *stmt_count_out = 0;
-    *hash_out = ctx ? ctx->session_stmt_hash : 0;
+    /* Support hash-only probe: callers (e.g. pool_wait_resume_cb in
+     * src/worker/worker.c) may pass NULL for buf/len/count when they
+     * only need the session_stmt_hash for backend selection. Matches the
+     * PG implementation's contract (see pgf_get_stmt_replay). */
+    if (replay_buf_out)  *replay_buf_out  = NULL;
+    if (replay_len_out)  *replay_len_out  = 0;
+    if (stmt_count_out)  *stmt_count_out  = 0;
+    if (hash_out)        *hash_out        = ctx ? ctx->session_stmt_hash : 0;
 
     if (!ctx || ctx->stmt_active_count == 0) return 0;
+    if (!replay_buf_out) return 0;  /* hash-only probe — done */
 
     /* First pass: measure total buffer size */
     size_t   total_size = 0;
