@@ -2762,6 +2762,12 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                    !pg_stmt_is_temp_context_change(ctx, sql, sl, qtype)) {
             ctx->stmt_schema_epoch++;
             ctx->stmt_semantic_unknown = false;
+            /* The DDL may have been issued via Parse(name,...)+Bind+Execute,
+             * leaving an orphan named PS on the backend that KEEL no longer
+             * tracks after clear_all.  Flag the backend dirty so release
+             * forces DISCARD ALL. */
+            if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                ctx->stmt_backend_dirty_orphan_ps = true;
             pg_stmt_clear_all(ctx);
             act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
             pg_stmt_restamp_context(ctx);
@@ -2772,6 +2778,12 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                     pg_sql_contains_word_ci(sql, sl, "plans"))) {
             ctx->stmt_schema_epoch++;
             ctx->stmt_semantic_unknown = false;
+            /* DISCARD PLANS does not deallocate named PS — mark orphan.
+             * DISCARD ALL does deallocate — no orphan flag needed. */
+            if (pg_sql_contains_word_ci(sql, sl, "plans") &&
+                !pg_sql_contains_word_ci(sql, sl, "all") &&
+                (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0))
+                ctx->stmt_backend_dirty_orphan_ps = true;
             pg_stmt_clear_all(ctx);
             act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
             /* DISCARD ALL resets all GUC settings and role back to session
@@ -3422,6 +3434,12 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                            !pg_stmt_is_temp_context_change(ctx, csql, csl, cqt)) {
                     ctx->stmt_schema_epoch++;
                     ctx->stmt_semantic_unknown = false;
+                    /* Extended-protocol DDL via named Parse leaves an orphan
+                     * named PS on the backend (KEEL forgets the name after
+                     * clear_all but PG still has it).  Flag so release forces
+                     * DISCARD ALL. */
+                    if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                        ctx->stmt_backend_dirty_orphan_ps = true;
                     pg_stmt_clear_all(ctx);
                     pg_stmt_restamp_context(ctx);
                 } else if ((cqt == KEEL_QUERY_DISCARD ||
@@ -3431,6 +3449,10 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                             pg_sql_contains_word_ci(csql, csl, "plans"))) {
                     ctx->stmt_schema_epoch++;
                     ctx->stmt_semantic_unknown = false;
+                    if (pg_sql_contains_word_ci(csql, csl, "plans") &&
+                        !pg_sql_contains_word_ci(csql, csl, "all") &&
+                        (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0))
+                        ctx->stmt_backend_dirty_orphan_ps = true;
                     pg_stmt_clear_all(ctx);
                     if (pg_sql_contains_word_ci(csql, csl, "all")) {
                         pg_stmt_guc_change_t reset_all = {
@@ -5092,6 +5114,14 @@ static int pgf_get_stmt_compat_profile(void* vctx,
     out->search_path_hash = ctx->stmt_search_path_hash;
     out->guc_hash = ctx->stmt_guc_hash;
     out->semantic_unknown = ctx->stmt_semantic_unknown;
+    /* One-shot orphan flag: a prior DDL or DISCARD PLANS cleared KEEL's
+     * stmt cache but left named prepared statements alive on the backend.
+     * Force semantic_unknown so the release path issues DISCARD ALL.  The
+     * flag is consumed here; after the release the new backend is clean. */
+    if (ctx->stmt_backend_dirty_orphan_ps) {
+        out->semantic_unknown = true;
+        ctx->stmt_backend_dirty_orphan_ps = false;
+    }
     return 0;
 }
 

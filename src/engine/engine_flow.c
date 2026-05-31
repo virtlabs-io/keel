@@ -5678,6 +5678,19 @@ fe_forward_done: ;
                     if (be->stmt_set_hash != 0) {
                         be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     }
+                    /* The session may have just executed a DDL or DISCARD
+                     * PLANS via named Parse that left orphan PS on the
+                     * backend; the protocol adapter signals this via the
+                     * stmt_compat_profile's semantic_unknown flag (one-shot,
+                     * consumed by this call). */
+                    if (flow->get_stmt_compat_profile) {
+                        keel_stmt_compat_profile_t orphan_check;
+                        memset(&orphan_check, 0, sizeof(orphan_check));
+                        if (flow->get_stmt_compat_profile(sf->ctx, &orphan_check) == 0 &&
+                            orphan_check.semantic_unknown) {
+                            be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                        }
+                    }
                     be->stmt_set_hash = 0;
                     memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }

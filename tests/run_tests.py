@@ -912,6 +912,7 @@ INTEGRATION_SCRIPTS = [
     "test-mysql-mariadb.sh",
     "test-mysql-pxc.sh",
     "test_rw_split.sh",
+    "test_pg_jdbc_prepared.sh",
 ]
 
 # Per-script timeout overrides (seconds).  Scripts not listed here use the
