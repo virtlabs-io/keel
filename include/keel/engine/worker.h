@@ -248,6 +248,18 @@ typedef struct keel_worker {
         uint64_t        rr_read_counter;
         uint64_t        rr_write_counter;
         uint64_t        rr_any_counter;
+        /* stale_read_policy=wait observability (Patch 2d-4):
+         *   wait_catchup_consulted_total      — router was consulted on a
+         *                                       token-bearing replica-eligible read
+         *   wait_catchup_degraded_to_primary  — router said WAIT_CATCHUP but
+         *                                       the engine could not async-park
+         *                                       in this build, so the read was
+         *                                       degraded to the primary. v0.5-alpha
+         *                                       limitation; v0.5-beta will replace
+         *                                       this with `keel_engine_consult_catchup`
+         *                                       + a resume continuation. */
+        uint64_t        wait_catchup_consulted_total;
+        uint64_t        wait_catchup_degraded_to_primary;
     } stats;
     
     /* Backend configuration (from engine config) */

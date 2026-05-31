@@ -675,6 +675,22 @@ target_link_options(test_engine_catchup_bridge PRIVATE ${TEST_COVERAGE_LINK_FLAG
 add_test(NAME test_engine_catchup_bridge COMMAND test_engine_catchup_bridge)
 set_tests_properties(test_engine_catchup_bridge PROPERTIES LABELS "engine;catchup")
 
+# Engine catchup-consult helper (Patch 2d-4): wait-catchup verdict the engine
+# hot path consults before READ-pool selection.
+add_executable(test_engine_catchup_consult test_engine_catchup_consult.c)
+target_link_libraries(test_engine_catchup_consult PRIVATE
+    keel_engine_flow
+    keelcore
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_engine_catchup_consult PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_engine_catchup_consult COMMAND test_engine_catchup_consult)
+set_tests_properties(test_engine_catchup_consult PROPERTIES LABELS "engine;catchup")
+
 # Failover-manager tests (cluster epoch, fencing, degraded mode, timeline)
 add_executable(test_failover_manager test_failover_manager.c)
 target_link_libraries(test_failover_manager PRIVATE

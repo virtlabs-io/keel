@@ -43,6 +43,7 @@
 #include "keel/mem/mem.h"
 #include "keel/protocol/tls_context.h"
 #include "keel/core/router.h"          /* keel_router_dispatch_sql() */
+#include "keel/engine/catchup_consult.h" /* Patch 2d-4 wait-catchup verdict */
 #include "keel/core/query_cache.h"     /* keel_query_cache_get/put/digest */
 #include "engine_scatter.h"            /* keel_engine_scatter_execute() */
 
@@ -2724,6 +2725,69 @@ copy_scan_done:
                     }
                     /* KEEL_ERR_NOT_SUPPORTED with reject_reason==NONE:
                      * no shard rule matched — use existing routing. */
+                }
+
+                /* === Patch 2d-4: stale_read_policy=wait consultation ===
+                 *
+                 * If the deployment carries a router with
+                 *   consistency_mode  = read_your_writes
+                 *   stale_read_policy = wait
+                 * AND this is a replica-eligible read AND the session has
+                 * captured a consistency token (LSN/GTID) from a prior write,
+                 * consult the router to see whether it would emit
+                 * KEEL_ROUTE_REASON_WAIT_CATCHUP for this query.
+                 *
+                 * v0.5-alpha SCOPE: when the router says "WAIT", we cannot
+                 * yet async-park + re-dispatch the session (the resume
+                 * continuation lands in v0.5-beta — see
+                 * `keel_engine_consult_catchup` in catchup_bridge.h, which
+                 * has the enqueue path wired). So for now we degrade to the
+                 * primary, log it, and bump a counter so operators can see
+                 * how often the policy degrades. This is strictly safer than
+                 * the alternative (serving a stale read from a behind
+                 * replica) and gives operators a measurable signal to size
+                 * the eventual park-and-re-dispatch budget. */
+                if (route == KEEL_FROUTE_READ &&
+                    worker->router != NULL &&
+                    sf->last_write_token.value[0] != '\0' &&
+                    act.sql_view != NULL &&
+                    act.sql_view_len > 0) {
+
+                    /* Parse the SQL just enough for the router to confirm
+                     * "replica-safe read"; 64KiB arena matches the bridge
+                     * unit test budget (smaller arenas overflow on real
+                     * production SQL). */
+                    keel_arena_t* _wc_arena = keel_arena_create(65536);
+                    if (_wc_arena) {
+                        keel_str_t _wc_sql = {
+                            .data = act.sql_view,
+                            .len  = act.sql_view_len,
+                        };
+                        const keel_qt_query_t* _wc_qt =
+                            keel_sql_analyze_full(_wc_sql, _wc_arena);
+
+                        keel_route_decision_t rd;
+                        memset(&rd, 0, sizeof(rd));
+                        worker->stats.wait_catchup_consulted_total++;
+                        if (keel_engine_should_degrade_to_primary_on_wait(
+                                worker->router,
+                                _wc_qt,
+                                &sf->last_write_token,
+                                session->in_transaction,
+                                &rd)) {
+                            worker->stats.wait_catchup_degraded_to_primary++;
+                            KEEL_LOG_INFO(KEEL_LOG_CAT_CONN,
+                                "W%u: session %lu: stale_read_policy=wait "
+                                "(WAIT_CATCHUP) degraded to primary in v0.5-alpha "
+                                "(token=%.*s tl=%u replica_idx=%zu max_wait_ms=%u)",
+                                worker->id, (unsigned long)session->id,
+                                (int)sizeof(rd.wait_token.value), rd.wait_token.value,
+                                rd.wait_token.timeline_id,
+                                rd.wait_server_index, rd.wait_max_ms);
+                            route = KEEL_FROUTE_WRITE;
+                        }
+                        keel_arena_destroy(_wc_arena);
+                    }
                 }
 
                 switch (route) {
