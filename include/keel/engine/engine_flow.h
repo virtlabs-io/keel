@@ -46,6 +46,7 @@ typedef enum keel_flow_result {
     KEEL_FLOW_LINKED_FE_RESPONSE,/**< io_uring linked send(FE)+recv(FE) — deferred response + rearm */
     KEEL_FLOW_WAIT_STMT_REPLAY,  /**< Replaying prepared stmts to new backend before forwarding client msg */
     KEEL_FLOW_WAIT_COMMIT_CHECK, /**< Replication-tracking: checking txid_status() on new primary */
+    KEEL_FLOW_WAIT_CATCHUP,      /**< Session parked in worker catch-up wait list until replica reaches required LSN/GTID token (see keel/engine/catchup.h). */
     KEEL_FLOW_SPLICE_BYPASS,     /**< Zero-copy: worker should peek+splice BE→FE until non-DataRow */
     KEEL_FLOW_WAIT_AUTH,         /**< Auth offloaded to thread — reactor must arm auth_notify_fd */
     KEEL_FLOW_CLOSED,            /**< Session closed — don't touch session anymore */

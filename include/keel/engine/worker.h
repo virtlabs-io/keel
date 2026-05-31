@@ -39,6 +39,7 @@
 #include "keel/reactor/reactor.h"
 #include "keel/mem/mem.h"
 #include "keel/engine/migration.h"
+#include "keel/engine/catchup.h"
 #include "keel/core/query_cache.h"
 #include "keel/core/auth.h"
 
@@ -276,6 +277,13 @@ typedef struct keel_worker {
 
     /* Connection rebalance timer (for automatic load-based migration) */
     keel_timer_entry_t   rebalance_timer;
+
+    /* Reactor-owned replica catch-up wait list (Phase 2). Owned by this
+     * worker; touched only from this thread's reactor and timer ticks.
+     * NULL until keel_worker_init() succeeds; remains NULL when the
+     * feature is disabled. */
+    keel_catchup_manager_t* catchup;
+    keel_timer_entry_t      catchup_tick_timer;
 
     /* Configurable operational parameters (propagated from keel_engine_config_t
      * at worker init; stored here so hot-path code never touches the config). */

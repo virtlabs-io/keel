@@ -378,6 +378,22 @@ typedef struct keel_stats_basic {
     keel_counter_t   flow_wait_backend_discard_events;  /**< WAIT_STMT_REPLAY entered for DISCARD ALL drain */
     keel_counter_t   flow_wait_backend_discard_ns_total;/**< WAIT_STMT_REPLAY discard nanoseconds until first backend byte */
 
+    /* -- Catch-up wait (Phase 2 reactor-owned WAIT loop) --
+     * One waiter == one session parked in keel_catchup_manager_t pending a
+     * replica reaching its required LSN/GTID token. */
+    keel_counter_t   catchup_waiters_enqueued;          /**< Sessions enqueued in the catch-up wait list */
+    keel_counter_t   catchup_waiters_fulfilled;         /**< Waiters released because target replica reached token */
+    keel_counter_t   catchup_waiters_timeout;           /**< Waiters released because max_replica_catchup_ms elapsed */
+    keel_counter_t   catchup_waiters_cancelled;         /**< Waiters released because session/connection closed */
+    keel_counter_t   catchup_wait_ns_total;             /**< Total nanoseconds sessions spent parked in WAIT_CATCHUP */
+    keel_counter_t   catchup_probes_issued;             /**< Replica catch-up probes sent (cache misses only) */
+    keel_counter_t   catchup_probes_succeeded;          /**< Probes that returned "reached" */
+    keel_counter_t   catchup_probes_negative;           /**< Probes that returned "not yet reached" */
+    keel_counter_t   catchup_probes_failed;             /**< Probes that errored (I/O, timeout, parse) */
+    keel_counter_t   catchup_cache_hits;                /**< Decisions resolved by the probe-result cache */
+    keel_counter_t   catchup_probe_reconnects;          /**< Probe sockets reopened after error/EOF */
+    keel_counter_t   catchup_probe_backoff_skips;       /**< Probe attempts skipped because socket is in backoff */
+
     /* -- Pool queue diagnostics -- */
     keel_counter_t   pool_wait_queue_enqueued;      /**< Sessions enqueued waiting for backend */
     keel_counter_t   pool_wait_queue_full_rejects;  /**< Enqueue attempts rejected due to full queue */

@@ -622,6 +622,7 @@ void keel_session_slab_destroy(keel_session_slab_t* slab)
 static void pool_prune_timer_cb(void* userdata);
 static void pool_refill_timer_cb(void* userdata);
 static void rebalance_timer_cb(void* userdata);
+static void catchup_tick_timer_cb(void* userdata);
 static void on_accept_complete(void* userdata, int result);
 
 /**
@@ -752,6 +753,24 @@ static void* worker_thread_func(void* arg)
         keel_timer_wheel_add(&worker->timers, &worker->rebalance_timer,
                             rcfg->rebalance_interval_ms,
                             worker, rebalance_timer_cb);
+    }
+
+    /* Reactor-owned replica catch-up wait list (Phase 2). The manager is
+     * always created so unit tests and admin introspection have a stable
+     * handle; whether any waiter is ever enqueued depends on the router's
+     * `stale_read_policy` (see src/core/router_weighted.c). */
+    if (!worker->catchup) {
+        worker->catchup = keel_catchup_manager_create(worker, NULL);
+        if (!worker->catchup) {
+            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+                "W%u: catch-up manager allocation failed; stale_read_policy=wait will not function",
+                worker->id);
+        } else {
+            memset(&worker->catchup_tick_timer, 0, sizeof(worker->catchup_tick_timer));
+            keel_timer_wheel_add(&worker->timers, &worker->catchup_tick_timer,
+                                 5 /* ms — matches KEEL_CATCHUP_CONFIG_DEFAULT.tick_interval_ms */,
+                                 worker, catchup_tick_timer_cb);
+        }
     }
     
     /* Main event loop */
@@ -2431,6 +2450,22 @@ rearm:
                         ? cfg->rebalance_interval_ms : 5000;
     keel_timer_wheel_add(&worker->timers, &worker->rebalance_timer,
                         interval, worker, rebalance_timer_cb);
+}
+
+/* ----------------------------------------------------------------------------
+ * Catch-up tick (Phase 2 reactor-owned WAIT loop)
+ * --------------------------------------------------------------------------*/
+static void catchup_tick_timer_cb(void* userdata)
+{
+    keel_worker_t* worker = (keel_worker_t*)userdata;
+    if (worker->catchup) {
+        keel_catchup_manager_tick(worker->catchup, get_time_ns());
+    }
+    /* Re-arm. 5 ms matches KEEL_CATCHUP_CONFIG_DEFAULT.tick_interval_ms.
+     * Once the manager exposes its configured interval we'll read it from
+     * there instead of hard-coding here. */
+    keel_timer_wheel_add(&worker->timers, &worker->catchup_tick_timer,
+                         5, worker, catchup_tick_timer_cb);
 }
 
 /* ============================================================================
@@ -4524,7 +4559,13 @@ void keel_worker_cleanup(keel_worker_t* worker)
     keel_session_slab_destroy(&worker->sessions);
     keel_pipe_pool_destroy(&worker->pipes);
     keel_reactor_destroy(worker->reactor);
-    
+
+    /* Destroy catch-up manager (cancels any parked waiters first). */
+    if (worker->catchup) {
+        keel_catchup_manager_destroy(worker->catchup);
+        worker->catchup = NULL;
+    }
+
     /* Destroy migration channel */
     keel_migration_destroy(&worker->migration);
 

@@ -408,6 +408,18 @@ target_link_libraries(test_router_timeout PRIVATE
 target_link_options(test_router_timeout PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router_timeout COMMAND test_router_timeout)
 
+# Catch-up wait list (Phase 2a — reactor-owned WAIT loop scaffolding)
+add_executable(test_catchup_waitlist test_catchup_waitlist.c)
+target_link_libraries(test_catchup_waitlist PRIVATE
+    test_utils
+    keel_worker_new
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_waitlist PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_waitlist COMMAND test_catchup_waitlist)
+
 # Stress / fuzz tests for router dispatch and connpool (Tier 6 / Feature 15+)
 add_executable(test_router_stress test_router_stress.c)
 target_link_libraries(test_router_stress PRIVATE
