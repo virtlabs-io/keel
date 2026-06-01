@@ -1449,6 +1449,35 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
         sf->flush_in_flight = true;
     }
 
+    /* Invariant (Bug B catch): if the session has named prepared statements
+     * pinned and we are about to forward a bare Bind ('B') to a backend whose
+     * stmt_set_hash is zero (definitively no named statements present), then
+     * the replay block above failed to fire.  PG will reject with "prepared
+     * statement does not exist" and KEEL will silently deadlock.  Convert
+     * this into a loud, recoverable session abort instead. */
+    if ((sf->pins & KEEL_FPIN_PREPARED_STMT) &&
+        be_conn->stmt_set_hash == 0 &&
+        pending_len > 0 && pending_data[0] == 'B') {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_POOL,
+            "W%u: INVARIANT (Bug B): session %lu has PREPARED_STMT pin but "
+            "backend fd=%d has stmt_set_hash=0; refusing to forward bare Bind "
+            "(pending_len=%zu) — would cause silent deadlock. Aborting session.",
+            worker->id, (unsigned long)session->id,
+            session->server_fd, pending_len);
+        static const uint8_t ps_missing_err[] = {
+            'E',
+            0,0,0,51,
+            'S','F','A','T','A','L',0,
+            'V','F','A','T','A','L',0,
+            'C','0','8','0','0','6',0,
+            'M','K','E','E','L',':',' ','P','S',' ','r','e','p','l','a','y',
+            ' ','m','i','s','s','i','n','g',0,
+            0
+        };
+        keel_try_send_nb(session->client_fd, ps_missing_err, sizeof(ps_missing_err));
+        return KEEL_FLOW_CLOSED;
+    }
+
     /* Forward the pending message to backend (non-blocking) */
     ssize_t s = keel_try_send_nb(session->server_fd, pending_data, pending_len);
     if (s < 0) {
