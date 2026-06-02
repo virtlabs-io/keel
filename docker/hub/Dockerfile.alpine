@@ -112,6 +112,8 @@ RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
         # Wire-protocol compression
         zlib \
         zstd-libs \
+        # YAML config parser
+        yaml \
         # Lua 5.4 hook runtime
         lua5.4 \
         # Python 3 hook runtime
