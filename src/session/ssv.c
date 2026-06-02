@@ -97,16 +97,20 @@ bool keel_ssv_is_stmt_only_pin(
 }
 
 /**
- * @brief Decide whether recent-write consistency still forces primary routing.
+ * @brief Decide whether consistency state still forces primary routing.
  */
 bool keel_ssv_requires_primary(
     const keel_ssv_atom_t atoms[KEEL_SSV_CK__COUNT],
     uint64_t now_ns,
     uint32_t ttl_ms)
 {
-    return keel_ssv_consistency_has_write_lsn(atoms) &&
-           !keel_ssv_consistency_ttl_ok(atoms, now_ns,
-                                        ttl_ms ? ttl_ms : KEEL_STICKY_PRIMARY_TTL_MS);
+    (void)now_ns;
+    (void)ttl_ms;
+
+    /* A populated token means the session has an exact LSN/GTID obligation.
+     * Until a reactor-owned replica catch-up check can prove a candidate has
+     * reached it, the safe v0.5-alpha policy is primary fallback. */
+    return keel_ssv_consistency_has_write_lsn(atoms);
 }
 
 /**

@@ -622,6 +622,7 @@ void keel_session_slab_destroy(keel_session_slab_t* slab)
 static void pool_prune_timer_cb(void* userdata);
 static void pool_refill_timer_cb(void* userdata);
 static void rebalance_timer_cb(void* userdata);
+static void catchup_tick_timer_cb(void* userdata);
 static void on_accept_complete(void* userdata, int result);
 
 /**
@@ -752,6 +753,24 @@ static void* worker_thread_func(void* arg)
         keel_timer_wheel_add(&worker->timers, &worker->rebalance_timer,
                             rcfg->rebalance_interval_ms,
                             worker, rebalance_timer_cb);
+    }
+
+    /* Reactor-owned replica catch-up wait list (Phase 2). The manager is
+     * always created so unit tests and admin introspection have a stable
+     * handle; whether any waiter is ever enqueued depends on the router's
+     * `stale_read_policy` (see src/core/router_weighted.c). */
+    if (!worker->catchup) {
+        worker->catchup = keel_catchup_manager_create(worker, NULL);
+        if (!worker->catchup) {
+            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+                "W%u: catch-up manager allocation failed; stale_read_policy=wait will not function",
+                worker->id);
+        } else {
+            memset(&worker->catchup_tick_timer, 0, sizeof(worker->catchup_tick_timer));
+            keel_timer_wheel_add(&worker->timers, &worker->catchup_tick_timer,
+                                 5 /* ms — matches KEEL_CATCHUP_CONFIG_DEFAULT.tick_interval_ms */,
+                                 worker, catchup_tick_timer_cb);
+        }
     }
     
     /* Main event loop */
@@ -1714,6 +1733,66 @@ static void backend_cleanup_and_return(keel_worker_t*        worker,
         KEEL_STAT_INC(worker->stats_ctx, pool_returns);
 }
 
+static bool prepare_backend_stmt_state_for_close_return(keel_session_flow_t* flow,
+                                                        backend_conn_t* be_conn)
+{
+    if (!flow || !be_conn)
+        return false;
+
+    const keel_proto_flow_vtable_t* vt = flow->flow;
+    if (!(flow->pins & KEEL_FPIN_PREPARED_STMT)) {
+        if (be_conn->stmt_set_hash != 0) {
+            be_conn->current_state_hash = UINT64_MAX;
+            be_conn->stmt_set_hash = 0;
+            memset(&be_conn->stmt_profile, 0, sizeof(be_conn->stmt_profile));
+        }
+        return true;
+    }
+
+    if (flow->ps_mode == KEEL_PS_MODE_ANONYMOUS) {
+        if (be_conn->stmt_set_hash != 0)
+            be_conn->current_state_hash = UINT64_MAX;
+        be_conn->stmt_set_hash = 0;
+        memset(&be_conn->stmt_profile, 0, sizeof(be_conn->stmt_profile));
+        return true;
+    }
+
+    if (flow->ps_mode == KEEL_PS_MODE_PINNING ||
+        flow->ps_mode == KEEL_PS_MODE_OFF ||
+        !vt || !vt->get_stmt_replay) {
+        return false;
+    }
+
+    keel_stmt_compat_profile_t stmt_profile;
+    memset(&stmt_profile, 0, sizeof(stmt_profile));
+
+    bool have_stmt_profile = false;
+    if (vt->get_stmt_compat_profile &&
+        vt->get_stmt_compat_profile(flow->ctx, &stmt_profile) == 0) {
+        have_stmt_profile = true;
+    }
+
+    vt->get_stmt_replay(flow->ctx, NULL, NULL, NULL,
+                        &stmt_profile.stmt_set_hash);
+
+    if (stmt_profile.stmt_set_hash == 0)
+        return false;
+
+    if (!have_stmt_profile)
+        stmt_profile.semantic_unknown = true;
+
+    if (stmt_profile.semantic_unknown) {
+        be_conn->stmt_set_hash = 0;
+        memset(&be_conn->stmt_profile, 0, sizeof(be_conn->stmt_profile));
+        be_conn->current_state_hash = UINT64_MAX;
+        return true;
+    }
+
+    be_conn->stmt_set_hash = stmt_profile.stmt_set_hash;
+    be_conn->stmt_profile = stmt_profile;
+    return true;
+}
+
 /* ============================================================================
  * Client Recv Callback
  * ============================================================================ */
@@ -1786,10 +1865,11 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
         return;
     }
 
-    /* No pending backend operation - can safely clean up now */
+    /* No pending backend operation - can safely clean up now. Keep the flow
+     * context alive until backend release below; prepared-statement
+     * virtualization needs it to stamp pooled backend state correctly. */
     if (recv_ctx) {
         keel_timer_wheel_cancel(&worker->timers, &recv_ctx->idle_timer);
-        keel_session_flow_destroy(&recv_ctx->flow);
     }
 
     if (session->client_fd >= 0) {
@@ -1823,6 +1903,11 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
                           !be_conn->in_transaction &&
                           !be_conn->hard_pinned &&
                           atomic_load(&be_conn->state) == BACKEND_CONN_ACTIVE;
+
+        if (can_return && recv_ctx) {
+            can_return = prepare_backend_stmt_state_for_close_return(
+                &recv_ctx->flow, be_conn);
+        }
         
         if (can_return && be_conn->pool) {
             /* Safe to return — backend is idle after last query completed */
@@ -1863,6 +1948,8 @@ static void close_session(keel_worker_t* worker, keel_session_t* session,
         session->server_fd = -1;
     }
 backend_release_done:
+    if (recv_ctx)
+        keel_session_flow_destroy(&recv_ctx->flow);
     
     /* plugin_state borrow is cleared; the flow vtable owns the context and
      * frees it in keel_session_flow_destroy() called above or below. */
@@ -2431,6 +2518,22 @@ rearm:
                         ? cfg->rebalance_interval_ms : 5000;
     keel_timer_wheel_add(&worker->timers, &worker->rebalance_timer,
                         interval, worker, rebalance_timer_cb);
+}
+
+/* ----------------------------------------------------------------------------
+ * Catch-up tick (Phase 2 reactor-owned WAIT loop)
+ * --------------------------------------------------------------------------*/
+static void catchup_tick_timer_cb(void* userdata)
+{
+    keel_worker_t* worker = (keel_worker_t*)userdata;
+    if (worker->catchup) {
+        keel_catchup_manager_tick(worker->catchup, get_time_ns());
+    }
+    /* Re-arm. 5 ms matches KEEL_CATCHUP_CONFIG_DEFAULT.tick_interval_ms.
+     * Once the manager exposes its configured interval we'll read it from
+     * there instead of hard-coding here. */
+    keel_timer_wheel_add(&worker->timers, &worker->catchup_tick_timer,
+                         5, worker, catchup_tick_timer_cb);
 }
 
 /* ============================================================================
@@ -4524,7 +4627,13 @@ void keel_worker_cleanup(keel_worker_t* worker)
     keel_session_slab_destroy(&worker->sessions);
     keel_pipe_pool_destroy(&worker->pipes);
     keel_reactor_destroy(worker->reactor);
-    
+
+    /* Destroy catch-up manager (cancels any parked waiters first). */
+    if (worker->catchup) {
+        keel_catchup_manager_destroy(worker->catchup);
+        worker->catchup = NULL;
+    }
+
     /* Destroy migration channel */
     keel_migration_destroy(&worker->migration);
 

@@ -89,13 +89,14 @@ bool keel_ssv_is_stmt_only_pin(
 /**
  * @brief Check whether this session's consistency atoms require primary routing.
  *
- * Returns true if the session has a recent write LSN whose TTL has not expired,
- * meaning the borrow path should acquire a PRIMARY connection — not a replica.
- * This is the consistency-aware complement to sticky-primary time checks.
+ * Returns true if the session carries a write-position token that has not been
+ * proven satisfied by a replica.  v0.5-alpha uses conservative primary fallback:
+ * a real LSN/GTID token does not expire by wall-clock time alone because lag can
+ * outlive any configured sticky window.
  *
  * @param atoms  The session's consistency_atoms[3] array.
  * @param now_ns Current monotonic timestamp (nanoseconds).
- * @param ttl_ms Sticky-primary TTL (milliseconds); 0 = use default.
+ * @param ttl_ms Reserved for legacy timestamp-only sticky-primary callers.
  * @return true if primary routing is required for read-after-write safety.
  */
 bool keel_ssv_requires_primary(

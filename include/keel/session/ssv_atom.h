@@ -199,6 +199,19 @@ static inline void keel_ssv_consistency_set_token(
 }
 
 /**
+ * @brief Store only the write timestamp for sticky-primary fallback.
+ *
+ * Used when a write has completed far enough to require read-your-writes
+ * protection, but no exact LSN/GTID token has been captured yet.
+ */
+static inline void keel_ssv_consistency_set_write_ts(
+    keel_ssv_atom_t atoms[KEEL_SSV_CK__COUNT],
+    uint64_t captured_at_ns)
+{
+    atoms[KEEL_SSV_CK_WRITE_LSN_TS].value.u64 = captured_at_ns;
+}
+
+/**
  * @brief Read the LSN string from the consistency atom.
  *
  * @param atoms Consistency atom array.
@@ -358,24 +371,24 @@ static inline void keel_ssv_config_clear(keel_ssv_atom_t atoms[KEEL_SSV_CFG__COU
  * @brief Check if a candidate replica satisfies the session's LSN requirement,
  *        using the sticky-primary TTL as a time-based fallback.
  *
- * Decision logic (zero-allocation, no I/O):
- *   1. No write recorded → replica is fine (return true).
- *   2. TTL expired → clear atoms, replica is fine (return true).
- *   3. TTL still active → caller must do a network check (return false).
+ * Decision logic for legacy timestamp-only sticky-primary callers
+ * (zero-allocation, no I/O):
+ *   1. No write timestamp recorded → replica is fine (return true).
+ *   2. TTL expired → timestamp-only fallback is no longer active (return true).
+ *   3. TTL still active → caller must keep using primary (return false).
  *
  * @param atoms           Consistency atom array.
  * @param now_ns          Current CLOCK_MONOTONIC_COARSE nanoseconds.
  * @param ttl_ms          Sticky-primary TTL in milliseconds (0 = use default 100ms).
- * @return true if the replica can be used without a position check.
+ * @return true if the sticky fallback window has expired. This does not prove
+ *         a token-bearing replica is caught up; use keel_ssv_requires_primary()
+ *         for the v0.5 conservative routing decision.
  */
 static inline bool keel_ssv_consistency_ttl_ok(
     const keel_ssv_atom_t atoms[KEEL_SSV_CK__COUNT],
     uint64_t now_ns,
     uint32_t ttl_ms)
 {
-    if (!keel_ssv_consistency_has_write_lsn(atoms))
-        return true;
-
     uint64_t ts = keel_ssv_consistency_get_ts(atoms);
     if (ts == 0)
         return true;

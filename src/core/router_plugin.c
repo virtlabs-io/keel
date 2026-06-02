@@ -888,12 +888,18 @@ static keel_error_t patroni_refresh_topology(
 
     /* Apply topology to the router: update health for known servers,
      * add newly discovered servers with the correct role. */
+    const keel_server_info_t* primary_srv = NULL;
     for (size_t i = 0; i < topo.server_count; i++) {
         const keel_server_info_t* srv = &topo.servers[i];
+        if (srv->is_primary && !primary_srv) {
+            primary_srv = srv;
+        }
 
         keel_route_server_t* existing = keel_router_get_server(router, srv->name);
         if (existing) {
             keel_router_set_server_health(router, srv->name, srv->health);
+            existing->role = srv->is_primary ? KEEL_SERVER_PRIMARY : KEEL_SERVER_REPLICA;
+            existing->timeline_id = (uint32_t)(srv->timeline > 0 ? srv->timeline : 0);
         } else {
             keel_route_server_t new_srv;
             memset(&new_srv, 0, sizeof(new_srv));
@@ -902,6 +908,7 @@ static keel_error_t patroni_refresh_topology(
             new_srv.port   = srv->port;
             new_srv.role   = srv->is_primary ? KEEL_SERVER_PRIMARY
                                              : KEEL_SERVER_REPLICA;
+            new_srv.timeline_id = (uint32_t)(srv->timeline > 0 ? srv->timeline : 0);
             new_srv.weight = 100;
             new_srv.health = srv->health;
             keel_error_t aerr = keel_router_add_server(router, &new_srv);
@@ -914,6 +921,17 @@ static keel_error_t patroni_refresh_topology(
     }
 
     keel_free(topo.servers);
+
+    /* Failover-manager: feed the primary observation through. If patroni
+     * reported a primary, observe_primary() will bump the epoch on flip
+     * and fence any previous primary. If no primary was reported, signal
+     * "lost" so the router enters degraded mode. */
+    if (primary_srv) {
+        keel_router_observe_primary(router, primary_srv->name,
+            (uint32_t)(primary_srv->timeline > 0 ? primary_srv->timeline : 0));
+    } else {
+        keel_router_observe_primary(router, NULL, 0);
+    }
     return KEEL_OK;
 }
 

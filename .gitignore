@@ -137,3 +137,10 @@ docs/full.md
 docs/all.md
 bench/bench_cloud_auth
 website/
+
+# Coverage artefacts (root-level gcov / lcov output)
+/*.gcov
+/coverage*.info
+/coverage*.css
+/coverage*.html
+/coverage-html/

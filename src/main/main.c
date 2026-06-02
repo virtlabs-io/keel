@@ -56,6 +56,7 @@
 #include "keel/core/cluster.h"
 #include "keel/core/config_reload.h"
 #include "keel/probe/probe.h"
+#include "keel/failover/failover_manager.h"
 #include "keel/mem/mem.h"
 #include "keel_error.h"
 #include "keel/core/ini.h"
@@ -93,6 +94,11 @@
 #include <sys/resource.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+/* execinfo.h is a GNU extension — absent on musl (Alpine). */
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#define KEEL_HAVE_EXECINFO 1
+#endif
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -950,6 +956,15 @@ static void crash_handler(int sig) {
     if (write(STDERR_FILENO, "FATAL: ", 7)) {}
     if (write(STDERR_FILENO, name, strlen(name))) {}
     if (write(STDERR_FILENO, " received — aborting\n", 21)) {}
+    /* Async-signal-safe backtrace: backtrace(3) itself is safe;
+     * backtrace_symbols_fd() is the safe (non-allocating) variant.
+     * Only available with glibc — musl (Alpine) has no execinfo.h. */
+#if defined(KEEL_HAVE_EXECINFO)
+    void* frames[64];
+    int   n = backtrace(frames, 64);
+    if (write(STDERR_FILENO, "backtrace:\n", 11)) {}
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+#endif
     /* Re-raise to get core dump */
     signal(sig, SIG_DFL);
     raise(sig);
@@ -1029,6 +1044,7 @@ typedef struct worker_group {
     int                 listen_fd;
     keel_engine_t*       engine;
     keel_probe_manager_t* probe_mgr;
+    keel_failover_manager_t* failover_mgr;
     keel_hook_registry_t* hook_registry;
 
     /* Prepared-statement pooling strategy */
@@ -1052,6 +1068,9 @@ typedef struct worker_group {
 
     /* Sticky-primary TTL (0 = disabled) */
     uint32_t             sticky_primary_ttl_ms; /**< ms to pin reads to primary after a write */
+
+    /* Failover-manager policy (proposal §3 — captured today, fencing wired later). */
+    keel_failover_config_t failover_cfg;
 
     /* Connection rebalancing */
     bool                 rebalance_enabled;
@@ -1821,6 +1840,7 @@ static void worker_group_defaults(worker_group_t* g) {
     g->listen_fd  = -1;
     g->engine     = NULL;
     g->probe_mgr  = NULL;
+    g->failover_mgr = NULL;
     g->ps_mode    = KEEL_PS_MODE_VIRTUALIZE;
     g->runtime_mode = KEEL_TIER_POOL;
     g->experimental_features = false;
@@ -1833,6 +1853,9 @@ static void worker_group_defaults(worker_group_t* g) {
     g->sharding_enabled = false;
     g->hooks_enabled = false;
     g->sticky_primary_ttl_ms = 100U;
+
+    /* Failover-manager policy (proposal §3) — capture operator intent now. */
+    g->failover_cfg = keel_failover_config_default();
     
     /* Initialize TLS configuration to disabled with safe defaults */
     memset(&g->tls_config, 0, sizeof(g->tls_config));
@@ -2364,6 +2387,10 @@ static void cleanup_startup_failure(keel_config_t* config, bool tls_initialized)
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         worker_group_t* wg = &g_groups[gi];
 
+        if (wg->failover_mgr) {
+            keel_failover_manager_destroy(wg->failover_mgr);
+            wg->failover_mgr = NULL;
+        }
         if (wg->probe_mgr) {
             keel_probe_manager_destroy(wg->probe_mgr);
             wg->probe_mgr = NULL;
@@ -3338,6 +3365,92 @@ int main(int argc, char** argv) {
                         int64_t spt = keel_config_get_duration_ms(config, section, "sticky_primary_ttl", -1);
                         if (spt >= 0)
                             wg->sticky_primary_ttl_ms = (uint32_t)spt;
+                    }
+
+                    /* Failover-manager policy knobs (proposal §3).
+                     * Parsed today so operator intent is captured in the
+                     * running config; fencing-aware behavior is delivered
+                     * with the failover-manager track. Defaults are the
+                     * conservative production baseline from the proposal. */
+                    {
+                        const char* p = keel_config_get_string(
+                            config, section, "failover_provider", NULL);
+                        if (p && *p) {
+                            if      (strcmp(p, "patroni") == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_PATRONI;
+                            else if (strcmp(p, "static")  == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_STATIC;
+                            else if (strcmp(p, "consul")  == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_CONSUL;
+                            else if (strcmp(p, "etcd")    == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_ETCD;
+                            else if (strcmp(p, "custom")  == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_CUSTOM;
+                            else if (strcmp(p, "none")    == 0) wg->failover_cfg.provider = KEEL_FAILOVER_PROVIDER_NONE;
+                            else KEEL_LOG_WARN(KEEL_LOG_CAT_CORE,
+                                "[%s] unknown failover_provider='%s' (keeping default)",
+                                wg->name, p);
+                        }
+
+                        v = keel_config_get_duration_ms(config, section,
+                                "failover_detection_interval",
+                                (int64_t)wg->failover_cfg.detection_interval_ms);
+                        if (v > 0) wg->failover_cfg.detection_interval_ms = (uint32_t)v;
+
+                        v = keel_config_get_int(config, section,
+                                "failover_failure_threshold",
+                                (int64_t)wg->failover_cfg.failure_threshold);
+                        if (v > 0) wg->failover_cfg.failure_threshold = (uint32_t)v;
+
+                        v = keel_config_get_duration_ms(config, section,
+                                "failover_promotion_grace",
+                                (int64_t)wg->failover_cfg.promotion_grace_ms);
+                        if (v >= 0) wg->failover_cfg.promotion_grace_ms = (uint32_t)v;
+
+                        wg->failover_cfg.old_primary_fencing_required =
+                            keel_config_get_bool(config, section,
+                                "failover_old_primary_fencing_required",
+                                wg->failover_cfg.old_primary_fencing_required);
+
+                        wg->failover_cfg.allow_ambiguous_write_retry =
+                            keel_config_get_bool(config, section,
+                                "failover_allow_ambiguous_write_retry",
+                                wg->failover_cfg.allow_ambiguous_write_retry);
+
+                        const char* rdf = keel_config_get_string(
+                            config, section, "failover_read_during_failover", NULL);
+                        if (rdf && *rdf) {
+                            if      (strcmp(rdf, "primary_only")              == 0) wg->failover_cfg.read_during_failover = KEEL_FAILOVER_READ_PRIMARY_ONLY;
+                            else if (strcmp(rdf, "reject")                    == 0) wg->failover_cfg.read_during_failover = KEEL_FAILOVER_READ_REJECT;
+                            else if (strcmp(rdf, "allow_caught_up_replicas") == 0) wg->failover_cfg.read_during_failover = KEEL_FAILOVER_READ_ALLOW_CAUGHT_UP_REPLICAS;
+                            else KEEL_LOG_WARN(KEEL_LOG_CAT_CORE,
+                                "[%s] unknown failover_read_during_failover='%s' (keeping default)",
+                                wg->name, rdf);
+                        }
+
+                        const char* tdf = keel_config_get_string(
+                            config, section, "failover_transaction_during_failover", NULL);
+                        if (tdf && *tdf) {
+                            if      (strcmp(tdf, "fail") == 0) wg->failover_cfg.transaction_during_failover = KEEL_FAILOVER_TXN_FAIL;
+                            else if (strcmp(tdf, "wait") == 0) wg->failover_cfg.transaction_during_failover = KEEL_FAILOVER_TXN_WAIT;
+                            else KEEL_LOG_WARN(KEEL_LOG_CAT_CORE,
+                                "[%s] unknown failover_transaction_during_failover='%s' (keeping default)",
+                                wg->name, tdf);
+                        }
+
+                        /* Loud safety log: ambiguous retry is dangerous.
+                         * If the operator enables it, surface a one-shot WARN
+                         * so it cannot be turned on by accident without a
+                         * paper trail in the log. */
+                        if (wg->failover_cfg.allow_ambiguous_write_retry) {
+                            KEEL_LOG_WARN(KEEL_LOG_CAT_CORE,
+                                "[%s] failover_allow_ambiguous_write_retry=on — "
+                                "writes may be retried after an ambiguous COMMIT; "
+                                "this can DUPLICATE rows on failover. "
+                                "See proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md",
+                                wg->name);
+                        }
+                        if (!wg->failover_cfg.old_primary_fencing_required) {
+                            KEEL_LOG_WARN(KEEL_LOG_CAT_CORE,
+                                "[%s] failover_old_primary_fencing_required=off — "
+                                "old primary may still accept writes after promotion; "
+                                "split-brain risk", wg->name);
+                        }
                     }
 
                     /* Connection rebalancing */
@@ -5257,6 +5370,10 @@ int main(int argc, char** argv) {
                  * dispatches are rejected with KEEL_ERR_NOT_SUPPORTED until
                  * the operator explicitly opts in. */
                 rcfg.scatter_merge_enabled = wg->scatter_merge_enabled;
+                /* Forward operator-set failover policy onto the router so
+                 * the (forthcoming) failover manager can read it without
+                 * walking back to the worker-group struct. */
+                rcfg.failover = wg->failover_cfg;
                 wg->router = keel_router_create(&rcfg);
                 if (wg->router) {
                     /* Register each server in the pool with the router */
@@ -5541,6 +5658,34 @@ int main(int argc, char** argv) {
                        wg->probe_cfg.interval_ms, wg->probe_cfg.timeout_ms,
                        wg->probe_cfg.retries);
             }
+
+            /* Active failover-manager detector loop. Reconciles probe-driven
+             * role changes into the router's cluster epoch so sessions
+             * observe topology drift (degraded-mode exit, timeline checks).
+             * Skip when router is absent — publish_primary would be a no-op
+             * and the extra thread only adds scheduling pressure. */
+            if (wg->router) {
+                keel_failover_manager_config_t fmcfg = {
+                    .detection_interval_ms = wg->failover_cfg.detection_interval_ms
+                                              ? wg->failover_cfg.detection_interval_ms : 500,
+                    .failure_threshold     = wg->failover_cfg.failure_threshold
+                                              ? wg->failover_cfg.failure_threshold : 3,
+                    .promotion_grace_ms    = wg->failover_cfg.promotion_grace_ms
+                                              ? wg->failover_cfg.promotion_grace_ms : 3000,
+                    .old_primary_fencing   = wg->failover_cfg.old_primary_fencing_required,
+                };
+                wg->failover_mgr = keel_failover_manager_create(
+                    &fmcfg,
+                    wg->probe_mgr,
+                    keel_engine_get_server_pool(wg->engine),
+                    wg->engine,
+                    wg->router);
+                if (wg->failover_mgr) {
+                    printf("  [%s] Failover-mgr: interval=%ums threshold=%u grace=%ums\n",
+                           wg->name, fmcfg.detection_interval_ms,
+                           fmcfg.failure_threshold, fmcfg.promotion_grace_ms);
+                }
+            }
         }
     }
 
@@ -5578,6 +5723,13 @@ int main(int argc, char** argv) {
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         if (g_groups[gi].probe_mgr)
             keel_probe_manager_start(g_groups[gi].probe_mgr);
+    }
+
+    /* Start failover-manager detector threads (after probe threads so the
+     * initial probe state is being populated when the detector wakes up) */
+    for (size_t gi = 0; gi < g_num_groups; gi++) {
+        if (g_groups[gi].failover_mgr)
+            keel_failover_manager_start(g_groups[gi].failover_mgr);
     }
     
     /* Register stats dump callback on first engine */
@@ -5792,6 +5944,14 @@ int main(int argc, char** argv) {
         g_cluster = NULL;
     }
     
+    /* Stop failover managers first (they reference probe state + router) */
+    for (size_t gi = 0; gi < g_num_groups; gi++) {
+        if (g_groups[gi].failover_mgr) {
+            keel_failover_manager_destroy(g_groups[gi].failover_mgr);
+            g_groups[gi].failover_mgr = NULL;
+        }
+    }
+
     /* Stop probe managers */
     for (size_t gi = 0; gi < g_num_groups; gi++) {
         keel_probe_manager_destroy(g_groups[gi].probe_mgr);

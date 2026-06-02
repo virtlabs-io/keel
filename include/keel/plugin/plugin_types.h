@@ -126,6 +126,7 @@ typedef struct keel_error_info {
 typedef struct keel_consistency_token {
     char        value[KEEL_CONSISTENCY_TOKEN_MAX];  /**< Null-terminated string */
     uint64_t    captured_at_ns;                     /**< Monotonic timestamp */
+    uint32_t    timeline_id;                        /**< PG WAL timeline, 0 when unknown/N/A */
 } keel_consistency_token_t;
 
 /* ============================================================================

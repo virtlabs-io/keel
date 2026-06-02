@@ -2794,7 +2794,7 @@ Error: KEEL binary not found
 | SQLMap stress | `./scripts/hardening-sqlmap.sh` | Parser stability under malicious SQL |
 | Runtime security | `ctest -R test_runtime_security_harness` | Seccomp + privilege drop |
 
-### CI / Release Gate (One Command)
+### CI / Readiness Gate (One Command)
 
 Use this entrypoint to standardize production-readiness checks:
 
@@ -2861,8 +2861,8 @@ For more information, see:
 intermittently in dev-container environments that do not support multiple
 loopback listeners or real network isolation.  These failures are **not** caused
 by any of the changes in this session and are tracked separately.  They pass
-reliably in the dedicated CI `ubuntu-24.04` runner with the staggered-start fix
-introduced in `test(cluster): stagger node starts in build_cluster`.
+reliably in the dedicated CI `ubuntu-24.04` runner with the staggered-start
+cluster launch behavior.
 
 Run the test in isolation to confirm:
 

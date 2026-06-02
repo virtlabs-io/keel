@@ -745,9 +745,25 @@ backend_pool_t* backend_pool_create(const backend_pool_config_t* config)
         pthread_mutexattr_destroy(&attr);
     }
     
-    /* Resolve protocol flow vtable — eliminates strcmp branching */
+    /* Resolve protocol flow vtable — eliminates strcmp branching.
+     *
+     * A non-NULL but unknown protocol name is a hard misconfiguration: cleanup_slot
+     * is never invoked, so every returned connection is force-closed with
+     * BACKEND_CLOSE_REASON_CLEANUP_ERROR and the pool churns forever. Refuse to
+     * create the pool instead of degrading silently.
+     *
+     * A NULL protocol is tolerated for unit-test constructors that don't drive the
+     * cleanup/borrow path; production config always populates protocol. */
     if (config->protocol) {
         pool->flow_vt = keel_proto_flow_get(config->protocol);
+        if (!pool->flow_vt) {
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_POOL,
+                "backend_pool_create: unknown protocol \"%s\" — no flow vtable registered",
+                config->protocol);
+            pthread_mutex_destroy(&pool->lock);
+            keel_free(pool);
+            return NULL;
+        }
     }
     
     pool->clean_list = NULL;
@@ -981,7 +997,19 @@ backend_conn_t* backend_pool_borrow(backend_pool_t* pool, uint64_t required_stat
                 }
                 backend_pool_mark_borrowed(conn);
                 conn->needs_sync = false;
-                POOL_STAT_INC(pool, pool_borrow_exact_state_match);
+                /* If this backend has named prepared statements from a different
+                 * session, the engine must run full protocol cleanup (DISCARD ALL)
+                 * before forwarding the new session's first message — otherwise
+                 * a Parse() reusing one of those statement names hits
+                 * "prepared statement already exists". */
+                if (conn->stmt_set_hash != 0) {
+                    conn->needs_full_cleanup = true;
+                    conn->stmt_set_hash      = 0;
+                    backend_pool_reset_stmt_profile(conn);
+                    POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                } else {
+                    POOL_STAT_INC(pool, pool_borrow_exact_state_match);
+                }
                 pool_record_borrow_result(pool, BORROW_RESULT_SUCCESS);
                 pool->active_count++;
                 pthread_mutex_unlock(&pool->lock);
@@ -2164,43 +2192,59 @@ static void refill_async_complete(struct backend_conn* conn, bool success, void*
 int backend_pool_refill_one(backend_pool_t* pool)
 {
     if (!pool) return 0;
-    
+
+    pthread_mutex_lock(&pool->lock);
+
     /* Exponential backoff on consecutive refill failures.
      * Prevents log flooding and CPU waste when the backend is unreachable.
      * Starts at 1s, doubles up to 30s.  Resets on first successful connect. */
     if (pool->refill_backoff_until > 0) {
         uint64_t now = get_time_ms();
-        if (now < pool->refill_backoff_until) return 0;
+        if (now < pool->refill_backoff_until) {
+            pthread_mutex_unlock(&pool->lock);
+            return 0;
+        }
         pool->refill_backoff_until = 0;  /* Backoff expired, retry */
     }
-    
+
     /* Only refill if there are waiters or we're below min_connections */
     size_t idle_count = 0;
     for (backend_conn_t* c = pool->clean_list; c; c = c->next) idle_count++;
     for (backend_conn_t* c = pool->idle_list; c; c = c->next) idle_count++;
-    
+
     bool need_refill = (pool->wait_queue_head != NULL) ||
                        (idle_count + pool->active_count < pool->config.min_connections);
-    if (!need_refill) return 0;
-    
+    if (!need_refill) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
     /* Reactor must be set for async connect — no synchronous fallback */
-    if (!pool->reactor) return 0;
-    
-    /* Async path: find ONE closed slot and start async connect */
+    if (!pool->reactor) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
+    /* Async path: find ONE closed slot and start async connect.
+     * Unlock before backend_async_start — async I/O must not hold pool->lock. */
     for (size_t i = 0; i < pool->total_count; i++) {
         backend_conn_t* conn = &pool->connections[i];
         backend_conn_state_t expected = BACKEND_CONN_CLOSED;
         if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
+            pthread_mutex_unlock(&pool->lock);
             int rc = backend_async_start(pool, conn, pool->reactor,
                                          refill_async_complete, pool);
             if (rc < 0) {
-                /* Failed to start async connect */
+                /* Failed to start async connect — return slot to CLOSED. */
+                pthread_mutex_lock(&pool->lock);
                 backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, false);
+                pthread_mutex_unlock(&pool->lock);
                 return 0;
             }
             return 1;  /* Async connect in progress */
         }
     }
+    pthread_mutex_unlock(&pool->lock);
     return 0;
 }
 
@@ -2237,7 +2281,9 @@ void backend_pool_async_warmup(backend_pool_t* pool)
             int rc = backend_async_start(pool, conn, pool->reactor,
                                          refill_async_complete, pool);
             if (rc < 0) {
+                pthread_mutex_lock(&pool->lock);
                 backend_pool_close_slot_locked(pool, conn, BACKEND_CLOSE_REASON_IO_ERROR, false);
+                pthread_mutex_unlock(&pool->lock);
                 break;
             }
             kicked++;

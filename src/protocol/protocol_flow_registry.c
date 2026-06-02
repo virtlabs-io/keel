@@ -69,9 +69,18 @@ const keel_proto_flow_vtable_t* keel_proto_flow_get(const char* name)
         }
     }
 
-    /* Fallback: check built-in externs by name */
-    if (strcmp(name, "postgres") == 0) return &keel_proto_flow_postgres;
-    if (strcmp(name, "mysql") == 0)    return &keel_proto_flow_mysql;
+    /* Fallback: check built-in externs by name. Accept common aliases
+     * so configs that say `protocol = postgresql` or `mariadb` resolve
+     * to the same vtable; otherwise pool->flow_vt silently stays NULL
+     * and DISCARD-ALL cleanup force-closes every borrowed connection. */
+    if (strcmp(name, "postgres") == 0 ||
+        strcmp(name, "postgresql") == 0 ||
+        strcmp(name, "pgsql") == 0 ||
+        strcmp(name, "pg") == 0)
+        return &keel_proto_flow_postgres;
+    if (strcmp(name, "mysql") == 0 ||
+        strcmp(name, "mariadb") == 0)
+        return &keel_proto_flow_mysql;
 
     return NULL;
 }

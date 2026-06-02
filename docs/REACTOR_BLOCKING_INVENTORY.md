@@ -1,9 +1,9 @@
 # Reactor-Blocking Inventory
 
-Status: **v0.2-alpha planning** &middot; Total call sites: **26** &middot; Gate: [`scripts/check_forbidden_blocking.sh`](../scripts/check_forbidden_blocking.sh)
+Status: **reactor hot-path cleanup inventory** &middot; Total call sites: **26** &middot; Gate: [`scripts/check_forbidden_blocking.sh`](../scripts/check_forbidden_blocking.sh)
 
 This document categorizes every blocking call site currently present in the
-documented reactor hot-path files. It is the punch-list driving the v0.2-alpha
+documented reactor hot-path files. It is the punch-list driving the
 reactor refactor and the source of truth for which entries should be removed
 from [`scripts/forbidden_blocking_baseline.txt`](../scripts/forbidden_blocking_baseline.txt)
 as each refactor lands.
@@ -159,7 +159,7 @@ socket during graceful worker shutdown. The send is one-shot and tiny.
 |---|---|---|---|
 | [src/worker/migration.c](../src/worker/migration.c#L76) | 76 | `sendmsg` | `SCM_RIGHTS` ancillary datagram |
 
-**Action:** defer to a post-v0.2 pass. Either add `MSG_DONTWAIT` and
+**Action:** defer to a follow-up pass. Either add `MSG_DONTWAIT` and
 handle `EAGAIN` (queueing the handoff) or annotate with `NOLINT` if a
 shutdown-time stall is acceptable.
 
@@ -169,7 +169,7 @@ shutdown-time stall is acceptable.
 
 `engine_scatter.c` uses helper functions (`sc_read_full`, `sc_write_full`)
 that loop on `recv()` / `send()` without `MSG_DONTWAIT` during scatter
-fan-out. This is a known issue tracked separately from the v0.2 reactor
+fan-out. This is a known issue tracked separately from the reactor cleanup
 work.
 
 | File | Line | Call | Notes |
@@ -202,11 +202,10 @@ control-plane cleanup.
 
 ## Refactor sequencing
 
-The agreed ordering for v0.2-alpha (this branch) is:
+The agreed refactor ordering is:
 
 1. **PR #4** &mdash; categories A, B, C, D (engine_flow async).
 2. **PR #3** &mdash; categories E, G, H (backend_pool + worker cleanup async).
 3. **PR #5** &mdash; category F (remove or quarantine legacy connect).
 
-Categories I, J, K remain in the baseline after v0.2-alpha and are
-addressed in subsequent releases.
+Categories I, J, K remain in the baseline and are addressed by later cleanup work.

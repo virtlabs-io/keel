@@ -1,6 +1,6 @@
 # Chaos Manifest
 
-This is the v0.4-alpha production chaos inventory. Scenarios are intentionally
+This is the production chaos inventory. Scenarios are intentionally
 named after failure modes, not implementation tricks, so CI and release reviews
 can verify coverage without reading every shell script.
 
@@ -31,7 +31,7 @@ and duplicate prevention.
 tests/chaos/run-chaos.sh
 ```
 
-For release candidates, run this against the Docker chaos stack from a clean
+Before tagging a release, run this against the Docker chaos stack from a clean
 checkout and archive KEEL logs plus operational replay logs as artifacts.
 
 Scatter scenarios require a scatter/sharding chaos topology. If that topology is

@@ -37,6 +37,9 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
+#include <pthread.h>
+#include <stdatomic.h>
+
 /* ============================================================================
  * MySQL Wire Protocol Constants
  * ============================================================================ */
@@ -742,7 +745,45 @@ static void* my_probe_create(const keel_backend_server_t* server,
     return ctx;
 }
 
-static const char ROLE_SQL[] = "SELECT @@read_only AS ro";
+static const char ROLE_SQL[]      = "SELECT @@read_only AS ro";
+static const char GTID_MODE_SQL[] = "SELECT @@gtid_mode";
+static const char GTID_ENF_SQL[]  = "SELECT @@enforce_gtid_consistency";
+
+/*
+ * One-shot WARN dedup for "GTID disabled" observations. The probe runs
+ * periodically against every backend in every worker group; the proposal
+ * (proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md §1, MySQL)
+ * calls for a startup-time GTID capability check. We surface it at probe
+ * time (the only place we have an authenticated connection) but rate-limit
+ * to one log line per host:port per process so misconfig is visible without
+ * spamming the log every probe interval.
+ */
+#define KEEL_PROBE_MY_GTID_WARN_SLOTS 32
+static pthread_mutex_t s_gtid_warn_mu = PTHREAD_MUTEX_INITIALIZER;
+static char            s_gtid_warned[KEEL_PROBE_MY_GTID_WARN_SLOTS][96];
+static size_t          s_gtid_warned_count = 0;
+
+static bool probe_my_gtid_warn_first(const char* host, uint16_t port)
+{
+    char key[96];
+    snprintf(key, sizeof(key), "%s:%u", host ? host : "?", (unsigned)port);
+    bool first = false;
+    pthread_mutex_lock(&s_gtid_warn_mu);
+    for (size_t i = 0; i < s_gtid_warned_count; i++) {
+        if (strcmp(s_gtid_warned[i], key) == 0) {
+            pthread_mutex_unlock(&s_gtid_warn_mu);
+            return false;
+        }
+    }
+    if (s_gtid_warned_count < KEEL_PROBE_MY_GTID_WARN_SLOTS) {
+        snprintf(s_gtid_warned[s_gtid_warned_count], sizeof(s_gtid_warned[0]),
+                 "%s", key);
+        s_gtid_warned_count++;
+        first = true;
+    }
+    pthread_mutex_unlock(&s_gtid_warn_mu);
+    return first;
+}
 
 /**
  * @brief Execute one MySQL health-check and role-detection probe cycle.
@@ -818,6 +859,35 @@ static keel_error_t my_probe_check(void* opaque,
         result->detected_role = KEEL_SERVER_ROLE_AUTO;
         snprintf(result->message, sizeof(result->message),
                  "role unknown (@@read_only='%s')", value);
+    }
+
+    /* 4b. GTID capability check (proposal §1: MySQL GTID startup validation).
+     * Best-effort: a parse error or missing variable on older servers is
+     * treated as "unknown" and does not affect health. Misconfigurations
+     * (gtid_mode != ON, enforce_gtid_consistency != ON) are logged exactly
+     * once per host:port via probe_my_gtid_warn_first(). */
+    char gtid_mode[32]   = {0};
+    char gtid_enforce[32] = {0};
+    char ignored[64];
+    if (probe_mysql_query(fd, GTID_MODE_SQL, gtid_mode, sizeof(gtid_mode),
+                          ctx->timeout_ms,
+                          ignored, sizeof(ignored)) == 0) {
+        (void)probe_mysql_query(fd, GTID_ENF_SQL,
+                                gtid_enforce, sizeof(gtid_enforce),
+                                ctx->timeout_ms,
+                                ignored, sizeof(ignored));
+        bool mode_ok    = (strcmp(gtid_mode, "ON") == 0);
+        bool enforce_ok = (strcmp(gtid_enforce, "ON") == 0);
+        if ((!mode_ok || !enforce_ok) &&
+            probe_my_gtid_warn_first(server->host, server->port)) {
+            KEEL_LOG_WARN(KEEL_LOG_CAT_PROBE,
+                "mysql probe %s:%u: GTID capability degraded "
+                "(@@gtid_mode='%s', @@enforce_gtid_consistency='%s'); "
+                "read_your_writes via GTID requires both = ON",
+                server->host, (unsigned)server->port,
+                gtid_mode[0] ? gtid_mode : "?",
+                gtid_enforce[0] ? gtid_enforce : "?");
+        }
     }
 
     /* 5. Send COM_QUIT and close */

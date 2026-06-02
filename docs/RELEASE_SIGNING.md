@@ -74,8 +74,8 @@ Example output format:
 Once configured, trigger a release tag:
 
 ```bash
-git tag -a alpha-0.3.0 -m "Release alpha-0.3.0"
-git push origin alpha-0.3.0
+git tag -a <release-tag> -m "Release <release-tag>"
+git push origin <release-tag>
 ```
 
 Monitor the workflow at: **Actions** → **package-linux** → Latest run

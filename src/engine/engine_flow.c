@@ -43,6 +43,7 @@
 #include "keel/mem/mem.h"
 #include "keel/protocol/tls_context.h"
 #include "keel/core/router.h"          /* keel_router_dispatch_sql() */
+#include "keel/engine/catchup_consult.h" /* Patch 2d-4 wait-catchup verdict */
 #include "keel/core/query_cache.h"     /* keel_query_cache_get/put/digest */
 #include "engine_scatter.h"            /* keel_engine_scatter_execute() */
 
@@ -55,6 +56,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -397,6 +399,10 @@ static inline void engine_annotate_scatter_result(
  * reads from asynchronous replicas. */
 #ifndef KEEL_STICKY_PRIMARY_TTL_MS
 #define KEEL_STICKY_PRIMARY_TTL_MS 100
+#endif
+
+#ifndef KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS
+#define KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS 50
 #endif
 
 /**
@@ -954,6 +960,76 @@ static bool backend_needs_state_sync(const keel_session_flow_t* sf,
            session->state_hash != 0;
 }
 
+static int capture_consistency_token_after_write(
+    keel_session_flow_t* sf,
+    keel_session_t* session,
+    const keel_proto_flow_vtable_t* flow)
+{
+    if (!sf || !session || !flow || !flow->capture_consistency_token ||
+        session->server_fd < 0) {
+        return -1;
+    }
+
+    int fd = session->server_fd;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+
+    struct timeval saved_rcv = {0, 0};
+    struct timeval saved_snd = {0, 0};
+    socklen_t optlen = sizeof(saved_rcv);
+    bool have_rcv = (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                                &saved_rcv, &optlen) == 0);
+    optlen = sizeof(saved_snd);
+    bool have_snd = (getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                                &saved_snd, &optlen) == 0);
+
+    struct timeval tv = {
+        .tv_sec = KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS / 1000,
+        .tv_usec = (KEEL_CONSISTENCY_CAPTURE_TIMEOUT_MS % 1000) * 1000,
+    };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if ((flags & O_NONBLOCK) != 0 &&
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) { /* NOLINT(keel-blocking) */
+        if (have_rcv)
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                             &saved_rcv, sizeof(saved_rcv));
+        if (have_snd)
+            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                             &saved_snd, sizeof(saved_snd));
+        return -1;
+    }
+
+    keel_consistency_token_t token;
+    memset(&token, 0, sizeof(token));
+    int rc = flow->capture_consistency_token(sf->ctx, fd, &token);
+
+    if ((flags & O_NONBLOCK) != 0)
+        (void)fcntl(fd, F_SETFL, flags);
+    if (have_rcv)
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                         &saved_rcv, sizeof(saved_rcv));
+    if (have_snd)
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                         &saved_snd, sizeof(saved_snd));
+
+    if (rc != 0 || token.value[0] == '\0') {
+        return -1;
+    }
+
+    if (token.captured_at_ns == 0)
+        token.captured_at_ns = engine_now_ns();
+    sf->last_write_token = token;
+    sf->last_write_ns = token.captured_at_ns;
+    keel_ssv_consistency_set_token(sf->consistency_atoms, &token);
+    if (flow->notify_write_lsn)
+        flow->notify_write_lsn(sf->ctx, token.value);
+    return 0;
+}
+
 /* ============================================================================
  * Session Flow Init/Destroy
  * ============================================================================ */
@@ -1371,6 +1447,35 @@ keel_flow_result_t keel_engine_flow_resume_from_pool(
     if (pending_len > 0 && pending_data[0] == 'H' &&
         sf->flush_pending_count > 0) {
         sf->flush_in_flight = true;
+    }
+
+    /* Invariant (Bug B catch): if the session has named prepared statements
+     * pinned and we are about to forward a bare Bind ('B') to a backend whose
+     * stmt_set_hash is zero (definitively no named statements present), then
+     * the replay block above failed to fire.  PG will reject with "prepared
+     * statement does not exist" and KEEL will silently deadlock.  Convert
+     * this into a loud, recoverable session abort instead. */
+    if ((sf->pins & KEEL_FPIN_PREPARED_STMT) &&
+        be_conn->stmt_set_hash == 0 &&
+        pending_len > 0 && pending_data[0] == 'B') {
+        KEEL_LOG_ERROR(KEEL_LOG_CAT_POOL,
+            "W%u: INVARIANT (Bug B): session %lu has PREPARED_STMT pin but "
+            "backend fd=%d has stmt_set_hash=0; refusing to forward bare Bind "
+            "(pending_len=%zu) — would cause silent deadlock. Aborting session.",
+            worker->id, (unsigned long)session->id,
+            session->server_fd, pending_len);
+        static const uint8_t ps_missing_err[] = {
+            'E',
+            0,0,0,51,
+            'S','F','A','T','A','L',0,
+            'V','F','A','T','A','L',0,
+            'C','0','8','0','0','6',0,
+            'M','K','E','E','L',':',' ','P','S',' ','r','e','p','l','a','y',
+            ' ','m','i','s','s','i','n','g',0,
+            0
+        };
+        keel_try_send_nb(session->client_fd, ps_missing_err, sizeof(ps_missing_err));
+        return KEEL_FLOW_CLOSED;
     }
 
     /* Forward the pending message to backend (non-blocking) */
@@ -2211,28 +2316,30 @@ copy_scan_done:
                         (act.route_hint == KEEL_FROUTE_REPLICA);
                     if (!explicit_read_only_tx &&
                         route == KEEL_FROUTE_REPLICA &&
-                        sf->sticky_primary_ttl_ms > 0 && sf->last_write_ns != 0) {
+                        sf->last_write_ns != 0) {
                         uint64_t now = engine_now_ns();
                         uint64_t ttl_ms = sf->sticky_primary_ttl_ms
                                             ? sf->sticky_primary_ttl_ms
                                             : KEEL_STICKY_PRIMARY_TTL_MS;
-                        /* SSV consistency atom carries the same TTL window.
-                         * If the atom says the write is still recent we force
-                         * primary; when the TTL expires we clear both the
-                         * legacy timestamp AND the atom so future reads are
-                         * free to route to replicas. */
-                        if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
-                                                         now, ttl_ms)) {
-                            /* Reactor-safe fallback: do not run inline replica
-                             * catch-up probes from the worker. While the sticky
-                             * window is active, route reads to primary. */
+                        if (keel_ssv_requires_primary(sf->consistency_atoms,
+                                                      now, (uint32_t)ttl_ms)) {
+                            /* Reactor-safe fallback: a real LSN/GTID token must
+                             * not be expired by time alone. Route to primary
+                             * until a future async verifier proves a replica is
+                             * caught up. */
+                            route = KEEL_FROUTE_PRIMARY;
+                            if (worker->stats_ctx)
+                                KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
+                        } else if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms,
+                                                                now, (uint32_t)ttl_ms)) {
+                            /* Timestamp-only legacy fallback for local writes
+                             * where no exact token has been captured yet. */
                             route = KEEL_FROUTE_PRIMARY;
                             if (worker->stats_ctx)
                                 KEEL_STAT_INC(worker->stats_ctx, sticky_primary_hits);
                         } else {
-                            /* TTL expired — clear timestamp and atoms */
+                            /* TTL expired for a timestamp-only sticky marker. */
                             sf->last_write_ns = 0;
-                            keel_ssv_consistency_clear(sf->consistency_atoms);
                         }
                     }
                 } /* KEEL_TIER_HAS_ROUTING */
@@ -2647,6 +2754,69 @@ copy_scan_done:
                     }
                     /* KEEL_ERR_NOT_SUPPORTED with reject_reason==NONE:
                      * no shard rule matched — use existing routing. */
+                }
+
+                /* === Patch 2d-4: stale_read_policy=wait consultation ===
+                 *
+                 * If the deployment carries a router with
+                 *   consistency_mode  = read_your_writes
+                 *   stale_read_policy = wait
+                 * AND this is a replica-eligible read AND the session has
+                 * captured a consistency token (LSN/GTID) from a prior write,
+                 * consult the router to see whether it would emit
+                 * KEEL_ROUTE_REASON_WAIT_CATCHUP for this query.
+                 *
+                 * v0.5-alpha SCOPE: when the router says "WAIT", we cannot
+                 * yet async-park + re-dispatch the session (the resume
+                 * continuation lands in v0.5-beta — see
+                 * `keel_engine_consult_catchup` in catchup_bridge.h, which
+                 * has the enqueue path wired). So for now we degrade to the
+                 * primary, log it, and bump a counter so operators can see
+                 * how often the policy degrades. This is strictly safer than
+                 * the alternative (serving a stale read from a behind
+                 * replica) and gives operators a measurable signal to size
+                 * the eventual park-and-re-dispatch budget. */
+                if (route == KEEL_FROUTE_READ &&
+                    worker->router != NULL &&
+                    sf->last_write_token.value[0] != '\0' &&
+                    act.sql_view != NULL &&
+                    act.sql_view_len > 0) {
+
+                    /* Parse the SQL just enough for the router to confirm
+                     * "replica-safe read"; 64KiB arena matches the bridge
+                     * unit test budget (smaller arenas overflow on real
+                     * production SQL). */
+                    keel_arena_t* _wc_arena = keel_arena_create(65536);
+                    if (_wc_arena) {
+                        keel_str_t _wc_sql = {
+                            .data = act.sql_view,
+                            .len  = act.sql_view_len,
+                        };
+                        const keel_qt_query_t* _wc_qt =
+                            keel_sql_analyze_full(_wc_sql, _wc_arena);
+
+                        keel_route_decision_t rd;
+                        memset(&rd, 0, sizeof(rd));
+                        worker->stats.wait_catchup_consulted_total++;
+                        if (keel_engine_should_degrade_to_primary_on_wait(
+                                worker->router,
+                                _wc_qt,
+                                &sf->last_write_token,
+                                session->in_transaction,
+                                &rd)) {
+                            worker->stats.wait_catchup_degraded_to_primary++;
+                            KEEL_LOG_INFO(KEEL_LOG_CAT_CONN,
+                                "W%u: session %lu: stale_read_policy=wait "
+                                "(WAIT_CATCHUP) degraded to primary in v0.5-alpha "
+                                "(token=%.*s tl=%u replica_idx=%zu max_wait_ms=%u)",
+                                worker->id, (unsigned long)session->id,
+                                (int)sizeof(rd.wait_token.value), rd.wait_token.value,
+                                rd.wait_token.timeline_id,
+                                rd.wait_server_index, rd.wait_max_ms);
+                            route = KEEL_FROUTE_WRITE;
+                        }
+                        keel_arena_destroy(_wc_arena);
+                    }
                 }
 
                 switch (route) {
@@ -3395,15 +3565,15 @@ copy_scan_done:
                  *   1. Payload fits in one TCP segment (no short-send risk)
                  *   2. Not a no-response command (needs recv to chain with)
                  *   3. Not COPY data (needs FE recv, not BE recv)
-                 *   4. Not pipelined extended protocol (continues loop)
+                 *   4. Not extended protocol (Parse/Bind/Execute batches are
+                 *      already pipelined and need exact ordering semantics)
                  *   5. Not a jumbo message (needs FE continuation)
                  */
                 {
                     bool want_wait_be = !act.no_response
                         && !(act.msg_kind == KEEL_MSG_KIND_COPY
                              && act.be_payload_len > 0 && act.be_payload[0] == 'd')
-                        && !(act.msg_kind == KEEL_MSG_KIND_EXTENDED
-                             && !(act.pin_clear & KEEL_FPIN_EXTENDED_PROTO))
+                        && act.msg_kind != KEEL_MSG_KIND_EXTENDED
                         && !jumbo_msg;
 
                     if (want_wait_be && act.be_payload_len <= 65536) {
@@ -3439,8 +3609,12 @@ copy_scan_done:
                     /* Send blocked — defer remainder to io_uring.
                      * Stamp write time eagerly (the send WILL complete). */
                     if (KEEL_TIER_HAS_ROUTING(sf->mode) &&
-                        (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL)))
-                        sf->last_write_ns = engine_now_ns();
+                        (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL))) {
+                        uint64_t write_ns = engine_now_ns();
+                        sf->last_write_ns = write_ns;
+                        keel_ssv_consistency_set_write_ts(sf->consistency_atoms,
+                                                          write_ns);
+                    }
                     if (act.effect & KEEL_QE_UNKNOWN_STATE)
                         keel_ssv_opaque_set_unknown(sf->opaque_atoms);
 
@@ -3504,8 +3678,12 @@ be_forward_done:
              * that read-after-write queries within the TTL window are
              * routed to the primary. */
             if (act.effect & (KEEL_QE_WRITE | KEEL_QE_DDL)) {
-                if (KEEL_TIER_HAS_ROUTING(sf->mode))
-                    sf->last_write_ns = engine_now_ns();
+                if (KEEL_TIER_HAS_ROUTING(sf->mode)) {
+                    uint64_t write_ns = engine_now_ns();
+                    sf->last_write_ns = write_ns;
+                    keel_ssv_consistency_set_write_ts(sf->consistency_atoms,
+                                                      write_ns);
+                }
 
                 /* Cache write invalidation: save a copy of the write query so
                  * that query_complete can parse it to evict affected table entries
@@ -4588,9 +4766,18 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                     keel_try_send_nb(session->client_fd, act.fe_payload, act.fe_payload_len);
                 if (session->backend_conn)
                 {
+                    /* Replay failed mid-stream.  The backend's prepared
+                     * statement state is now ambiguous: a "duplicate stmt"
+                     * error means the offending Parse left a stmt resident,
+                     * while a syntax error means no stmt was created.  We
+                     * cannot reliably tell from here, so quarantine the
+                     * backend and force it to be destroyed by close_session
+                     * rather than risk pooling a connection that still
+                     * carries leftover "S_*" definitions. */
                     session->backend_conn->stmt_set_hash = 0;
                     memset(&session->backend_conn->stmt_profile, 0,
                            sizeof(session->backend_conn->stmt_profile));
+                    session->backend_conn->protocol_desync = true;
                 }
                 sf->stmt_replay_count       = 0;
                 sf->stmt_replay_rfq_pending = false;
@@ -4884,12 +5071,31 @@ keel_flow_result_t keel_engine_flow_on_be_data(
                                   worker->id,
                                   einfo.sqlstate ? einfo.sqlstate : "?");
                 }
-                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
-                    "W%u: backend error class=%d sqlstate=%s msg=%s",
-                    worker->id,
-                    (int)einfo.error_class,
-                    einfo.sqlstate ? einfo.sqlstate : "?",
-                    einfo.message ? einfo.message : "?");
+                /* Connection-fatal errors are operator-actionable → WARN.
+                 * Pure client-side query errors (syntax/permission/constraint
+                 * — SQLSTATE class 22/23/42) are user mistakes routinely
+                 * forwarded to the client; logging them at WARN floods the
+                 * log on every typo. Demote those to INFO. */
+                const char* ss = einfo.sqlstate;
+                bool client_side_error = ss && (
+                    strncmp(ss, "22", 2) == 0 ||  /* data exception */
+                    strncmp(ss, "23", 2) == 0 ||  /* integrity constraint */
+                    strncmp(ss, "42", 2) == 0);   /* syntax / access rule */
+                if (einfo.connection_ok && client_side_error) {
+                    KEEL_LOG_INFO(KEEL_LOG_CAT_CONN,
+                        "W%u: backend error class=%d sqlstate=%s msg=%s",
+                        worker->id,
+                        (int)einfo.error_class,
+                        ss ? ss : "?",
+                        einfo.message ? einfo.message : "?");
+                } else {
+                    KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                        "W%u: backend error class=%d sqlstate=%s msg=%s",
+                        worker->id,
+                        (int)einfo.error_class,
+                        ss ? ss : "?",
+                        einfo.message ? einfo.message : "?");
+                }
             }
             /* Error response — do not cache this result */
             if (sf->cache_pending) {
@@ -5313,13 +5519,29 @@ fe_forward_done: ;
          * Core returns to L7 mode for the next query. */
         session->fast_forward_mode = 0;
 
-        /* Phase 5 consistency token capture is intentionally not performed
-         * inline here. The old path temporarily cleared O_NONBLOCK and ran a
-         * protocol query on the worker reactor, which can stall unrelated
-         * sessions. Correctness is preserved by sticky-primary routing during
-         * the TTL window; async token capture can be reintroduced as its own
-         * reactor-owned pre-query state machine. */
-        sf->capture_lsn_pending = false;
+        if (sf->capture_lsn_pending) {
+            if (capture_consistency_token_after_write(sf, session, flow) != 0) {
+                if (session->backend_conn) {
+                    session->backend_conn->protocol_desync = true;
+                    if (session->backend_conn->pool) {
+                        backend_pool_discard(session->backend_conn->pool,
+                                             session->backend_conn,
+                                             BACKEND_CLOSE_REASON_PROTOCOL_ERROR);
+                    } else if (session->server_fd >= 0) {
+                        close(session->server_fd);
+                    }
+                    session->backend_conn = NULL;
+                    session->backend_generation = 0;
+                    session->server_fd = -1;
+                } else if (session->server_fd >= 0) {
+                    close(session->server_fd);
+                    session->server_fd = -1;
+                }
+                sf->capture_lsn_pending = false;
+                return KEEL_FLOW_ERROR;
+            }
+            sf->capture_lsn_pending = false;
+        }
 
         /*
          * FIX: Use protocol's authoritative backend_reuse_gate() instead of
@@ -5469,8 +5691,35 @@ fe_forward_done: ;
                     memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                     be->current_state_hash  = 0xFFFFFFFFFFFFFFFFULL;  /* sentinel → DISCARD ALL */
                 } else {
-                    /* No prepared stmts (or ANONYMOUS) — clear hash so backend
-                     * can go to clean_list (or get DISCARD ALL if SET vars exist) */
+                    /* No prepared stmts pin from this session (or ANONYMOUS).
+                     *
+                     * If the backend still carries a non-zero stmt_set_hash,
+                     * those statements were prepared by a *previous* session
+                     * whose ownership we did not inherit (e.g. this session
+                     * borrowed the backend for a non-PS command before any
+                     * Parse).  Clearing the hash without cleanup would lie
+                     * to the next borrower: a fresh session would receive
+                     * a backend that still has "S_1" defined, and its first
+                     * Parse("S_1", ...) would fail with "prepared statement
+                     * already exists".  Force a DISCARD ALL via the cleanup
+                     * sentinel so the backend returns to the clean list with
+                     * no leftover named statements. */
+                    if (be->stmt_set_hash != 0) {
+                        be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                    }
+                    /* The session may have just executed a DDL or DISCARD
+                     * PLANS via named Parse that left orphan PS on the
+                     * backend; the protocol adapter signals this via the
+                     * stmt_compat_profile's semantic_unknown flag (one-shot,
+                     * consumed by this call). */
+                    if (flow->get_stmt_compat_profile) {
+                        keel_stmt_compat_profile_t orphan_check;
+                        memset(&orphan_check, 0, sizeof(orphan_check));
+                        if (flow->get_stmt_compat_profile(sf->ctx, &orphan_check) == 0 &&
+                            orphan_check.semantic_unknown) {
+                            be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
+                        }
+                    }
                     be->stmt_set_hash = 0;
                     memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                 }

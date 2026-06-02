@@ -99,8 +99,12 @@ const char* keel_route_reason_name(keel_route_reason_t r)
     case KEEL_ROUTE_REASON_DDL:               return "DDL";
     case KEEL_ROUTE_REASON_TRANSACTION_CTRL:  return "TRANSACTION_CTRL";
     case KEEL_ROUTE_REASON_SEMANTIC_UNSAFE:   return "SEMANTIC_UNSAFE";
+    case KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY: return "CONSISTENCY_PRIMARY";
     case KEEL_ROUTE_REASON_UNKNOWN_FUNCTION:  return "UNKNOWN_FUNCTION";
     case KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS:  return "COMMIT_AMBIGUOUS";
+    case KEEL_ROUTE_REASON_OLD_PRIMARY_FENCED:return "OLD_PRIMARY_FENCED";
+    case KEEL_ROUTE_REASON_DEGRADED_MODE:     return "DEGRADED_MODE";
+    case KEEL_ROUTE_REASON_WAIT_CATCHUP:      return "WAIT_CATCHUP";
     default:                                  return "UNKNOWN";
     }
 }
@@ -128,6 +132,9 @@ static const char* const k_route_factor_names[32] = {
     [16] = "COMMIT_IN_DOUBT",
     [17] = "REPLICA_OK",
     [18] = "USER_PINNED",
+    [19] = "CONSISTENCY_TOKEN",
+    [20] = "NODE_FENCED",
+    [21] = "DEGRADED_MODE",
 };
 
 size_t keel_route_factors_to_json_array(uint32_t factors,
@@ -236,11 +243,16 @@ typedef struct router_server {
     char*               name;           /**< Owned copy of name */
     char*               host;           /**< Owned copy of host */
     bool                active;         /**< Server is active */
-    
+
+    /* Failover-manager role state — orthogonal to config.role (RW/RO/WO)
+     * and config.health. Owned by keel_router_observe_primary() and the
+     * manual override API. */
+    keel_node_role_state_t role_state;
+
     /* Weighted selection state */
     int                 effective_weight; /**< Current effective weight */
     int                 current_weight;   /**< Weight for current round */
-    
+
     /* Statistics */
     uint64_t            routes;         /**< Times selected */
     uint64_t            errors;         /**< Routing errors */
@@ -286,6 +298,15 @@ struct keel_router {
     char*               shard_rule_tables[KEEL_ROUTER_MAX_SHARD_RULES];  /* owned copies */
     char*               shard_rule_columns[KEEL_ROUTER_MAX_SHARD_RULES]; /* owned copies */
     size_t              shard_rule_count;
+
+    /* Failover-manager state (proposal §3). The mutex guards `epoch` and
+     * per-server `role_state` transitions; the routing fast path reads
+     * `role_state` without the lock — `rebuild_indices()` runs under the
+     * same observer that updated it, and stale reads at most cause one
+     * extra eligible candidate that the next route call will exclude. */
+    pthread_mutex_t      epoch_mu;
+    keel_cluster_epoch_t epoch;
+    _Atomic bool         degraded_mode; /**< True when no PRIMARY is currently observed. */
 };
 
 /* ============================================================================
@@ -311,6 +332,20 @@ keel_router_config_t keel_router_config_default(void) {
         .query_timeout = KEEL_MSEC(KEEL_DEFAULT_QUERY_TIMEOUT_MS),
         /* Scatter is experimental; operators must opt in per worker group. */
         .scatter_merge_enabled = false,
+        .consistency_mode = KEEL_CONSISTENCY_READ_YOUR_WRITES,
+        .max_replica_lag_bytes = 16ULL * 1024ULL * 1024ULL,
+        .max_replica_catchup_ms = 50,
+        .stale_read_policy = KEEL_STALE_READ_ROUTE_PRIMARY,
+        .failover = {
+            .provider                     = KEEL_FAILOVER_PROVIDER_NONE,
+            .detection_interval_ms        = 500,
+            .failure_threshold            = 3,
+            .promotion_grace_ms           = 3000,
+            .old_primary_fencing_required = true,
+            .allow_ambiguous_write_retry  = false,
+            .read_during_failover         = KEEL_FAILOVER_READ_PRIMARY_ONLY,
+            .transaction_during_failover  = KEEL_FAILOVER_TXN_FAIL,
+        },
     };
 }
 
@@ -332,7 +367,7 @@ keel_router_t* keel_router_create(const keel_router_config_t* config) {
     
     router->config = config ? *config : keel_router_config_default();
     router->rand_seed = (unsigned int)time(NULL);
-    
+
     /* Create temporary arena for query parsing */
     router->temp_arena = keel_arena_create(4096);
     if (!router->temp_arena) {
@@ -342,6 +377,13 @@ keel_router_t* keel_router_create(const keel_router_config_t* config) {
 
     /* Initialize dispatch mutex for thread-safe concurrent access to temp_arena */
     pthread_mutex_init(&router->dispatch_mutex, NULL);
+
+    /* Failover-manager epoch state. Generation starts at 0 ("no primary
+     * observed yet"); the first keel_router_observe_primary() bumps it to
+     * 1 and exits degraded mode. */
+    pthread_mutex_init(&router->epoch_mu, NULL);
+    memset(&router->epoch, 0, sizeof(router->epoch));
+    atomic_store(&router->degraded_mode, false);
 
     KEEL_LOG_INFO(KEEL_LOG_CAT_POOL, 
                  "Created router: strategy=%d, read_write_split=%d, primary_read_weight=%.2f",
@@ -380,7 +422,8 @@ void keel_router_destroy(keel_router_t* router) {
     }
 
     pthread_mutex_destroy(&router->dispatch_mutex);
-    
+    pthread_mutex_destroy(&router->epoch_mu);
+
     keel_free(router);
 }
 
@@ -403,7 +446,17 @@ static void rebuild_indices(keel_router_t* router) {
         if (!router->servers[i].active) {
             continue;
         }
-        
+        /* Failover-manager fencing: DEMOTED and DRAINING servers are
+         * removed from the routing pool. The server entry remains in the
+         * topology (visible to admin / metrics) but no new traffic is
+         * dispatched to it. DEMOTED is sticky until the operator unfences
+         * via keel_router_set_node_role_state(). */
+        keel_node_role_state_t rs = router->servers[i].role_state;
+        if (rs == KEEL_NODE_STATE_DEMOTED ||
+            rs == KEEL_NODE_STATE_DRAINING) {
+            continue;
+        }
+
         keel_server_role_t role = router->servers[i].config.role;
         
         switch (role) {
@@ -586,6 +639,201 @@ void keel_router_set_server_health(keel_router_t* router,
                          name, old_health, health);
         }
     }
+}
+
+/* ============================================================================
+ * Failover manager — node role state and cluster epoch
+ * ============================================================================
+ *
+ * The failover manager owns the role-state axis (PRIMARY/REPLICA/DEMOTED/...)
+ * and a monotonic cluster epoch. Topology observers (Patroni REST, SQL
+ * discovery, MySQL probe) call keel_router_observe_primary() after each
+ * refresh; the manager increments the epoch on flip, fences the previous
+ * primary per `failover.old_primary_fencing_required`, and rebuilds the
+ * routing indices so subsequent dispatches do not touch the demoted node.
+ *
+ * v0.5-alpha fencing is process-level only: KEEL refuses to route NEW
+ * traffic to a DEMOTED node. In-flight transactions still observe the
+ * existing commit-in-doubt semantics in engine_flow. External STONITH or
+ * IP-takeover style fencing is left as a future opt-in hook.
+ */
+
+const char* keel_node_role_state_name(keel_node_role_state_t s)
+{
+    switch (s) {
+    case KEEL_NODE_STATE_UNKNOWN:   return "UNKNOWN";
+    case KEEL_NODE_STATE_PRIMARY:   return "PRIMARY";
+    case KEEL_NODE_STATE_REPLICA:   return "REPLICA";
+    case KEEL_NODE_STATE_UNHEALTHY: return "UNHEALTHY";
+    case KEEL_NODE_STATE_DRAINING:  return "DRAINING";
+    case KEEL_NODE_STATE_DEMOTED:   return "DEMOTED";
+    default:                        return "UNKNOWN";
+    }
+}
+
+/* Find the internal slot for `name`. Returns NULL when not found or when
+ * `name`/`router` are NULL. Caller must hold whatever consistency guarantee
+ * it needs — this is a private lookup. */
+static router_server_t* find_server_slot(keel_router_t* router, const char* name)
+{
+    if (!router || !name) return NULL;
+    for (size_t i = 0; i < router->server_count; i++) {
+        if (router->servers[i].active &&
+            strcmp(router->servers[i].name, name) == 0) {
+            return &router->servers[i];
+        }
+    }
+    return NULL;
+}
+
+void keel_router_get_cluster_epoch(const keel_router_t* router,
+                                   keel_cluster_epoch_t* out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!router) return;
+    pthread_mutex_lock((pthread_mutex_t*)&router->epoch_mu);
+    *out = router->epoch;
+    pthread_mutex_unlock((pthread_mutex_t*)&router->epoch_mu);
+}
+
+bool keel_router_observe_primary(keel_router_t* router,
+                                 const char* name,
+                                 uint32_t timeline_id)
+{
+    if (!router) return false;
+
+    pthread_mutex_lock(&router->epoch_mu);
+
+    /* Case A: caller signals "primary lost". Move into degraded mode and
+     * mark the previously-known primary UNHEALTHY so the routing pool
+     * cannot drain into a dead node. We deliberately do NOT bump the
+     * epoch — the cluster is between primaries; the next concrete
+     * observation will flip generation. */
+    if (!name || !*name) {
+        bool flipped = false;
+        if (router->epoch.primary_name[0] != '\0') {
+            router_server_t* prev = find_server_slot(router,
+                                                    router->epoch.primary_name);
+            if (prev && prev->role_state == KEEL_NODE_STATE_PRIMARY) {
+                prev->role_state = KEEL_NODE_STATE_UNHEALTHY;
+                rebuild_indices(router);
+                flipped = true;
+            }
+            router->epoch.primary_name[0] = '\0';
+        }
+        atomic_store(&router->degraded_mode, true);
+        pthread_mutex_unlock(&router->epoch_mu);
+        if (flipped) {
+            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+                "failover: primary lost; router entered DEGRADED mode "
+                "(read_during_failover=%d, transaction_during_failover=%d)",
+                (int)router->config.failover.read_during_failover,
+                (int)router->config.failover.transaction_during_failover);
+        }
+        return flipped;
+    }
+
+    /* Case B: same primary observed (no-op). */
+    if (strcmp(router->epoch.primary_name, name) == 0 &&
+        router->epoch.timeline_id == timeline_id) {
+        /* If we were in degraded mode and the observer re-confirms the
+         * primary, exit degraded mode but keep generation. */
+        if (atomic_load(&router->degraded_mode)) {
+            atomic_store(&router->degraded_mode, false);
+            KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
+                "failover: primary '%s' re-confirmed; router exited DEGRADED mode",
+                name);
+        }
+        pthread_mutex_unlock(&router->epoch_mu);
+        return false;
+    }
+
+    /* Case C: real flip. Fence the previous primary if any, promote the
+     * new one, bump generation. */
+    bool fencing_required = router->config.failover.old_primary_fencing_required;
+    char prev_name[64];
+    snprintf(prev_name, sizeof(prev_name), "%s", router->epoch.primary_name);
+
+    if (prev_name[0] != '\0' && strcmp(prev_name, name) != 0) {
+        router_server_t* prev = find_server_slot(router, prev_name);
+        if (prev) {
+            prev->role_state = fencing_required
+                ? KEEL_NODE_STATE_DEMOTED
+                : KEEL_NODE_STATE_DRAINING;
+            /* Demote the previous primary's static role so that if the
+             * operator later clears the fence with
+             * keel_router_set_node_role_state(..., UNKNOWN), the node
+             * rejoins the pool as a replica, not as a stale primary. */
+            prev->config.role = KEEL_SERVER_REPLICA;
+        }
+    }
+
+    router_server_t* cur = find_server_slot(router, name);
+    if (cur) {
+        cur->role_state  = KEEL_NODE_STATE_PRIMARY;
+        cur->config.role = KEEL_SERVER_PRIMARY;
+        if (timeline_id != 0) {
+            cur->config.timeline_id = timeline_id;
+        }
+    }
+
+    router->epoch.generation++;
+    snprintf(router->epoch.primary_name, sizeof(router->epoch.primary_name),
+             "%s", name);
+    router->epoch.timeline_id   = timeline_id;
+    router->epoch.observed_at_ms = (uint64_t)(keel_time_now() / 1000000LL);
+
+    rebuild_indices(router);
+    atomic_store(&router->degraded_mode, false);
+
+    uint64_t new_gen = router->epoch.generation;
+    pthread_mutex_unlock(&router->epoch_mu);
+
+    KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
+        "failover: epoch flip generation=%llu primary='%s' timeline=%u "
+        "(previous='%s' state=%s fencing=%s)",
+        (unsigned long long)new_gen, name, (unsigned)timeline_id,
+        prev_name[0] ? prev_name : "(none)",
+        fencing_required ? "DEMOTED" : "DRAINING",
+        fencing_required ? "on" : "off");
+    return true;
+}
+
+keel_error_t keel_router_set_node_role_state(keel_router_t* router,
+                                             const char* name,
+                                             keel_node_role_state_t state)
+{
+    if (!router || !name) return KEEL_ERR_INVALID_ARG;
+    pthread_mutex_lock(&router->epoch_mu);
+    router_server_t* srv = find_server_slot(router, name);
+    if (!srv) {
+        pthread_mutex_unlock(&router->epoch_mu);
+        return KEEL_ERR_NOT_FOUND;
+    }
+    keel_node_role_state_t old = srv->role_state;
+    srv->role_state = state;
+    rebuild_indices(router);
+    pthread_mutex_unlock(&router->epoch_mu);
+    KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
+        "failover: manual override server='%s' role_state %s -> %s",
+        name,
+        keel_node_role_state_name(old),
+        keel_node_role_state_name(state));
+    return KEEL_OK;
+}
+
+keel_node_role_state_t keel_router_get_node_role_state(const keel_router_t* router,
+                                                       const char* name)
+{
+    if (!router || !name) return KEEL_NODE_STATE_UNKNOWN;
+    for (size_t i = 0; i < router->server_count; i++) {
+        if (router->servers[i].active &&
+            strcmp(router->servers[i].name, name) == 0) {
+            return router->servers[i].role_state;
+        }
+    }
+    return KEEL_NODE_STATE_UNKNOWN;
 }
 
 /**
@@ -820,10 +1068,19 @@ static bool should_use_readonly(
     if (!router->config.read_write_split) {
         return false;
     }
+
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_PRIMARY_ONLY) {
+        return false;
+    }
     
     /* Session is pinned? */
     if (session && session->pinned_server) {
         return false;  /* Will use pinned server regardless */
+    }
+
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+        session && session->requires_consistent_read) {
+        return false;
     }
     
     /* In a transaction? Must stick to same server */
@@ -847,6 +1104,74 @@ static bool should_use_readonly(
     }
 
     return keel_qt_can_use_replica(qt);
+}
+
+static bool query_is_replica_safe_read(const keel_qt_query_t* qt)
+{
+    if (!qt) {
+        return false;
+    }
+    if (qt->has_error ||
+        (qt->flags & KEEL_QT_FLAG_PARTIAL_PARSE) ||
+        qt->func_count > 0) {
+        return false;
+    }
+    return keel_qt_can_use_replica(qt);
+}
+
+static bool consistency_forces_primary(
+    const keel_router_t* router,
+    const keel_qt_query_t* qt,
+    const keel_route_session_t* session
+) {
+    if (!router || !query_is_replica_safe_read(qt)) {
+        return false;
+    }
+    if (session && session->pinned_server) {
+        return false;
+    }
+    if (session && (session->in_transaction || session->has_temp_tables)) {
+        return false;
+    }
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_PRIMARY_ONLY) {
+        return true;
+    }
+    return router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+           session &&
+           session->requires_consistent_read;
+}
+
+/**
+ * @brief Should the router emit a WAIT_CATCHUP decision for this request?
+ *
+ * True when the operator picked `stale_read_policy=wait` AND the session
+ * carries a consistency token (`requires_consistent_read` + non-empty
+ * `required_consistency_token.value`). The actual replica-safety check
+ * is done by the caller via `consistency_forces_primary()` — this helper
+ * only encodes the policy precondition that flips the consistency path
+ * from primary-fallback to park-and-probe.
+ *
+ * Returning true does not by itself emit WAIT_CATCHUP: the read path also
+ * needs an eligible replica. If no replica is available the routing logic
+ * falls back to the legacy primary path with `KEEL_DF_NO_REPLICAS`.
+ */
+static bool should_wait_for_catchup(
+    const keel_router_t* router,
+    const keel_route_session_t* session)
+{
+    if (!router || !session) {
+        return false;
+    }
+    if (router->config.stale_read_policy != KEEL_STALE_READ_WAIT) {
+        return false;
+    }
+    if (router->config.consistency_mode != KEEL_CONSISTENCY_READ_YOUR_WRITES) {
+        return false;
+    }
+    if (!session->requires_consistent_read) {
+        return false;
+    }
+    return session->required_consistency_token.value[0] != '\0';
 }
 
 /**
@@ -1042,6 +1367,37 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         return KEEL_ERR_UNAVAILABLE;
     }
 
+    /* Failover-manager: degraded mode gating.
+     *
+     * When keel_router_observe_primary() was called with NULL (primary
+     * unreachable) and no concrete new primary has been observed yet, the
+     * router enters degraded mode. Per the [failover] policy:
+     *   - read_during_failover=REJECT       : refuse reads (default ALLOW)
+     *   - transaction_during_failover=REJECT: refuse anything inside a tx
+     *     (and refuse writes outright, since they cannot be routed)
+     */
+    if (atomic_load(&router->degraded_mode)) {
+        bool is_read = query_is_replica_safe_read(qt);
+        bool in_tx   = session && session->in_transaction;
+        bool reject_reads =
+            router->config.failover.read_during_failover
+                == KEEL_FAILOVER_READ_REJECT;
+        bool reject_tx =
+            router->config.failover.transaction_during_failover
+                == KEEL_FAILOVER_TXN_FAIL;
+        bool refuse =
+            (!is_read)                         /* writes can never succeed */
+            || (reject_reads && is_read)
+            || (reject_tx   && in_tx);
+        if (refuse) {
+            decision->is_read     = is_read;
+            decision->reason      = "degraded mode: cluster has no primary";
+            decision->reason_code = KEEL_ROUTE_REASON_DEGRADED_MODE;
+            decision->decision_factors |= KEEL_DF_DEGRADED_MODE;
+            return KEEL_ERR_UNAVAILABLE;
+        }
+    }
+
     if (session && session->pinned_server) {
         decision->server      = session->pinned_server;
         decision->was_pinned  = true;
@@ -1050,6 +1406,18 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         decision->decision_factors |= KEEL_DF_SESSION_PINNED;
         if (!simulate) router->stats.pinned_routes++;
         return KEEL_OK;
+    }
+
+    if (router->config.consistency_mode == KEEL_CONSISTENCY_READ_YOUR_WRITES &&
+        router->config.stale_read_policy == KEEL_STALE_READ_REJECT &&
+        session && session->requires_consistent_read &&
+        !session->in_transaction && !session->has_temp_tables &&
+        query_is_replica_safe_read(qt)) {
+        decision->is_read = true;
+        decision->reason = "consistent read rejected: no replica catch-up proof";
+        decision->reason_code = KEEL_ROUTE_REASON_LAG_EXCEEDED;
+        decision->decision_factors |= KEEL_DF_CONSISTENCY_TOKEN;
+        return KEEL_ERR_UNAVAILABLE;
     }
 
     /* Feature 7: Cross-transaction shard validation.
@@ -1070,8 +1438,29 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         return KEEL_ERR_SHARD_CROSS_TX;
     }
 
+    bool force_primary_for_consistency =
+        consistency_forces_primary(router, qt, session);
     bool is_read = should_use_readonly(router, qt, session);
-    decision->is_read = is_read;
+
+    /* WAIT-policy escape hatch: when the operator picked
+     * `stale_read_policy=wait` and the session has a consistency token, do
+     * NOT force primary. Instead the read path will select a candidate
+     * replica and emit `KEEL_ROUTE_REASON_WAIT_CATCHUP`; the engine then
+     * parks the session in the per-worker catch-up manager (see
+     * keel/engine/catchup.h) until a probe proves the replica reached the
+     * token. If no eligible replica exists this collapses to the legacy
+     * primary fallback. */
+    bool wait_catchup_mode = false;
+    if (force_primary_for_consistency && should_wait_for_catchup(router, session)) {
+        force_primary_for_consistency = false;
+        is_read                       = true;
+        wait_catchup_mode             = true;
+    }
+
+    if (force_primary_for_consistency) {
+        is_read = false;
+    }
+    decision->is_read = is_read || force_primary_for_consistency;
 
     router_server_t* selected = NULL;
 
@@ -1083,6 +1472,28 @@ static keel_error_t route_internal_ex(keel_router_t* router,
 
         if (read_count > 0) {
             selected = select_server(router, read_indices, read_count, true);
+        }
+
+        if (wait_catchup_mode && selected && selected->config.role != KEEL_SERVER_PRIMARY) {
+            /* Replica picked, but session must be parked until it catches
+             * up to the token. The engine consumes wait_server_index +
+             * wait_token + wait_max_ms and enqueues a waiter; on REACHED
+             * the original SQL is re-dispatched against this same replica.
+             * If `selected` is the primary (added via primary_read_weight
+             * when no replica is eligible) fall through to the normal
+             * read/fallback path — there is nothing to wait for. */
+            size_t srv_idx = (size_t)(selected - router->servers);
+            decision->server             = NULL;
+            decision->wait_server_index  = srv_idx;
+            decision->wait_token         = session->required_consistency_token;
+            decision->wait_max_ms        = router->config.max_replica_catchup_ms;
+            decision->reason             = "consistent read: parked until replica reaches token";
+            decision->reason_code        = KEEL_ROUTE_REASON_WAIT_CATCHUP;
+            decision->decision_factors  |= (KEEL_DF_WAIT_CATCHUP | KEEL_DF_CONSISTENCY_TOKEN);
+            if (!simulate) {
+                router->stats.read_routes++;
+            }
+            return KEEL_OK;
         }
 
         if (!selected && router->config.failover_to_primary) {
@@ -1122,8 +1533,40 @@ static keel_error_t route_internal_ex(keel_router_t* router,
         }
 
         if (selected) {
-            if (!simulate) router->stats.write_routes++;
-            if (session && session->in_transaction) {
+            if (!simulate) {
+                if (force_primary_for_consistency)
+                    router->stats.read_routes++;
+                else
+                    router->stats.write_routes++;
+            }
+            if (force_primary_for_consistency) {
+                if (session && session->required_consistency_token.timeline_id != 0 &&
+                    selected->config.timeline_id != 0 &&
+                    session->required_consistency_token.timeline_id != selected->config.timeline_id) {
+                    /* Failover-manager: consistency token was minted on a
+                     * different PG timeline than the current primary. If
+                     * the operator opted into `stale_read_policy=REJECT`,
+                     * refuse the route to avoid phantom reads after a
+                     * re-fork. Otherwise (legacy default) just tag the
+                     * decision with TIMELINE_STALE for observability. */
+                    if (router->config.stale_read_policy
+                            == KEEL_STALE_READ_REJECT) {
+                        decision->server      = NULL;
+                        decision->reason      = "consistency token timeline is stale";
+                        decision->reason_code = KEEL_ROUTE_REASON_TIMELINE_STALE;
+                        decision->decision_factors |=
+                            (KEEL_DF_CONSISTENCY_TOKEN | KEEL_DF_STICKY_PRIMARY);
+                        return KEEL_ERR_UNAVAILABLE;
+                    }
+                    decision->reason      = "consistency token timeline is stale";
+                    decision->reason_code = KEEL_ROUTE_REASON_TIMELINE_STALE;
+                } else {
+                    decision->reason      = "consistency token requires primary";
+                    decision->reason_code = KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY;
+                }
+                decision->decision_factors |=
+                    (KEEL_DF_CONSISTENCY_TOKEN | KEEL_DF_STICKY_PRIMARY);
+            } else if (session && session->in_transaction) {
                 decision->reason      = use_shard_filter ? "single-shard transaction" : "in transaction";
                 decision->reason_code = KEEL_ROUTE_REASON_IN_TRANSACTION;
                 decision->decision_factors |= KEEL_DF_IN_TRANSACTION;

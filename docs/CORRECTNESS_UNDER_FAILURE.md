@@ -1,7 +1,6 @@
 # Correctness Under Failure
 
-This document is the v0.4-alpha correctness contract. KEEL's first production
-story is not feature breadth; it is conservative PostgreSQL proxying and pooling
+This document is the correctness contract. KEEL's production story is not feature breadth; it is conservative PostgreSQL proxying and pooling
 that fails closed when routing, state, parser, or failover certainty is missing.
 
 KEEL should be positioned as:
@@ -64,18 +63,79 @@ positive proof, not absence of obvious writes.
 
 ## Stability Tiers
 
-| Area | v0.4-alpha tier | Release rule |
+| Area | Current maturity | Operational rule |
 |------|-----------------|--------------|
 | PostgreSQL proxy mode | Stable target | Must pass protocol, TLS, auth, and drain gates. |
 | PostgreSQL pool mode | Stable target | Backend reuse requires protocol-confirmed idle state. |
-| Smart read routing | Beta | Replica routing only after semantic safety and session cleanliness checks. |
-| Prepared statement virtualization | Beta | Requires lifecycle tracking and invalidation tests per deployment. |
+| Smart read routing | Hardening | Replica routing only after semantic safety and session cleanliness checks. |
+| Prepared statement virtualization | Hardening | Requires lifecycle tracking and invalidation tests per deployment. |
 | Session virtualization | Experimental | Must not be a default production promise. |
 | Sharding and scatter-gather | Experimental | Opt-in only, fail closed when disabled or ambiguous. |
 | Multi-shard transactions | Experimental | Blocked on commit-in-doubt crash-recovery coverage. |
 | Result cache | Experimental | Disabled by default and gated by `experimental_features`. |
-| MySQL | Alpha | Keep parity tests, but do not position as the first production baseline. |
+| MySQL | Hardening | Keep parity tests, but do not position as the first production baseline. |
 | GraphQL, MCP, natural language parsing | Research | Design and experiments only. |
+
+## Read-Your-Writes Consistency and Stale-Read Policy
+
+KEEL tracks the last write performed by a session as a
+`keel_consistency_token_t` (either a PostgreSQL WAL LSN or a MySQL GTID
+set, stored on the per-session `sf->last_write_token`). When a
+`consistency_mode = read_your_writes` router is configured, every
+token-bearing read is classified by the router before server selection.
+
+### stale_read_policy = warn (default)
+
+The router selects the best replica, notes that the replica may be
+behind, logs a WARNING, and routes normally. No client-visible impact.
+
+### stale_read_policy = fail
+
+The router rejects the query with a routing error when the replica
+cannot be confirmed as caught up. The session must retry.
+
+### stale_read_policy = wait (safe-degrade)
+
+The router emits `KEEL_ROUTE_REASON_WAIT_CATCHUP`. The intended behavior
+is to park the session and wait up to `max_replica_catchup_ms` for the
+replica to catch up, then re-dispatch.
+
+When the full async-park + resume continuation is not yet active (which
+depends on the build configuration), the engine falls back to a
+**safe-degrade** path: it consults
+`keel_engine_should_degrade_to_primary_on_wait()` and, when the router
+would emit WAIT_CATCHUP, **routes the read to the primary** rather than
+parking the session. This preserves RYW correctness at the cost of
+marginal extra primary load.
+
+The correctness rule is:
+
+```text
+If the replica is behind and stale_read_policy=wait,
+route to primary. Never return stale data to a RYW session.
+```
+
+The safe-degrade path is visible via two operator-facing counters on
+the Prometheus `/metrics` endpoint and in `SHOW STATS`:
+
+| Stat name | Description |
+|---|---|
+| `wait_catchup_consulted_total` | Total token-bearing reads that triggered a router consultation |
+| `wait_catchup_degraded_to_primary_total` | Subset that were degraded to primary (router said WAIT_CATCHUP) |
+
+A non-zero `wait_catchup_degraded_to_primary_total` is expected and
+correct when operating in safe-degrade mode. It is **not** an error —
+it means the RYW guarantee is being upheld via primary routing. If the
+ratio `degraded / consulted` is high, consider increasing
+`max_replica_catchup_ms`, reducing replication lag, or using
+`stale_read_policy = warn` to allow slightly stale reads.
+
+### in_transaction invariant
+
+RYW token evaluation and the WAIT_CATCHUP path are **skipped** when
+`session->in_transaction` is true. Inside a transaction the session is
+already pinned to a backend and the routing path does not re-select;
+token evaluation on a mid-transaction read would be incorrect.
 
 ## Ownership Rules
 
@@ -102,7 +162,7 @@ clean or the backend is closed. Cleanup failure is a close reason, not a warning
 ## State Machines
 
 The canonical state-machine reference is [STATE_MODEL.md](STATE_MODEL.md). For
-v0.4-alpha release review, the minimum state-machine diagrams and invariants are:
+readiness review, the minimum state-machine diagrams and invariants are:
 
 ```text
 Frontend:    startup -> auth -> ready -> parse -> bind -> execute -> sync -> ready
@@ -121,7 +181,7 @@ observable reason code when it closes or rejects work.
 
 ## Prepared Statement Lifecycle
 
-Prepared-statement virtualization remains beta until the runtime tracks and tests:
+Prepared-statement virtualization remains in hardening until the runtime tracks and tests:
 
 ```text
 client statement name
@@ -184,7 +244,7 @@ route.
 
 ## Chaos and Replay Requirements
 
-v0.4-alpha work should prioritize deterministic tests for:
+Correctness work should prioritize deterministic tests for:
 
 - extended PostgreSQL protocol recovery: Parse/Bind/Execute, unnamed statements,
   named statements, portals, cursor fetch, Sync recovery, ErrorResponse recovery,
@@ -235,7 +295,7 @@ safe degradation, and fail-closed behavior. Avoid claims that imply uninterrupte
 upgrades, invisible failover, complete statelessness, universal SQL coverage, or
 self-proving correctness.
 
-## Release Gate Command
+## Correctness Gate Command
 
 Run deterministic correctness gates with:
 

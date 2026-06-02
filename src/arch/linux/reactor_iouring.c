@@ -1069,28 +1069,44 @@ static int iouring_chain_send_recv(
 {
     iouring_state_t* state = (iouring_state_t*)reactor->backend_state;
 
-    /* Allocate both SQEs upfront to avoid partial chain on failure */
-    struct io_uring_sqe* sqe_send = get_sqe_or_flush(reactor, state);
-    if (sqe_send == NULL) {
-        errno = EAGAIN;
-        return -1;
-    }
-    struct io_uring_sqe* sqe_recv = get_sqe_or_flush(reactor, state);
-    if (sqe_recv == NULL) {
+    /*
+     * The linked pair must be queued atomically.  Reserving one SQE and then
+     * flushing while looking for the second can submit a half-built chain under
+     * pressure, which is worse than falling back to the ordinary send/recv path.
+     */
+    if (state->free_top < 2) {
         errno = EAGAIN;
         return -1;
     }
 
-    /* Allocate tracking ops from the pending pool */
+    if (io_uring_sq_space_left(&state->ring) < 2) {
+        reactor->stats.sq_overflow++;
+        io_uring_submit(&state->ring);
+        if (io_uring_sq_space_left(&state->ring) < 2) {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
+
+    /* Allocate tracking ops before SQEs so failure cannot strand SQ entries. */
     iouring_op_t* send_op = alloc_pending_op(state);
     if (send_op == NULL) {
-        errno = ENOMEM;
+        errno = EAGAIN;
         return -1;
     }
     iouring_op_t* recv_op = alloc_pending_op(state);
     if (recv_op == NULL) {
         free_pending_op(state, send_op);
-        errno = ENOMEM;
+        errno = EAGAIN;
+        return -1;
+    }
+
+    struct io_uring_sqe* sqe_send = io_uring_get_sqe(&state->ring);
+    struct io_uring_sqe* sqe_recv = io_uring_get_sqe(&state->ring);
+    if (sqe_send == NULL || sqe_recv == NULL) {
+        free_pending_op(state, send_op);
+        free_pending_op(state, recv_op);
+        errno = EAGAIN;
         return -1;
     }
 

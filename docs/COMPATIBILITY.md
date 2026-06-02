@@ -1,7 +1,7 @@
 # KEEL Configuration API Compatibility
 
 This document defines the stability tier of every `keel.ini` configuration key,
-the deprecation policy, and migration notes for any breaking changes between releases.
+the deprecation policy, and the location of migration notes for breaking changes.
 
 ---
 
@@ -9,17 +9,17 @@ the deprecation policy, and migration notes for any breaking changes between rel
 
 | Tier | Meaning |
 |------|---------|
-| **Stable** | Will not be renamed or removed without a minimum 2-release deprecation window. A deprecated key produces a `WARN`-level log message. |
-| **Experimental** | Working but the interface (name, semantics, or defaults) may change in any release. Not subject to the deprecation policy. |
+| **Stable** | Will not be renamed or removed without a documented deprecation window. A deprecated key produces a `WARN`-level log message. |
+| **Experimental** | Working but the interface (name, semantics, or defaults) may change while the feature is maturing. Not subject to the deprecation policy. |
 | **Internal** | Not intended for end users. May be removed or changed without notice. |
 
 ---
 
 ## Deprecation Policy
 
-1. A key is first marked `[DEPRECATED]` in a release note.
-2. In that release it still works but logs a warning on every SIGHUP and startup.
-3. The key is removed no earlier than **two releases later**.
+1. A key is first marked `[DEPRECATED]` in the changelog or release notes.
+2. While deprecated, it still works but logs a warning on every SIGHUP and startup.
+3. The key is removed only after the documented compatibility window has elapsed.
 4. Migration guides appear in the `### Migration` section of the relevant `CHANGELOG.md` entry.
 
 ---
@@ -264,16 +264,14 @@ Format: `name = host=… port=… dbname=… role=… weight=… [user=…] [pas
 
 ## Migration Notes
 
-### alpha-0.3.0
+Release-specific migration history belongs in [CHANGELOG.md](../CHANGELOG.md).
 
-No breaking key changes from `alpha-0.1`.
+### Planned
 
-### Future (planned)
-
-The following experimental keys may be promoted to Stable or renamed before v1.0.0:
+The following experimental keys may be promoted to Stable or renamed before the stable API milestone:
 
 - `fast_network_path` — may become `splice_bypass` to better reflect the mechanism
 - `tls_auto_generate` / `tls_auto_dir` — may be collapsed into a single `tls_auto = /path/to/dir` key
 - `use_buf_rings` — may be folded into `io_uring_mode = standard | buf_rings`
 
-Any rename will follow the 2-release deprecation policy above.
+Any rename will follow the deprecation policy above.

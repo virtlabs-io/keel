@@ -183,6 +183,7 @@ static keel_router_t* create_test_router(void) {
         .host = "db-primary",
         .port = 5432,
         .role = KEEL_SERVER_PRIMARY,
+        .timeline_id = 1,
         .weight = 100,
         .health = KEEL_HEALTH_UP
     };
@@ -194,6 +195,7 @@ static keel_router_t* create_test_router(void) {
         .host = "db-replica1",
         .port = 5432,
         .role = KEEL_SERVER_REPLICA,
+        .timeline_id = 1,
         .weight = 100,
         .health = KEEL_HEALTH_UP
     };
@@ -205,6 +207,7 @@ static keel_router_t* create_test_router(void) {
         .host = "db-replica2",
         .port = 5432,
         .role = KEEL_SERVER_REPLICA,
+        .timeline_id = 1,
         .weight = 100,
         .health = KEEL_HEALTH_UP
     };
@@ -694,6 +697,116 @@ TEST(router_can_use_replica) {
     keel_router_destroy(router);
 }
 
+TEST(read_your_writes_routes_primary) {
+    keel_router_t* router = create_test_router();
+    ASSERT_NE(router, NULL);
+
+    keel_route_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.requires_consistent_read = true;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
+
+    keel_route_decision_t decision;
+    keel_error_t err = keel_router_route_sql(
+        router, KEEL_STR("SELECT * FROM users"), &session, &decision);
+
+    ASSERT_EQ(err, KEEL_OK);
+    ASSERT_NE(decision.server, NULL);
+    ASSERT_STR_EQ(decision.server->name, "primary");
+    ASSERT_TRUE(decision.is_read);
+    ASSERT_EQ(decision.reason_code, KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY);
+    ASSERT_TRUE((decision.decision_factors & KEEL_DF_CONSISTENCY_TOKEN) != 0);
+
+    keel_arena_t* arena = keel_arena_create(4096);
+    ASSERT_NE(arena, NULL);
+    keel_qt_query_t* qt_read = keel_sql_analyze_full(
+        KEEL_STR("SELECT * FROM users"), arena);
+    ASSERT_FALSE(keel_router_can_use_replica(router, qt_read, &session));
+    keel_arena_destroy(arena);
+
+    keel_router_destroy(router);
+}
+
+TEST(read_your_writes_reports_stale_timeline) {
+    keel_router_t* router = create_test_router();
+    ASSERT_NE(router, NULL);
+
+    keel_route_server_t* primary = keel_router_get_server(router, "primary");
+    ASSERT_NE(primary, NULL);
+    primary->timeline_id = 2;
+
+    keel_route_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.requires_consistent_read = true;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
+
+    keel_route_decision_t decision;
+    keel_error_t err = keel_router_route_sql(
+        router, KEEL_STR("SELECT * FROM users"), &session, &decision);
+
+    ASSERT_EQ(err, KEEL_OK);
+    ASSERT_NE(decision.server, NULL);
+    ASSERT_STR_EQ(decision.server->name, "primary");
+    ASSERT_EQ(decision.reason_code, KEEL_ROUTE_REASON_TIMELINE_STALE);
+    ASSERT_TRUE((decision.decision_factors & KEEL_DF_CONSISTENCY_TOKEN) != 0);
+
+    keel_router_destroy(router);
+}
+
+TEST(read_your_writes_reject_policy_fails_closed) {
+    keel_router_config_t config = keel_router_config_default();
+    config.primary_read_weight = 0.5;
+    config.stale_read_policy = KEEL_STALE_READ_REJECT;
+
+    keel_router_t* router = keel_router_create(&config);
+    ASSERT_NE(router, NULL);
+
+    keel_route_server_t primary = {
+        .name = "primary",
+        .host = "db-primary",
+        .port = 5432,
+        .role = KEEL_SERVER_PRIMARY,
+        .timeline_id = 1,
+        .weight = 100,
+        .health = KEEL_HEALTH_UP
+    };
+    ASSERT_EQ(keel_router_add_server(router, &primary), KEEL_OK);
+
+    keel_route_server_t replica = {
+        .name = "replica1",
+        .host = "db-replica1",
+        .port = 5432,
+        .role = KEEL_SERVER_REPLICA,
+        .timeline_id = 1,
+        .weight = 100,
+        .health = KEEL_HEALTH_UP
+    };
+    ASSERT_EQ(keel_router_add_server(router, &replica), KEEL_OK);
+
+    keel_route_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.requires_consistent_read = true;
+    snprintf(session.required_consistency_token.value,
+             sizeof(session.required_consistency_token.value), "0/ABCD1234");
+    session.required_consistency_token.timeline_id = 1;
+
+    keel_route_decision_t decision;
+    keel_error_t err = keel_router_route_sql(
+        router, KEEL_STR("SELECT * FROM users"), &session, &decision);
+
+    ASSERT_EQ(err, KEEL_ERR_UNAVAILABLE);
+    ASSERT_EQ(decision.server, NULL);
+    ASSERT_TRUE(decision.is_read);
+    ASSERT_EQ(decision.reason_code, KEEL_ROUTE_REASON_LAG_EXCEEDED);
+    ASSERT_TRUE((decision.decision_factors & KEEL_DF_CONSISTENCY_TOKEN) != 0);
+
+    keel_router_destroy(router);
+}
+
 TEST(router_dump) {
     keel_router_t* router = create_test_router();
     ASSERT_NE(router, NULL);
@@ -837,6 +950,9 @@ int main(int argc, char* argv[]) {
     
     printf("\nAPI tests:\n");
     RUN_TEST(router_can_use_replica);
+    RUN_TEST(read_your_writes_routes_primary);
+    RUN_TEST(read_your_writes_reports_stale_timeline);
+    RUN_TEST(read_your_writes_reject_policy_fails_closed);
     RUN_TEST(router_dump);
     
     printf("\nDiscovery tests:\n");

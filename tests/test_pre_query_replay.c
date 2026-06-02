@@ -8,6 +8,7 @@
 #include "keel/engine/engine_flow.h"
 #include "keel/engine/backend_pool.h"
 #include "keel/session/session.h"
+#include "keel/session/ssv_atom.h"
 #include "keel/session/state_profile.h"
 #include "keel/protocol/protocol_flow.h"
 #include "keel/mem/mem.h"
@@ -51,6 +52,85 @@ static size_t build_ready_for_query(uint8_t* buf, char status)
     wr32(buf + 1, 5);
     buf[5] = (uint8_t)status;
     return 6;
+}
+
+static size_t build_simple_query(uint8_t* buf, const char* sql)
+{
+    size_t sql_len = strlen(sql) + 1;
+    buf[0] = 'Q';
+    wr32(buf + 1, (uint32_t)(4 + sql_len));
+    memcpy(buf + 5, sql, sql_len);
+    return 1 + 4 + sql_len;
+}
+
+static size_t build_startup(uint8_t* buf, const char* user, const char* db)
+{
+    uint8_t* p = buf + 4;
+    wr32(p, 0x00030000);
+    p += 4;
+    memcpy(p, "user", 5);
+    p += 5;
+    size_t user_len = strlen(user);
+    memcpy(p, user, user_len + 1);
+    p += user_len + 1;
+    memcpy(p, "database", 9);
+    p += 9;
+    size_t db_len = strlen(db);
+    memcpy(p, db, db_len + 1);
+    p += db_len + 1;
+    *p++ = '\0';
+    wr32(buf, (uint32_t)(p - buf));
+    return (size_t)(p - buf);
+}
+
+static size_t build_named_parse(uint8_t* buf, const char* name, const char* sql)
+{
+    size_t name_len = strlen(name);
+    size_t sql_len = strlen(sql);
+    size_t body_len = name_len + 1 + sql_len + 1 + 2;
+    buf[0] = 'P';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(buf + 5, name, name_len + 1);
+    memcpy(buf + 5 + name_len + 1, sql, sql_len + 1);
+    buf[5 + name_len + 1 + sql_len + 1] = 0;
+    buf[5 + name_len + 1 + sql_len + 2] = 0;
+    return 1 + 4 + body_len;
+}
+
+static size_t build_bind(uint8_t* buf, const char* portal, const char* stmt)
+{
+    size_t portal_len = strlen(portal);
+    size_t stmt_len = strlen(stmt);
+    size_t body_len = portal_len + 1 + stmt_len + 1 + 2 + 2 + 2;
+    uint8_t* p = buf + 5;
+    buf[0] = 'B';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(p, portal, portal_len + 1);
+    p += portal_len + 1;
+    memcpy(p, stmt, stmt_len + 1);
+    p += stmt_len + 1;
+    p[0] = 0; p[1] = 0; p += 2;
+    p[0] = 0; p[1] = 0; p += 2;
+    p[0] = 0; p[1] = 0;
+    return 1 + 4 + body_len;
+}
+
+static size_t build_execute(uint8_t* buf, const char* portal)
+{
+    size_t portal_len = strlen(portal);
+    size_t body_len = portal_len + 1 + 4;
+    buf[0] = 'E';
+    wr32(buf + 1, (uint32_t)(4 + body_len));
+    memcpy(buf + 5, portal, portal_len + 1);
+    wr32(buf + 5 + portal_len + 1, 0);
+    return 1 + 4 + body_len;
+}
+
+static size_t build_extended_msg(uint8_t* buf, uint8_t type)
+{
+    buf[0] = type;
+    wr32(buf + 1, 4);
+    return 5;
 }
 
 static size_t build_parse_complete(uint8_t* buf)
@@ -135,6 +215,14 @@ typedef struct fake_replay_ctx {
     uint64_t replay_hash;
     int cleanup_mode;
     size_t cleanup_calls;
+    keel_consistency_token_t capture_token;
+    int capture_rc;
+    size_t capture_calls;
+    size_t notify_calls;
+    char notified_lsn[KEEL_CONSISTENCY_TOKEN_MAX];
+    keel_query_effect_flags_t fe_effect;
+    bool fe_no_response;
+    size_t fe_calls;
 } fake_replay_ctx_t;
 
 enum {
@@ -269,6 +357,43 @@ static int fake_on_be_msg(void* ctx,
     return 0;
 }
 
+static int fake_on_fe_msg(void* ctx,
+                          const uint8_t* data,
+                          size_t len,
+                          keel_fe_action_t* act)
+{
+    fake_replay_ctx_t* rctx = (fake_replay_ctx_t*)ctx;
+    if (!rctx || !data || len == 0 || !act)
+        return -1;
+
+    rctx->fe_calls++;
+    *act = keel_fe_action_default();
+    act->type = KEEL_FE_ACT_QUERY;
+    act->msg_kind = KEEL_MSG_KIND_SQL;
+    act->effect = rctx->fe_effect;
+    act->route_hint = (rctx->fe_effect & (KEEL_QE_WRITE | KEEL_QE_DDL))
+        ? KEEL_FROUTE_WRITE
+        : KEEL_FROUTE_READ;
+    act->be_payload = data;
+    act->be_payload_len = len;
+    act->no_response = rctx->fe_no_response;
+    if (len > 6 && data[0] == 'Q') {
+        act->sql_view = (const char*)data + 5;
+        act->sql_view_len = strlen((const char*)data + 5);
+    }
+    return 0;
+}
+
+static void fake_get_info(keel_plugin_info_t* out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    out->name = "fake";
+    out->api_version = KEEL_PLUGIN_API_V1;
+    out->capabilities = KEEL_PCAP_CONSISTENCY_TOKEN;
+}
+
 static int fake_get_stmt_replay(void* ctx,
                                 uint8_t** out_buf,
                                 size_t* out_len,
@@ -293,13 +418,316 @@ static int fake_get_stmt_replay(void* ctx,
     return 0;
 }
 
+static int fake_capture_consistency_token(void* ctx, int be_fd,
+                                          keel_consistency_token_t* out)
+{
+    fake_replay_ctx_t* rctx = (fake_replay_ctx_t*)ctx;
+    if (!rctx || !out || be_fd < 0)
+        return -1;
+    rctx->capture_calls++;
+    if (rctx->capture_rc != 0)
+        return rctx->capture_rc;
+    *out = rctx->capture_token;
+    return 0;
+}
+
+static void fake_notify_write_lsn(void* ctx, const char* lsn)
+{
+    fake_replay_ctx_t* rctx = (fake_replay_ctx_t*)ctx;
+    if (!rctx || !lsn)
+        return;
+    rctx->notify_calls++;
+    snprintf(rctx->notified_lsn, sizeof(rctx->notified_lsn), "%s", lsn);
+}
+
 static const keel_proto_flow_vtable_t s_fake_replay_vt = {
     .frame_len = fake_frame_len,
+    .on_fe_msg = fake_on_fe_msg,
     .on_be_msg = fake_on_be_msg,
+    .get_info = fake_get_info,
     .build_cleanup = fake_build_cleanup,
     .drain_cleanup_response = fake_drain_cleanup_response,
     .get_stmt_replay = fake_get_stmt_replay,
+    .capture_consistency_token = fake_capture_consistency_token,
+    .notify_write_lsn = fake_notify_write_lsn,
 };
+
+static void assert_fe_effect_stamps_tokenless_write_ts(
+    keel_query_effect_flags_t effect,
+    const char* sql,
+    bool expect_capture_pending)
+{
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    rctx.fe_effect = effect;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.phase = KEEL_PHASE_READY;
+    sf.mode = expect_capture_pending ? KEEL_TIER_FULL : KEEL_TIER_SMART;
+
+    uint8_t msg[128];
+    size_t msg_len = build_simple_query(msg, sql);
+
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, msg_len);
+    TEST_ASSERT(r == KEEL_FLOW_WAIT_BACKEND || r == KEEL_FLOW_LINKED_SEND);
+    TEST_ASSERT_EQ(rctx.fe_calls, 1u);
+    TEST_ASSERT(sf.last_write_ns != 0);
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms),
+                   sf.last_write_ns);
+    TEST_ASSERT(!keel_ssv_consistency_has_write_lsn(sf.consistency_atoms));
+    TEST_ASSERT(!keel_ssv_consistency_ttl_ok(sf.consistency_atoms,
+                                             sf.last_write_ns,
+                                             100));
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, expect_capture_pending);
+
+    if (session.server_fd < 0)
+        be_sv[0] = -1;
+    close_pair(be_sv);
+}
+
+static void test_fe_tokenless_write_stamps_sticky_primary(void)
+{
+    TEST_BEGIN("ryw: FE write stamps tokenless sticky-primary timestamp");
+
+    assert_fe_effect_stamps_tokenless_write_ts(KEEL_QE_WRITE,
+                                               "UPDATE t SET v = 1",
+                                               false);
+
+    TEST_END();
+}
+
+static void test_fe_tokenless_ddl_stamps_sticky_primary(void)
+{
+    TEST_BEGIN("ryw: FE DDL stamps tokenless sticky-primary timestamp");
+
+    assert_fe_effect_stamps_tokenless_write_ts(KEEL_QE_DDL,
+                                               "ALTER TABLE t ADD COLUMN v int",
+                                               false);
+
+    TEST_END();
+}
+
+static void test_fe_write_capture_pending_preserves_tokenless_stickiness(void)
+{
+    TEST_BEGIN("ryw: FE write awaiting capture still has sticky-primary timestamp");
+
+    assert_fe_effect_stamps_tokenless_write_ts(KEEL_QE_WRITE,
+                                               "INSERT INTO t VALUES (1)",
+                                               true);
+
+    TEST_END();
+}
+
+static void test_fe_read_does_not_stamp_sticky_primary(void)
+{
+    TEST_BEGIN("ryw: FE read does not stamp sticky-primary timestamp");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    rctx.fe_effect = KEEL_QE_READONLY;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.phase = KEEL_PHASE_READY;
+    sf.mode = KEEL_TIER_SMART;
+
+    uint8_t msg[128];
+    size_t msg_len = build_simple_query(msg, "SELECT * FROM t");
+
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, msg_len);
+    TEST_ASSERT(r == KEEL_FLOW_WAIT_BACKEND || r == KEEL_FLOW_LINKED_SEND);
+    TEST_ASSERT_EQ(rctx.fe_calls, 1u);
+    TEST_ASSERT_EQ(sf.last_write_ns, 0ULL);
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms), 0ULL);
+    TEST_ASSERT(!keel_ssv_consistency_has_write_lsn(sf.consistency_atoms));
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
+
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_extended_sync_does_not_use_linked_send(void)
+{
+    TEST_BEGIN("extended protocol: Sync waits for backend without linked send");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 17;
+    worker.ps_mode = KEEL_PS_MODE_TRACKING;
+    worker.runtime_mode = KEEL_TIER_POOL;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    keel_session_flow_t sf;
+    TEST_ASSERT_EQ(keel_session_flow_init(&sf, VT, &session), 0);
+
+    uint8_t startup[256];
+    keel_fe_action_t startup_act;
+    size_t startup_len = build_startup(startup, "testuser", "testdb");
+    TEST_ASSERT_EQ(VT->on_fe_msg(sf.ctx, startup, startup_len, &startup_act), KEEL_OK);
+    sf.phase = KEEL_PHASE_READY;
+    session.state = KEEL_SESSION_READY;
+
+    uint8_t msg[512];
+    size_t n = 0;
+    n += build_named_parse(msg + n, "stmtcache_deadbeef", "SELECT 1");
+    n += build_bind(msg + n, "", "stmtcache_deadbeef");
+    n += build_execute(msg + n, "");
+    n += build_extended_msg(msg + n, 'S');
+
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+    TEST_ASSERT_EQ(sf.linked_send_len, 0u);
+
+    uint8_t got[512];
+    ssize_t nr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT_EQ(nr, (ssize_t)n);
+    TEST_ASSERT(memcmp(got, msg, n) == 0);
+
+    if (VT->destroy_context)
+        VT->destroy_context(sf.ctx);
+    session.plugin_state = NULL;
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_post_write_capture_success_updates_ssv(void)
+{
+    TEST_BEGIN("ryw: post-write capture stores token in session state");
+
+    int be_sv[2] = { -1, -1 };
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = fe_sv[0];
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    snprintf(rctx.capture_token.value, sizeof(rctx.capture_token.value),
+             "0/CAFEBABE");
+    rctx.capture_token.captured_at_ns = 123456789ULL;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.capture_lsn_pending = true;
+
+    uint8_t bebuf[64];
+    size_t n = 0;
+    n += build_command_complete_tag(bebuf + n, "UPDATE 1");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_OK);
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
+    TEST_ASSERT_EQ(rctx.capture_calls, 1u);
+    TEST_ASSERT_EQ(rctx.notify_calls, 1u);
+    TEST_ASSERT_STR_EQ(rctx.notified_lsn, "0/CAFEBABE");
+    TEST_ASSERT_STR_EQ(sf.last_write_token.value, "0/CAFEBABE");
+    TEST_ASSERT_STR_EQ(keel_ssv_consistency_get_lsn(sf.consistency_atoms),
+                       "0/CAFEBABE");
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms),
+                   123456789ULL);
+
+    if (session.server_fd < 0)
+        be_sv[0] = -1;
+    close_pair(be_sv);
+    close_pair(fe_sv);
+    TEST_END();
+}
+
+static void test_post_write_capture_failure_fails_closed(void)
+{
+    TEST_BEGIN("ryw: post-write capture failure fails closed");
+
+    int be_sv[2] = { -1, -1 };
+    int fe_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+    TEST_ASSERT(make_socketpair(fe_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = fe_sv[0];
+
+    fake_replay_ctx_t rctx;
+    memset(&rctx, 0, sizeof(rctx));
+    rctx.capture_rc = -1;
+
+    keel_session_flow_t sf;
+    memset(&sf, 0, sizeof(sf));
+    sf.flow = &s_fake_replay_vt;
+    sf.ctx = &rctx;
+    sf.capture_lsn_pending = true;
+
+    uint8_t bebuf[64];
+    size_t n = 0;
+    n += build_command_complete_tag(bebuf + n, "UPDATE 1");
+    n += build_ready_for_query(bebuf + n, 'I');
+
+    keel_flow_result_t r = keel_engine_flow_on_be_data(&sf, &session, bebuf, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_ERROR);
+    TEST_ASSERT_EQ(sf.capture_lsn_pending, false);
+    TEST_ASSERT_EQ(rctx.capture_calls, 1u);
+    TEST_ASSERT_EQ(rctx.notify_calls, 0u);
+    TEST_ASSERT_EQ(sf.last_write_token.value[0], '\0');
+    TEST_ASSERT_EQ(keel_ssv_consistency_has_write_lsn(sf.consistency_atoms), false);
+    TEST_ASSERT_EQ(session.server_fd, -1);
+
+    be_sv[0] = -1;
+    close_pair(be_sv);
+    close_pair(fe_sv);
+    TEST_END();
+}
 
 static void test_flag_lifecycle_and_forward_on_rfq(void)
 {
@@ -1744,6 +2172,13 @@ int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
 
+    test_fe_tokenless_write_stamps_sticky_primary();
+    test_fe_tokenless_ddl_stamps_sticky_primary();
+    test_fe_write_capture_pending_preserves_tokenless_stickiness();
+    test_fe_read_does_not_stamp_sticky_primary();
+    test_extended_sync_does_not_use_linked_send();
+    test_post_write_capture_success_updates_ssv();
+    test_post_write_capture_failure_fails_closed();
     test_flag_lifecycle_and_forward_on_rfq();
     test_absorb_without_rfq();
     test_partial_then_completion();

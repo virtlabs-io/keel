@@ -51,6 +51,7 @@ target_link_libraries(keel
     PRIVATE keelcore
     PRIVATE keel_admin
     PRIVATE keel_probe
+    PRIVATE keel_failover
     PRIVATE keel_hook
     PRIVATE keelsql
     PRIVATE keelmem

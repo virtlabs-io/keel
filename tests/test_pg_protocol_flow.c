@@ -381,8 +381,14 @@ static void test_startup_bad_version(void) {
     keel_fe_action_t act;
     int rc = VT->on_fe_msg(ctx, buf, 8, &act);
 
-    TEST_ASSERT_EQ(rc, -1);
-    TEST_ASSERT_EQ(act.type, KEEL_FE_ACT_ERROR);
+    /* D3 fix: proxy sends an ErrorResponse before closing, so rc==0 and the
+     * action is AUTH_REJECT (not the old silent KEEL_FE_ACT_ERROR).
+     * fe_response must be a valid 'E' message. */
+    TEST_ASSERT_EQ(rc, 0);
+    TEST_ASSERT_EQ(act.type, KEEL_FE_ACT_AUTH_REJECT);
+    TEST_ASSERT(act.fe_response != NULL);
+    TEST_ASSERT(act.fe_response_len > 0);
+    TEST_ASSERT_EQ(act.fe_response[0], 'E');
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -2024,7 +2030,9 @@ static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
-    TEST_ASSERT(!after.semantic_unknown);
+    /* DDL with previously-tracked named PS marks semantic_unknown so the
+     * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
+    TEST_ASSERT(after.semantic_unknown);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -3130,7 +3138,9 @@ static void test_ps_tracking_extended_ddl_invalidates_stmt_set(void) {
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
-    TEST_ASSERT(!after.semantic_unknown);
+    /* DDL with previously-tracked named PS marks semantic_unknown so the
+     * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
+    TEST_ASSERT(after.semantic_unknown);
 
     VT->destroy_context(ctx);
     TEST_END();

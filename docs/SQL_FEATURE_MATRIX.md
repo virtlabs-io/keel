@@ -9,7 +9,7 @@ Status meanings:
 
 | Status | Meaning |
 |--------|---------|
-| Production | Intended for first-release production use when the documented configuration is followed. |
+| Production | Intended for production use when the documented configuration is followed. |
 | Experimental | Implemented but not a production guarantee until the listed gates pass. |
 | Rejects | KEEL must fail closed with SQLSTATE `0A000` / `KEEL_ERR_NOT_SUPPORTED`, never silently return an approximate result. |
 | Planned | Not implemented as a supported behavior yet. |
@@ -67,7 +67,7 @@ Status meanings:
 | Startup recovery | Planned | Scan `pg_prepared_xacts WHERE gid LIKE 'keel_%'`, reconcile with durable log, resolve or expose admin-required state. |
 | Admin in-doubt transaction view and controls | Planned | Operators need inspect/commit/rollback tooling for unresolved prepared xacts. |
 
-## Release Gates
+## Promotion Gates
 
 Scatter cannot be promoted from experimental until these gates are green:
 

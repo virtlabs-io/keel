@@ -86,6 +86,7 @@
 #include "keel/core/ini.h"
 #include "keel/sql/query_tree.h"
 #include "keel/core/scatter_store.h" /* keel_sort_key_t, KEEL_SCATTER_MAX_ORDER_KEYS */
+#include "keel/plugin/plugin_types.h" /* keel_consistency_token_t */
 
 /* Compatibility aliases for server roles */
 #define KEEL_SERVER_PRIMARY  KEEL_SERVER_ROLE_RW
@@ -115,6 +116,205 @@ typedef enum keel_route_strategy {
 } keel_route_strategy_t;
 
 /**
+ * @brief Session consistency mode for read routing.
+ */
+typedef enum keel_consistency_mode {
+    KEEL_CONSISTENCY_EVENTUAL = 0,       /**< Reads may use replicas without a write-position token. */
+    KEEL_CONSISTENCY_READ_YOUR_WRITES,   /**< Reads after writes require a proven position or primary. */
+    KEEL_CONSISTENCY_MONOTONIC,          /**< Reserved for future ordered-token routing. */
+    KEEL_CONSISTENCY_PRIMARY_ONLY,       /**< All reads use a write-capable server. */
+} keel_consistency_mode_t;
+
+/**
+ * @brief What to do when no replica has proven it reached the required token.
+ */
+typedef enum keel_stale_read_policy {
+    KEEL_STALE_READ_ROUTE_PRIMARY = 0,   /**< Conservative production default. */
+    KEEL_STALE_READ_WAIT,                /**< Reserved for reactor-owned catch-up waits. */
+    KEEL_STALE_READ_REJECT,              /**< Reject rather than using unproven replicas/primary fallback. */
+} keel_stale_read_policy_t;
+
+/**
+ * @brief External cluster-state provider used by the failover manager.
+ *
+ * Currently the failover decisions are driven entirely by KEEL's own probe
+ * subsystem (PostgreSQL `pg_is_in_recovery()` / Patroni REST / MySQL
+ * `@@read_only`); the `provider` knob is a forward-looking declaration of
+ * the operator's chosen source of truth so the upcoming failover manager
+ * can refuse to act when its assumptions are not met.
+ */
+typedef enum keel_failover_provider {
+    KEEL_FAILOVER_PROVIDER_NONE = 0,    /**< No external provider; static topology. */
+    KEEL_FAILOVER_PROVIDER_PATRONI,     /**< Patroni REST API (default for PG HA). */
+    KEEL_FAILOVER_PROVIDER_STATIC,      /**< Static role assignments only. */
+    KEEL_FAILOVER_PROVIDER_CONSUL,      /**< Reserved. */
+    KEEL_FAILOVER_PROVIDER_ETCD,        /**< Reserved. */
+    KEEL_FAILOVER_PROVIDER_CUSTOM,      /**< Reserved (plugin-provided). */
+} keel_failover_provider_t;
+
+/**
+ * @brief Read routing policy while the failover manager is in degraded mode.
+ */
+typedef enum keel_failover_read_policy {
+    KEEL_FAILOVER_READ_PRIMARY_ONLY = 0,        /**< Drain replicas; only the
+                                                     newly confirmed primary
+                                                     serves reads. Default. */
+    KEEL_FAILOVER_READ_REJECT,                  /**< Refuse new reads until
+                                                     topology has settled. */
+    KEEL_FAILOVER_READ_ALLOW_CAUGHT_UP_REPLICAS,/**< Allow replicas that prove
+                                                     catch-up via the existing
+                                                     consistency-token path. */
+} keel_failover_read_policy_t;
+
+/**
+ * @brief Transaction routing policy while the failover manager is in degraded mode.
+ *
+ * The v0.5-alpha baseline is intentionally conservative: in-flight
+ * transactions during a failover MUST fail. KEEL must never silently
+ * replay or migrate a transaction that may have already committed on the
+ * old primary. The enum is shaped to make the safe default explicit and
+ * leaves room for future opt-in retry policies that are scoped to a
+ * narrow, classified set of statements.
+ */
+typedef enum keel_failover_txn_policy {
+    KEEL_FAILOVER_TXN_FAIL = 0,         /**< Fail in-flight transactions. Default. */
+    KEEL_FAILOVER_TXN_WAIT,             /**< Reserved: hold up to a grace window. */
+} keel_failover_txn_policy_t;
+
+/**
+ * @brief Failover-manager policy knobs.
+ *
+ * Mirrors the `[failover]` config block from
+ * `proposals/keel-v.05-alpha-consistent_read-failover-pstmt.md` §3. The
+ * struct is wired through `keel_router_config_t` so it parses today; the
+ * fencing-aware behavior is delivered with the failover-manager track.
+ * Operators that set the knobs early get configuration-stability across
+ * the upgrade and a recorded intent in the running config dump.
+ */
+typedef struct keel_failover_config {
+    keel_failover_provider_t   provider;            /**< Source of truth (see enum). */
+    uint32_t                  detection_interval_ms; /**< Probe-driven detection cadence. */
+    uint32_t                  failure_threshold;    /**< Consecutive failures before flip. */
+    uint32_t                  promotion_grace_ms;   /**< Wait after promotion before reuse. */
+    bool                      old_primary_fencing_required; /**< Refuse traffic to demoted
+                                                                 primary until fenced. */
+    bool                      allow_ambiguous_write_retry;  /**< MUST stay false in prod. */
+    keel_failover_read_policy_t read_during_failover;       /**< Read routing during flip. */
+    keel_failover_txn_policy_t  transaction_during_failover;/**< In-flight txn policy. */
+} keel_failover_config_t;
+
+/** Default failover policy — matches the proposal's production baseline. */
+static inline keel_failover_config_t keel_failover_config_default(void) {
+    return (keel_failover_config_t){
+        .provider                     = KEEL_FAILOVER_PROVIDER_NONE,
+        .detection_interval_ms        = 500,
+        .failure_threshold            = 3,
+        .promotion_grace_ms           = 3000,
+        .old_primary_fencing_required = true,
+        .allow_ambiguous_write_retry  = false,
+        .read_during_failover         = KEEL_FAILOVER_READ_PRIMARY_ONLY,
+        .transaction_during_failover  = KEEL_FAILOVER_TXN_FAIL,
+    };
+}
+
+/**
+ * @brief Failover-manager view of a node's role state.
+ *
+ * Orthogonal to `keel_server_health_t` (UP/DOWN/DEGRADED/...) and to the
+ * static `keel_server_role_t` (RW/RO/WO). The failover manager owns this
+ * axis and uses it to fence demoted primaries, drain nodes being removed
+ * from rotation, and surface "unknown" while topology has not yet been
+ * observed.
+ *
+ * The lifecycle is operator-visible. DEMOTED is a sticky terminal state for
+ * fencing purposes: a node observed as the previous primary after an
+ * epoch flip MUST NOT receive new traffic until the operator manually
+ * clears it (e.g. via the admin API or by removing/re-adding the server).
+ * The router's process-level reject is the v0.5-alpha fencing strategy;
+ * external STONITH-style fencing is a future opt-in.
+ */
+typedef enum keel_node_role_state {
+    KEEL_NODE_STATE_UNKNOWN = 0, /**< Not yet observed by the failover manager. */
+    KEEL_NODE_STATE_PRIMARY,     /**< Authoritative writer for the current epoch. */
+    KEEL_NODE_STATE_REPLICA,     /**< Following the current primary. */
+    KEEL_NODE_STATE_UNHEALTHY,   /**< Probe failing; routing should avoid. */
+    KEEL_NODE_STATE_DRAINING,    /**< Being removed; new traffic refused. */
+    KEEL_NODE_STATE_DEMOTED,     /**< Old primary after a flip; FENCED until unfenced. */
+} keel_node_role_state_t;
+
+/** Stable ASCII name for a node role state ("UNKNOWN" for OOR values). */
+const char* keel_node_role_state_name(keel_node_role_state_t s);
+
+/**
+ * @brief Monotonic cluster-state generation tracked per-router.
+ *
+ * The generation is bumped whenever the failover manager observes a new
+ * authoritative primary or a timeline switch. Borrowed backends carry the
+ * epoch they were borrowed under so the pool / engine can invalidate stale
+ * references after a flip. The struct is value-copy safe.
+ */
+typedef struct keel_cluster_epoch {
+    uint64_t generation;        /**< Bumped on every epoch flip. Starts at 0. */
+    char     primary_name[64];  /**< Empty string when no primary is known. */
+    uint32_t timeline_id;       /**< 0 when unknown / N/A. */
+    uint64_t observed_at_ms;    /**< Wall-clock millis at last observation. */
+} keel_cluster_epoch_t;
+
+/**
+ * @brief Snapshot the current cluster epoch.
+ *
+ * Thread-safe. The router takes its epoch mutex for the duration of the
+ * copy. Safe to call from any worker thread.
+ */
+void keel_router_get_cluster_epoch(const keel_router_t* router,
+                                   keel_cluster_epoch_t* out);
+
+/**
+ * @brief Inform the router about the current cluster primary.
+ *
+ * When `(name, timeline_id)` differs from the current epoch, the router
+ * bumps `generation`, records the new primary, marks the previous primary
+ * @c KEEL_NODE_STATE_DEMOTED (when
+ * `failover.old_primary_fencing_required = true`, the default) or
+ * @c KEEL_NODE_STATE_DRAINING otherwise, and sets the new primary to
+ * @c KEEL_NODE_STATE_PRIMARY.
+ *
+ * Passing `name = NULL` records "primary lost" — the current primary, if
+ * any, is moved to @c KEEL_NODE_STATE_UNHEALTHY and the router enters
+ * degraded mode for write routing. Reads continue to honour
+ * `failover.read_during_failover`.
+ *
+ * Thread-safe.
+ *
+ * @return `true` when an epoch flip was recorded, `false` for a no-op.
+ */
+bool keel_router_observe_primary(keel_router_t* router,
+                                 const char* name,
+                                 uint32_t timeline_id);
+
+/**
+ * @brief Force a named node into the given role state (operator override).
+ *
+ * Intended for admin tooling — for example, to unfence a previously DEMOTED
+ * node after it has been verified to have rejoined the cluster as a
+ * follower. The router does not validate the transition; operators are
+ * trusted not to mark a server PRIMARY without an epoch update.
+ *
+ * @return @c KEEL_OK, @c KEEL_ERR_INVALID_ARG, or @c KEEL_ERR_NOT_FOUND.
+ */
+keel_error_t keel_router_set_node_role_state(keel_router_t* router,
+                                             const char* name,
+                                             keel_node_role_state_t state);
+
+/**
+ * @brief Read the current role state of a named node.
+ *
+ * Returns @c KEEL_NODE_STATE_UNKNOWN for unknown names or NULL router.
+ */
+keel_node_role_state_t keel_router_get_node_role_state(const keel_router_t* router,
+                                                       const char* name);
+
+/**
  * @brief Router-visible health state for a backend server.
  */
 #ifndef KEEL_SERVER_HEALTH_DEFINED
@@ -140,6 +340,7 @@ typedef struct keel_route_server {
     const char*         host;       /**< Hostname or IP */
     uint16_t            port;       /**< Port number */
     keel_server_role_t   role;       /**< Primary or replica */
+    uint32_t            timeline_id;/**< PostgreSQL WAL timeline, 0 when unknown/N/A */
     int                 weight;     /**< Base weight (1-1000) */
     size_t              shard_id;   /**< Logical shard bucket for sharded routing */
     
@@ -173,6 +374,16 @@ typedef struct keel_route_session {
      * to the client as an explicit failure). The engine mirrors this from
      * `keel_session_flow_t::commit_in_doubt` before every routing call. */
     bool                commit_in_doubt;
+
+    /* v0.5-alpha read-your-writes routing. When true, read queries must not
+     * use replicas unless a future reactor-owned catch-up verifier proves the
+     * replica has reached required_consistency_token. Under
+     * `stale_read_policy = wait` the engine parks the session in the
+     * per-worker catch-up manager until a probe proves the candidate replica
+     * has reached `required_consistency_token` (see keel/engine/catchup.h);
+     * other policies fall back to primary or reject. */
+    bool                     requires_consistent_read;
+    keel_consistency_token_t required_consistency_token; /**< token (.value/.timeline_id/.captured_at_ns) */
 } keel_route_session_t;
 
 /**
@@ -201,12 +412,26 @@ typedef enum keel_route_reason {
     KEEL_ROUTE_REASON_DDL,               /**< DDL statement routed to primary */
     KEEL_ROUTE_REASON_TRANSACTION_CTRL,  /**< Transaction-control (BEGIN/COMMIT/…) */
     KEEL_ROUTE_REASON_SEMANTIC_UNSAFE,   /**< Read-looking SQL was not proven replica-safe */
+    KEEL_ROUTE_REASON_CONSISTENCY_PRIMARY, /**< RYW/monotonic token forced primary fallback */
     KEEL_ROUTE_REASON_UNKNOWN_FUNCTION,  /**< SQL calls a function not in the metadata
                                               cache; conservative policy forces primary. */
     KEEL_ROUTE_REASON_COMMIT_AMBIGUOUS,  /**< Session has an unresolved commit-in-doubt;
                                               no new query may be routed until the
                                               prior transaction outcome is determined.
                                               See docs/CORRECTNESS_UNDER_FAILURE.md. */
+    KEEL_ROUTE_REASON_OLD_PRIMARY_FENCED,/**< Target is the previous primary
+                                              after an epoch flip; routing
+                                              refused until the operator
+                                              unfences it. */
+    KEEL_ROUTE_REASON_DEGRADED_MODE,     /**< Cluster is in degraded mode
+                                              (no PRIMARY observed); routing
+                                              refused per failover policy. */
+    KEEL_ROUTE_REASON_WAIT_CATCHUP,      /**< RYW read deferred: session must park
+                                              in the worker catch-up manager until
+                                              the candidate replica reaches the
+                                              session's required token. The decision
+                                              carries `wait_server_index`, `wait_token`,
+                                              and `wait_max_ms`; `server` is NULL. */
     KEEL_ROUTE_REASON_COUNT,
 } keel_route_reason_t;
 
@@ -253,6 +478,14 @@ typedef enum keel_route_factor {
     KEEL_DF_COMMIT_IN_DOUBT     = (1u << 16), /**< Prior COMMIT outcome unresolved */
     KEEL_DF_REPLICA_OK          = (1u << 17), /**< Proven safe for a replica */
     KEEL_DF_USER_PINNED         = (1u << 18), /**< SET keel.route = primary */
+    KEEL_DF_CONSISTENCY_TOKEN   = (1u << 19), /**< Session carries required LSN/GTID */
+    KEEL_DF_NODE_FENCED         = (1u << 20), /**< Eligible target was excluded
+                                                   because it is DEMOTED/DRAINING. */
+    KEEL_DF_DEGRADED_MODE       = (1u << 21), /**< Router is in degraded mode
+                                                   (no PRIMARY observed). */
+    KEEL_DF_WAIT_CATCHUP        = (1u << 22), /**< Read deferred to worker catch-up
+                                                   manager until replica reaches
+                                                   the required token. */
 } keel_route_factor_t;
 
 /**
@@ -282,6 +515,13 @@ typedef struct keel_route_decision {
     bool                  is_read;      /**< Query is read-only */
     bool                  was_pinned;   /**< Decision due to pinning */
     size_t                shard_index;  /**< Resolved shard for sharded routing */
+
+    /* Populated only when `reason_code == KEEL_ROUTE_REASON_WAIT_CATCHUP`.
+     * The engine must park the session in the worker catch-up manager using
+     * these fields; `server` is NULL until the waiter resumes with REACHED. */
+    size_t                   wait_server_index; /**< Index into worker server_pools[] */
+    keel_consistency_token_t wait_token;        /**< Token to wait for */
+    uint32_t                 wait_max_ms;       /**< Upper bound for parking */
 } keel_route_decision_t;
 
 /**
@@ -409,6 +649,19 @@ typedef struct keel_router_config {
      * `scatter_merge = on`; see docs/PRODUCTION_READINESS.md.
      */
     bool                scatter_merge_enabled;
+
+    /* Consistency policy. v0.5-alpha production support is intentionally
+     * conservative: READ_YOUR_WRITES + ROUTE_PRIMARY. WAIT/REJECT are kept in
+     * the typed config surface but remain future reactor-owned behaviors. */
+    keel_consistency_mode_t consistency_mode;
+    uint64_t            max_replica_lag_bytes;
+    uint32_t            max_replica_catchup_ms;
+    keel_stale_read_policy_t stale_read_policy;
+
+    /* Failover-manager policy (proposal §3). Parsed today so operator intent
+     * is captured in the running config; fencing/degraded-mode behavior is
+     * delivered with the failover-manager track. */
+    keel_failover_config_t failover;
 
 } keel_router_config_t;
 

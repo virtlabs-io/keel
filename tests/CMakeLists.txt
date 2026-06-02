@@ -408,6 +408,163 @@ target_link_libraries(test_router_timeout PRIVATE
 target_link_options(test_router_timeout PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router_timeout COMMAND test_router_timeout)
 
+# Catch-up wait list (Phase 2a — reactor-owned WAIT loop scaffolding)
+add_executable(test_catchup_waitlist test_catchup_waitlist.c)
+target_link_libraries(test_catchup_waitlist PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_waitlist PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_waitlist COMMAND test_catchup_waitlist)
+
+# Catch-up PG probe state machine — pure helpers + manager-helper unit
+# tests (Phase 2b-test). Does not require a running Postgres.
+add_executable(test_catchup_pg_unit test_catchup_pg_unit.c)
+target_link_libraries(test_catchup_pg_unit PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_pg_unit PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_pg_unit COMMAND test_catchup_pg_unit)
+
+# Catch-up PG probe state machine — socketpair-mock end-to-end of the
+# full QUERY round through a real reactor (Phase 2b-test, part 3).
+add_executable(test_catchup_pg_mock test_catchup_pg_mock.c)
+target_link_libraries(test_catchup_pg_mock PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_pg_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_pg_mock COMMAND test_catchup_pg_mock)
+
+# Catch-up MySQL probe state machine — pure helper unit tests (Phase 2c).
+# Does not require a running MySQL.
+add_executable(test_catchup_my_unit test_catchup_my_unit.c)
+target_link_libraries(test_catchup_my_unit PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_my_unit PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_unit COMMAND test_catchup_my_unit)
+
+# Catch-up MySQL probe state machine — socketpair-mock end-to-end of
+# the full QUERY round through a real reactor (Phase 2c).
+add_executable(test_catchup_my_mock test_catchup_my_mock.c)
+target_link_libraries(test_catchup_my_mock PRIVATE
+    test_utils
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_catchup_my_mock PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_mock COMMAND test_catchup_my_mock)
+
+# Catch-up MySQL probe state machine — live-MySQL e2e through the full
+# backend_async_start (TCP + caching_sha2_password / mysql_native_password
+# + optional TLS) + probe round (Phase 2c). Skips when no MySQL replica
+# is reachable or `mysql` CLI is missing.
+# Set KEEL_TEST_MY_HOST2/PORT2 (replica) or start
+# docker/compose/mysql-replication.yml (defaults 127.0.0.1:3307).
+add_executable(test_catchup_my_e2e test_catchup_my_e2e.c)
+target_link_libraries(test_catchup_my_e2e PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keelcore
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_catchup_my_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_catchup_my_e2e COMMAND test_catchup_my_e2e)
+set_tests_properties(test_catchup_my_e2e PROPERTIES
+    LABELS "e2e;catchup;integration"
+    TIMEOUT 60)
+
+# Catch-up PG probe state machine — live-PostgreSQL e2e through the full
+# backend_async_start (TCP + SCRAM-SHA-256 + optional TLS) + probe round
+# (Phase 2b-test, part 4). Skips when no PG cluster is reachable.
+# Set KEEL_TEST_PG_HOST1/PORT1 (primary) and KEEL_TEST_PG_HOST2/PORT2
+# (replica), or start docker/compose/pg-streaming.yml.
+# Uses libpq for the primary-LSN oracle (SCRAM-SHA-256 capable) — the
+# probe SM itself goes through KEEL's own backend_async_start.
+find_package(PostgreSQL QUIET)
+if(PostgreSQL_FOUND)
+    add_executable(test_catchup_pg_e2e test_catchup_pg_e2e.c)
+    target_link_libraries(test_catchup_pg_e2e PRIVATE
+        test_utils
+        ${LINUX_START_GROUP}
+        keel_worker_new
+        keelcore
+        keel_engine_flow
+        keel_session
+        keel_proto_postgres
+        keel_proto_mysql
+        keel_proto_flow_registry
+        keelsql
+        keelstats
+        keel_arch_common
+        keel_arch_platform
+        keelmem
+        keelutil
+        OpenSSL::Crypto
+        PostgreSQL::PostgreSQL
+        ${LINUX_END_GROUP}
+        Threads::Threads
+    )
+    target_link_options(test_catchup_pg_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_catchup_pg_e2e COMMAND test_catchup_pg_e2e)
+    set_tests_properties(test_catchup_pg_e2e PROPERTIES
+        LABELS "e2e;catchup;integration"
+        TIMEOUT 60)
+else()
+    message(STATUS "libpq not found — skipping test_catchup_pg_e2e (install postgresql-dev / libpq-dev)")
+endif()
+
 # Stress / fuzz tests for router dispatch and connpool (Tier 6 / Feature 15+)
 add_executable(test_router_stress test_router_stress.c)
 target_link_libraries(test_router_stress PRIVATE
@@ -428,6 +585,35 @@ target_link_libraries(test_connpool_stress PRIVATE
 target_include_directories(test_connpool_stress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/support)
 target_link_options(test_connpool_stress PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_connpool_stress COMMAND test_connpool_stress)
+
+# Regression torture: observer-thread + waiter wakeup invariant
+# Pins the ACTIVE_WITHOUT_OWNER race that surfaced when adding a new
+# observer pthread (failover_manager) alongside the worker pool.
+add_executable(test_pool_observer_race test_pool_observer_race.c)
+target_include_directories(test_pool_observer_race PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/worker
+)
+target_link_libraries(test_pool_observer_race PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_engine_flow
+    keel_session
+    keel_proto_postgres
+    keel_proto_mysql
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    keel_proto_flow_registry
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_pool_observer_race PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_pool_observer_race COMMAND test_pool_observer_race)
 
 # Connection pool exhaustion and wait-queue tests
 add_executable(test_connpool_exhaust test_connpool_exhaust.c)
@@ -462,6 +648,103 @@ target_link_libraries(test_router PRIVATE
 )
 target_link_options(test_router PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_router COMMAND test_router)
+
+# Router WAIT_CATCHUP emission (Patch 2d-2): stale_read_policy=wait path
+add_executable(test_router_wait_catchup test_router_wait_catchup.c)
+target_link_libraries(test_router_wait_catchup PRIVATE
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_router_wait_catchup PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_router_wait_catchup COMMAND test_router_wait_catchup)
+set_tests_properties(test_router_wait_catchup PROPERTIES LABELS "core;catchup")
+
+# Engine catchup-bridge (Patch 2d-3): router→catchup-manager handoff.
+add_executable(test_engine_catchup_bridge test_engine_catchup_bridge.c)
+target_link_libraries(test_engine_catchup_bridge PRIVATE
+    keel_engine_flow
+    keel_worker_new
+    keelcore
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_engine_catchup_bridge PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_engine_catchup_bridge COMMAND test_engine_catchup_bridge)
+set_tests_properties(test_engine_catchup_bridge PROPERTIES LABELS "engine;catchup")
+
+# Engine catchup-consult helper (Patch 2d-4): wait-catchup verdict the engine
+# hot path consults before READ-pool selection.
+add_executable(test_engine_catchup_consult test_engine_catchup_consult.c)
+target_link_libraries(test_engine_catchup_consult PRIVATE
+    keel_engine_flow
+    keelcore
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_engine_catchup_consult PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_engine_catchup_consult COMMAND test_engine_catchup_consult)
+set_tests_properties(test_engine_catchup_consult PROPERTIES LABELS "engine;catchup")
+
+# Engine catchup-consult live PG e2e (Patch 2d-5): exercises the consult
+# helper with a real WAL LSN captured from the live primary via libpq.
+# Skips gracefully when no PG primary is reachable.
+if(PostgreSQL_FOUND)
+    add_executable(test_engine_catchup_consult_pg_e2e test_engine_catchup_consult_pg_e2e.c)
+    target_link_libraries(test_engine_catchup_consult_pg_e2e PRIVATE
+        keel_engine_flow
+        keelcore
+        keel_arch_common
+        keel_arch_platform
+        keelmem
+        keelutil
+        PostgreSQL::PostgreSQL
+        Threads::Threads
+    )
+    target_link_options(test_engine_catchup_consult_pg_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_engine_catchup_consult_pg_e2e COMMAND test_engine_catchup_consult_pg_e2e)
+    set_tests_properties(test_engine_catchup_consult_pg_e2e PROPERTIES
+        LABELS "e2e;engine;catchup;integration"
+        TIMEOUT 30)
+else()
+    message(STATUS "libpq not found — skipping test_engine_catchup_consult_pg_e2e")
+endif()
+
+# Engine catchup-consult live MySQL e2e (Patch 2d-5, MySQL parity):
+# captures a real GTID set from the live primary via the `mysql` CLI
+# and exercises the consult helper. Skips at runtime when no MySQL
+# primary is reachable or `mysql` CLI is missing.
+add_executable(test_engine_catchup_consult_my_e2e test_engine_catchup_consult_my_e2e.c)
+target_link_libraries(test_engine_catchup_consult_my_e2e PRIVATE
+    keel_engine_flow
+    keelcore
+    keel_arch_common
+    keel_arch_platform
+    keelmem
+    keelutil
+    Threads::Threads
+)
+target_link_options(test_engine_catchup_consult_my_e2e PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_engine_catchup_consult_my_e2e COMMAND test_engine_catchup_consult_my_e2e)
+set_tests_properties(test_engine_catchup_consult_my_e2e PROPERTIES
+    LABELS "e2e;engine;catchup;integration"
+    TIMEOUT 30)
+
+# Failover-manager tests (cluster epoch, fencing, degraded mode, timeline)
+add_executable(test_failover_manager test_failover_manager.c)
+target_link_libraries(test_failover_manager PRIVATE
+    test_utils
+    keelcore
+    Threads::Threads
+)
+target_link_options(test_failover_manager PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_failover_manager COMMAND test_failover_manager)
+set_tests_properties(test_failover_manager PROPERTIES LABELS "core")
 
 # Router explainer (read-only per-query simulation)
 add_executable(test_router_explain test_router_explain.c)
@@ -2726,10 +3009,10 @@ set_tests_properties(check_forbidden_blocking PROPERTIES
 )
 
 # =============================================================================
-# v0.2-alpha observability — metrics invariants gate.
+# Observability metrics invariants gate.
 # Forbids ad-hoc mutation of state-machine fields whose transitions feed
 # reason-coded metrics (backend close_reason, commit_in_doubt/commit_in_flight).
-# See proposals/v0.2-alpha_observability.md §27/§28.
+# See the observability proposal invariants.
 # =============================================================================
 add_test(
     NAME  check_metrics_invariants
@@ -2742,7 +3025,7 @@ set_tests_properties(check_metrics_invariants PROPERTIES
 )
 
 # =============================================================================
-# v0.2-alpha observability §26 — User-facing metrics reference parity gate.
+# User-facing metrics reference parity gate.
 # Ensures every metric registered in keel_prom_format.c's metadata table is
 # documented in docs/METRICS_REFERENCE.md, and vice versa, so the operator
 # reference cannot drift out of sync with the actual exported metric set.
@@ -2758,7 +3041,7 @@ set_tests_properties(check_metrics_reference PROPERTIES
 )
 
 # =============================================================================
-# v0.4-alpha correctness messaging gate.
+# Correctness messaging gate.
 # Prevents public Markdown docs from reintroducing broad production claims that
 # conflict with the conservative correctness-under-failure contract.
 # =============================================================================
@@ -2768,6 +3051,16 @@ add_test(
             ${CMAKE_SOURCE_DIR}
 )
 set_tests_properties(check_dangerous_marketing_claims PROPERTIES
+    LABELS "lint"
+    TIMEOUT 30
+)
+
+add_test(
+    NAME  check_doc_release_mentions
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/check_doc_release_mentions.sh
+            ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(check_doc_release_mentions PROPERTIES
     LABELS "lint"
     TIMEOUT 30
 )

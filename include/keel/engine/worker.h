@@ -39,6 +39,7 @@
 #include "keel/reactor/reactor.h"
 #include "keel/mem/mem.h"
 #include "keel/engine/migration.h"
+#include "keel/engine/catchup.h"
 #include "keel/core/query_cache.h"
 #include "keel/core/auth.h"
 
@@ -247,6 +248,18 @@ typedef struct keel_worker {
         uint64_t        rr_read_counter;
         uint64_t        rr_write_counter;
         uint64_t        rr_any_counter;
+        /* stale_read_policy=wait observability (Patch 2d-4):
+         *   wait_catchup_consulted_total      — router was consulted on a
+         *                                       token-bearing replica-eligible read
+         *   wait_catchup_degraded_to_primary  — router said WAIT_CATCHUP but
+         *                                       the engine could not async-park
+         *                                       in this build, so the read was
+         *                                       degraded to the primary. v0.5-alpha
+         *                                       limitation; v0.5-beta will replace
+         *                                       this with `keel_engine_consult_catchup`
+         *                                       + a resume continuation. */
+        uint64_t        wait_catchup_consulted_total;
+        uint64_t        wait_catchup_degraded_to_primary;
     } stats;
     
     /* Backend configuration (from engine config) */
@@ -276,6 +289,13 @@ typedef struct keel_worker {
 
     /* Connection rebalance timer (for automatic load-based migration) */
     keel_timer_entry_t   rebalance_timer;
+
+    /* Reactor-owned replica catch-up wait list (Phase 2). Owned by this
+     * worker; touched only from this thread's reactor and timer ticks.
+     * NULL until keel_worker_init() succeeds; remains NULL when the
+     * feature is disabled. */
+    keel_catchup_manager_t* catchup;
+    keel_timer_entry_t      catchup_tick_timer;
 
     /* Configurable operational parameters (propagated from keel_engine_config_t
      * at worker init; stored here so hot-path code never touches the config). */

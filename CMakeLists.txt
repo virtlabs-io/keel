@@ -515,6 +515,9 @@ add_subdirectory(src/core)
 # Probe system (health checks + failover)
 add_subdirectory(src/probe)
 
+# Failover manager (active detector loop + router-epoch reconciliation)
+add_subdirectory(src/failover)
+
 # Hook/trigger system (Lua, Python, native plugins)
 add_subdirectory(src/hook)
 

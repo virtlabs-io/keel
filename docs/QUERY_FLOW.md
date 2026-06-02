@@ -439,7 +439,7 @@ The protocol vtable returns a `route_hint` with each query action:
 
 **File:** `src/engine/engine_flow.c`
 
-After a write query, subsequent reads from the same session are forced to the primary for a configurable TTL (default `KEEL_STICKY_PRIMARY_TTL_MS`).  The check now uses SSV consistency atoms rather than raw timestamp arithmetic:
+After a write query, subsequent reads from the same session are forced to the primary for a configurable TTL (default `KEEL_STICKY_PRIMARY_TTL_MS`) when no exact write-position token has been captured. If the session carries a real LSN/GTID token, KEEL keeps routing reads to primary until a reactor-owned catch-up verifier can prove a replica has reached that token:
 
 ```c
 if (route == KEEL_FROUTE_REPLICA && sf->last_write_ns != 0) {
@@ -447,16 +447,17 @@ if (route == KEEL_FROUTE_REPLICA && sf->last_write_ns != 0) {
     uint64_t ttl_ms = sf->sticky_primary_ttl_ms
                         ? sf->sticky_primary_ttl_ms
                         : KEEL_STICKY_PRIMARY_TTL_MS;
-    if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms, now, ttl_ms)) {
-        route = KEEL_FROUTE_PRIMARY;  // TTL active — force primary
+    if (keel_ssv_requires_primary(sf->consistency_atoms, now, ttl_ms)) {
+        route = KEEL_FROUTE_PRIMARY;  // token present — force primary
+    } else if (!keel_ssv_consistency_ttl_ok(sf->consistency_atoms, now, ttl_ms)) {
+        route = KEEL_FROUTE_PRIMARY;  // legacy TTL active — force primary
     } else {
-        sf->last_write_ns = 0;        // TTL expired — clear
-        keel_ssv_consistency_clear(sf->consistency_atoms);
+        sf->last_write_ns = 0;        // timestamp-only TTL expired
     }
 }
 ```
 
-`keel_ssv_consistency_ttl_ok()` returns `true` when the write's TTL has expired (replica is safe) and `false` when the write is still recent (primary required).  On expiry, both the legacy timestamp and the consistency atoms are cleared so future reads route freely to replicas.
+`keel_ssv_consistency_ttl_ok()` is now only the timestamp-only fallback. `keel_ssv_requires_primary()` is the authoritative token check: a populated LSN/GTID token does not expire by wall-clock time alone.
 
 This prevents stale reads from async replicas after writes (read-after-write consistency).
 

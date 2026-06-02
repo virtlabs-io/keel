@@ -156,6 +156,7 @@ typedef struct pg_flow_ctx {
     uint64_t stmt_search_path_hash; /**< Cached search_path hash component. */
     uint64_t stmt_guc_hash;       /**< Cached tracked-GUC hash component. */
     bool     stmt_semantic_unknown; /**< Conservative semantic-unknown marker. */
+    bool     stmt_backend_dirty_orphan_ps; /**< Backend has named PS that KEEL no longer tracks (DDL/DISCARD PLANS cleared cache without backend cleanup). One-shot: consumed by next get_stmt_compat_profile to force DISCARD ALL on release. */
     bool     stmt_temp_tx_reset_pending; /**< Temp context changes again when txn ends. */
     bool     stmt_temp_tx_rollback_reset_pending; /**< Temp context changes again if the txn rolls back. */
     bool     stmt_last_tx_end_was_rollback; /**< Most recent tx-end statement was ROLLBACK. */
