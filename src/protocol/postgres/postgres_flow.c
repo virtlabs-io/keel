@@ -36,6 +36,7 @@
 #include "keel/util/platform_compat.h"
 #include "keel/util/util.h"   /* keel_hash_fnv1a_64 */
 #include "keel/log/log.h"
+#include "keel/util/diag_ps.h"
 #include <ctype.h>             /* isalnum, isspace */
 
 /* ---- Constants ---- */
@@ -3196,6 +3197,16 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
         act->pin_update = KEEL_FPIN_EXTENDED_PROTO;
         act->be_payload = data; act->be_payload_len = len;
         act->ext_response_count = 1;  /* ParseComplete */
+        if (keel_diag_ps_enabled() && len > 5) {
+            const char* _pn = (const char*)(data + 5);
+            size_t _pnl = strnlen(_pn, len - 5);
+            size_t _qoff = 5 + _pnl + 1;
+            const char* _sql = (_qoff < len) ? (const char*)(data + _qoff) : "";
+            size_t _sl = (_qoff < len) ? strnlen(_sql, len - _qoff) : 0;
+            if (_sl > 80) _sl = 80;
+            KEEL_DIAG_PS("P_RAW ctx=%p name='%s' sql='%.*s%s'",
+                (void*)ctx, _pn, (int)_sl, _sql, _sl == 80 ? "..." : "");
+        }
 
         /* Parse: 'P' + int32 len + string stmt_name + string query + ...
          * If stmt_name is non-empty, this creates a named prepared statement
@@ -3315,6 +3326,11 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                         uint64_t h = pg_stmt_entry_hash(entry, ctx->stmt_context_sig);
                         entry->hash = h;
                         entry->confirmed = false;
+                        KEEL_DIAG_PS("PARSE ctx=%p name='%s' hash=0x%016llx sess_hash=0x%016llx ctx_sig=0x%016llx",
+                            (void*)ctx, stmt_name,
+                            (unsigned long long)h,
+                            (unsigned long long)ctx->session_stmt_hash,
+                            (unsigned long long)ctx->stmt_context_sig);
                         if (!pg_pending_parse_push(ctx, stmt_name, h)) {
                             /* Cannot safely replay a statement set whose
                              * confirmations we can no longer match to Parse
@@ -3351,6 +3367,10 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             if (stmt_off < len) {
                 const char* stmt_name = (const char*)(data + stmt_off);
                 pg_stmt_entry_t* entry = pg_stmt_find(ctx, stmt_name);
+                KEEL_DIAG_PS("BIND  ctx=%p name='%s' found=%d confirmed=%d sess_hash=0x%016llx",
+                    (void*)ctx, stmt_name, entry ? 1 : 0,
+                    entry ? (int)entry->confirmed : -1,
+                    (unsigned long long)ctx->session_stmt_hash);
                 if (entry) {
                     pg_stmt_activate(ctx, entry);
                 }
@@ -3602,6 +3622,10 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
          * Also remove from the prepared statement classification cache. */
         if (len > 6 && data[5] == 'S' && data[6] != '\0') {
             const char* stmt_name = (const char*)(data + 6);
+            pg_stmt_entry_t* pre = pg_stmt_find(ctx, stmt_name);
+            KEEL_DIAG_PS("CLOSE ctx=%p name='%s' had_entry=%d sess_hash_before=0x%016llx",
+                (void*)ctx, stmt_name, pre ? 1 : 0,
+                (unsigned long long)ctx->session_stmt_hash);
             pg_stmt_remove(ctx, stmt_name);
             /* Anonymous mode: also remove from the anon map */
             if (ctx->ps_mode == KEEL_PS_MODE_ANONYMOUS)
@@ -3929,6 +3953,12 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                 pg_stmt_entry_t* pe = pg_stmt_find(ctx, pending_name);
                 if (pe) pe->confirmed = true;
                 pg_stmt_recompute_session_hash(ctx);
+                KEEL_DIAG_PS("PCOMP ctx=%p name='%s' hash=0x%016llx new_sess_hash=0x%016llx",
+                    (void*)ctx, pending_name,
+                    (unsigned long long)pending_hash,
+                    (unsigned long long)ctx->session_stmt_hash);
+            } else {
+                KEEL_DIAG_PS("PCOMP ctx=%p (no pending — unnamed or empty queue)", (void*)ctx);
             }
         }
         return 0;
@@ -3992,6 +4022,23 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         act->is_error_response = true;
         ctx->stmt_discard_plans_absorb_pending = false;
         pg_pending_parse_clear(ctx);
+        if (keel_diag_ps_enabled()) {
+            const uint8_t* dp  = data + 5;
+            const uint8_t* den = data + len;
+            char sqlstate[8] = {0};
+            char msg[160]   = {0};
+            while (dp < den && *dp != '\0') {
+                uint8_t ft = *dp++;
+                const char* fv = (const char*)dp;
+                size_t fl = strnlen(fv, (size_t)(den - dp));
+                if (ft == 'C' && fl < sizeof(sqlstate)) memcpy(sqlstate, fv, fl);
+                else if (ft == 'M' && fl < sizeof(msg)) memcpy(msg, fv, fl);
+                dp += fl + 1;
+            }
+            KEEL_DIAG_PS("ERROR ctx=%p SQLSTATE=%s msg='%s' sess_hash=0x%016llx",
+                (void*)ctx, sqlstate, msg,
+                (unsigned long long)ctx->session_stmt_hash);
+        }
         /* Detect query_canceled (SQLSTATE 57014) to suppress the following
          * ReadyForQuery so no stale Z reaches the client socket buffer.
          * For any other error the flag is cleared to prevent spurious fires. */

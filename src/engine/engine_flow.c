@@ -28,6 +28,7 @@
 #include "keel/trace/trace.h"
 #include "keel/protocol/tls_context.h"
 #include "keel/log/log.h"
+#include "keel/util/diag_ps.h"
 #include "keel/log/audit_log.h"
 #include "keel/core/stats.h"
 #include "keel/log/query_log.h"
@@ -474,6 +475,49 @@ static void apply_captured_fe_pin_effects(keel_session_flow_t* sf,
     sf->flow->captured_fe_pin_effects(sf->ctx, buf, len,
                                       &pin_update, &pin_clear);
     keel_session_flow_apply_pin_change(sf, session, worker, pin_update, pin_clear);
+}
+
+/**
+ * @brief Run protocol classification (on_fe_msg) on each message in a
+ *        FE buffer that is about to be forwarded RAW to the backend
+ *        (e.g. via pre_query stash for state_sync / stmt_replay).
+ *
+ * Background: when state_sync or stmt_replay triggers on a pipelined
+ * FE message (Parse/Bind/.../Sync batched into one recv), the dispatch
+ * loop processes only the TRIGGER msg through on_fe_msg and then stashes
+ * the entire tail (data + pos … data + len) into pending_pre_query_buf
+ * for verbatim forwarding after the pre-query op completes.  Without
+ * this prefetch, the tail's Parse messages bypass the protocol plugin's
+ * stmt_cache update, so prepared-statements declared in the tail are
+ * never tracked for replay → "prepared statement S_N does not exist"
+ * after the backend is later reclaimed/cleaned.
+ *
+ * @param sf          Session flow context.
+ * @param buf         Follow buffer (typically `data + pos`).
+ * @param buf_len     Total bytes in @p buf.
+ * @param skip_bytes  Bytes at the head that were already classified
+ *                    (typically the trigger msg's frame length).
+ */
+/* Exposed (non-static) so tests can exercise it directly; not part of the
+ * public engine_flow API.  Declared in tests via a local extern. */
+void keel_engine_flow_prefetch_classify_follow_buf(keel_session_flow_t* sf,
+                                                   const uint8_t* buf,
+                                                   size_t buf_len,
+                                                   size_t skip_bytes)
+{
+    if (!sf || !sf->flow || !sf->flow->on_fe_msg || !sf->flow->frame_len ||
+        !buf || buf_len <= skip_bytes)
+        return;
+
+    size_t p = skip_bytes;
+    while (p < buf_len) {
+        ssize_t fl = sf->flow->frame_len(sf->ctx, buf + p, buf_len - p, 0);
+        if (fl <= 0 || (size_t)fl > buf_len - p)
+            return;
+        keel_fe_action_t throwaway = keel_fe_action_default();
+        (void)sf->flow->on_fe_msg(sf->ctx, buf + p, (size_t)fl, &throwaway);
+        p += (size_t)fl;
+    }
 }
 
 /**
@@ -3035,6 +3079,13 @@ copy_scan_done:
                             be_conn ? (unsigned long long)be_conn->stmt_set_hash : 0ULL,
                             (unsigned long long)sf->stmt_replay_hash,
                             (data + pos) ? (unsigned)(data + pos)[0] : 0);
+                        KEEL_DIAG_PS("BORROW sess=%lu sess_hash=0x%016llx be_fd=%d be_hash=0x%016llx needs_replay=%d msg='%c'",
+                            (unsigned long)session->id,
+                            (unsigned long long)stmt_profile.stmt_set_hash,
+                            be_conn ? be_conn->fd : -1,
+                            be_conn ? (unsigned long long)be_conn->stmt_set_hash : 0ULL,
+                            (int)needs_replay,
+                            (data + pos) && pos < len ? (char)(data + pos)[0] : '?');
                     }
                 } else {
                     /* pins_stable == NONE: no sticky state — free borrow */
@@ -3185,6 +3236,21 @@ copy_scan_done:
             bool needs_state_sync =
                 backend_needs_state_sync(sf, session, session->backend_conn);
 
+            /* Snapshot the prepared-statement replay buffer BEFORE any
+             * pre-classification of the follow-buffer tail.  Prefetch may
+             * include DDL (CREATE/ALTER/DROP) whose classification clears
+             * the per-session stmt cache, which would otherwise leave the
+             * later get_stmt_replay() call at the stmt-replay branch with
+             * an empty buffer — even though the borrowed backend still
+             * needs the OLD cached statements to satisfy the tail's
+             * Bind(S_N).  Captured here so prefetch can safely mutate the
+             * cache; freed below at the stmt-replay branch (or in the
+             * dispose at the bottom of this block if not consumed). */
+            uint8_t* prefetched_replay_buf   = NULL;
+            size_t   prefetched_replay_len   = 0;
+            uint32_t prefetched_replay_count = 0;
+            uint64_t prefetched_replay_hash  = 0;
+
             const uint8_t* setup_follow_buf = NULL;
             size_t setup_follow_len = 0;
             if (act.be_payload != NULL &&
@@ -3194,6 +3260,40 @@ copy_scan_done:
             } else {
                 setup_follow_buf = data + pos;
                 setup_follow_len = len - pos;
+                /* Pre-classify any pipelined messages in the tail so
+                 * Parses inside the stash update stmt_cache.  Without
+                 * this, named PS declared in a pipelined batch that
+                 * follows a state_sync/stmt_replay trigger never reach
+                 * the replay buffer → "S_N does not exist" after the
+                 * backend is reclaimed.  Only run when a deferred path
+                 * will actually stash these bytes (state_sync,
+                 * stmt_replay, deferred BEGIN, or full cleanup) — the
+                 * normal dispatch loop classifies them otherwise. */
+                bool will_stash_follow =
+                    needs_state_sync ||
+                    (sf->stmt_replay_hash != 0 && flow->get_stmt_replay) ||
+                    (sf->begin_deferred && sf->begin_deferred_payload_len > 0) ||
+                    (session->backend_conn &&
+                     session->backend_conn->needs_full_cleanup);
+                if (will_stash_follow) {
+                    /* Snapshot replay first (see comment above) so prefetch
+                     * mutations don't strand the stmt-replay branch with an
+                     * empty buffer.  Mirror the exact precondition the
+                     * stmt-replay branch uses so we don't snapshot when it
+                     * won't consume (avoid heap leak on the rare path where
+                     * act.be_payload is NULL). */
+                    if (sf->stmt_replay_hash != 0 && flow->get_stmt_replay &&
+                        act.be_payload && act.be_payload_len > 0) {
+                        (void)flow->get_stmt_replay(sf->ctx,
+                                                    &prefetched_replay_buf,
+                                                    &prefetched_replay_len,
+                                                    &prefetched_replay_count,
+                                                    &prefetched_replay_hash);
+                    }
+                    keel_engine_flow_prefetch_classify_follow_buf(sf, setup_follow_buf,
+                                                                  setup_follow_len,
+                                                                  (size_t)flen);
+                }
             }
 
             /* Deferred-BEGIN replay (PR #4 — async): a BEGIN was buffered
@@ -3213,8 +3313,10 @@ copy_scan_done:
                     sf->begin_deferred = false;
                     keel_flow_result_t br =
                         defer_begin_replay(sf, session, setup_follow_buf, setup_follow_len);
-                    if (br == KEEL_FLOW_ERROR)
+                    if (br == KEEL_FLOW_ERROR) {
+                        if (prefetched_replay_buf) keel_free(prefetched_replay_buf);
                         return KEEL_FLOW_ERROR;
+                    }
                     if (setup_result == KEEL_FLOW_OK)
                         setup_result = br;
                 }
@@ -3233,8 +3335,10 @@ copy_scan_done:
                     : -1;
                 keel_instr_end(WORKER_INSTR(worker), KEEL_INSTR_STATE_SYNC,
                                _sync_t0);
-                if (sync_len < 0)
+                if (sync_len < 0) {
+                    if (prefetched_replay_buf) keel_free(prefetched_replay_buf);
                     return KEEL_FLOW_ERROR;
+                }
                 if (sync_len == 0) {
                     session->backend_conn->current_state_hash = session->state_hash;
                     session->backend_conn->needs_sync = false;
@@ -3272,8 +3376,10 @@ copy_scan_done:
                         sync_buf, (size_t)sync_len,
                         setup_follow_buf, setup_follow_len,
                         resume);
-                    if (sr == KEEL_FLOW_ERROR)
+                    if (sr == KEEL_FLOW_ERROR) {
+                        if (prefetched_replay_buf) keel_free(prefetched_replay_buf);
                         return KEEL_FLOW_ERROR;
+                    }
                     if (setup_result == KEEL_FLOW_OK)
                         setup_result = sr;
                 }
@@ -3283,8 +3389,10 @@ copy_scan_done:
                 sf->begin_deferred = false;
                 keel_flow_result_t br =
                     defer_begin_replay(sf, session, setup_follow_buf, setup_follow_len);
-                if (br == KEEL_FLOW_ERROR)
+                if (br == KEEL_FLOW_ERROR) {
+                    if (prefetched_replay_buf) keel_free(prefetched_replay_buf);
                     return KEEL_FLOW_ERROR;
+                }
                 if (setup_result == KEEL_FLOW_OK)
                     setup_result = br;
             }
@@ -3317,7 +3425,25 @@ copy_scan_done:
                 uint32_t rcount = 0;
                 uint64_t rhash  = 0;
 
-                int gr = flow->get_stmt_replay(sf->ctx, &rbuf, &rlen, &rcount, &rhash);
+                int gr;
+                if (prefetched_replay_buf && prefetched_replay_len > 0 &&
+                    prefetched_replay_count > 0) {
+                    /* Consume the snapshot captured before prefetch
+                     * mutated the cache (e.g. DDL clear_all).  Ownership
+                     * transfers to the local rbuf — clear the snapshot
+                     * pointers so the late dispose below is a no-op. */
+                    rbuf   = prefetched_replay_buf;
+                    rlen   = prefetched_replay_len;
+                    rcount = prefetched_replay_count;
+                    rhash  = prefetched_replay_hash;
+                    prefetched_replay_buf   = NULL;
+                    prefetched_replay_len   = 0;
+                    prefetched_replay_count = 0;
+                    prefetched_replay_hash  = 0;
+                    gr = 0;
+                } else {
+                    gr = flow->get_stmt_replay(sf->ctx, &rbuf, &rlen, &rcount, &rhash);
+                }
                 if (gr == 0 && rbuf && rlen > 0 && rcount > 0) {
                     /* Replay buffer size guard */
                     if (sf->backend_max_replay_bytes > 0 &&
@@ -3397,6 +3523,12 @@ copy_scan_done:
                 }
                 if (rbuf) keel_free(rbuf);
                 sf->stmt_replay_hash = 0;  /* fallback: send original msg as-is */
+            }
+            /* Snapshot must be consumed by the branch above; free if any
+             * path skipped it (defensive — should not happen in practice). */
+            if (prefetched_replay_buf) {
+                keel_free(prefetched_replay_buf);
+                prefetched_replay_buf = NULL;
             }
 
             /* needs_full_cleanup for stmt_hash=0 (FE path): backend was
@@ -4812,6 +4944,10 @@ keel_flow_result_t keel_engine_flow_on_be_data(
             /* All ParseComplete responses received AND replay RFQ drained.
              * Stamp the backend with the session's stmt_set_hash. */
             if (session->backend_conn && sf->stmt_replay_hash) {
+                KEEL_DIAG_PS("REPLAY_DONE sess=%lu be_fd=%d new_be_hash=0x%016llx",
+                    (unsigned long)session->id,
+                    session->backend_conn->fd,
+                    (unsigned long long)sf->stmt_replay_hash);
                 session->backend_conn->stmt_set_hash = sf->stmt_replay_hash;
                 session->backend_conn->stmt_profile = sf->stmt_replay_profile;
                 session->backend_conn->stmt_profile.stmt_set_hash = sf->stmt_replay_hash;
@@ -5679,6 +5815,9 @@ fe_forward_done: ;
                     } else {
                         be->stmt_set_hash = stmt_profile.stmt_set_hash;
                         be->stmt_profile = stmt_profile;
+                        KEEL_DIAG_PS("RELEASE sess=%lu be_fd=%d stamp_hash=0x%016llx",
+                            (unsigned long)session->id, be->fd,
+                            (unsigned long long)stmt_profile.stmt_set_hash);
                     }
                 } else if (sf->ps_mode == KEEL_PS_MODE_PINNING
                            && (sf->pins & KEEL_FPIN_PREPARED_STMT)) {

@@ -2400,6 +2400,30 @@ target_link_libraries(test_pre_query_replay PRIVATE
 target_link_options(test_pre_query_replay PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_pre_query_replay COMMAND test_pre_query_replay)
 
+# Regression: pipelined Parse classification in pre-query follow buffer
+add_executable(test_ps_pipeline_classify test_ps_pipeline_classify.c)
+target_link_libraries(test_ps_pipeline_classify PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keel_worker_new
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_engine_flow
+    keel_session
+    keelmem
+    keelutil
+    keelsql
+    keelstats
+    keel_arch_common
+    keel_arch_platform
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+target_link_options(test_ps_pipeline_classify PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_ps_pipeline_classify COMMAND test_ps_pipeline_classify)
+
 # Dual-protocol PG/MySQL separation & equivalence matrix
 add_executable(test_dual_protocol_matrix test_dual_protocol_matrix.c)
 target_link_libraries(test_dual_protocol_matrix PRIVATE
