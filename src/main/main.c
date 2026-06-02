@@ -94,7 +94,11 @@
 #include <sys/resource.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+/* execinfo.h is a GNU extension — absent on musl (Alpine). */
+#if defined(__GLIBC__)
 #include <execinfo.h>
+#define KEEL_HAVE_EXECINFO 1
+#endif
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -953,11 +957,14 @@ static void crash_handler(int sig) {
     if (write(STDERR_FILENO, name, strlen(name))) {}
     if (write(STDERR_FILENO, " received — aborting\n", 21)) {}
     /* Async-signal-safe backtrace: backtrace(3) itself is safe;
-     * backtrace_symbols_fd() is the safe (non-allocating) variant. */
+     * backtrace_symbols_fd() is the safe (non-allocating) variant.
+     * Only available with glibc — musl (Alpine) has no execinfo.h. */
+#if defined(KEEL_HAVE_EXECINFO)
     void* frames[64];
     int   n = backtrace(frames, 64);
     if (write(STDERR_FILENO, "backtrace:\n", 11)) {}
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
+#endif
     /* Re-raise to get core dump */
     signal(sig, SIG_DFL);
     raise(sig);
