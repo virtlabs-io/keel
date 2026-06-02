@@ -439,8 +439,8 @@ static void test_virt_unnamed_parse_skips_session_hash(void) {
 
     /* session_stmt_hash must remain zero — unnamed stmt has no pending parse */
     TEST_ASSERT_EQ(c->session_stmt_hash, 0ULL);
-    /* pending_parse_valid must not be set (or pending_parse_hash must be 0) */
-    TEST_ASSERT(!c->pending_parse_valid || c->pending_parse_hash == 0);
+    /* Unnamed statements must not enter the named-Parse confirmation FIFO. */
+    TEST_ASSERT_EQ(c->pending_parse_count, 0u);
 
     /* Confirm that a subsequent named Parse *does* register */
     len = build_named_parse(buf, "named1", "SELECT 1");

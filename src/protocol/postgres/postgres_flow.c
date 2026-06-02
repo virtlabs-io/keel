@@ -50,6 +50,60 @@ static void pg_stmt_recompute_session_hash(pg_flow_ctx_t* ctx);
 static uint64_t pg_stmt_entry_hash(const pg_stmt_entry_t* entry,
                                    uint64_t context_sig);
 
+static void pg_pending_parse_clear(pg_flow_ctx_t* ctx)
+{
+    if (!ctx) return;
+    ctx->pending_parse_head = 0;
+    ctx->pending_parse_tail = 0;
+    ctx->pending_parse_count = 0;
+    memset(ctx->pending_parse_name, 0, sizeof(ctx->pending_parse_name));
+    memset(ctx->pending_parse_hash, 0, sizeof(ctx->pending_parse_hash));
+}
+
+static bool pg_pending_parse_push(pg_flow_ctx_t* ctx,
+                                  const char* name,
+                                  uint64_t hash)
+{
+    if (!ctx || !name || hash == 0)
+        return false;
+    if (ctx->pending_parse_count >= PG_STMT_CACHE_SIZE)
+        return false;
+
+    uint16_t idx = ctx->pending_parse_tail;
+    strncpy(ctx->pending_parse_name[idx], name,
+            sizeof(ctx->pending_parse_name[idx]) - 1);
+    ctx->pending_parse_name[idx][sizeof(ctx->pending_parse_name[idx]) - 1] = '\0';
+    ctx->pending_parse_hash[idx] = hash;
+    ctx->pending_parse_tail =
+        (uint16_t)((ctx->pending_parse_tail + 1u) % PG_STMT_CACHE_SIZE);
+    ctx->pending_parse_count++;
+    return true;
+}
+
+static bool pg_pending_parse_pop(pg_flow_ctx_t* ctx,
+                                 char* name,
+                                 size_t name_cap,
+                                 uint64_t* hash)
+{
+    if (!ctx || ctx->pending_parse_count == 0)
+        return false;
+
+    uint16_t idx = ctx->pending_parse_head;
+    if (name && name_cap > 0) {
+        strncpy(name, ctx->pending_parse_name[idx], name_cap - 1);
+        name[name_cap - 1] = '\0';
+    }
+    if (hash)
+        *hash = ctx->pending_parse_hash[idx];
+
+    ctx->pending_parse_name[idx][0] = '\0';
+    ctx->pending_parse_hash[idx] = 0;
+    ctx->pending_parse_head =
+        (uint16_t)((ctx->pending_parse_head + 1u) % PG_STMT_CACHE_SIZE);
+    ctx->pending_parse_count--;
+    return true;
+}
+
 /** Find a stmt_cache entry by name; returns NULL if not found. */
 static pg_stmt_entry_t* pg_stmt_find(pg_flow_ctx_t* ctx, const char* name) {
     for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
@@ -121,9 +175,7 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
         ctx->pending_track_had_prior = false;
     }
 
-    ctx->pending_parse_valid = false;
-    ctx->pending_parse_hash = 0;
-    ctx->pending_parse_name[0] = '\0';
+    pg_pending_parse_clear(ctx);
     ctx->pending_deallocate_valid = false;
     ctx->pending_deallocate_absorbed_error = false;
     ctx->pending_deallocate_complete = false;
@@ -3263,11 +3315,14 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                         uint64_t h = pg_stmt_entry_hash(entry, ctx->stmt_context_sig);
                         entry->hash = h;
                         entry->confirmed = false;
-                        strncpy(ctx->pending_parse_name, stmt_name,
-                                sizeof(ctx->pending_parse_name) - 1);
-                        ctx->pending_parse_name[sizeof(ctx->pending_parse_name)-1] = '\0';
-                        ctx->pending_parse_hash = h;
-                        ctx->pending_parse_valid = true;
+                        if (!pg_pending_parse_push(ctx, stmt_name, h)) {
+                            /* Cannot safely replay a statement set whose
+                             * confirmations we can no longer match to Parse
+                             * messages.  Mark the semantic profile unknown so
+                             * release/borrow paths fail closed instead of
+                             * advertising a partial stmt_set_hash. */
+                            ctx->stmt_semantic_unknown = true;
+                        }
                     }
 
                     /* For unnamed statements ("" name), also set
@@ -3862,14 +3917,19 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
         return 0;
     case '1': /* ParseComplete — confirm the in-flight prepared statement */
         act->stmt_replay_accepted = true;
-        if (ctx->pending_parse_valid && ctx->pending_parse_hash != 0) {
-            /* Mark the cache entry as confirmed and rebuild the session
-             * hash from scratch so context_sig is always included. */
-            pg_stmt_entry_t* pe = pg_stmt_find(ctx, ctx->pending_parse_name);
-            if (pe) pe->confirmed = true;
-            pg_stmt_recompute_session_hash(ctx);
-            ctx->pending_parse_valid = false;
-            ctx->pending_parse_hash  = 0;
+        {
+            char pending_name[64] = {0};
+            uint64_t pending_hash = 0;
+            if (pg_pending_parse_pop(ctx, pending_name,
+                                     sizeof(pending_name),
+                                     &pending_hash) &&
+                pending_hash != 0) {
+                /* Mark the cache entry as confirmed and rebuild the session
+                 * hash from scratch so context_sig is always included. */
+                pg_stmt_entry_t* pe = pg_stmt_find(ctx, pending_name);
+                if (pe) pe->confirmed = true;
+                pg_stmt_recompute_session_hash(ctx);
+            }
         }
         return 0;
     case 'C': /* CommandComplete */
@@ -3931,6 +3991,7 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
     case 'E': /* ErrorResponse */
         act->is_error_response = true;
         ctx->stmt_discard_plans_absorb_pending = false;
+        pg_pending_parse_clear(ctx);
         /* Detect query_canceled (SQLSTATE 57014) to suppress the following
          * ReadyForQuery so no stale Z reaches the client socket buffer.
          * For any other error the flag is cleared to prevent spurious fires. */

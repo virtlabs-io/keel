@@ -27,8 +27,9 @@
  * ============================================================================ */
 
 /** Maximum number of named prepared statements tracked per session.
- *  sysbench: 8 query types × 10 tables = 80 statements; 128 gives headroom. */
-#define PG_STMT_CACHE_SIZE 128
+ *  sysbench: 8 query types × 10 tables = 80 statements; Hibernate/ORM
+ *  workloads commonly use hundreds of generated server-side statements. */
+#define PG_STMT_CACHE_SIZE 512
 
 /** Maximum Parse wire message length stored for replay (§17).
  *  Messages larger than this cause the session to fall back to hard-pin. */
@@ -169,11 +170,15 @@ typedef struct pg_flow_ctx {
     uint32_t         stmt_evict_next;    /**< Round-robin eviction index. */
     uint64_t         session_stmt_hash; /**< XOR of each confirmed named-stmt .hash. */
 
-    /* In-flight Parse: name/hash of the stmt awaiting ParseComplete.
-     * XOR'd into session_stmt_hash only when ParseComplete arrives. */
-    char             pending_parse_name[64];
-    uint64_t         pending_parse_hash;
-    bool             pending_parse_valid;
+    /* In-flight named Parses awaiting ParseComplete, in backend response order.
+     * PostgreSQL permits multiple Parse messages before Sync, and pgJDBC /
+     * Hibernate can pipeline them.  Each entry is XOR'd into session_stmt_hash
+     * only when the corresponding ParseComplete arrives. */
+    char             pending_parse_name[PG_STMT_CACHE_SIZE][64];
+    uint64_t         pending_parse_hash[PG_STMT_CACHE_SIZE];
+    uint16_t         pending_parse_head;
+    uint16_t         pending_parse_tail;
+    uint16_t         pending_parse_count;
 
     /* Tracking-mode: pending simple-query PREPARE state for rollback on backend
      * rejection.  Set in the 'Q' PREPARE handler; cleared by CommandComplete("PREPARE")
