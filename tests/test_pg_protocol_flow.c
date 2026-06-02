@@ -2030,7 +2030,9 @@ static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
-    TEST_ASSERT(!after.semantic_unknown);
+    /* DDL with previously-tracked named PS marks semantic_unknown so the
+     * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
+    TEST_ASSERT(after.semantic_unknown);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -3136,7 +3138,9 @@ static void test_ps_tracking_extended_ddl_invalidates_stmt_set(void) {
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
-    TEST_ASSERT(!after.semantic_unknown);
+    /* DDL with previously-tracked named PS marks semantic_unknown so the
+     * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
+    TEST_ASSERT(after.semantic_unknown);
 
     VT->destroy_context(ctx);
     TEST_END();

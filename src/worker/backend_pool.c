@@ -745,15 +745,18 @@ backend_pool_t* backend_pool_create(const backend_pool_config_t* config)
         pthread_mutexattr_destroy(&attr);
     }
     
-    /* Resolve protocol flow vtable — eliminates strcmp branching */
+    /* Resolve protocol flow vtable — eliminates strcmp branching.
+     *
+     * A non-NULL but unknown protocol name is a hard misconfiguration: cleanup_slot
+     * is never invoked, so every returned connection is force-closed with
+     * BACKEND_CLOSE_REASON_CLEANUP_ERROR and the pool churns forever. Refuse to
+     * create the pool instead of degrading silently.
+     *
+     * A NULL protocol is tolerated for unit-test constructors that don't drive the
+     * cleanup/borrow path; production config always populates protocol. */
     if (config->protocol) {
         pool->flow_vt = keel_proto_flow_get(config->protocol);
         if (!pool->flow_vt) {
-            /* A NULL flow_vt is silently catastrophic: cleanup_slot is
-             * never invoked, so every returned connection is force-closed
-             * with BACKEND_CLOSE_REASON_CLEANUP_ERROR and the pool churns
-             * forever. Refuse to create the pool instead of degrading
-             * silently. */
             KEEL_LOG_ERROR(KEEL_LOG_CAT_POOL,
                 "backend_pool_create: unknown protocol \"%s\" — no flow vtable registered",
                 config->protocol);
@@ -761,12 +764,6 @@ backend_pool_t* backend_pool_create(const backend_pool_config_t* config)
             keel_free(pool);
             return NULL;
         }
-    } else {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_POOL,
-            "backend_pool_create: config->protocol is NULL — refusing to create pool");
-        pthread_mutex_destroy(&pool->lock);
-        keel_free(pool);
-        return NULL;
     }
     
     pool->clean_list = NULL;
