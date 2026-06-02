@@ -1629,6 +1629,13 @@ keel_flow_result_t keel_engine_flow_on_fe_data(
     size_t pos = 0;
     size_t ext_batch_start = (size_t)-1;  /* extended protocol send batching */
     uint16_t ext_flush_response_count = 0; /* pending response count for Flush terminal */
+    /* Accumulator for query-effect flags across an extended-protocol batch:
+     * the actual send happens on the Sync/Flush terminal, whose own act
+     * carries effect=0, so per-message effects (WRITE, DDL, BEGINS_TX, etc.)
+     * would otherwise be lost — making downstream post-send bookkeeping
+     * (sticky-primary stamp, query-cache invalidation, txn tracking) miss
+     * every parameterized statement.  Cleared each time a batch terminates. */
+    keel_query_effect_flags_t ext_batch_effect = 0;
     sf->linked_send_len = 0;              /* clear linked send state */
 
     KEEL_DEBUG_LOG("W%u: fe_data len=%zu phase=%d\n", worker->id, len, sf->phase);
@@ -3602,6 +3609,7 @@ copy_scan_done:
                 if (ext_batch_start == (size_t)-1)
                     ext_batch_start = pos;
                 ext_flush_response_count += (uint16_t)act.ext_response_count;
+                ext_batch_effect |= act.effect;
                 pos += (size_t)flen;
                 continue;
             }
@@ -3618,6 +3626,13 @@ copy_scan_done:
                 act.be_payload = data + ext_batch_start;
                 act.be_payload_len = pos + (size_t)flen - ext_batch_start;
                 ext_batch_start = (size_t)-1;
+                /* Hoist accumulated per-message effects onto the terminal's
+                 * act so post-send bookkeeping (sticky-primary stamp,
+                 * write-cache invalidation, txn tracking) sees the batch
+                 * as a whole.  OR-merge so any flag the terminal itself
+                 * may carry (rare) is preserved. */
+                act.effect |= ext_batch_effect;
+                ext_batch_effect = 0;
                 if (pos < len && data[pos] == 'H') { /* Flush terminal */
                     sf->flush_in_flight = true;
                     if (UINT16_MAX - sf->flush_pending_count < ext_flush_response_count)
