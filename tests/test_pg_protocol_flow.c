@@ -207,6 +207,13 @@ static size_t build_ready_for_query(uint8_t* buf, char status) {
     return 6;
 }
 
+/* Build ParseComplete: '1' + length(4) */
+static size_t build_parse_complete(uint8_t* buf) {
+    buf[0] = '1';
+    wr32(buf + 1, 4);
+    return 5;
+}
+
 /* Build a backend CommandComplete: 'C' + len(4) + tag\0 */
 static size_t build_command_complete(uint8_t* buf, const char* tag) {
     size_t tl = strlen(tag);
@@ -1570,6 +1577,56 @@ static void test_close_with_remaining_stmts_no_clear(void) {
     len = build_close(buf, "s2");
     VT->on_fe_msg(ctx, buf, len, &act);
     TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+
+    VT->destroy_context(ctx);
+    TEST_END();
+}
+
+static void test_pipelined_named_parse_completes_fifo(void) {
+    TEST_BEGIN("prepared: pipelined named ParseComplete confirms FIFO");
+
+    void* ctx = create_and_startup();
+    TEST_ASSERT_NOT_NULL(ctx);
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+
+    uint8_t buf[256];
+    keel_fe_action_t act;
+
+    size_t len = build_named_parse(buf, "S_89", "SELECT 89");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, len, &act), 0);
+    len = build_named_parse(buf, "S_90", "SELECT 90");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, len, &act), 0);
+
+    pg_stmt_entry_t* s89 = NULL;
+    pg_stmt_entry_t* s90 = NULL;
+    for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
+        if (c->stmt_cache[i].valid &&
+            strcmp(c->stmt_cache[i].name, "S_89") == 0)
+            s89 = &c->stmt_cache[i];
+        if (c->stmt_cache[i].valid &&
+            strcmp(c->stmt_cache[i].name, "S_90") == 0)
+            s90 = &c->stmt_cache[i];
+    }
+    TEST_ASSERT_NOT_NULL(s89);
+    TEST_ASSERT_NOT_NULL(s90);
+    TEST_ASSERT(!s89->confirmed);
+    TEST_ASSERT(!s90->confirmed);
+
+    uint8_t bebuf[16];
+    keel_be_action_t bact;
+    len = build_parse_complete(bebuf);
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, bebuf, len, &bact), 0);
+    TEST_ASSERT(s89->confirmed);
+    TEST_ASSERT(!s90->confirmed);
+    TEST_ASSERT(c->session_stmt_hash != 0);
+    uint64_t first_hash = c->session_stmt_hash;
+
+    len = build_parse_complete(bebuf);
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, bebuf, len, &bact), 0);
+    TEST_ASSERT(s89->confirmed);
+    TEST_ASSERT(s90->confirmed);
+    TEST_ASSERT(c->session_stmt_hash != 0);
+    TEST_ASSERT(c->session_stmt_hash != first_hash);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -5045,6 +5102,7 @@ int main(void) {
     test_unnamed_parse_no_prepared_pin();
     test_close_clears_prepared_pin();
     test_close_with_remaining_stmts_no_clear();
+    test_pipelined_named_parse_completes_fifo();
 
     /* 12) Prepared statement pooling modes */
     test_ps_pinning_named_parse_sets_pin();

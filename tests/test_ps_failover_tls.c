@@ -462,8 +462,8 @@ static void test_failover_stmt_replay_roundtrip(void) {
             keel_fe_action_t act;
             VT->on_fe_msg(fresh, rbuf + pos, 1 + msg_len, &act);
 
-            /* Deliver a synthetic ParseComplete backend response so that
-             * pending_parse_valid is cleared and the hash is updated. */
+            /* Deliver a synthetic ParseComplete backend response so that the
+             * pending confirmation is consumed and the hash is updated. */
             uint8_t pc[5];
             pc[0] = '1';
             pc[1] = 0; pc[2] = 0; pc[3] = 0; pc[4] = 4;

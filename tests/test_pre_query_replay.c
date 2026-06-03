@@ -2168,6 +2168,128 @@ static void test_backend_eof_during_stmt_replay(void)
     TEST_END();
 }
 
+static void test_extended_batch_write_stamps_sticky_primary(void)
+{
+    /* Regression: parameterized writes (Parse/Bind/Execute/Sync) hit the
+     * extended-protocol send-batching path in keel_engine_flow_on_fe_data.
+     * Pre-fix, the batched Parse/Bind/Execute messages skipped
+     * be_forward_done and Sync's own action carried effect=0, so
+     * sf.last_write_ns and consistency_atoms WRITE_TS were never updated
+     * — sticky-primary then routed the next SELECT to a replica and
+     * returned stale rows under replication lag (Prisma `pg` driver). */
+    TEST_BEGIN("extended batch: parameterized INSERT stamps sticky-primary ts");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 19;
+    worker.ps_mode = KEEL_PS_MODE_TRACKING;
+    worker.runtime_mode = KEEL_TIER_POOL;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    keel_session_flow_t sf;
+    TEST_ASSERT_EQ(keel_session_flow_init(&sf, VT, &session), 0);
+
+    uint8_t startup[256];
+    keel_fe_action_t startup_act;
+    size_t startup_len = build_startup(startup, "testuser", "testdb");
+    TEST_ASSERT_EQ(VT->on_fe_msg(sf.ctx, startup, startup_len, &startup_act), KEEL_OK);
+    sf.phase = KEEL_PHASE_READY;
+    sf.mode = KEEL_TIER_SMART;
+    session.state = KEEL_SESSION_READY;
+
+    uint8_t msg[512];
+    size_t n = 0;
+    n += build_named_parse(msg + n, "stmtcache_w1",
+                           "INSERT INTO t(v) VALUES ($1)");
+    n += build_bind(msg + n, "", "stmtcache_w1");
+    n += build_execute(msg + n, "");
+    n += build_extended_msg(msg + n, 'S');
+
+    TEST_ASSERT_EQ(sf.last_write_ns, 0ULL);
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+
+    /* Whole batch must arrive on the backend in a single contiguous send. */
+    uint8_t got[512];
+    ssize_t nr = recv(be_sv[1], got, sizeof(got), 0);
+    TEST_ASSERT_EQ(nr, (ssize_t)n);
+    TEST_ASSERT(memcmp(got, msg, n) == 0);
+
+    /* The fix: per-message WRITE effect must be hoisted onto the Sync
+     * terminal's action so the post-send sticky-primary stamp fires. */
+    TEST_ASSERT(sf.last_write_ns != 0);
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms),
+                   sf.last_write_ns);
+
+    if (VT->destroy_context)
+        VT->destroy_context(sf.ctx);
+    session.plugin_state = NULL;
+    close_pair(be_sv);
+    TEST_END();
+}
+
+static void test_extended_batch_read_does_not_stamp(void)
+{
+    /* Symmetric guard: a parameterized SELECT batch must NOT stamp
+     * sticky-primary (no false positives that would needlessly pin the
+     * session to the primary). */
+    TEST_BEGIN("extended batch: parameterized SELECT does not stamp ts");
+
+    int be_sv[2] = { -1, -1 };
+    TEST_ASSERT(make_socketpair(be_sv) == 0);
+
+    keel_worker_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.id = 20;
+    worker.ps_mode = KEEL_PS_MODE_TRACKING;
+    worker.runtime_mode = KEEL_TIER_POOL;
+
+    keel_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.worker = &worker;
+    session.server_fd = be_sv[0];
+    session.client_fd = -1;
+
+    keel_session_flow_t sf;
+    TEST_ASSERT_EQ(keel_session_flow_init(&sf, VT, &session), 0);
+
+    uint8_t startup[256];
+    keel_fe_action_t startup_act;
+    size_t startup_len = build_startup(startup, "testuser", "testdb");
+    TEST_ASSERT_EQ(VT->on_fe_msg(sf.ctx, startup, startup_len, &startup_act), KEEL_OK);
+    sf.phase = KEEL_PHASE_READY;
+    sf.mode = KEEL_TIER_SMART;
+    session.state = KEEL_SESSION_READY;
+
+    uint8_t msg[512];
+    size_t n = 0;
+    n += build_named_parse(msg + n, "stmtcache_r1",
+                           "SELECT v FROM t WHERE id = $1");
+    n += build_bind(msg + n, "", "stmtcache_r1");
+    n += build_execute(msg + n, "");
+    n += build_extended_msg(msg + n, 'S');
+
+    keel_flow_result_t r = keel_engine_flow_on_fe_data(&sf, &session, msg, n);
+    TEST_ASSERT_EQ(r, KEEL_FLOW_WAIT_BACKEND);
+
+    TEST_ASSERT_EQ(sf.last_write_ns, 0ULL);
+    TEST_ASSERT_EQ(keel_ssv_consistency_get_ts(sf.consistency_atoms), 0ULL);
+
+    if (VT->destroy_context)
+        VT->destroy_context(sf.ctx);
+    session.plugin_state = NULL;
+    close_pair(be_sv);
+    TEST_END();
+}
+
 int main(void)
 {
     printf("=== Async Pre-Query Replay Tests ===\n");
@@ -2177,6 +2299,8 @@ int main(void)
     test_fe_write_capture_pending_preserves_tokenless_stickiness();
     test_fe_read_does_not_stamp_sticky_primary();
     test_extended_sync_does_not_use_linked_send();
+    test_extended_batch_write_stamps_sticky_primary();
+    test_extended_batch_read_does_not_stamp();
     test_post_write_capture_success_updates_ssv();
     test_post_write_capture_failure_fails_closed();
     test_flag_lifecycle_and_forward_on_rfq();

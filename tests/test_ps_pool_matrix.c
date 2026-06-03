@@ -515,9 +515,9 @@ static void test_tracking_simple_query_prepare(void) {
 /* ============================================================================
  * Matrix 5: PS mode × stmt_hash consistency across ParseComplete
  *
- * In VIRTUALIZE mode, pending_parse_hash is XOR'd into session_stmt_hash
- * when ParseComplete arrives from the backend.  Verify:
- *   a) After named Parse, pending_parse_valid is true
+ * In VIRTUALIZE mode, a pending Parse FIFO entry is XOR'd into
+ * session_stmt_hash when ParseComplete arrives from the backend.  Verify:
+ *   a) After named Parse, one pending FIFO entry exists
  *   b) After ParseComplete (on_be_msg), session_stmt_hash changes
  *   c) A second distinct statement changes hash again (XOR)
  * ============================================================================ */
@@ -531,13 +531,13 @@ static void test_stmt_hash_after_parse_complete(void) {
 
     uint64_t hash_before = c->session_stmt_hash;
 
-    /* Named Parse → sets pending_parse_valid */
+    /* Named Parse pushes one pending confirmation */
     uint8_t buf[256];
     keel_fe_action_t fact;
     size_t len = build_named_parse(buf, "s1", "SELECT 1");
     VT->on_fe_msg(ctx, buf, len, &fact);
-    TEST_ASSERT(c->pending_parse_valid);
-    TEST_ASSERT(c->pending_parse_hash != 0);
+    TEST_ASSERT_EQ(c->pending_parse_count, 1u);
+    TEST_ASSERT(c->pending_parse_hash[c->pending_parse_head] != 0);
 
     /* Backend sends ParseComplete '1' */
     keel_be_action_t bact;
@@ -860,7 +860,7 @@ static void test_ps_with_failed_tx(void) {
 
     /* PS state should still be present in context */
     pg_flow_ctx_t *c = (pg_flow_ctx_t *)ctx;
-    TEST_ASSERT(c->named_stmt_count > 0 || c->pending_parse_valid);
+    TEST_ASSERT(c->named_stmt_count > 0 || c->pending_parse_count > 0);
 
     VT->destroy_context(ctx);
     TEST_END();
