@@ -16,7 +16,40 @@ reference.
 
 ---
 
+## [v0.5.4-alpha] — 2026-06-03
+
+### Added
+
+- **`scripts/make-release.sh`**: atomic release-bump script.  Run
+  `scripts/make-release.sh <version>` (e.g. `0.5.5-alpha`) to update
+  `CMakeLists.txt`, `src/main/main.c`, add a `CHANGELOG.md` stub, activate
+  `.githooks`, commit all staged changes, and create the annotated tag — all in
+  one step.  Eliminates version drift between the git tag and the compiled-in
+  version string.
+- **`.githooks/pre-push`**: local pre-push hook that rejects any `v*` tag push
+  where the semver extracted from the tag name does not match
+  `CMakeLists.txt VERSION`.  Activated automatically by `scripts/make-release.sh`
+  or manually with `git config core.hooksPath .githooks`.
+- **CI version consistency gate** (`package-linux.yml`): the packaging workflow
+  now validates tag semver vs `CMakeLists.txt VERSION` as its first step and
+  fails fast before any expensive build work if they disagree.
+
+### Changed
+
+- Bumped runtime version string to `0.5.4`.
+- Supersedes unpublished `v0.5.3-alpha`: GitHub's immutable-releases feature
+  permanently locked that tag name after the packaging workflow published it and
+  the release was subsequently deleted while attempting a retag.  All intended
+  v0.5.3-alpha content is included here.
+
+---
+
 ## [v0.5.3-alpha] — 2026-06-03
+
+> **Note**: this tag was never published as a GitHub Release.  GitHub's
+> immutable-releases feature permanently locked the tag name after the packaging
+> workflow ran; the release was deleted while attempting a retag to include the
+> docs commit.  All content from this entry is present in [v0.5.4-alpha].
 
 ### Changed
 

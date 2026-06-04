@@ -138,7 +138,7 @@
 #define KEEL_VERSION_MINOR 5
 #endif
 #ifndef KEEL_VERSION_PATCH
-#define KEEL_VERSION_PATCH 3
+#define KEEL_VERSION_PATCH 4
 #endif
 
 /* ============================================================================

@@ -40,6 +40,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Version consistency gate ──────────────────────────────────────────
+      # Fail fast if the tag semver does not match CMakeLists.txt VERSION.
+      # Prevents releasing a binary whose compiled-in version differs from the
+      # git tag.  Use scripts/make-release.sh to bump both atomically.
+      - name: Verify tag version matches CMakeLists.txt
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          semver="${tag#v}"
+          semver="${semver%%-*}"
+          if [[ ! "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Non-semver tag '$tag' — skipping version check"
+            exit 0
+          fi
+          cmake_ver=$(grep -oP '(?<=VERSION )\d+\.\d+\.\d+' CMakeLists.txt | head -1)
+          if [[ "$semver" != "$cmake_ver" ]]; then
+            echo "::error::Tag '$tag' semver '$semver' ≠ CMakeLists.txt VERSION '$cmake_ver'"
+            echo "::error::Use scripts/make-release.sh to bump the version before tagging."
+            exit 1
+          fi
+          echo "Version check passed: tag=${tag}  cmake=${cmake_ver}"
+
       - name: Install build + packaging dependencies
         run: |
           sudo apt-get update

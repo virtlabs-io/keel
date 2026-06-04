@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — reject version-tag pushes that disagree with CMakeLists.txt
+#
+# Activated by:
+#   git config core.hooksPath .githooks          (manual, once per clone)
+#   scripts/make-release.sh <version>            (automatic)
+#
+# The hook fires on every 'git push'.  It only validates refs matching
+# refs/tags/v*.  Non-versioned tags and branch pushes are ignored.
+set -euo pipefail
+
+# Read CMakeLists.txt from the repo root, not necessarily $PWD
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CMAKE_FILE="${REPO_ROOT}/CMakeLists.txt"
+
+cmake_ver=""
+if [[ -f "$CMAKE_FILE" ]]; then
+  cmake_ver=$(grep -oP '(?<=VERSION )\d+\.\d+\.\d+' "$CMAKE_FILE" | head -1)
+fi
+
+while IFS=' ' read -r local_ref _local_oid remote_ref _remote_oid; do
+  # Only inspect tag refs
+  [[ "$local_ref" == refs/tags/* ]] || continue
+
+  tag="${local_ref#refs/tags/}"
+
+  # Only versioned tags starting with 'v'
+  [[ "$tag" == v* ]] || continue
+
+  # Extract semver: strip leading 'v', then strip -alpha / -beta / -rc / etc.
+  semver="${tag#v}"
+  semver="${semver%%-*}"
+
+  # Skip non-semver tags (e.g. v1 or vNightly)
+  [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+
+  if [[ -z "$cmake_ver" ]]; then
+    echo "pre-push: WARNING: could not read VERSION from CMakeLists.txt — skipping check" >&2
+    continue
+  fi
+
+  if [[ "$semver" != "$cmake_ver" ]]; then
+    echo "pre-push: REJECTED ─ tag '${tag}' semver '${semver}' ≠ CMakeLists.txt VERSION '${cmake_ver}'" >&2
+    echo "pre-push: Run  scripts/make-release.sh ${semver}${tag#v${semver}}  to bump consistently." >&2
+    exit 1
+  fi
+
+  echo "pre-push: version check OK — tag ${tag} = CMakeLists.txt ${cmake_ver}" >&2
+done
+
+exit 0
