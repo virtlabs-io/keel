@@ -2,7 +2,11 @@
 
 # KEEL — Database Connection Pooler & Proxy
 
-**KEEL** is a high-performance connection pooler and intelligent proxy for **PostgreSQL** and **MySQL**. It sits between your application and your databases, multiplexing thousands of app connections over a small pool of real backend connections — reducing database load, improving tail latency, and adding routing intelligence with zero application changes.
+**KEEL** is a correctness-first PostgreSQL connection pooler and intelligent
+database proxy. Its production candidate profile is conservative PostgreSQL
+transaction pooling with prepared-statement virtualization. Broader routing,
+MySQL, sharding, and cluster features exist, but are labelled by maturity and
+should be enabled deliberately.
 
 > [GitHub](https://github.com/virtlabs-io/keel) · [Documentation](https://github.com/virtlabs-io/keel/tree/main/docs) · [Changelog](https://github.com/virtlabs-io/keel/blob/main/CHANGELOG.md) · [License: AGPL-3.0](https://github.com/virtlabs-io/keel/blob/main/LICENSE)
  
@@ -13,11 +17,11 @@
 | Problem | How KEEL solves it |
 |---------|-------------------|
 | Too many connections overloading the database | Transaction pooling multiplexes hundreds of app threads over a small backend pool |
-| Read replicas sitting idle while the primary is overloaded | Automatic read/write splitting routes SELECTs to replicas and writes to primary |
+| Read replicas sitting idle while the primary is overloaded | Smart read/write routing exists in the Hardening bucket and can be enabled deliberately |
 | ORM prepared statements breaking pooling (Hibernate, pgx, GORM, SQLAlchemy) | Transparent prepared-statement virtualization — no ORM changes required |
-| Session state (SET, search_path, GUCs) lost when connections are reused | Session-context preservation keeps per-session state consistent across backend reassignment |
-| Patroni failover causing application errors | Automatic role detection and routing updates on primary/replica changes |
-| Cloud IAM token rotation for RDS/Cloud SQL/Azure | Built-in AWS, GCP, and Azure token management — no rotation scripts needed |
+| Session state (SET, search_path, GUCs) lost when connections are reused | Session-context preservation is being hardened for stateful workloads |
+| Patroni failover causing application errors | Role observation and conservative routing are in the Hardening bucket |
+| Cloud IAM token rotation for RDS/Cloud SQL/Azure | Cloud auth providers are available as Experimental/Hardening features depending on provider and deployment |
 | Compliance requirements for audit logging and TLS enforcement | Structured audit log, mTLS, LDAP/PAM integration, privilege drop, seccomp filter |
 
 ---
@@ -26,11 +30,14 @@
 
 | Tag | Base | Size | Use when |
 |-----|------|------|---------|
-| `latest`, `debian`, immutable Debian tags | Debian Trixie Slim | ~120 MB | Default — best library compatibility |
+| Immutable Debian release tags, `debian` | Debian Trixie Slim | ~120 MB | Default base, best library compatibility |
 | `ubuntu`, immutable Ubuntu tags | Ubuntu 24.04 LTS | ~140 MB | Ubuntu-centric environments |
 | `alpine`, immutable Alpine tags | Alpine 3.20 | ~40 MB | Minimal footprint, musl libc |
+| `latest` | Debian base | ~120 MB | Mutable convenience tag for development |
 
 All images are multi-arch: **linux/amd64** and **linux/arm64**.
+
+Production deployments should pin an immutable release tag or digest.
 
 ---
 
@@ -46,7 +53,7 @@ docker run -d \
   -e KEEL_SERVER_PASSWORD=secret \
   -e KEEL_SERVER_DATABASE=mydb \
   -p 7432:7432 \
-  vlbsio/keel
+  vlbsio/keel:<release-tag>
 ```
 
 Then connect your app to `localhost:7432` exactly as you would connect to PostgreSQL directly.
@@ -57,7 +64,7 @@ Then connect your app to `localhost:7432` exactly as you would connect to Postgr
 docker run -d \
   -v /path/to/keel.ini:/etc/keel/keel.ini \
   -p 7432:7432 \
-  vlbsio/keel
+  vlbsio/keel:<release-tag>
 ```
 
 ### Docker Compose
@@ -65,7 +72,7 @@ docker run -d \
 ```yaml
 services:
   keel:
-    image: vlbsio/keel
+    image: vlbsio/keel:<release-tag>
     ports:
       - "7432:7432"   # PostgreSQL proxy
       - "9101:9101"   # Prometheus metrics
@@ -89,21 +96,22 @@ the summary below mirrors it.
 > Patroni failover, and transaction tracking are in the **Hardening** bucket
 > — enable deliberately with monitoring.
 
-### ✅ Stable (production-ready)
+### Production candidate
 
-These are safe to use in production today with default settings.
+These are the supported production candidate capabilities when configured
+conservatively and validated against your workload.
 
 | Feature | What it does |
 |---------|-------------|
 | **PostgreSQL transaction pooling** | Connections returned to the pool after each transaction; hundreds of app connections share a small backend pool |
 | **PostgreSQL prepared-statement virtualization** | Named prepared statements transparently replayed on any backend — works with Hibernate, pgx, GORM, SQLAlchemy, Prisma |
 | **Full TLS + mTLS** | Frontend TLS termination, backend TLS, optional client certificate verification (kTLS acceleration is *Hardening* — kernel/cipher support varies) |
-| **SCRAM-SHA-256 / MD5 auth** | Full PostgreSQL authentication; `caching_sha2_password` / `mysql_native_password` for MySQL |
+| **SCRAM-SHA-256 / MD5 auth** | PostgreSQL authentication; prefer SCRAM-SHA-256 for production |
 | **Admin console** | `psql`-compatible admin interface: `SHOW POOLS`, `SHOW STATS`, `SHOW SERVERS`, `RELOAD`, and 20+ commands |
 | **Prometheus metrics** | `/metrics` endpoint with pool, session, query, and TLS counters + P50/P95/P99 histograms |
 | **Live config reload** | SIGHUP reloads pool sizes, TLS certs, timeouts, and server weights without restart |
 | **Graceful drain/shutdown** | In-flight queries complete before shutdown; commit-in-doubt sessions are never force-closed |
-| **Privilege drop + seccomp** | Drops root after bind; optional seccomp syscall filter reduces attack surface |
+| **Privilege drop + seccomp** | Supported hardening controls; enable in production where the runtime supports them |
 
 ### 🔶 Hardening (works, needs validation in your environment)
 
@@ -138,14 +146,10 @@ These require `experimental_features = true` in config. Use in non-critical envi
 
 ## Database & Platform Support
 
-### Supported databases
-
-| Database | Versions | Status |
-|----------|---------|--------|
-| PostgreSQL | 14, 15, 16, 17 | ✅ Tested in CI |
-| MySQL | 8.0, 8.4, 9.x | ✅ Tested in CI |
-| MariaDB | 10.11, 11.x | ✅ Tested in CI |
-| Percona XtraDB Cluster | 8.0 | ✅ Validated |
+The supported PostgreSQL version list and database maturity notes live in
+[`docs/COMPATIBILITY.md`](https://github.com/virtlabs-io/keel/blob/main/docs/COMPATIBILITY.md).
+PostgreSQL is the production candidate baseline; MySQL, MariaDB, and Percona
+topologies are in the Hardening bucket.
 
 ### Cloud databases
 
@@ -169,16 +173,16 @@ No password rotation scripts needed — KEEL handles token generation and cachin
 
 ## Security Hardening
 
-KEEL is built with defense-in-depth:
+KEEL supports defense-in-depth controls:
 
-- **Seccomp BPF filter** — allowlist-only syscall policy (`baseline` or `strict` mode)
-- **Privilege drop** — drops to unprivileged user after binding ports
+- **Seccomp BPF filter** — allowlist-only syscall policy (`baseline` or `strict` mode), opt-in by config
+- **Privilege drop** — drops to unprivileged user after binding ports, opt-in by config
 - **mTLS** — optional client certificate verification with CN/SAN identity extraction
 - **LDAP / PAM integration** — enterprise authentication via `ldap_bind()` or `pam_authenticate()`
 - **Structured audit log** — NDJSON audit trail for auth, admin, query, and pool events; filterable by event type
 - **Cipher enforcement** — configurable TLS 1.2/1.3 cipher suites and minimum version
 - **Certificate hot-reload** — `SIGHUP` triggers atomic TLS context swap without dropping connections
-- **No COPY from untrusted input** — SQL parser blocks dangerous patterns at the proxy layer
+- **Known limits surfaced** — review `docs/LIMITATIONS.md` before enabling Hardening or Experimental features
 
 ---
 
@@ -193,20 +197,14 @@ protocol          = postgresql
 bind_addr         = 0.0.0.0
 bind_port         = 7432
 num_workers       = 4
-mode              = pool            # pool | smart | proxy | full
+mode              = pool
 prepared_statement = virtualize     # transparent PS replay for ORMs
 min_pool_size     = 10
 max_pool_size     = 100
+auth_method       = scram-sha-256
 
 [worker_group.myapp.servers]
 primary  = host=db1.internal port=5432 dbname=myapp user=app password=secret role=RW weight=100
-replica1 = host=db2.internal port=5432 dbname=myapp user=app password=secret role=RO weight=100
-replica2 = host=db3.internal port=5432 dbname=myapp user=app password=secret role=RO weight=100
-
-[worker_group.myapp.probe]
-type     = patroni
-endpoint = http://db1.internal:8008
-interval = 3s
 ```
 
 For the full configuration reference, see [docs/DOCKER.md](https://github.com/virtlabs-io/keel/blob/main/docs/DOCKER.md).

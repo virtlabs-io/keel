@@ -13,6 +13,8 @@
  */
 #include "keel_otlp_encode.h"
 
+#include "keel/core/config.h"
+
 #include "opentelemetry/proto/collector/metrics/v1/metrics_service.pb.h"
 #include "opentelemetry/proto/metrics/v1/metrics.pb.h"
 #include "opentelemetry/proto/resource/v1/resource.pb.h"
@@ -149,7 +151,7 @@ static const struct {
     const char* value;
 } k_resource_attrs[] = {
     { "service.name",        "keel" },
-    { "service.version",     "0.2.0-alpha" },
+    { "service.version",     KEEL_VERSION },
     { "telemetry.sdk.name",  "keel-otlp" },
     { "telemetry.sdk.language", "c" },
 };

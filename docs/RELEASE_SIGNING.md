@@ -104,7 +104,7 @@ Users can verify the authenticity of released packages:
 gpg --recv-keys <KEY_ID>
 
 # Verify a package signature
-gpg --verify keel_0.3.0_amd64.deb.asc keel_0.3.0_amd64.deb
+gpg --verify keel_<version>_<arch>.deb.asc keel_<version>_<arch>.deb
 
 # Verify SHA256SUMS
 gpg --verify SHA256SUMS.asc

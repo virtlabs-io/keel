@@ -549,7 +549,7 @@ Both protocols share `generate_sync_sql()` from `include/keel/session/state_prof
 **File:** `src/protocol/postgres/postgres_flow.c`  
 **Struct:** `pg_flow_ctx_t`
 
-Each PostgreSQL session flow context maintains an in-memory statement cache (`PG_STMT_CACHE_SIZE = 32` slots):
+Each PostgreSQL session flow context maintains an in-memory statement cache (`PG_STMT_CACHE_SIZE = 512` slots):
 
 | Field | Type | Description |
 |-------|------|-------------|

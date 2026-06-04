@@ -10,8 +10,8 @@ Items are organised by status and priority.
 
 Each item below is present in the codebase with focused tests. **Production
 maturity varies across items** — [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)
-is the single source of truth for which features are Stable, Hardening,
-Experimental, or Aspirational. Anything in this list that depends on an
+is the single source of truth for which features are Production candidate,
+Hardening, Experimental, Aspirational, or Research. Anything in this list that depends on an
 experimental subsystem (sharding, scatter-merge, multi-shard 2PC, WAL LSN /
 GTID replica catch-up probes, cluster wire compression, result cache, web
 management UI) must not be treated as production-supported unless the matching
@@ -132,7 +132,7 @@ recommended production deployment is **PostgreSQL in `pool` mode** with
 - **Multi-Proxy HA Cluster** — 2–3 KEEL instances form a cluster with heartbeat-based peer health monitoring, config gossip (checksum-based reconciliation), transitive peer discovery, NOTIFY_SERVER event delivery; wire protocol magic `0x4B454C43`; `[cluster]` INI section + `KEEL_CLUSTER_*` env vars; 25 unit tests
 - **Cluster Wire-Protocol Compression** — transparent zlib/zstd payload compression on the gossip TCP wire for WAN/cross-region deployments; codec flag encoded in top 2 bits of the `payload_len` header field (protocol v4); configurable per-node via `compress = none|zlib|zstd` and `compress_threshold_bytes`; `keel_compress`/`keel_decompress`/`keel_compress_bound` unified API; libzstd auto-detected at build time (`KEEL_HAS_ZSTD`); Dockerfiles updated with `libzstd-dev` (build) and `libzstd1` (runtime); 14 new unit + e2e tests (51 total in election suite); see [CLUSTER_WIRE_COMPRESSION.md](CLUSTER_WIRE_COMPRESSION.md)
 - **Kubernetes Native** — Helm chart (`helm/keel/`) with ConfigMap, Secret, StatefulSet, PodMonitor; Go controller-runtime operator (`operator/`) with `KeelPool` CRD, reconcile loop, distroless Dockerfile; HPA guidance on `pool_wait_queue_enqueued` metric
-- **Docker Official Images** — multi-arch (`linux/amd64`, `linux/arm64`) at `ghcr.io/virtlabs/keel:latest`; `KEEL_*` env var config via `docker/docker-entrypoint.sh`; production Compose templates; GitHub Actions publish on `v*.*.*` tags
+- **Docker Images** — multi-arch (`linux/amd64`, `linux/arm64`) container images; `KEEL_*` env var config via `docker/docker-entrypoint.sh`; Compose templates; GitHub Actions publish on release tags
 - **Release Packaging** — tar.gz, DEB, and RPM packages via CPack with man pages (`keel(1)`, `keel.ini(5)`), systemd unit, post-install user/group creation, logrotate config, proper dependency declarations
 - **Hardening CI** — unified CI gate with sanitizer matrix (ASan+UBSan, TSan, MSan), shadow diff, backpressure tests, syscall fault injection, network chaos, checksec verification, TLS audit, sqlmap fuzzing
 - **GitHub Actions CI/CD** — build+test on every push/PR, sanitizer matrix on PRs, weekly hardening schedule, automated DEB/RPM/TGZ release packaging on tags

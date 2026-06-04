@@ -1,20 +1,23 @@
 # KEEL Docker Guide
 
-Official multi-arch Docker images for KEEL are published to the GitHub Container Registry. This guide covers pulling, running, and deploying KEEL in containers.
+Official multi-arch Docker images for KEEL are published to the GitHub Container Registry.
+For DEB, RPM, tarball, and general package installs, use
+[PACKAGE_INSTALL.md](PACKAGE_INSTALL.md). This guide covers container-specific
+usage.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Pull the latest image (linux/amd64 and linux/arm64)
-docker pull ghcr.io/virtlabs/keel:latest
+# Pull an immutable release tag or digest for production
+docker pull ghcr.io/virtlabs/keel:<release-tag>
 
 # Run with a config file
 docker run --rm \
   -v ./my-keel.ini:/etc/keel/keel.ini:ro \
   -p 7432:7432 -p 6433:6433 -p 9101:9101 \
-  ghcr.io/virtlabs/keel:latest
+  ghcr.io/virtlabs/keel:<release-tag>
 
 # Run with environment variables only (no config file needed for cluster)
 docker run --rm \
@@ -23,7 +26,7 @@ docker run --rm \
   -e KEEL_CLUSTER_INITIAL_PEERS="node-2:9100,node-3:9100" \
   -v ./keel.ini:/etc/keel/keel.ini:ro \
   -p 7432:7432 -p 6433:6433 \
-  ghcr.io/virtlabs/keel:latest
+  ghcr.io/virtlabs/keel:<release-tag>
 ```
 
 ---
@@ -32,9 +35,9 @@ docker run --rm \
 
 | Tag | Description |
 |-----|-------------|
-| `latest` | Default published image |
-| `<tag>` | Immutable tag listed in the container registry or release notes |
+| `<release-tag>` | Immutable tag listed in the container registry or release notes |
 | `sha-abc1234` | Specific commit |
+| `latest` | Mutable convenience tag; avoid for production rollouts |
 
 Supported platforms: **linux/amd64**, **linux/arm64**
 
@@ -96,7 +99,7 @@ The entrypoint script (`docker-entrypoint.sh`) maps `KEEL_*` environment variabl
 
 ---
 
-## Production Compose Templates
+## Compose Templates
 
 Two ready-made Compose files are shipped in `docker/compose/`.
 
@@ -136,7 +139,7 @@ KEEL1_SQL_PORT=5432 KEEL2_SQL_PORT=5433 \
 ### Override the image tag
 
 ```bash
-KEEL_IMAGE=ghcr.io/virtlabs/keel:1.2.0 \
+KEEL_IMAGE=ghcr.io/virtlabs/keel:<release-tag> \
   docker compose -f docker/compose/pg-ha-official.yml up -d
 ```
 
@@ -157,7 +160,7 @@ docker build -t keel:local .
 docker buildx create --use --name keel-builder
 
 # Build + push to registry
-KEEL_PUBLISH_TAG=1.2.0 ./docker/build-linux.sh publish
+KEEL_PUBLISH_TAG=<release-tag> ./docker/build-linux.sh publish
 
 # Dry run (no push)
 ./docker/build-linux.sh publish-dry
@@ -174,7 +177,7 @@ docker build --target tester -t keel:test .
 
 ## GitHub Actions — Automated Publish
 
-The workflow in `.github/workflows/docker-publish.yml` runs on every `v*.*.*` tag:
+The workflow in `.github/workflows/docker-publish.yml` runs for release tags:
 
 1. Sets up QEMU + buildx for cross-compilation.
 2. Builds the `tester` stage for `linux/amd64` and fails fast if tests fail.

@@ -7,23 +7,25 @@ high-performance database connection pooler and proxy.
 
 | Tag | Base image | Size |
 |-----|-----------|------|
-| `latest`, `debian`, immutable Debian tags | `debian:bookworm-slim` | ~120 MB |
+| Immutable Debian release tags, `debian` | `debian:bookworm-slim` | ~120 MB |
 | `ubuntu`, immutable Ubuntu tags | `ubuntu:24.04` | ~140 MB |
 | `alpine`, immutable Alpine tags | `alpine:3.20` | ~40 MB |
+| `latest` | Debian base | Mutable convenience tag |
 
-`latest` tracks the default stable image on the **Debian** base.
+Production deployments should pin an immutable release tag or digest. `latest`
+is for development and smoke testing.
 
 ## Quick start
 
 ```bash
-# Debian (default / recommended)
-docker pull vlbsio/keel
+# Debian release tag (recommended for production)
+docker pull vlbsio/keel:<release-tag>
 
 # Alpine (smallest)
 docker pull vlbsio/keel:alpine
 
 # Run with your own config
-docker run -v /path/to/keel.ini:/etc/keel/keel.ini -p 7432:7432 vlbsio/keel
+docker run -v /path/to/keel.ini:/etc/keel/keel.ini -p 7432:7432 vlbsio/keel:<release-tag>
 ```
 
 ## Environment variable overrides
@@ -36,7 +38,7 @@ docker run \
   -e KEEL_CLUSTER_ENABLED=false \
   -e KEEL_CLUSTER_NODE_ID=keel-1 \
   -p 7432:7432 \
-  vlbsio/keel
+  vlbsio/keel:<release-tag>
 ```
 
 See [docker/docker-entrypoint.sh](../docker-entrypoint.sh) for the full list.
@@ -73,9 +75,9 @@ docker build -f docker/hub/Dockerfile.alpine -t vlbsio/keel:alpine .
 
 ## CI / CD
 
-Production images are built and pushed to Docker Hub automatically via
+Images are built and pushed to Docker Hub automatically via
 [`.github/workflows/hub-publish.yml`](../../.github/workflows/hub-publish.yml)
-on every `vX.Y.Z` git tag.
+on release tags.
 
 ### Required repository secrets
 

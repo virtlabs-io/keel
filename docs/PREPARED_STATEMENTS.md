@@ -55,7 +55,7 @@ The `prepared_statement` config key selects the strategy per worker group.
 **How it works**
 
 Keel intercepts every named `Parse` message before it reaches the backend.
-The raw Parse wire bytes are stored in a per-session cache (up to 128 slots — `PG_STMT_CACHE_SIZE`).
+The raw Parse wire bytes are stored in a per-session cache (up to 512 slots, `PG_STMT_CACHE_SIZE`).
 A synthetic `ParseComplete` is returned to the client immediately — the backend
 never sees the Parse.
 
@@ -96,9 +96,9 @@ the client's Bind, transparently re-establishing the server-side state.
 - Replay cost: the first Bind on a new backend incurs one extra round-trip
   (Parse + Sync → ParseComplete).  For long-running applications with many
   prepared statements this cost is amortised quickly.
-- Cache size: a session can hold up to 128 named prepared statements
+- Cache size: a session can hold up to 512 named prepared statements
   (`PG_STMT_CACHE_SIZE` in `postgres_flow_internal.h`)
-  simultaneously.  If a client creates more than 128 named statements, the
+  simultaneously.  If a client creates more than 512 named statements, the
   oldest one is evicted (LRU).  Applications that maintain thousands of named
   statements simultaneously are not well-suited to this mode.
 - Only intercepts `Parse` messages in the **extended query protocol**.  If the
@@ -493,7 +493,7 @@ the backend may reject statements with non-matching SQL when strict hashing is e
 |---|---|---|
 | Statement namespace | Named (string key) | Numeric (backend-assigned int32) |
 | ID transferable? | Yes (name is portable) | No (backend-assigned) |
-| Map size | 128 (`PG_STMT_CACHE_SIZE`) | 64 (`MY_STMT_MAP_SIZE`) |
+| Map size | 512 (`PG_STMT_CACHE_SIZE`) | 64 (`MY_STMT_MAP_SIZE`) |
 | Session hash | FNV-1a over SQL bytes | FNV-1a over stmt_id bytes |
 | Replay unit | `Parse` wire message | `COM_STMT_PREPARE` wire message |
 | Close signal | `Close('S', name)` | `COM_STMT_CLOSE(stmt_id)` — no response |
@@ -507,7 +507,7 @@ the backend may reject statements with non-matching SQL when strict hashing is e
 ### Stmt cache
 
 Each session's protocol context (`pg_flow_ctx_t`) holds a fixed-size cache of
-up to `PG_STMT_CACHE_SIZE` (128) named statement entries:
+up to `PG_STMT_CACHE_SIZE` (512) named statement entries:
 
 ```c
 typedef struct pg_stmt_entry {
@@ -607,7 +607,7 @@ Does your application use prepared statements?
 │   └── Any mode works; use the default (virtualize)
 │
 ├── Yes — via extended query protocol (Parse/Bind/Execute)
-│   ├── Fewer than 128 simultaneous named statements per session?
+│   ├── Fewer than 512 simultaneous named statements per session?
 │   │   └── ✅ virtualize (default)
 │   ├── Uses binary parameters / open cursors / HOLD portals?
 │   │   └── ✅ pinning     (at the cost of lower pool efficiency)

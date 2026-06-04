@@ -369,7 +369,7 @@ cmd_dev() {
 #
 # Usage:
 #   ./docker/build-linux.sh publish
-#   KEEL_PUBLISH_TAG=1.2.0 ./docker/build-linux.sh publish
+#   KEEL_PUBLISH_TAG=<release-tag> ./docker/build-linux.sh publish
 #   KEEL_PUBLISH_IMAGE=myrepo/keel KEEL_PUBLISH_TAG=edge ./docker/build-linux.sh publish
 cmd_publish() {
     if ! docker buildx version &>/dev/null; then

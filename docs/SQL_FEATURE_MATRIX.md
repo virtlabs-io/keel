@@ -9,18 +9,18 @@ Status meanings:
 
 | Status | Meaning |
 |--------|---------|
-| Production | Intended for production use when the documented configuration is followed. |
+| Production candidate | Intended for production use when the documented production candidate configuration is followed. |
 | Experimental | Implemented but not a production guarantee until the listed gates pass. |
 | Rejects | KEEL must fail closed with SQLSTATE `0A000` / `KEEL_ERR_NOT_SUPPORTED`, never silently return an approximate result. |
-| Planned | Not implemented as a supported behavior yet. |
+| Aspirational | Not implemented as a supported behavior yet. |
 
 ## Core Routing
 
 | SQL pattern | Route/result | Status | Notes |
 |-------------|--------------|--------|-------|
-| Non-sharded table query | Normal pool routing | Production | Uses read/write split, transaction pinning, and configured pool mode. |
+| Non-sharded table query | Normal pool routing | Production candidate | Uses configured pool mode. Read/write split is part of `smart` hardening, not the default production candidate profile. |
 | Sharded table with equality predicate on shard key | `SINGLE` shard | Experimental | Correctness depends on shard rule configuration and parser extraction. |
-| Sharded table without shard-key predicate, `scatter_merge = off` | Rejects | Production guard | Prevents accidental fan-out in the default production profile. |
+| Sharded table without shard-key predicate, `scatter_merge = off` | Rejects | Production candidate guard | Prevents accidental fan-out in the default production profile. |
 | Sharded table without shard-key predicate, `scatter_merge = on` | `SCATTER` | Experimental | Executor must use `dr->scatter.decisions[]`, not array position or shard id alone. |
 | Primary + replica per shard | Router-selected backend per shard | Experimental | Reads may choose replicas; writes must choose primaries. |
 | Missing or unhealthy shard participant | Partial plan with failed count / unavailable path | Experimental | Load and failover gates must validate operator-visible behavior. |
@@ -41,8 +41,8 @@ Status meanings:
 | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` | Rejects | Rejects | Set semantics are global and cannot be evaluated independently per shard. |
 | Recursive CTE | Rejects | Rejects | Cross-shard recursion can silently miss links. |
 | Read-only CTE without recursion | Scatter pass-through or single fallback for constant CTEs | Experimental | Do not rely on cross-shard joins inside CTEs unless data is colocated. |
-| `SELECT DISTINCT col` | Planned | Reject before production promotion | Needs global deduplication for row-returning distinct. |
-| `STRING_AGG`, `ARRAY_AGG`, `json*_agg` | Planned | Reject before production promotion | Needs aggregate-specific merge semantics. |
+| `SELECT DISTINCT col` | Aspirational | Reject before production promotion | Needs global deduplication for row-returning distinct. |
+| `STRING_AGG`, `ARRAY_AGG`, `json*_agg` | Aspirational | Reject before production promotion | Needs aggregate-specific merge semantics. |
 | Cross-shard joins across independent shard keys | Rejects | Rejects | Co-locate tables or join in the application. |
 
 ## Scatter DML
@@ -53,8 +53,8 @@ Status meanings:
 | Scatter `UPDATE` / `DELETE` without `RETURNING` | Statement-level scatter write | Experimental | Current scope is statement-level atomic scatter DML only. |
 | Scatter `INSERT ... SELECT` without `RETURNING` | Statement-level scatter write | Experimental | Must be validated per workload. |
 | Scatter DML with `RETURNING` | Rejects | Rejects | Cross-shard row ordering and result merge are undefined today. |
-| Multi-row `INSERT ... VALUES` with mixed shard keys | Planned | Reject before production promotion | Current extraction risks first-row routing; needs decomposition by shard. |
-| Writable CTE | Planned | Reject before production promotion | Avoid duplicate writes across shards. |
+| Multi-row `INSERT ... VALUES` with mixed shard keys | Aspirational | Reject before production promotion | Current extraction risks first-row routing; needs decomposition by shard. |
+| Writable CTE | Aspirational | Reject before production promotion | Avoid duplicate writes across shards. |
 
 ## 2PC Scope
 
@@ -62,10 +62,10 @@ Status meanings:
 |------------|--------|----------------------------|
 | In-memory coordinator state machine and deterministic GIDs | Experimental | Unit-tested but not durable. |
 | Statement-level scatter write prepare/commit | Experimental | Must remain opt-in and gated. |
-| True distributed frontend transactions | Planned | Defer prepare/commit to frontend `COMMIT`/`ROLLBACK` boundaries. |
-| Durable coordinator log | Planned | Record participants, prepared state, final decision, phase-2 acknowledgements, recovery attempts. |
-| Startup recovery | Planned | Scan `pg_prepared_xacts WHERE gid LIKE 'keel_%'`, reconcile with durable log, resolve or expose admin-required state. |
-| Admin in-doubt transaction view and controls | Planned | Operators need inspect/commit/rollback tooling for unresolved prepared xacts. |
+| True distributed frontend transactions | Aspirational | Defer prepare/commit to frontend `COMMIT`/`ROLLBACK` boundaries. |
+| Durable coordinator log | Aspirational | Record participants, prepared state, final decision, phase-2 acknowledgements, recovery attempts. |
+| Startup recovery | Aspirational | Scan `pg_prepared_xacts WHERE gid LIKE 'keel_%'`, reconcile with durable log, resolve or expose admin-required state. |
+| Admin in-doubt transaction view and controls | Aspirational | Operators need inspect/commit/rollback tooling for unresolved prepared xacts. |
 
 ## Promotion Gates
 

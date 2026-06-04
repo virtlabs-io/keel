@@ -2,14 +2,58 @@
 
 > Status: current functional limitation inventory
 > Source of truth for production maturity: [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
-> This document tracks functional limitations exposed by the e2e suite; it is
-> not a production-readiness statement.
+> This document is the single user-facing known-limitations page. Detailed
+> subsystem inventories below include e2e findings and engineering notes, but
+> the summary sections are the operator-facing contract.
 > Last full e2e baseline: **563 passed / 16 xfailed / 4 xpassed / ~1 unrelated flaky**.
 > Failure inventory under `--runxfail` (sharding suites only): **16 failing**
 > in `test_sharding_limitations.py`.
 
-This document is the authoritative inventory of every functional limitation
-currently exposed by the e2e suite. Each entry describes:
+## Production-Candidate Boundaries
+
+The production candidate profile is PostgreSQL `pool` mode with
+`prepared_statement = virtualize` and `experimental_features = false`.
+
+Anything outside that profile must be treated according to the maturity table in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md):
+
+- **Hardening:** useful and implemented, but validate failure behavior before
+  production traffic.
+- **Experimental:** explicit opt-in only.
+- **Aspirational:** not a production guarantee.
+- **Research:** exploratory only.
+
+## Unsupported Protocols and Features
+
+The following are not production-supported through Keel today:
+
+| Area | Status | Recommended action |
+|------|--------|--------------------|
+| PostgreSQL GSSAPI backend authentication | Unsupported | Use SCRAM-SHA-256, mTLS, or a supported auth provider. |
+| PostgreSQL replication protocol / physical streaming through Keel | Unsupported | Connect replication clients directly to PostgreSQL or a purpose-built replication proxy. |
+| PostgreSQL logical replication protocol through Keel | Unsupported | Connect logical replication clients directly. |
+| Extended-protocol `COPY BOTH` / replication-style streaming | Unsupported | Connect directly or use a dedicated session/proxy path. |
+| Transaction-pool use of backend-PID-sensitive application logic | Unsupported as a pooling guarantee | Use `mode = proxy` for sessions that rely on `pg_backend_pid()` identity. |
+| Cross-transaction temporary-table state in pooled sessions | Unsupported as transparent pooling | Use `mode = proxy` or a pinned/session-specific connection. |
+| Sharding and scatter-merge as a production guarantee | Experimental | Enable only with `experimental_features = true` and `scatter_merge = on`, then test shard rules and query shapes. |
+| Multi-shard 2PC as a production guarantee | Experimental | Use only in lab or carefully controlled rollouts. |
+| Result cache correctness and invalidation | Aspirational | Keep `result_cache = off` for production traffic. |
+| Natural-language, MCP, GraphQL, or agent-facing query mediation | Research | Do not plan production deployments around these interfaces. |
+| Windows production deployments | Unsupported | Use Linux or Linux containers. |
+
+## Known Limitations Summary
+
+| Area | Maturity | Impact | Workaround |
+|------|----------|--------|------------|
+| Smart read/write routing and failover | Hardening | Requires workload-specific validation for stale-read, promotion, and role-flap behavior. | Start with `mode = pool`; promote to `smart` only after testing. |
+| Session-state virtualization beyond prepared statements | Hardening | Some semantic session state can still require pinning or replay validation. | Keep stateful tools in `mode = proxy`; use admin/metrics to inspect pins. |
+| WAL/GTID replica catch-up probes | Experimental | Token storage exists, but replica catch-up checks are not the production default. | Use sticky-primary fallback or route reads to primary for strict RYW. |
+| Sharded scatter queries | Experimental | Unsupported shapes fail closed; some advanced analytics require single-backend execution. | Use explicit shard-key predicates or a dedicated analytics path. |
+| PostgreSQL LISTEN sessions | Hardening | LISTEN requires backend affinity and reduces pool efficiency. | Use a dedicated listener connection or service. |
+| MySQL protocol support | Hardening | Not the first production baseline. | Validate against your driver and topology before production traffic. |
+
+The rest of this document is the detailed engineering inventory. Each entry
+describes:
 
 1. **What** the limitation is (observable behaviour).
 2. **Affected tests** and the assertion(s) that fire.

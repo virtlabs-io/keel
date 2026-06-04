@@ -65,14 +65,14 @@ positive proof, not absence of obvious writes.
 
 | Area | Current maturity | Operational rule |
 |------|-----------------|--------------|
-| PostgreSQL proxy mode | Stable target | Must pass protocol, TLS, auth, and drain gates. |
-| PostgreSQL pool mode | Stable target | Backend reuse requires protocol-confirmed idle state. |
+| PostgreSQL proxy mode | Production candidate | Must pass protocol, TLS, auth, and drain gates. |
+| PostgreSQL pool mode | Production candidate | Backend reuse requires protocol-confirmed idle state. |
 | Smart read routing | Hardening | Replica routing only after semantic safety and session cleanliness checks. |
-| Prepared statement virtualization | Hardening | Requires lifecycle tracking and invalidation tests per deployment. |
-| Session virtualization | Experimental | Must not be a default production promise. |
+| Prepared statement virtualization | Production candidate for PostgreSQL extended-protocol named statements | Requires lifecycle tracking and invalidation tests per deployment. |
+| Session virtualization | Hardening | Must not be a default production promise. |
 | Sharding and scatter-gather | Experimental | Opt-in only, fail closed when disabled or ambiguous. |
 | Multi-shard transactions | Experimental | Blocked on commit-in-doubt crash-recovery coverage. |
-| Result cache | Experimental | Disabled by default and gated by `experimental_features`. |
+| Result cache | Aspirational | Disabled by default and not a production guarantee. |
 | MySQL | Hardening | Keep parity tests, but do not position as the first production baseline. |
 | GraphQL, MCP, natural language parsing | Research | Design and experiments only. |
 

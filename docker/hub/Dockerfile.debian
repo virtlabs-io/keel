@@ -5,7 +5,7 @@
 # Multi-stage build that compiles KEEL in Release mode and produces a minimal
 # runtime image based on debian:trixie-slim.
 #
-# Docker Hub:  vlbsio/keel:debian   vlbsio/keel:latest   vlbsio/keel:X.Y.Z
+# Docker Hub:  vlbsio/keel:debian   vlbsio/keel:<release-tag>
 #
 # Build:
 #   docker build -f docker/hub/Dockerfile.debian -t vlbsio/keel:debian .
