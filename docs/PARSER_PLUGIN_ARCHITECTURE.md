@@ -46,10 +46,10 @@ does not become replica-safe.
 | Parser registry and builtin registration | Implemented |
 | Builtin `sql.postgresql` parser plugin | Implemented |
 | Router dispatch through parser contract | Started, with legacy query-tree bridge |
-| Router consuming only `keel_semantic_plan_t` | Planned |
-| Frontend-bound parser config | Planned |
-| External `dlopen` parser plugins | Planned |
-| Second parser prototype | Planned |
+| Router consuming only `keel_semantic_plan_t` | Aspirational |
+| Frontend-bound parser config | Aspirational |
+| External `dlopen` parser plugins | Aspirational |
+| Second parser prototype | Research |
 
 ## Production Rules
 
@@ -77,4 +77,3 @@ bounded behavior. The required contract is:
 The router may consume a parser result only when `keel_semantic_plan_valid()` is
 true and the plan's safety level allows the requested backend class. Any plugin
 failure is a primary, pin, reject, or close decision, never a replica decision.
-

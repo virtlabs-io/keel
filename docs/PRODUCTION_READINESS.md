@@ -15,41 +15,42 @@ only after replay validation, and `experimental_features = false`.
 
 | Status | Features |
 |--------|----------|
-| Stable target | PostgreSQL proxy mode, PostgreSQL pool mode, admin inspection, Prometheus/OTLP observability |
-| Hardening | Smart read routing, PostgreSQL prepared-statement virtualization, SSV, Patroni failover, transaction tracking |
-| Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, result cache, cluster compression |
-| Hardening | MySQL wire protocol and pooling |
+| Production candidate | PostgreSQL proxy mode, PostgreSQL pool mode, PostgreSQL prepared-statement virtualization, admin inspection, Prometheus/OTLP observability |
+| Hardening | Smart read routing, SSV, Patroni failover, transaction tracking, MySQL wire protocol and pooling |
+| Experimental | Sharding, scatter-merge, multi-shard 2PC, WAL/GTID catch-up probes, cluster compression |
+| Aspirational | Result-cache correctness guarantees |
 | Research | GraphQL, MCP, natural-language parsing |
 
 ## Maturity Levels
 
 | Level | Meaning | Operational rule |
 |-------|---------|------------------|
-| Stable | The hot path is reactor-owned, has focused tests, exposes operator-visible counters, and is expected to be safe under normal production load. | Can be enabled by default for supported deployments. |
+| Production candidate | The hot path is reactor-owned, has focused tests, exposes operator-visible counters, and is expected to be safe under supported PostgreSQL production load when configured conservatively. | Can be enabled by default for supported deployments. |
 | Hardening | Code exists and is useful, but cross-feature behavior or failure semantics still need deterministic chaos/fault coverage. | Enable deliberately and watch the listed counters/logs. |
 | Experimental | Prototype or advanced feature with known unclosed production questions. | Do not advertise as a production guarantee. |
 | Aspirational | Design target or roadmap item. | Documentation must describe it as planned work only. |
+| Research | Exploratory work without a production contract. | Do not configure or sell as a product capability. |
 
 ## Feature Maturity
 
 | Area | Current maturity | Notes |
 |------|------------------|-------|
-| Reactor worker hot path | Stable | Worker, engine, and pool production paths must remain free of blocking `send`, `recv`, `select`, `poll`, and wait loops. `scripts/check_forbidden_blocking.sh` enforces this. |
-| Backend connect/auth | Stable | Backend refill and warmup use the async connect state machine. Legacy synchronous helpers must remain out of worker production flow. |
-| PostgreSQL transaction pooling | Stable | State sync, deferred BEGIN, prepared-statement replay, and cleanup are ordered pre-query phases. Reuse requires protocol-confirmed idle status. |
+| Reactor worker hot path | Production candidate | Worker, engine, and pool production paths must remain free of blocking `send`, `recv`, `select`, `poll`, and wait loops. `scripts/check_forbidden_blocking.sh` enforces this. |
+| Backend connect/auth | Production candidate | Backend refill and warmup use the async connect state machine. Legacy synchronous helpers must remain out of worker production flow. |
+| PostgreSQL transaction pooling | Production candidate | State sync, deferred BEGIN, prepared-statement replay, and cleanup are ordered pre-query phases. Reuse requires protocol-confirmed idle status. |
 | MySQL transaction pooling | Hardening | Wire support exists, but keep parity tests with PostgreSQL for cleanup, replay, and pin handling. |
-| Prepared statement pooling | Stable for tracked/virtualized PostgreSQL; hardening for all cross-protocol combinations | Replay/discard must be atomic from the client perspective. |
+| Prepared statement pooling | Production candidate for virtualized PostgreSQL; hardening for tracking and cross-protocol combinations | Replay/discard must be atomic from the client perspective. |
 | Session-context virtualization / SSV | Hardening | State/profile hashing is implemented; semantic GUC coverage and consistency-token capture require continued protocol-level tests. |
-| Sticky-primary read-after-write | Stable | Sticky window is conservative and reactor-safe. |
+| Sticky-primary read-after-write | Hardening | Sticky window is conservative and reactor-safe; production use should validate workload and failover behavior. |
 | WAL LSN / GTID replica catch-up probes | Experimental | Token parsing/storage exists; live replica catch-up probes must remain reactor-owned before production promotion. |
-| Automatic failover and role detection | Stable for native/Patroni-observed flips; MySQL Group Replication / Galera promotion orchestration remains experimental | Per-router monotonic cluster epoch fences old primary (`DEMOTED` role-state, filtered out of `rw/ro` indices); decisions surface `OLD_PRIMARY_FENCED` / `DEGRADED_MODE` reasons. See [Failover Semantics](#failover-semantics) below. |
+| Automatic failover and role detection | Hardening for native/Patroni-observed flips; MySQL Group Replication / Galera promotion orchestration remains experimental | Per-router monotonic cluster epoch fences old primary (`DEMOTED` role-state, filtered out of `rw/ro` indices); decisions surface `OLD_PRIMARY_FENCED` / `DEGRADED_MODE` reasons. See [Failover Semantics](#failover-semantics) below. |
 | Horizontal sharding and scatter-merge | Experimental | Gated at dispatch behind `scatter_merge = on` per worker group (default `off`); scatter-eligible queries are rejected with SQLSTATE `0A000` until opted in. Recursive CTEs over sharded tables always fail closed with `0A000` (see [LIMITATIONS §1.1](LIMITATIONS.md#11-recursive-common-table-expressions-ctes)). Keep enabled only for deployments that accept feature-specific risk and test their shard rules. |
 | Multi-shard 2PC | Experimental | Requires commit-in-doubt and crash-recovery matrix validation before production promotion. |
-| TLS/mTLS | Stable | kTLS acceleration is hardening because kernel and cipher compatibility vary by deployment. |
+| TLS/mTLS | Production candidate | kTLS acceleration is experimental because kernel and cipher compatibility vary by deployment. |
 | Cloud and enterprise auth | Hardening | Token caching and provider hooks exist; provider outages and renewal edge cases must be validated per environment. |
-| Admin console, JSON API, Prometheus | Stable for inspection; hardening for UI polish | Operational inspectability takes priority over UI expansion. |
-| Observability — metric inventory + admin/Prometheus surfaces | Stable | 188 metrics catalogued in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md), enforced in CI by `scripts/check_metrics_invariants.sh` and `scripts/check_metrics_reference.sh`. Zero per-request label cardinality on the hot path. |
-| Observability — OTLP/HTTP push exporter (`KEEL_ENABLE_OTLP=ON`) | Stable | Background aggregator, non-blocking submit, collector outage isolated from serving (`test_otlp_fault_injection`), perf budget enforced by `test_otlp_overhead_bench`. Operator quick-start: [docs/OBSERVABILITY.md](OBSERVABILITY.md). |
+| Admin console, JSON API, Prometheus | Production candidate for inspection; hardening for UI polish | Operational inspectability takes priority over UI expansion. |
+| Observability - metric inventory + admin/Prometheus surfaces | Production candidate | 188 metrics catalogued in [docs/METRICS_REFERENCE.md](METRICS_REFERENCE.md), enforced in CI by `scripts/check_metrics_invariants.sh` and `scripts/check_metrics_reference.sh`. Zero per-request label cardinality on the hot path. |
+| Observability - OTLP/HTTP push exporter (`KEEL_ENABLE_OTLP=ON`) | Production candidate | Background aggregator, non-blocking submit, collector outage isolated from serving (`test_otlp_fault_injection`), perf budget enforced by `test_otlp_overhead_bench`. Operator quick-start: [docs/OBSERVABILITY.md](OBSERVABILITY.md). |
 | Web management UI | Experimental | Useful as a read-only view, but not a production control plane. |
 | Connection migration and multi-proxy cluster compression | Experimental | Requires stronger drain, residual, and peer-failure coverage. |
 | Result cache framework | Aspirational | Framework hooks exist; query-result correctness and invalidation are not production guarantees. |

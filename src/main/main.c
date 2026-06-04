@@ -54,6 +54,7 @@
 #include "keel/core/stats.h"
 #include "keel/core/admin.h"
 #include "keel/core/cluster.h"
+#include "keel/core/config.h"
 #include "keel/core/config_reload.h"
 #include "keel/probe/probe.h"
 #include "keel/failover/failover_manager.h"
@@ -134,10 +135,10 @@
 #define KEEL_VERSION_MAJOR 0
 #endif
 #ifndef KEEL_VERSION_MINOR
-#define KEEL_VERSION_MINOR 2
+#define KEEL_VERSION_MINOR 5
 #endif
 #ifndef KEEL_VERSION_PATCH
-#define KEEL_VERSION_PATCH 0
+#define KEEL_VERSION_PATCH 4
 #endif
 
 /* ============================================================================
@@ -256,7 +257,7 @@ static void print_version(void) {
     printf("\n");
     printf("Protocols:\n");
     printf("  + PostgreSQL (v3 protocol)\n");
-    printf("  - MySQL (planned)\n");
+    printf("  + MySQL (hardening)\n");
     printf("\n");
     printf("Build info:\n");
     printf("  Compiler: %s\n",
@@ -2061,8 +2062,8 @@ static bool validate_experimental_feature_gates(bool cluster_compression_enabled
         const char* section = wg->section[0] ? wg->section : "(worker_group)";
         bool allow_group_experimental =
             g_experimental_features_enabled || wg->experimental_features;
-        /* mode = full enables hooks, transaction tracking, and LSN capture —
-         * all of which are hardening/experimental in v0.2-alpha.  Require an
+        /* mode = full enables hooks, transaction tracking, and LSN capture,
+         * all of which are hardening/experimental.  Require an
          * explicit experimental_features opt-in rather than silently enabling
          * them for users who copy a config without reading the fine print. */
         if (KEEL_TIER_IS_EXPERIMENTAL(wg->runtime_mode) && !allow_group_experimental) {
@@ -2070,7 +2071,7 @@ static bool validate_experimental_feature_gates(bool cluster_compression_enabled
                 "Experimental feature requires experimental_features=true: [%s] mode=full. "
                 "mode=full enables hardening/experimental subsystems (hooks, transaction "
                 "tracking, LSN capture) and is not the recommended production default for "
-                "v0.2-alpha. Use mode=pool or mode=smart instead.",
+                "production candidate deployments. Use mode=pool or mode=smart instead.",
                 section);
             valid = false;
         }
@@ -4996,7 +4997,7 @@ int main(int argc, char** argv) {
         if (KEEL_TIER_IS_EXPERIMENTAL(wg->runtime_mode)) {
             printf("    WARNING: mode=full enables hardening/experimental subsystems "
                    "(hooks, transaction tracking, LSN capture) and is not the "
-                   "recommended production default for v0.2-alpha.\n");
+                   "recommended production default.\n");
         }
     }
     printf("  Stats:    level=%s", g_config.stats_level_str);

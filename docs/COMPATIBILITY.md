@@ -5,10 +5,15 @@ the deprecation policy, and the location of migration notes for breaking changes
 
 ---
 
-## Stability Tiers
+## Configuration API Stability
 
-| Tier | Meaning |
-|------|---------|
+This table describes whether a configuration key name and basic shape are stable.
+It is separate from feature maturity. Feature maturity uses the taxonomy in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md): Production candidate,
+Hardening, Experimental, Aspirational, and Research.
+
+| API tier | Meaning |
+|----------|---------|
 | **Stable** | Will not be renamed or removed without a documented deprecation window. A deprecated key produces a `WARN`-level log message. |
 | **Experimental** | Working but the interface (name, semantics, or defaults) may change while the feature is maturing. Not subject to the deprecation policy. |
 | **Internal** | Not intended for end users. May be removed or changed without notice. |
@@ -24,6 +29,25 @@ the deprecation policy, and the location of migration notes for breaking changes
 
 ---
 
+## Database Backends
+
+This is the single supported PostgreSQL version list for the documentation.
+Other PostgreSQL versions may work, but are not part of the supported test
+matrix unless they are added here.
+
+| Database | Version | Support status | Notes |
+|----------|---------|----------------|-------|
+| PostgreSQL | 14 | Supported | PostgreSQL v3 wire protocol. |
+| PostgreSQL | 15 | Supported | PostgreSQL v3 wire protocol. |
+| PostgreSQL | 16 | Supported, primary CI target | Main integration service version. |
+| PostgreSQL | 17 | Supported | PostgreSQL v3 wire protocol. |
+| MySQL | 8.0 / 8.4 | Hardening | Wire support exists; not the first production baseline. |
+| MySQL | 9.x | Hardening | Group Replication validation is still hardening. |
+| MariaDB | 10.11 / 11.x | Hardening | Galera validation is still hardening. |
+| Percona XtraDB Cluster | 8.0 | Hardening | PXC validation is still hardening. |
+
+---
+
 ## `[keel]` — Global Settings
 
 | Key | Tier | Default | Reloadable | Notes |
@@ -35,6 +59,14 @@ the deprecation policy, and the location of migration notes for breaking changes
 | `shutdown_timeout_ms` | Stable | `30000` | ✅ SIGHUP | Grace period before forced drain |
 | `daemonize` | Stable | `false` | ❌ restart | Double-fork into background |
 | `experimental_features` | Stable | `false` | ❌ restart | Required opt-in gate for experimental features |
+
+Experimental features use the same opt-in pattern everywhere:
+
+1. `[keel] experimental_features = true`
+2. One or more explicit feature keys, such as `scatter_merge = on`,
+   `wal_lsn_capture = on`, or `gtid_capture = on`
+
+Without both signals, experimental features must remain disabled or fail closed.
 
 ---
 
@@ -115,9 +147,9 @@ the deprecation policy, and the location of migration notes for breaking changes
 | Key | Tier | Default | Reloadable | Notes |
 |-----|------|---------|------------|-------|
 | `prepared_statement` | Stable | `virtualize` | ❌ restart | `virtualize` `pinning` `tracking` `anonymous` |
-| `transaction_tracking` | Hardening | `off` | ❌ restart | XID probe + read-after-write LSN tokens. Tier per [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md). |
+| `transaction_tracking` | Stable | `off` | ❌ restart | XID probe + read-after-write LSN tokens. Feature maturity: Hardening. |
 | `fast_network_path` | Experimental | `on` | ❌ restart | MSG_PEEK + splice bypass for DataRow frames |
-| `result_cache` | Aspirational | `off` | ❌ restart | Query result caching framework hooks; correctness and invalidation are not production guarantees. Tier per [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md). Disables zero-copy splice bypass when `on`. |
+| `result_cache` | Experimental | `off` | ❌ restart | Query result caching framework hooks; feature maturity: Aspirational. Correctness and invalidation are not production guarantees. Disables zero-copy splice bypass when `on`. |
 | `scatter_merge` | Experimental | `off` | ❌ restart | Enables scatter-merge routing. When `off` (default), scatter-eligible queries are rejected at dispatch with SQLSTATE `0A000` (`feature_not_supported`). Recursive CTEs over sharded tables are always rejected regardless of this flag. |
 | `wal_lsn_capture` | Experimental | `off` | ❌ restart | Enables WAL LSN capture |
 | `gtid_capture` | Experimental | `off` | ❌ restart | Enables GTID capture |
@@ -237,6 +269,9 @@ Format: `name = host=… port=… dbname=… role=… weight=… [user=…] [pas
 | `failure_threshold` | Stable | `3` | ✅ SIGHUP | Consecutive failures before marking DOWN |
 | `auto_sync` | Stable | `true` | ✅ SIGHUP | Detect config mismatches via gossip |
 | `initial_peers` | Stable | — | ❌ restart | Comma-separated `host:port` list |
+
+Feature maturity: Experimental. Cluster features are not part of the production
+candidate profile.
 
 ---
 

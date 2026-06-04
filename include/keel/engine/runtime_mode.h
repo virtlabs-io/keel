@@ -103,7 +103,8 @@ typedef enum keel_tier {
 
 /**
  * True if the tier enables hardening/experimental subsystems (hooks, txn
- * tracking, LSN capture) that are NOT recommended for production in v0.2-alpha.
+ * tracking, LSN capture) that are not recommended for the production candidate
+ * profile.
  *
  * Use this in config validation to require `experimental_features = true`
  * whenever `mode = full` is configured.

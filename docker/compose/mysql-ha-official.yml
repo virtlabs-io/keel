@@ -1,5 +1,5 @@
 # =============================================================================
-# KEEL Multi-Proxy HA Cluster — Production Compose Template (MySQL)
+# KEEL Multi-Proxy HA Cluster — Compose Template (MySQL)
 # =============================================================================
 # Uses the published keel image from ghcr.io instead of a local build.
 # Backs 3 KEEL proxy nodes onto a MySQL 9 primary + 2 async GTID replicas.
@@ -17,8 +17,9 @@
 #   Cluster peer → 9100 (internal only)
 #
 # Usage:
-#   docker pull ghcr.io/virtlabs/keel:latest
-#   docker compose -f docker/compose/mysql-ha-official.yml up -d
+#   docker pull ghcr.io/virtlabs/keel:<release-tag>
+#   KEEL_IMAGE=ghcr.io/virtlabs/keel:<release-tag> \
+#     docker compose -f docker/compose/mysql-ha-official.yml up -d
 #
 #   # Connect via any keel node (MySQL protocol)
 #   mysql -h 127.0.0.1 -P 7306 -u root -proot test
@@ -31,7 +32,7 @@
 name: keel-mysql-ha
 
 x-keel-base: &keel-base
-  image: ${KEEL_IMAGE:-ghcr.io/virtlabs/keel:latest}
+  image: ${KEEL_IMAGE:?set KEEL_IMAGE to an immutable release tag or digest}
   restart: unless-stopped
   networks:
     - cluster

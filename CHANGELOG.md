@@ -3,7 +3,9 @@
 All notable changes to KEEL are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha-0.3.0` forward.
+KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `v0.5.0-alpha` forward.
+Older alpha releases (`alpha-0.1`, `alpha-0.3.0`) used ad-hoc naming and are preserved below for
+reference.
 
 > **Migration notes** for breaking config key changes appear in each release
 > section under a `### Migration` heading.
@@ -11,6 +13,117 @@ KEEL uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from `alpha
 ---
 
 ## [Unreleased]
+
+---
+
+## [v0.5.4-alpha] — 2026-06-03
+
+### Added
+
+- **`scripts/make-release.sh`**: atomic release-bump script.  Run
+  `scripts/make-release.sh <version>` (e.g. `0.5.5-alpha`) to update
+  `CMakeLists.txt`, `src/main/main.c`, add a `CHANGELOG.md` stub, activate
+  `.githooks`, commit all staged changes, and create the annotated tag — all in
+  one step.  Eliminates version drift between the git tag and the compiled-in
+  version string.
+- **`.githooks/pre-push`**: local pre-push hook that rejects any `v*` tag push
+  where the semver extracted from the tag name does not match
+  `CMakeLists.txt VERSION`.  Activated automatically by `scripts/make-release.sh`
+  or manually with `git config core.hooksPath .githooks`.
+- **CI version consistency gate** (`package-linux.yml`): the packaging workflow
+  now validates tag semver vs `CMakeLists.txt VERSION` as its first step and
+  fails fast before any expensive build work if they disagree.
+
+### Changed
+
+- Bumped runtime version string to `0.5.4`.
+- Supersedes unpublished `v0.5.3-alpha`: GitHub's immutable-releases feature
+  permanently locked that tag name after the packaging workflow published it and
+  the release was subsequently deleted while attempting a retag.  All intended
+  v0.5.3-alpha content is included here.
+
+---
+
+## [v0.5.3-alpha] — 2026-06-03
+
+> **Note**: this tag was never published as a GitHub Release.  GitHub's
+> immutable-releases feature permanently locked the tag name after the packaging
+> workflow ran; the release was deleted while attempting a retag to include the
+> docs commit.  All content from this entry is present in [v0.5.4-alpha].
+
+### Changed
+
+- Bumped runtime version string to `0.5.3` (`KEEL_VERSION_PATCH` in `src/main/main.c`).
+- Updated `CHANGELOG.md` to reflect the full v0.5.x release history; fixed stale
+  `alpha-0.3.0` references to the current version scheme.
+- Package version metadata updated to `0.5.3`.
+
+---
+
+## [v0.5.2-alpha] — 2026-06-02
+
+### Fixed
+
+**Prepared-statement pipeline correctness and sticky-primary read-after-write**
+
+- **`fix(postgres)`: track pipelined parse confirmations** (`00320f9`)
+  Correctly account for Parse confirmations in the pipelined extended-protocol path,
+  preventing off-by-one errors in the parse-completion counter.
+
+- **`fix(ps)`: classify pipelined Parses + snapshot replay before DDL clear** (`72d50d0`)
+  Classify each Parse in a pipelined batch independently so DDL and DML statements
+  within the same pipeline receive the correct query-effect flags. Snapshot cached
+  replay data before the DDL-induced cache clear so the replay buffer for the
+  statement that triggered the DDL is not lost.
+  Regression tests: `tests/test_ps_pipeline_classify.c` (4 cases, 27 assertions).
+
+- **`fix(engine)`: propagate query effects through extended-protocol send batching** (`47a765a`)
+  In the send-batching optimisation, Parse/Bind/Execute messages skipped
+  `be_forward_done` and the Sync terminal's action carried `effect=0`. The
+  post-send sticky-primary timestamp stamp (`sf->last_write_ns`,
+  `consistency_atoms[WRITE_TS]`) was never set for any parameterised write,
+  causing the next SELECT to route to a replica and return stale rows under
+  replication lag (~65–90% stale-read rate with Prisma/node-pg drivers at scale).
+  Fix: OR-accumulate per-message `act.effect` into `ext_batch_effect` during
+  batching; merge it onto the Sync/Flush terminal action before `be_forward_done`.
+  Regression tests: `tests/test_pre_query_replay.c` —
+  `test_extended_batch_write_stamps_sticky_primary` +
+  `test_extended_batch_read_does_not_stamp`.
+  Validated: driver-prisma 2000/2000, driver-hibernate 500/500, driver-jdbc
+  500/500, ctest 144/144.
+
+---
+
+## [v0.5.1-alpha] — 2026-06-02
+
+> Patch tag: same commit as [v0.5.0-alpha]. No functional changes; retagged for
+> Docker CI pipeline alignment.
+
+---
+
+## [v0.5.0-alpha] — 2026-06-02
+
+### Changed — Documentation consistency and README rewrite
+
+- Rewrote `README.md` around the product story, the conservative PostgreSQL
+  production candidate profile, and a single five-level maturity taxonomy:
+  Production candidate, Hardening, Experimental, Aspirational, Research.
+- Added `docs/PACKAGE_INSTALL.md` as the single package install guide for DEB,
+  RPM, tarball, and Docker install patterns.
+- Promoted `docs/LIMITATIONS.md` into the single known-limitations page and
+  added an operator-facing unsupported protocol/features summary.
+- Added the supported PostgreSQL version list to `docs/COMPATIBILITY.md` as the
+  documentation source of truth for PostgreSQL version support.
+- Clarified `SECURITY.md` with one operational security model and corrected
+  privilege-drop/seccomp wording to distinguish supported controls from default
+  config.
+- Updated package/runtime version metadata to `0.5.0`.
+
+### Known limitations
+
+Known limitations for this release line are tracked in
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md). Operators should review that page
+before enabling hardening or experimental features.
 
 ### Added — Consistent-read catch-up track, Patch 2d-4 / 2d-5
 
@@ -439,7 +552,7 @@ cannot resolve a lost COMMIT as committed.
 - `BENCHMARKS.md` — throughput and latency comparison vs PgBouncer 1.22
 
 ### Changed
-- Production-status documentation now separates `v0.2-alpha` features into
+- Production-status documentation now separates feature maturity into
   `Production candidate`, `Hardening`, `Experimental`, and `Aspirational`
   buckets across `README.md`, `docs/PRODUCTION_READINESS.md`, and config examples
 - Recommended production deployment is now documented consistently as
@@ -599,7 +712,11 @@ Initial internal alpha release. Core engine, PostgreSQL pooling, basic routing, 
 
 ---
 
-[Unreleased]: https://github.com/virtlabs-io/keel/compare/alpha-0.3.0...HEAD
-[alpha-0.3.0]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
-[0.3.0-dev]: https://github.com/virtlabs-io/keel/compare/alpha-0.1...alpha-0.3.0
-[alpha-0.1]: https://github.com/virtlabs-io/keel/releases/tag/alpha-0.1
+[Unreleased]: https://github.com/virtlabs-io/keel/compare/v0.5.3-alpha...HEAD
+[v0.5.3-alpha]: https://github.com/virtlabs-io/keel/compare/v0.5.2-alpha...v0.5.3-alpha
+[v0.5.2-alpha]: https://github.com/virtlabs-io/keel/compare/v0.5.1-alpha...v0.5.2-alpha
+[v0.5.1-alpha]: https://github.com/virtlabs-io/keel/compare/v0.5.0-alpha...v0.5.1-alpha
+[v0.5.0-alpha]: https://github.com/virtlabs-io/keel/compare/v0.3.1-alpha...v0.5.0-alpha
+[alpha-0.3.0]: https://github.com/virtlabs-io/keel/compare/v0.1-alpha...v0.3.1-alpha
+[0.3.0-dev]: https://github.com/virtlabs-io/keel/compare/v0.1-alpha...v0.3.1-alpha
+[alpha-0.1]: https://github.com/virtlabs-io/keel/releases/tag/v0.1-alpha

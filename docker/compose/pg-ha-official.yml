@@ -1,5 +1,5 @@
 # =============================================================================
-# KEEL Multi-Proxy HA Cluster — Production Compose Template (PG)
+# KEEL Multi-Proxy HA Cluster — Compose Template (PG)
 # =============================================================================
 # Uses the published keel image from ghcr.io instead of a local build.
 # Config is supplied entirely via KEEL_* environment variables — no INI
@@ -18,11 +18,12 @@
 #   Cluster peer → 9100 (internal only)
 #
 # Usage:
-#   # Pull latest image
-#   docker pull ghcr.io/virtlabs/keel:latest
+#   # Pull an immutable release image
+#   docker pull ghcr.io/virtlabs/keel:<release-tag>
 #
 #   # Start the full stack
-#   docker compose -f docker/compose/pg-ha-official.yml up -d
+#   KEEL_IMAGE=ghcr.io/virtlabs/keel:<release-tag> \
+#     docker compose -f docker/compose/pg-ha-official.yml up -d
 #
 #   # Connect via any keel node
 #   psql -h 127.0.0.1 -p 7432 -U postgres postgres
@@ -33,14 +34,14 @@
 #   psql -h 127.0.0.1 -p 6433 -U admin keel -c "SHOW CLUSTER STATS;"
 #
 # Override the image tag:
-#   KEEL_IMAGE=ghcr.io/virtlabs/keel:1.2.0 \
-#   docker compose -f docker/compose/pg-ha-official.yml up -d
+#   KEEL_IMAGE=ghcr.io/virtlabs/keel:<release-tag> \
+#     docker compose -f docker/compose/pg-ha-official.yml up -d
 # =============================================================================
 
 name: keel-pg-ha
 
 x-keel-base: &keel-base
-  image: ${KEEL_IMAGE:-ghcr.io/virtlabs/keel:latest}
+  image: ${KEEL_IMAGE:?set KEEL_IMAGE to an immutable release tag or digest}
   restart: unless-stopped
   networks:
     - cluster

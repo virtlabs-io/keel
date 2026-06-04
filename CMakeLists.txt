@@ -33,7 +33,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(keel
-    VERSION 0.3.0
+    VERSION 0.5.4
     DESCRIPTION "High-performance database connection pooler"
     LANGUAGES C
 )
@@ -81,11 +81,11 @@ option(KEEL_ENABLE_TRACE "Enable L4 USDT probe points" OFF)
 option(KEEL_ENABLE_FULL_STATS "Enable L5 SQL fingerprint aggregation" OFF)
 option(KEEL_ENABLE_LUA "Enable embedded Lua interpreter for hooks" OFF)
 option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" OFF)
-# Default OFF since v0.2: scripting interpreters are an expanded attack surface
+# Default OFF: scripting interpreters are an expanded attack surface
 # and runtime cost. The CI matrix builds two variants: 'core' (both OFF) and
 # 'full' (both ON). Distributors should ship the 'core' package by default and
 # offer 'full' as a separately-installed superset. See docs/BUILD_VARIANTS.md.
-option(KEEL_ENABLE_OTLP "Build OTLP metrics exporter (requires nanopb; off by default until v0.2-alpha lands)" OFF)
+option(KEEL_ENABLE_OTLP "Build OTLP metrics exporter (requires nanopb; off by default)" OFF)
 
 # Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
 # while the BEGIN's ReadyForQuery is being absorbed asynchronously.  Sessions
@@ -527,7 +527,7 @@ add_subdirectory(src/admin)
 # Distributed tracing (W3C context, OTLP export)
 add_subdirectory(src/trace)
 
-# OTLP metrics exporter (opt-in; off by default until v0.2-alpha)
+# OTLP metrics exporter (opt-in; off by default)
 if(KEEL_ENABLE_OTLP)
     add_subdirectory(src/observability)
 endif()

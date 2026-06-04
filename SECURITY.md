@@ -38,15 +38,42 @@ Out of scope:
 - Issues requiring physical access or local root on the host
 - Security issues in benchmark or example scripts
 
+## Operational Security Model
+
+Keel is a network proxy that terminates client database connections and opens
+backend database connections. Treat it as part of the trusted database access
+path.
+
+Recommended production posture:
+
+- Bind client listeners only where application clients need access.
+- Keep admin and metrics listeners on a trusted management network.
+- Use TLS or mTLS for untrusted networks.
+- Use SCRAM-SHA-256, mTLS, or an external auth provider instead of `trust`.
+- Run as a dedicated non-root user after startup.
+- Enable seccomp where the host/container runtime supports it.
+- Keep `experimental_features = false` for the production candidate profile.
+
+Security boundaries:
+
+- Keel does not make unsafe SQL safe. Application authorization remains a
+  database and application responsibility.
+- Keel does not hide backend identity for features that explicitly expose it,
+  such as `pg_backend_pid()`.
+- Keel's admin interface is operator-facing and must not be exposed publicly.
+- Experimental hooks and embedded scripting expand the trusted code base; use
+  the `core` build unless scripting is required.
+
 ## Security Hardening Features
 
-KEEL ships with several hardening measures enabled by default:
+Keel supports these hardening measures:
 
 - **Binary hardening** — PIE, full RELRO, NX, stack canary (`-fstack-protector-strong`)
-- **Seccomp filter** — baseline and strict BPF syscall allowlists
-- **Privilege drop** — drops root after bind and `RLIMIT_NOFILE` setup
+- **Seccomp filter** — baseline and strict BPF syscall allowlists, opt-in by config
+- **Privilege drop** — drops root after bind and `RLIMIT_NOFILE` setup, opt-in by config
 - **TLS enforcement** — minimum TLS 1.2, cipher suite policy, cert hot-reload
 - **Audit logging** — structured NDJSON security event log
 - **Sanitizer CI** — ASan + UBSan, TSan, and MSan run on every PR
 
-See [docs/TESTING.md](docs/TESTING.md) for the full hardening CI matrix.
+See [docs/TESTING.md](docs/TESTING.md) for the full hardening CI matrix and
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#security) for security config keys.
