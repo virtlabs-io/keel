@@ -38,10 +38,14 @@ KEEL_VARIANT=full ./docker/build-linux.sh test
 
 ## Packaging
 
-`CPACK_PACKAGE_FILE_NAME` includes the variant suffix:
+`CPACK_PACKAGE_FILE_NAME` includes the variant suffix, and release packaging
+can also append the target distro when `KEEL_PACKAGE_DISTRO` is set:
 
 - `keel-core-<version>-Linux-<arch>.deb`
 - `keel-full-<version>-Linux-<arch>.deb`
+- `keel-core-<version>-debian12-Linux-<arch>.deb`
+- `keel-core-<version>-ubuntu24-Linux-<arch>.deb`
+- `keel-core-<version>-rocky9-Linux-<arch>.rpm`
 
 Distributors can ship both side by side; the `core` package is the
 recommended default.

@@ -11,7 +11,7 @@ on:
       - 'v*'
 
 jobs:
-  package:
+  test-gate:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -35,7 +35,6 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -111,9 +110,131 @@ jobs:
             --build-dir build-gate \
             --ci
 
+  package:
+    needs: test-gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            image: debian:12
+            generators: DEB
+            install_command: |
+              apt-get update
+              apt-get install -y \
+                build-essential \
+                cmake \
+                ninja-build \
+                pkg-config \
+                dpkg-dev \
+                git \
+                ca-certificates \
+                libssl-dev \
+                liburing-dev \
+                libyaml-dev \
+                lua5.4 \
+                liblua5.4-dev \
+                python3 \
+                python3-dev \
+                python3-pip \
+                groff-base
+          - distro: ubuntu24
+            image: ubuntu:24.04
+            generators: DEB
+            install_command: |
+              apt-get update
+              apt-get install -y \
+                build-essential \
+                cmake \
+                ninja-build \
+                pkg-config \
+                dpkg-dev \
+                git \
+                ca-certificates \
+                libssl-dev \
+                liburing-dev \
+                libyaml-dev \
+                lua5.4 \
+                liblua5.4-dev \
+                python3 \
+                python3-dev \
+                python3-pip \
+                groff-base
+          - distro: rocky9
+            image: rockylinux:9
+            generators: RPM
+            install_command: |
+              dnf -y install 'dnf-command(config-manager)'
+              dnf config-manager --set-enabled crb
+              dnf -y install epel-release
+              dnf -y install \
+                gcc \
+                gcc-c++ \
+                make \
+                cmake \
+                ninja-build \
+                pkgconf-pkg-config \
+                rpm-build \
+                git \
+                ca-certificates \
+                openssl-devel \
+                liburing-devel \
+                libyaml-devel \
+                lua \
+                lua-devel \
+                python3 \
+                python3-devel \
+                python3-pip \
+                which \
+                findutils \
+                tar \
+                gzip \
+                diffutils
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install build + packaging dependencies
+        run: ${{ matrix.install_command }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
       # ── Build distributable packages ─────────────────────────────────────
       - name: Build Linux packages
+        env:
+          GENERATORS: ${{ matrix.generators }}
+          KEEL_PACKAGE_DISTRO: ${{ matrix.distro }}
         run: bash scripts/package-linux.sh
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keel-linux-packages-${{ matrix.distro }}
+          path: artifacts/packages/*
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_PRIVATE_KEY != '' }}
+      # Pre-release tags (alpha / beta / rc) are allowed to publish unsigned
+      # artifacts with a warning; production tags still require a signing key.
+      IS_PRERELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && (contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || startsWith(github.ref_name, 'alpha-') || startsWith(github.ref_name, 'beta-') || startsWith(github.ref_name, 'rc-')) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: keel-linux-packages-*
+          merge-multiple: true
+          path: artifacts/packages
 
       - name: Generate CycloneDX SBOM
         if: startsWith(github.ref, 'refs/tags/')
@@ -186,8 +307,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(
-            artifacts/packages/keel_*.deb
-            artifacts/packages/keel-*.rpm
+            artifacts/packages/*.deb
+            artifacts/packages/*.rpm
             artifacts/packages/keel-*-Linux-*.tar.gz
             artifacts/packages/keel-*.cdx.json
           )

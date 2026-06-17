@@ -89,7 +89,7 @@ When signing is configured, you should see:
 - ✅ Upload signatures to Release assets
 
 Release assets will include:
-- `keel_*.deb` + `keel_*.deb.asc` (signature)
+- `keel-*.deb` + `keel-*.deb.asc` (signature)
 - `keel-*.rpm` + `keel-*.rpm.asc` (signature)
 - `keel-*-Linux-*.tar.gz` + `keel-*-Linux-*.tar.gz.asc` (signature)
 - `SHA256SUMS` + `SHA256SUMS.asc` (manifest signature)
@@ -104,7 +104,7 @@ Users can verify the authenticity of released packages:
 gpg --recv-keys <KEY_ID>
 
 # Verify a package signature
-gpg --verify keel_<version>_<arch>.deb.asc keel_<version>_<arch>.deb
+gpg --verify keel-core-<version>-<distro>-Linux-<arch>.deb.asc keel-core-<version>-<distro>-Linux-<arch>.deb
 
 # Verify SHA256SUMS
 gpg --verify SHA256SUMS.asc
