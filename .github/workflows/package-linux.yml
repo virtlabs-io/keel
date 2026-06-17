@@ -181,6 +181,7 @@ jobs:
                 git \
                 ca-certificates \
                 openssl-devel \
+                zlib-devel \
                 liburing-devel \
                 libyaml-devel \
                 lua \
