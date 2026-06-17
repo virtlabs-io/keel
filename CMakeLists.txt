@@ -291,7 +291,7 @@ endif()
 #   Compile:
 #     -fstack-protector-strong  — stack canaries on functions with buffers
 #     -fPIE                     — position-independent executable code
-#     -D_FORTIFY_SOURCE=3       — compile-time + run-time buffer overflow checks
+#     -D_FORTIFY_SOURCE=2|3     — compile-time + run-time buffer overflow checks
 #
 #   Link:
 #     -pie                      — ASLR for the executable
@@ -304,10 +304,18 @@ endif()
 # only for profiling builds where PIE overhead matters.
 # ============================================================================
 if(KEEL_ENABLE_HARDENING)
+    # glibc toolchains such as Rocky 9 (GCC 11) treat _FORTIFY_SOURCE>2 as a
+    # warning; with -Werror that becomes a hard failure. Use level 3 where the
+    # compiler/libc stack supports it, otherwise fall back to level 2.
+    set(KEEL_FORTIFY_SOURCE_LEVEL 3)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 12)
+        set(KEEL_FORTIFY_SOURCE_LEVEL 2)
+    endif()
+
     set(KEEL_HARDENING_COMPILE_FLAGS
         -fstack-protector-strong
         -fPIE
-        -D_FORTIFY_SOURCE=3
+        -D_FORTIFY_SOURCE=${KEEL_FORTIFY_SOURCE_LEVEL}
     )
     set(KEEL_HARDENING_LINK_FLAGS
         -pie
@@ -317,7 +325,7 @@ if(KEEL_ENABLE_HARDENING)
     )
     add_compile_options(${KEEL_HARDENING_COMPILE_FLAGS})
     add_link_options(${KEEL_HARDENING_LINK_FLAGS})
-    message(STATUS "KEEL: exploit-mitigation hardening flags enabled")
+    message(STATUS "KEEL: exploit-mitigation hardening flags enabled (_FORTIFY_SOURCE=${KEEL_FORTIFY_SOURCE_LEVEL})")
 endif()
 
 # ============================================================================
