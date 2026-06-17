@@ -74,8 +74,8 @@ Example output format:
 Once configured, trigger a release tag:
 
 ```bash
-git tag -a <release-tag> -m "Release <release-tag>"
-git push origin <release-tag>
+git tag -a v0.5.5-alpha -m "Release v0.5.5-alpha"
+git push origin v0.5.5-alpha
 ```
 
 Monitor the workflow at: **Actions** → **package-linux** → Latest run
@@ -89,7 +89,7 @@ When signing is configured, you should see:
 - ✅ Upload signatures to Release assets
 
 Release assets will include:
-- `keel_*.deb` + `keel_*.deb.asc` (signature)
+- `keel-*.deb` + `keel-*.deb.asc` (signature)
 - `keel-*.rpm` + `keel-*.rpm.asc` (signature)
 - `keel-*-Linux-*.tar.gz` + `keel-*-Linux-*.tar.gz.asc` (signature)
 - `SHA256SUMS` + `SHA256SUMS.asc` (manifest signature)
@@ -104,7 +104,7 @@ Users can verify the authenticity of released packages:
 gpg --recv-keys <KEY_ID>
 
 # Verify a package signature
-gpg --verify keel_<version>_<arch>.deb.asc keel_<version>_<arch>.deb
+gpg --verify keel-core-0.5.5-debian12-Linux-x86_64.deb.asc keel-core-0.5.5-debian12-Linux-x86_64.deb
 
 # Verify SHA256SUMS
 gpg --verify SHA256SUMS.asc

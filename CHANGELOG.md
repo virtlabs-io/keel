@@ -14,6 +14,18 @@ reference.
 
 ## [Unreleased]
 
+### Changed — Distro-specific Linux packages
+
+Linux release packages are now built in distro-matched environments instead of
+all being produced from a single Ubuntu packaging host.
+
+- `package-linux` now runs a shared Ubuntu 24.04 test gate and then builds
+  release artifacts in Debian 12, Ubuntu 24.04, and Rocky 9 containers.
+- Release artifact filenames now include the target distro suffix so DEB and
+  RPM outputs are unambiguous about their glibc baseline.
+- Rocky 9 RPMs are built against glibc 2.34, Debian 12 DEBs against glibc
+  2.36, and Ubuntu 24.04 DEBs against their native Noble userspace baseline.
+
 ---
 
 ## [v0.5.4-alpha] — 2026-06-03
@@ -216,6 +228,18 @@ conservative (fence old primary, fail in-flight transactions).
 - **Operators parsing routing JSON:** two new `reason_code` values
   (`OLD_PRIMARY_FENCED`, `DEGRADED_MODE`) and two new `factors` entries
   (`NODE_FENCED`, `DEGRADED_MODE`) may appear in route-explain output.
+
+### Changed — Distro-specific Linux packages
+
+Linux release packages are now built in distro-matched environments instead of
+all being produced from a single Ubuntu packaging host.
+
+- `package-linux` now runs a shared Ubuntu 24.04 test gate and then builds
+  release artifacts in Debian 12, Ubuntu 24.04, and Rocky 9 containers.
+- Release artifact filenames now include the target distro suffix so DEB and
+  RPM outputs are unambiguous about their glibc baseline.
+- Rocky 9 RPMs are built against glibc 2.34, Debian 12 DEBs against glibc
+  2.36, and Ubuntu 24.04 DEBs against their native Noble userspace baseline.
 
 ### Changed — Route-decision explainer, conservative function policy, commit-in-doubt gate
 

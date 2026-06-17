@@ -33,7 +33,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(keel
-    VERSION 0.5.4
+    VERSION 0.5.5
     DESCRIPTION "High-performance database connection pooler"
     LANGUAGES C
 )
@@ -638,6 +638,8 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "High-performance database connection pool
 set(CPACK_PACKAGE_DESCRIPTION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(KEEL_PACKAGE_DISTRO "" CACHE STRING
+    "Optional distro suffix embedded in release artifact names (for example debian12, ubuntu24, rocky9)")
 # Build-variant suffix: 'core' = no scripting; 'full' = Lua and/or Python on.
 # Distributors and operators can tell at a glance which package they hold.
 if(KEEL_ENABLE_LUA OR KEEL_ENABLE_PYTHON)
@@ -645,7 +647,11 @@ if(KEEL_ENABLE_LUA OR KEEL_ENABLE_PYTHON)
 else()
     set(KEEL_PACKAGE_VARIANT "core")
 endif()
-set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${KEEL_PACKAGE_VARIANT}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(KEEL_PACKAGE_FILE_DISTRO_SUFFIX "")
+if(KEEL_PACKAGE_DISTRO)
+    set(KEEL_PACKAGE_FILE_DISTRO_SUFFIX "-${KEEL_PACKAGE_DISTRO}")
+endif()
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${KEEL_PACKAGE_VARIANT}-${CPACK_PACKAGE_VERSION}${KEEL_PACKAGE_FILE_DISTRO_SUFFIX}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 
 set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 set(CPACK_STRIP_FILES "bin/keel;bin/keel-cli")
