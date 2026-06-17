@@ -1754,9 +1754,27 @@ keel_error_t keel_auth_load_userlist(
         memcpy(password, pwstart, pwlen); password[pwlen] = '\0';
 
         keel_auth_user_t u = {0};
+        char* parsed_salt = NULL;
         u.username      = username;
         u.password_hash = password;
         u.can_login     = true;
+
+        /* If the userlist contains a pre-hashed SCRAM verifier, parse it
+         * so the SCRAM provider uses stored_key/server_key directly. */
+        if (strncmp(password, "SCRAM-SHA-256$", 14) == 0) {
+            if (keel_auth_scram_parse_hash(password,
+                                           &parsed_salt,
+                                           &u.iterations,
+                                           u.stored_key,
+                                           u.server_key) == KEEL_OK) {
+                u.has_scram_keys = true;
+                u.password_salt = parsed_salt;
+            } else {
+                KEEL_LOG_WARN(KEEL_LOG_CAT_AUTH,
+                    "auth: invalid SCRAM verifier for user '%s' in '%s'; treating as plaintext",
+                    username, filepath);
+            }
+        }
 
         keel_error_t err = keel_auth_add_user(mgr, &u);
         if (err == KEEL_OK) {
@@ -1764,6 +1782,11 @@ keel_error_t keel_auth_load_userlist(
         } else if (err != KEEL_ERR_ALREADY_EXISTS) {
             KEEL_LOG_WARN(KEEL_LOG_CAT_AUTH,
                 "auth: failed to add user '%s' from userlist (err=%d)", username, (int)err);
+        }
+
+        if (parsed_salt) {
+            keel_free(parsed_salt);
+            parsed_salt = NULL;
         }
     }
 

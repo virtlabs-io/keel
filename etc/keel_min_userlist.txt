@@ -1,0 +1,2 @@
+"keel_usr_cli" "SCRAM-SHA-256$4096:Xc+ySDPgs3FpHAvR41kUmw==:7vPdkfQTLP2LSVYNBfw5P6oF66BqIlXA496ZjCMGEnI=:gIjTJ30f+KM7lnbTQo+WxAVrrsMi+Hp3PhNzGNyTuCc="
+# "keel_usr_cli" "keel_pwd_cli"
