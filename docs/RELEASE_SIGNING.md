@@ -74,8 +74,8 @@ Example output format:
 Once configured, trigger a release tag:
 
 ```bash
-git tag -a v0.5.5-alpha -m "Release v0.5.5-alpha"
-git push origin v0.5.5-alpha
+git tag -a <release-tag> -m "Release <release-tag>"
+git push origin <release-tag>
 ```
 
 Monitor the workflow at: **Actions** → **package-linux** → Latest run
@@ -104,7 +104,7 @@ Users can verify the authenticity of released packages:
 gpg --recv-keys <KEY_ID>
 
 # Verify a package signature
-gpg --verify keel-core-0.5.5-debian12-Linux-x86_64.deb.asc keel-core-0.5.5-debian12-Linux-x86_64.deb
+gpg --verify keel-core-<version>-<distro>-Linux-<arch>.deb.asc keel-core-<version>-<distro>-Linux-<arch>.deb
 
 # Verify SHA256SUMS
 gpg --verify SHA256SUMS.asc
