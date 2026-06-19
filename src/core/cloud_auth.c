@@ -1067,7 +1067,7 @@ static keel_error_t gcp_iam_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                { volatile void* _vp = buf; memset((void*)_vp, 0, sizeof(buf)); }
+                { volatile uint8_t* _vp = (volatile uint8_t*)buf; size_t _n = sizeof(buf); while (_n--) _vp[_n] = 0; }
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1296,7 +1296,7 @@ static keel_error_t azure_ad_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                { volatile void* _vp = buf; memset((void*)_vp, 0, sizeof(buf)); }
+                { volatile uint8_t* _vp = (volatile uint8_t*)buf; size_t _n = sizeof(buf); while (_n--) _vp[_n] = 0; }
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1447,7 +1447,7 @@ static keel_error_t static_fetch_token(keel_cloud_auth_provider_t* prov,
      * The volatile-qualified pointer prevents the compiler from
      * dead-store-eliminating the memset (CodeQL recognizes this as a
      * secure-wipe pattern). */
-    { volatile void* _vp = buf; memset((void*)_vp, 0, sizeof(buf)); }
+    { volatile uint8_t* _vp = (volatile uint8_t*)buf; size_t _n = sizeof(buf); while (_n--) _vp[_n] = 0; }
 
     token_out->token = token;
     token_out->token_len = nread;
