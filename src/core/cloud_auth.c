@@ -75,12 +75,12 @@ void keel_cloud_token_cache_destroy(keel_cloud_token_cache_t* cache) {
     if (!cache) return;
     if (cache->cached_token) {
         /* Zero out the token before freeing */
-        memset(cache->cached_token, 0, cache->cached_token_len);
+        OPENSSL_cleanse(cache->cached_token, cache->cached_token_len);
         keel_free(cache->cached_token);
     }
     if (cache->provider && cache->provider->ops && cache->provider->ops->destroy)
         cache->provider->ops->destroy(cache->provider);
-    memset(cache, 0, sizeof(*cache));
+    OPENSSL_cleanse(cache, sizeof(*cache));
 }
 
 /**
@@ -131,7 +131,7 @@ const char* keel_cloud_auth_get_password(keel_cloud_token_cache_t* cache,
 
     /* Swap cached token */
     if (cache->cached_token) {
-        memset(cache->cached_token, 0, cache->cached_token_len);
+        OPENSSL_cleanse(cache->cached_token, cache->cached_token_len);
         keel_free(cache->cached_token);
     }
     cache->cached_token = tok.token;
@@ -391,15 +391,15 @@ static void aws_iam_destroy(keel_cloud_auth_provider_t* prov) {
     aws_iam_provider_t* aws = (aws_iam_provider_t*)prov;
     keel_free(aws->region);
     if (aws->access_key_id) {
-        memset(aws->access_key_id, 0, strlen(aws->access_key_id));
+        OPENSSL_cleanse(aws->access_key_id, strlen(aws->access_key_id));
         keel_free(aws->access_key_id);
     }
     if (aws->secret_access_key) {
-        memset(aws->secret_access_key, 0, strlen(aws->secret_access_key));
+        OPENSSL_cleanse(aws->secret_access_key, strlen(aws->secret_access_key));
         keel_free(aws->secret_access_key);
     }
     if (aws->session_token) {
-        memset(aws->session_token, 0, strlen(aws->session_token));
+        OPENSSL_cleanse(aws->session_token, strlen(aws->session_token));
         keel_free(aws->session_token);
     }
     keel_free(aws);

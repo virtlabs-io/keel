@@ -159,18 +159,10 @@ static int probe_read_full(int fd, void* buf, size_t len, uint32_t timeout_ms)
  */
 static int probe_write_full(int fd, const void* buf, size_t len)
 {
-    /* This function writes MySQL probe packets over a raw socket.  MySQL
-     * protocol begins in plaintext and only upgrades to TLS if both sides
-     * advertise SSL support; the probe deliberately operates at the
-     * plaintext layer to check backend liveness before any TLS
-     * negotiation.  CodeQL cpp/cleartext-transmission flags this because
-     * the buffer may carry auth-scramble material, but plaintext is
-     * intentional for the liveness-probe use case.  Production client
-     * traffic goes through the TLS-enabled session path, not here. */
     const char* p = (const char*)buf;
     size_t left = len;
     while (left > 0) {
-        ssize_t n = write(fd, p, left); /* NOLINT(cpp/cleartext-transmission) */
+        ssize_t n = write(fd, p, left);
         if (n <= 0) return -1;
         p += n;
         left -= (size_t)n;
