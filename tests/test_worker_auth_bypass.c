@@ -59,6 +59,22 @@ static int init_worker_with_method(keel_worker_t* worker,
     cfg.num_workers = 1;
     cfg.auth_method = method;
 
+    /* Suppress backend-pool warmup so the test does not depend on a
+     * reachable PostgreSQL backend.  Without this, keel_worker_init()
+     * pre-allocates `pool_max_size` connection slots and kicks off an
+     * async connect for each — those async contexts are owned by the
+     * reactor and are only reclaimed when the reactor is pumped, which
+     * never happens in this unit test (we never accept connections).
+     * That shows up as a leak under ASan/LSan and masks any real
+     * leak introduced by the auth code under test.
+     *
+     * Using a protocol name that backend_pool_create() rejects
+     * (keel_proto_flow_get returns NULL → pool create returns NULL →
+     * server_pools[i] is NULL → warmup loop's NULL guard skips it)
+     * is the lightest-touch way to keep the auth-setup code path
+     * exercised while avoiding the pre-existing warmup leak. */
+    cfg.default_protocol = "__test_skip_backend_pool__";
+
     keel_engine_t* engine = keel_engine_create(&cfg);
     /* keel_engine_create itself must not fail in these tests — if it
      * does, the assertion failure is more useful than a silent skip. */
