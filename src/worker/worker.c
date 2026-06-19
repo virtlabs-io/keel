@@ -4407,89 +4407,182 @@ int keel_worker_init(
      *
      * Build the auth manager from the engine config.  Each worker gets its
      * own manager instance (shared-nothing model) so there is no locking on
-     * the auth hot path.  The manager is NULL in trust mode.
+     * the auth hot path.  The manager is NULL only when the operator
+     * explicitly selects `auth_method = trust`.
+     *
+     * FAIL-CLOSED CONTRACT (proposals/review_20260618_01.md §A1, §A2):
+     *
+     * The frontend protocol layer treats a NULL auth_manager as "accept
+     * every connection without authentication" (see postgres_flow.c and
+     * mysql_flow.c — the `if (ctx->auth_manager)` guard).  Because that
+     * guard makes "no manager" indistinguishable from "trust mode", any
+     * code path that lands here with a configured non-trust method but a
+     * missing manager is a critical authentication bypass.
+     *
+     * We therefore fail closed at every step:
+     *   - If the configured method has no provider implementation
+     *     (KEEL_AUTH_PASSWORD, GSSAPI, SSPI, RADIUS, REJECT,
+     *     PASSTHROUGH, NONE, or any future enum member without a case
+     *     below), refuse to start the worker.  This is the A1 fix: the
+     *     previous `default:` arm logged a warning and switched to trust.
+     *   - If `keel_auth_manager_create()` fails (e.g. transient OOM at
+     *     worker startup), refuse to start.  This is the A2 fix.
+     *   - If `keel_auth_manager_register()` fails for the requested
+     *     provider, refuse to start.  Also A2.
+     *
+     * The only legitimate way to leave `auth_manager == NULL` here is an
+     * explicit `cfg->auth_method == KEEL_AUTH_TRUST`, which the outer
+     * guard lets drop through.  Trust is still subject to the
+     * `--strict-auth` startup check performed during INI parsing.
      */
     worker->auth_manager = NULL;
     if (cfg && cfg->auth_method != KEEL_AUTH_TRUST) {
+        /* Resolve the configured method to (a) the provider ops that
+         * service it and (b) any provider-specific configuration struct.
+         * Methods without a case below are rejected by the default arm
+         * instead of being routed through trust. */
+        const keel_auth_provider_ops_t* provider_ops = NULL;
+        const void*                     provider_cfg = NULL;
+        /* Provider-config structs are stack-local; their lifetime covers
+         * the keel_auth_manager_register() call, which copies any fields
+         * it needs to keep.  Declared in this scope so all cases share
+         * the storage. */
+        keel_auth_ldap_config_t  lcfg;
+        keel_auth_pam_config_t   pcfg;
+        keel_auth_query_config_t qcfg;
+
+        switch (cfg->auth_method) {
+        case KEEL_AUTH_SCRAM_SHA_256:
+            provider_ops = keel_auth_scram_sha256_ops();
+            break;
+        case KEEL_AUTH_MD5:
+            provider_ops = keel_auth_md5_ops();
+            break;
+        case KEEL_AUTH_CERTIFICATE:
+            provider_ops = keel_auth_cert_ops();
+            break;
+        case KEEL_AUTH_LDAP:
+            lcfg = (keel_auth_ldap_config_t){
+                .url           = cfg->auth_ldap_url,
+                .base_dn       = cfg->auth_ldap_base_dn,
+                .bind_dn       = cfg->auth_ldap_bind_dn,
+                .bind_password = cfg->auth_ldap_bind_password,
+                .dn_suffix     = cfg->auth_ldap_dn_suffix,
+                .search_filter = cfg->auth_ldap_search_filter,
+                .start_tls     = cfg->auth_ldap_start_tls,
+                .timeout_s     = cfg->auth_ldap_timeout_s > 0
+                                 ? cfg->auth_ldap_timeout_s : 5,
+            };
+            provider_ops = keel_auth_ldap_ops();
+            provider_cfg = &lcfg;
+            break;
+        case KEEL_AUTH_PAM:
+            pcfg = (keel_auth_pam_config_t){
+                .service_name = cfg->auth_pam_service_name
+                                ? cfg->auth_pam_service_name : "keel",
+            };
+            provider_ops = keel_auth_pam_ops();
+            provider_cfg = &pcfg;
+            break;
+        case KEEL_AUTH_QUERY:
+            qcfg = (keel_auth_query_config_t){
+                .query       = cfg->auth_query,
+                .conn_string = cfg->auth_query_conn_string,
+            };
+            provider_ops = keel_auth_query_ops();
+            provider_cfg = &qcfg;
+            break;
+        case KEEL_AUTH_TRUST:
+            /* Defensive: the outer `!= KEEL_AUTH_TRUST` guard makes this
+             * unreachable today, but documenting intent protects against a
+             * future refactor that loosens the guard.  Trust must never
+             * reach the default arm, which would refuse to start. */
+            break;
+        default:
+            /* A1 fix: any method without a provider (includes
+             * KEEL_AUTH_PASSWORD, which has no cleartext-verify provider
+             * wired in, plus GSSAPI/SSPI/RADIUS/REJECT/PASSTHROUGH/NONE
+             * and any future enum member) must abort worker startup
+             * rather than silently downgrade to trust. */
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH,
+                "Worker %u: auth_method '%s' (enum=%d) has no provider "
+                "implementation — refusing to start the worker. "
+                "Configure an explicit supported auth_method "
+                "(scram-sha-256, md5, cert, ldap, pam, auth_query, "
+                "trust, or reject). A NULL auth manager would be "
+                "interpreted by the protocol layer as trust mode.",
+                worker->id,
+                keel_auth_method_name(cfg->auth_method),
+                (int)cfg->auth_method);
+            return -1;
+        }
+
         keel_auth_manager_config_t amcfg = {
-            .default_method   = cfg->auth_method,
+            .default_method       = cfg->auth_method,
             .allow_clear_password = true,
-            .scram_iterations = 4096,
+            .scram_iterations     = 4096,
         };
         worker->auth_manager = keel_auth_manager_create(&amcfg);
         if (!worker->auth_manager) {
+            /* A2 fix: failure inside the auth-manager constructor (most
+             * likely OOM under memory pressure) must abort the worker.
+             * The previous code logged "falling back to trust" and let
+             * the worker serve traffic unauthenticated. */
             KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH,
-                "Worker %u: failed to create auth manager — falling back to trust",
-                worker->id);
-        } else {
-            keel_error_t rerr = KEEL_OK;
-            switch (cfg->auth_method) {
-            case KEEL_AUTH_SCRAM_SHA_256:
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_scram_sha256_ops(), NULL);
-                if (rerr == KEEL_OK && cfg->auth_userlist_file)
-                    keel_auth_load_userlist(worker->auth_manager, cfg->auth_userlist_file);
-                break;
-            case KEEL_AUTH_MD5:
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_md5_ops(), NULL);
-                if (rerr == KEEL_OK && cfg->auth_userlist_file)
-                    keel_auth_load_userlist(worker->auth_manager, cfg->auth_userlist_file);
-                break;
-            case KEEL_AUTH_CERTIFICATE:
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_cert_ops(), NULL);
-                break;
-            case KEEL_AUTH_LDAP: {
-                keel_auth_ldap_config_t lcfg = {
-                    .url           = cfg->auth_ldap_url,
-                    .base_dn       = cfg->auth_ldap_base_dn,
-                    .bind_dn       = cfg->auth_ldap_bind_dn,
-                    .bind_password = cfg->auth_ldap_bind_password,
-                    .dn_suffix     = cfg->auth_ldap_dn_suffix,
-                    .search_filter = cfg->auth_ldap_search_filter,
-                    .start_tls     = cfg->auth_ldap_start_tls,
-                    .timeout_s     = cfg->auth_ldap_timeout_s > 0
-                                     ? cfg->auth_ldap_timeout_s : 5,
-                };
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_ldap_ops(), &lcfg);
-                break;
-            }
-            case KEEL_AUTH_PAM: {
-                keel_auth_pam_config_t pcfg = {
-                    .service_name = cfg->auth_pam_service_name
-                                    ? cfg->auth_pam_service_name : "keel",
-                };
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_pam_ops(), &pcfg);
-                break;
-            }
-            case KEEL_AUTH_QUERY: {
-                keel_auth_query_config_t qcfg = {
-                    .query       = cfg->auth_query,
-                    .conn_string = cfg->auth_query_conn_string,
-                };
-                rerr = keel_auth_manager_register(worker->auth_manager,
-                                                  keel_auth_query_ops(), &qcfg);
-                break;
-            }
-            default:
-                KEEL_LOG_WARN(KEEL_LOG_CAT_AUTH,
-                    "Worker %u: unrecognised auth method %d — using trust",
-                    worker->id, (int)cfg->auth_method);
-                keel_auth_manager_destroy(worker->auth_manager);
-                worker->auth_manager = NULL;
-                break;
-            }
-            if (rerr != KEEL_OK && worker->auth_manager) {
+                "Worker %u: failed to create auth manager for method "
+                "'%s' (enum=%d) — refusing to start the worker. "
+                "A NULL auth manager would be interpreted by the "
+                "protocol layer as trust mode.",
+                worker->id,
+                keel_auth_method_name(cfg->auth_method),
+                (int)cfg->auth_method);
+            return -1;
+        }
+
+        if (provider_ops) {
+            keel_error_t rerr = keel_auth_manager_register(
+                worker->auth_manager, provider_ops, provider_cfg);
+            if (rerr != KEEL_OK) {
+                /* A2 fix: provider registration failure must abort the
+                 * worker.  Tear down the partially-built manager first
+                 * so we don't leak it — keel_worker_cleanup() is not
+                 * invoked for the failing worker by the pool-init caller,
+                 * only for the already-succeeded siblings. */
                 KEEL_LOG_ERROR(KEEL_LOG_CAT_AUTH,
-                    "Worker %u: auth provider registration failed (err=%d) — falling back to trust",
-                    worker->id, (int)rerr);
+                    "Worker %u: auth provider registration failed for "
+                    "method '%s' (enum=%d, err=%d) — refusing to start "
+                    "the worker. A NULL auth manager would be interpreted "
+                    "by the protocol layer as trust mode.",
+                    worker->id,
+                    keel_auth_method_name(cfg->auth_method),
+                    (int)cfg->auth_method, (int)rerr);
                 keel_auth_manager_destroy(worker->auth_manager);
                 worker->auth_manager = NULL;
+                return -1;
             }
         }
+
+        /* Userlist-based providers load their user database after a
+         * successful register.  A missing or malformed userlist is
+         * non-fatal here: the manager will simply reject every login
+         * attempt until the operator reloads a valid file.  That is the
+         * desired fail-closed behaviour — every request is rejected
+         * rather than silently accepted. */
+        if ((cfg->auth_method == KEEL_AUTH_SCRAM_SHA_256 ||
+             cfg->auth_method == KEEL_AUTH_MD5) &&
+            cfg->auth_userlist_file) {
+            keel_auth_load_userlist(worker->auth_manager,
+                                    cfg->auth_userlist_file);
+        }
+    } else if (cfg && cfg->auth_method == KEEL_AUTH_TRUST) {
+        /* Explicit operator opt-in.  Audited at WARN so trust usage is
+         * visible in every deployment's logs; the `--strict-auth` flag
+         * enforced during INI parsing is the stronger guard. */
+        KEEL_LOG_WARN(KEEL_LOG_CAT_AUTH,
+            "Worker %u: auth_method=trust — the worker will accept all "
+            "client connections without authentication. This is "
+            "intentional but unsafe on untrusted networks.",
+            worker->id);
     }
 
     return 0;

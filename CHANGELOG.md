@@ -14,6 +14,58 @@ reference.
 
 ## [Unreleased]
 
+### Security — Authentication fail-closed startup (review_20260618_01 §A1, §A2)
+
+KEEL's frontend protocol layer treats a worker with a `NULL` auth manager
+as "trust mode" (accept every connection without authentication). The
+previous worker-startup code had three fail-open paths that could produce
+a `NULL` auth manager without the operator explicitly opting into trust:
+
+- `auth_method = password` (the documented default in
+  `etc/keel.ini.example`) had no provider case in the worker's auth
+  switch; the `default:` arm destroyed the manager and logged
+  *"falling back to trust"*.
+- `keel_auth_manager_create()` failing (e.g. transient OOM at startup)
+  triggered the same fallback.
+- `keel_auth_manager_register()` failing for the requested provider
+  triggered it again.
+
+Each case silently turned a configured (non-trust) deployment into an
+open authenticator.
+
+**Changed** (`src/worker/worker.c::keel_worker_init`):
+
+- The `default:` arm of the auth-method switch now refuses to start the
+  worker (`return -1`) for any method without a provider implementation.
+  This includes `KEEL_AUTH_PASSWORD`, `KEEL_AUTH_GSSAPI`,
+  `KEEL_AUTH_SSPI`, `KEEL_AUTH_RADIUS`, `KEEL_AUTH_REJECT`,
+  `KEEL_AUTH_PASSTHROUGH`, `KEEL_AUTH_NONE`, and any future enum member
+  added without a case. The error message names the method and explains
+  why a `NULL` manager would be unsafe.
+- `keel_auth_manager_create()` returning `NULL` now refuses to start the
+  worker instead of logging a "falling back to trust" warning.
+- `keel_auth_manager_register()` failure for the requested provider now
+  destroys the partially-built manager and refuses to start the worker.
+- `KEEL_AUTH_TRUST` is the only legitimate path that leaves
+  `worker->auth_manager == NULL`, and it now emits a WARN-level audit
+  line so explicit trust usage is visible in every deployment's logs.
+- The auth-manager setup was restructured to resolve the provider ops
+  first and register in a single step, eliminating the prior
+  register-then-load-userlist ordering inconsistency between SCRAM and
+  MD5.
+
+**Documentation** (`etc/keel.ini.example`): the misleading
+`auth_method = password` example has been replaced with the actual
+default (`scram-sha-256`), and the docs note the fail-closed behaviour
+plus a back-reference to the review document.
+
+**Tests** (`tests/test_worker_auth_bypass.c`, registered as
+`test_worker_auth_bypass`): regression suite pinning the new contract
+across 11 cases — six unsupported-method cases that must refuse to start
+(password, reject, gssapi, radius, passthrough, none), the explicit-trust
+positive path, three supported-method positives (scram-sha-256, md5,
+cert), and the `keel_auth_manager_create() == NULL` contract.
+
 ### Changed — Distro-specific Linux packages
 
 Linux release packages are now built in distro-matched environments instead of

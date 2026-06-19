@@ -356,15 +356,25 @@ server_password = secret
 # controls how Keel verifies client credentials before establishing a session.
 #
 # Values:
-#   password    — standard hashed-password auth (default; md5/scram)
-#   trust       — no authentication (development only)
-#   pam         — Linux PAM; useful for LDAP/AD integration via pam_ldap
-#   ldap        — direct LDAP bind+search (no PAM dependency)
-#   cert        — mTLS client certificate (CN or SAN used as username)
-#   auth_query  — validate credentials via a SQL function on the backend
+#   scram-sha-256 — SCRAM-SHA-256 challenge/response (recommended; default)
+#   md5           — legacy MD5 challenge/response (deprecated, RFC 6151;
+#                   rejected by --strict-auth)
+#   trust         — no authentication (development only; rejected by
+#                   --strict-auth; see SECURITY.md)
+#   pam           — Linux PAM; useful for LDAP/AD integration via pam_ldap
+#   ldap          — direct LDAP bind+search (no PAM dependency)
+#   cert          — mTLS client certificate (CN or SAN used as username)
+#   auth_query    — validate credentials via a SQL function on the backend
 #
-# Default: password
-# auth_method = password
+# Fail-closed behaviour: if Keel cannot construct or register the auth
+# provider for the configured method (including typos, unsupported
+# methods such as `password`/`gssapi`/`radius`/`passthrough`, or
+# transient memory pressure at startup), the worker refuses to start
+# rather than silently fall back to trust.  See
+# proposals/review_20260618_01.md §A1/§A2 for background.
+#
+# Default: scram-sha-256
+# auth_method = scram-sha-256
 
 # PAM service name to use when auth_method = pam.
 # The service is looked up in /etc/pam.d/<service>.
