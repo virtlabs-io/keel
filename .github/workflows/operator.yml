@@ -22,6 +22,9 @@ concurrency:
   group: operator-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Operator unit tests (webhook defaulter + validator)

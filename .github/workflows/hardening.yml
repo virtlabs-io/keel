@@ -18,6 +18,9 @@ concurrency:
   group: hardening-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Binary Hardening Verification (checksec)

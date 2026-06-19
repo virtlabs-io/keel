@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Memory policy lint — no direct system allocator calls outside mem/ arch/

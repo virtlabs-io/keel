@@ -27,6 +27,9 @@ on:
         required: false
         default: '60'
 
+permissions:
+  contents: read
+
 jobs:
   fuzz-ci:
     name: libFuzzer — ${{ matrix.target }}
