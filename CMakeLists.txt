@@ -291,7 +291,9 @@ endif()
 #   Compile:
 #     -fstack-protector-strong  — stack canaries on functions with buffers
 #     -fPIE                     — position-independent executable code
-#     -D_FORTIFY_SOURCE=3       — compile-time + run-time buffer overflow checks
+#     -D_FORTIFY_SOURCE=2|3     — compile-time + run-time buffer overflow checks
+#                                 (highest level supported by the toolchain;
+#                                  see probe below)
 #
 #   Link:
 #     -pie                      — ASLR for the executable
@@ -303,12 +305,57 @@ endif()
 # bar for memory-corruption exploits.  Disable with -DKEEL_ENABLE_HARDENING=OFF
 # only for profiling builds where PIE overhead matters.
 # ============================================================================
+# _FORTIFY_SOURCE level is detected at configure time rather than pinned to a
+# compiler version.  Known failure modes the probe must survive:
+#
+#   * glibc + GCC 11 (e.g. Rocky 9): _FORTIFY_SOURCE>2 emits
+#        #warning _FORTIFY_SOURCE > 2 is treated like 2 on this platform
+#     which -Werror turns into a hard failure.
+#   * Alpine's hardened GCC specs already define _FORTIFY_SOURCE, so an
+#     explicit -D on the command line triggers -Wmacro-redefined.
+#   * musl / older glibc: level 3 may be unsupported entirely.
+#
+# The probe compiles a trivial TU that includes <features.h> under -Werror,
+# trying level 3 first and falling back to 2, then to "no define" (letting
+# the toolchain default apply).
+# ============================================================================
 if(KEEL_ENABLE_HARDENING)
+    include(CheckCSourceCompiles)
+
+    set(_keel_fortify_save_req_flags   "${CMAKE_REQUIRED_FLAGS}")
+    set(_keel_fortify_save_req_defs    "${CMAKE_REQUIRED_DEFINITIONS}")
+
+    set(CMAKE_REQUIRED_FLAGS "-Werror")
+    set(_keel_fortify_probe "
+#include <features.h>
+int main(void) { return 0; }
+")
+    set(KEEL_FORTIFY_SOURCE_LEVEL 0)
+    foreach(_level 3 2)
+        set(CMAKE_REQUIRED_DEFINITIONS "-D_FORTIFY_SOURCE=${_level}")
+        check_c_source_compiles("${_keel_fortify_probe}" _keel_fortify_${_level}_ok)
+        if(_keel_fortify_${_level}_ok)
+            set(KEEL_FORTIFY_SOURCE_LEVEL ${_level})
+            break()
+        endif()
+    endforeach()
+
+    set(CMAKE_REQUIRED_FLAGS       "${_keel_fortify_save_req_flags}")
+    set(CMAKE_REQUIRED_DEFINITIONS "${_keel_fortify_save_req_defs}")
+    unset(_keel_fortify_save_req_flags)
+    unset(_keel_fortify_save_req_defs)
+    unset(_keel_fortify_probe)
+    unset(_level)
+
     set(KEEL_HARDENING_COMPILE_FLAGS
         -fstack-protector-strong
         -fPIE
-        -D_FORTIFY_SOURCE=3
     )
+    if(KEEL_FORTIFY_SOURCE_LEVEL GREATER 0)
+        list(APPEND KEEL_HARDENING_COMPILE_FLAGS
+             -D_FORTIFY_SOURCE=${KEEL_FORTIFY_SOURCE_LEVEL})
+    endif()
+
     set(KEEL_HARDENING_LINK_FLAGS
         -pie
         -Wl,-z,relro
@@ -317,7 +364,8 @@ if(KEEL_ENABLE_HARDENING)
     )
     add_compile_options(${KEEL_HARDENING_COMPILE_FLAGS})
     add_link_options(${KEEL_HARDENING_LINK_FLAGS})
-    message(STATUS "KEEL: exploit-mitigation hardening flags enabled")
+    message(STATUS "KEEL: exploit-mitigation hardening flags enabled "
+                   "(_FORTIFY_SOURCE=${KEEL_FORTIFY_SOURCE_LEVEL})")
 endif()
 
 # ============================================================================
