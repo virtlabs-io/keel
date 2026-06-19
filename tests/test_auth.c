@@ -192,6 +192,60 @@ static void test_scram_hash_password(void) {
     TEST_END();
 }
 
+static void test_scram_hash_format_pg_compatible(void) {
+    TEST_BEGIN("scram_hash_format: PostgreSQL-compatible $ separator");
+
+#ifdef KEEL_HAS_OPENSSL
+    /* Generate a hash and verify the format uses '$' between salt and
+     * stored_key, matching PostgreSQL's pg_authid.rolpassword format:
+     *   SCRAM-SHA-256$<iter>:<salt>$<stored>:<server>
+     * not the legacy Keel format that used ':' everywhere. */
+    char* hash = NULL;
+    keel_error_t err = keel_auth_scram_hash_password("pw", 4096, &hash);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_NOT_NULL(hash);
+    if (!hash) { TEST_END(); return; }
+
+    /* Skip "SCRAM-SHA-256$<iter>:" to reach the salt */
+    const char* salt_start = strchr(hash + 14, ':');
+    TEST_ASSERT_NOT_NULL(salt_start);
+    salt_start++;
+    /* The next separator MUST be '$', not ':' */
+    const char* sep = strchr(salt_start, '$');
+    TEST_ASSERT_NOT_NULL(sep);
+    /* And there must NOT be a ':' before that '$' in the salt body
+     * (base64 can contain '+', '/', '=', but never '$' or ':' so this
+     * check is unambiguous). */
+    const char* colon_in_salt = strchr(salt_start, ':');
+    if (colon_in_salt) {
+        TEST_ASSERT(colon_in_salt > sep);
+    }
+    keel_free(hash);
+
+    /* Parse a known PostgreSQL-format hash and verify it round-trips.
+     * This is the hash the user reported: password "keel_pwd_cli"
+     * exported from PostgreSQL. */
+    const char* pg_hash =
+        "SCRAM-SHA-256$4096:5KOkk+vGXeSKcfz8ZMeJhw==$"
+        "DqiI33Y7Xsvn81W5pv6mqRSqZmNs8YEy5BIQyuTcFvY=:"
+        "EFCcfr9WcDKylBAuf8j/T4vdiv9HPnTYRHW8Fcm0Nj4=";
+    char* salt = NULL;
+    int iters = 0;
+    uint8_t sk[32], svk[32];
+    err = keel_auth_scram_parse_hash(pg_hash, &salt, &iters, sk, svk);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    if (err == KEEL_OK) {
+        TEST_ASSERT_EQ(iters, 4096);
+        TEST_ASSERT_NOT_NULL(salt);
+        keel_free(salt);
+    }
+#else
+    printf("    Skipping (no OpenSSL)\n");
+#endif
+
+    TEST_END();
+}
+
 /* ============================================================================
  * Test: Auth Method Names
  * ============================================================================ */
@@ -1475,6 +1529,7 @@ int main(void) {
     test_user_management();
     test_trust_auth();
     test_scram_hash_password();
+    test_scram_hash_format_pg_compatible();
     test_auth_method_names();
     test_auth_state_names();
     test_scram_hash_parsing();
