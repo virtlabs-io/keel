@@ -33,7 +33,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
-#include <openssl/crypto.h>   /* OPENSSL_cleanse —不会被dead-store elimination优化掉的secure memset */
+#include <openssl/crypto.h>   /* OPENSSL_cleanse — secure zeroize the compiler cannot dead-store-eliminate */
 #endif
 
 #include <arpa/inet.h>
