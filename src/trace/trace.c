@@ -519,7 +519,23 @@ char* keel_otlp_build_json(const keel_span_t* spans, size_t count,
 
     size_t pos = 0;
 
-#define APPEND(...) pos += (size_t)snprintf(buf + pos, buf_size - pos, __VA_ARGS__)
+    /* Safe append: snprintf returns the number of characters that WOULD
+     * have been written if the buffer were large enough, which can exceed
+     * the remaining space (buf_size - pos).  The naive pattern
+     *   pos += snprintf(buf + pos, buf_size - pos, ...)
+     * lets pos overshoot buf_size on truncation, so the next call computes
+     * buf_size - pos as a huge value (unsigned underflow) and snprintf
+     * writes past the buffer end.  This macro clamps pos to buf_size so
+     * the remaining-space argument never underflows and buf + pos never
+     * points past the allocation.  CodeQL cpp/overflowing-snprintf. */
+#define APPEND(...) do { \
+        if (pos < buf_size) { \
+            int _n = snprintf(buf + pos, buf_size - pos, __VA_ARGS__); \
+            if (_n < 0) pos = buf_size; \
+            else pos += (size_t)_n; \
+            if (pos > buf_size) pos = buf_size; \
+        } \
+    } while (0)
 
     APPEND("{\"resourceSpans\":[{");
     APPEND("\"resource\":{\"attributes\":[");
