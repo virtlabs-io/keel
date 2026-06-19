@@ -33,7 +33,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
-#include <openssl/crypto.h>   /* OPENSSL_cleanse — secure zeroize the compiler cannot dead-store-eliminate */
+#include <openssl/crypto.h>   /* OPENSSL_cleanse for heap-resident secrets (cached tokens, AWS keys) */
 #endif
 
 #include <arpa/inet.h>
@@ -1067,7 +1067,7 @@ static keel_error_t gcp_iam_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                OPENSSL_cleanse(buf, sizeof(buf));
+                explicit_bzero(buf, sizeof(buf));
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1296,7 +1296,7 @@ static keel_error_t azure_ad_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                OPENSSL_cleanse(buf, sizeof(buf));
+                explicit_bzero(buf, sizeof(buf));
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1444,9 +1444,9 @@ static keel_error_t static_fetch_token(keel_cloud_auth_provider_t* prov,
     memcpy(token, buf, nread + 1);
 
     /* Zero the stack buffer that held the secret.
-     * OPENSSL_cleanse uses a volatile-qualified internally so the compiler
-     * cannot dead-store-eliminate it (CodeQL cpp/memset-may-be-deleted). */
-    OPENSSL_cleanse(buf, sizeof(buf));
+     * explicit_bzero has an external linkage that prevents the compiler
+     * from dead-store-eliminating it (CodeQL cpp/memset-may-be-deleted). */
+    explicit_bzero(buf, sizeof(buf));
 
     token_out->token = token;
     token_out->token_len = nread;
