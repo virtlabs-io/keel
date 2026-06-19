@@ -14,6 +14,49 @@ reference.
 
 ## [Unreleased]
 
+### Security — Constant-time password verification (review_20260618_01 §A3, §A4, §B5, §M10)
+
+The SCRAM-SHA-256 `StoredKey` comparison and the MD5 password-hash
+comparison both used libc short-circuiting comparators (`memcmp` and
+`strcmp` respectively) despite the MD5 provider's docstring already
+promising "constant-time comparison". A short-circuiting comparator leaks
+byte-by-byte timing information about which prefix of the recovered key
+agrees with the stored value; over many auth attempts an attacker
+co-located with the proxy (or LAN-adjacent to the admin socket) can
+statistically recover key material and forge credentials.
+
+**Changed** (`src/core/auth.c`):
+
+- **SCRAM `StoredKey` verification** (`scram_process`): `memcmp` replaced
+  with `CRYPTO_memcmp` from OpenSSL. Both buffers are exactly
+  `SCRAM_SHA256_DIGEST_LEN` (32) bytes. Closes §A3 and §B5 (the admin
+  auth path uses the same `auth.c` comparison).
+- **MD5 password verification** (`md5_process`): `strcmp` replaced with
+  `CRYPTO_memcmp(client_hash, expected, 35)`. The function-level
+  docstring's "constant-time comparison" promise is now honoured.
+- **MD5 response-length validation** tightened from `len < 35` to
+  `len != 35`. The previous check accepted arbitrarily long responses
+  starting with `"md5"` and then fed them to `strcmp` — both a timing
+  channel and a wasteful-input vector. Closes §M10.
+- Added `#include <openssl/crypto.h>` for the `CRYPTO_memcmp` declaration.
+
+**Tests** (`tests/test_auth.c`): five new regression cases that drive the
+full `keel_auth_process` exchange so both the equal and unequal branches
+of the constant-time comparison are exercised end-to-end. The existing
+SCRAM/MD5 tests only covered the challenge-issue phase and never called
+`keel_auth_process`, so the comparison code was previously untested:
+
+- `test_md5_constant_time_correct` — correct password → `SUCCESS`
+  (equal branch).
+- `test_md5_constant_time_wrong` — wrong password → `FAILED`
+  (unequal branch).
+- `test_md5_rejects_wrong_length` — 11-byte and 41-byte payloads →
+  `FAILED` (tightened `len != 35` gate).
+- `test_scram_constant_time_correct` — honest SCRAM-SHA-256 exchange
+  (PBKDF2 + HMAC + XOR ClientProof) → `SUCCESS` (equal branch).
+- `test_scram_constant_time_wrong` — syntactically valid but
+  cryptographically wrong ClientProof → `FAILED` (unequal branch).
+
 ### Security — Authentication fail-closed startup (review_20260618_01 §A1, §A2)
 
 KEEL's frontend protocol layer treats a worker with a `NULL` auth manager

@@ -37,6 +37,7 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>   /* CRYPTO_memcmp — constant-time comparison */
 #endif
 
 /* Note: ldap_ctx_t is defined in the LDAP section below.
@@ -796,8 +797,20 @@ static keel_auth_state_t scram_process(
             return KEEL_AUTH_STATE_ERROR;
         }
         
-        /* Compare with stored key */
-        if (memcmp(verify_key, sctx->stored_key, SCRAM_SHA256_DIGEST_LEN) != 0) {
+        /* Compare with stored key.
+         *
+         * A3 (review_20260618_01.md): use CRYPTO_memcmp instead of memcmp.
+         * libc memcmp short-circuits on the first mismatched byte, leaking
+         * byte-by-byte timing information about *which* prefix of the
+         * recovered StoredKey agrees with the stored value. An attacker
+         * with many auth attempts (e.g. co-located on the same host as
+         * the admin socket, or LAN-adjacent) can statistically recover
+         * StoredKey and forge a valid ClientProof. CRYPTO_memcmp takes the
+         * same number of cycles regardless of where (or whether) the
+         * buffers differ. Both buffers are exactly
+         * SCRAM_SHA256_DIGEST_LEN (32) bytes — no length-mismatch
+         * concern. */
+        if (CRYPTO_memcmp(verify_key, sctx->stored_key, SCRAM_SHA256_DIGEST_LEN) != 0) {
             /* NOTE: auth_message contains the SCRAM auth-message string which
              * is derived from exchanged nonces and salts — do NOT log it.
              * Log only byte lengths so operators can diagnose protocol
@@ -1094,9 +1107,17 @@ static keel_auth_state_t md5_process(
     /* The data we receive is just the password hash (null-terminated) */
     const char* client_hash = (const char*)data;
     
-    /* Validate: should be "md5" + 32 hex chars = 35 bytes (null may have been
-     * stripped by the Phase B parser before calling us). */
-    if (len < 35 || strncmp(client_hash, "md5", 3) != 0) {
+    /* Validate: the PostgreSQL MD5 response is exactly "md5" + 32 hex
+     * chars = 35 bytes. The wire framing strips the trailing NUL before
+     * calling us, so `len` is the payload size without it.
+     *
+     * A4/M10 (review_20260618_01.md): the previous check was `len < 35`,
+     * which accepted arbitrarily long responses starting with "md5" and
+     * then fed them to strcmp — both a timing channel ( strcmp scans
+     * until the first NUL/mismatch) and a wasteful-input vector.
+     * Tightening to `len != 35` rejects malformed responses at the door
+     * so the constant-time compare below always runs on exactly 35 bytes. */
+    if (len != 35 || strncmp(client_hash, "md5", 3) != 0) {
         KEEL_LOG_DEBUG(KEEL_LOG_CAT_CORE, "Invalid MD5 response format");
         ctx->state = KEEL_AUTH_STATE_FAILED;
         ctx->error_message = keel_strdup("Invalid MD5 password format");
@@ -1120,7 +1141,15 @@ static keel_auth_state_t md5_process(
         return KEEL_AUTH_STATE_ERROR;
     }
     
-    bool match = (strcmp(client_hash, expected) == 0);
+    /* A4 (review_20260618_01.md): the function-level docstring at line ~1069
+     * already promises "constant-time comparison" but the previous body used
+     * strcmp, which short-circuits on the first differing byte. CRYPTO_memcmp
+     * runs in time independent of where the buffers first differ.
+     *
+     * Both `client_hash` (validated to len == 35 above) and `expected`
+     * (always "md5" + 32 hex from keel_md5_password) are exactly 35 bytes,
+     * so a fixed-length constant-time compare is correct here. */
+    bool match = (CRYPTO_memcmp(client_hash, expected, 35) == 0);
     keel_free(expected);
     
     if (match) {
