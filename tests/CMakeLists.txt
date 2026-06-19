@@ -130,6 +130,45 @@ target_compile_definitions(test_admin_auth PRIVATE KEEL_HAS_OPENSSL=1)
 target_link_options(test_admin_auth PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
 add_test(NAME test_admin_auth COMMAND test_admin_auth)
 
+# Authentication fail-closed regression (review_20260618_01.md §A1, §A2).
+# Verifies keel_worker_init() refuses to start when the configured
+# auth_method has no provider implementation or when the auth manager
+# cannot be constructed — instead of silently falling back to trust.
+add_executable(test_worker_auth_bypass test_worker_auth_bypass.c)
+target_link_libraries(test_worker_auth_bypass PRIVATE
+    test_utils
+    ${LINUX_START_GROUP}
+    keelengine
+    keel_engine_flow
+    keel_worker_new
+    keel_session
+    keelcore
+    keelstats
+    keel_probe
+    keel_proto_postgres
+    keel_proto_mysql
+    keel_proto_flow_registry
+    keel_tls
+    keel_hook
+    keellog_plugin
+    keellog
+    keel_arch_platform
+    keel_arch_common
+    keelmem
+    keelutil
+    keelsql
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LINUX_END_GROUP}
+    Threads::Threads
+)
+if(KEEL_USE_IOURING AND URING_FOUND)
+    target_link_libraries(test_worker_auth_bypass PRIVATE uring)
+endif()
+target_compile_definitions(test_worker_auth_bypass PRIVATE KEEL_HAS_OPENSSL=1)
+target_link_options(test_worker_auth_bypass PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+add_test(NAME test_worker_auth_bypass COMMAND test_worker_auth_bypass)
+
 # Cloud-native authentication tests
 add_executable(test_cloud_auth test_cloud_auth.c)
 target_link_libraries(test_cloud_auth PRIVATE
