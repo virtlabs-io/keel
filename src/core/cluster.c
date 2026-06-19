@@ -1236,6 +1236,43 @@ static bool cluster_send_vote_request(keel_cluster_t* c,
 }
 
 /**
+ * @brief Compute a randomised per-node election timeout.
+ *
+ * Mixes node_id (stable per node) with @p salt (varies per call) using
+ * FNV-1a, so that:
+ *   - Different nodes get different timeouts (avoids simultaneous startup
+ *     elections).
+ *   - The same node gets a different timeout after each failed election
+ *     (avoids the persistent split-vote deadlock in 2-node clusters, where
+ *     both nodes retry in lockstep because their timeouts are deterministic
+ *     functions of node_id alone).
+ *
+ * @param c    Cluster instance.
+ * @param salt Varies the output across calls. Pass 0 at startup and the
+ *             just-attempted term after a failed election.
+ * @return     Election timeout in milliseconds.
+ */
+static uint32_t cluster_compute_election_timeout(
+    const keel_cluster_t* c, uint64_t salt) {
+    uint32_t base  = c->config.heartbeat_interval_ms * 2;
+    if (base < 500) base = 500;
+    uint32_t range = c->config.heartbeat_interval_ms;
+    if (range < 100) range = 100;
+
+    uint32_t h = 2166136261u;  /* FNV-1a 32-bit offset basis */
+    for (const char* p = c->config.node_id; *p; p++) {
+        h ^= (uint8_t)(*p);
+        h *= 16777619u;
+    }
+    while (salt) {
+        h ^= (uint32_t)(salt & 0xff);
+        h *= 16777619u;
+        salt >>= 8;
+    }
+    return base + (h % (range + 1));
+}
+
+/**
  * @brief Run one full leader election round.
  *
  * Increments the term, votes for self, requests votes from all active
@@ -1323,6 +1360,17 @@ static void cluster_run_election(keel_cluster_t* c) {
         atomic_store(&c->role, KEEL_CLUSTER_ROLE_FOLLOWER);
         /* Back off before next attempt */
         atomic_store(&c->last_leader_contact_ns, cluster_now_ns());
+        /* Re-randomise the election timeout using the just-attempted term
+         * as salt. Without this, every node's timeout is a deterministic
+         * function of node_id alone, so after a simultaneous split-vote
+         * all nodes reset last_leader_contact_ns to ~now and fire their
+         * next election at the same instant again — producing a permanent
+         * 1/N votes loop (observed on 2-node clusters under ASan/CI).
+         * Mixing the term into the FNV-1a hash yields a different timeout
+         * per attempt, so one node will strictly precede the others on
+         * the next round and win. */
+        c->election_timeout_ms =
+            cluster_compute_election_timeout(c, new_term);
         KEEL_LOG_INFO(KEEL_LOG_CAT_CORE,
             "[cluster] Election for term %" PRIu64
             " failed: got %d/%d votes (need %d)",
@@ -2242,18 +2290,10 @@ keel_cluster_t* keel_cluster_create(const keel_cluster_config_t* config) {
          *   base  = 2 × heartbeat_interval_ms
          *   jitter = 0 .. heartbeat_interval_ms  (FNV-1a hash of node_id)
          * This ensures no two nodes share the same timeout, preventing
-         * split-vote deadlocks without external configuration. */
-        uint32_t base  = c->config.heartbeat_interval_ms * 2;
-        if (base < 500) base = 500;
-        uint32_t range = c->config.heartbeat_interval_ms;
-        if (range < 100) range = 100;
-
-        uint32_t h = 2166136261u;
-        for (const char* p = c->config.node_id; *p; p++) {
-            h ^= (uint8_t)(*p);
-            h *= 16777619u;  /* FNV-1a 32-bit */
-        }
-        c->election_timeout_ms = base + (h % (range + 1));
+         * split-vote deadlocks without external configuration. The same
+         * helper is re-invoked after every failed election (with the term
+         * as salt) so retries do not fall into lockstep. */
+        c->election_timeout_ms = cluster_compute_election_timeout(c, 0);
 
         /* Derive the persistent state path from node_id when the caller
          * left it empty.  Uses /tmp so it works in containers without
