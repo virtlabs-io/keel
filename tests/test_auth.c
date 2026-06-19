@@ -917,6 +917,550 @@ static void test_auth_query_ops_api(void) {
 }
 
 /* ============================================================================
+ * §A3 / §A4 regression — constant-time comparison coverage
+ *
+ * The existing scram_auth_flow / md5_auth tests above only exercise the
+ * challenge-issue phase (start + get_message). They never call
+ * keel_auth_process(), so the password-verifying comparison (the very
+ * line the A3/A4 fix changes) was not covered. The tests below drive
+ * the full exchange through keel_auth_process so both the equal and
+ * unequal branches of CRYPTO_memcmp are exercised.
+ *
+ * cover review_20260618_01.md §A3 (SCRAM StoredKey) and §A4 (MD5 strcmp).
+ * ============================================================================ */
+
+#ifdef KEEL_HAS_OPENSSL
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <openssl/crypto.h>
+
+/* Minimal RFC 4648 base64 decoder for test use only.
+ * Returns number of decoded bytes, or -1 on invalid input.
+ * Values in the table are shifted by 1 (1..64) so that 0 unambiguously
+ * marks an invalid byte — important because base64 'A' legitimately
+ * decodes to 0. */
+static int test_b64_decode(const char* in, uint8_t* out, size_t out_max) {
+    static const int8_t tab[256] = {
+        ['A']=1,['B']=2,['C']=3,['D']=4,['E']=5,['F']=6,['G']=7,['H']=8,
+        ['I']=9,['J']=10,['K']=11,['L']=12,['M']=13,['N']=14,['O']=15,['P']=16,
+        ['Q']=17,['R']=18,['S']=19,['T']=20,['U']=21,['V']=22,['W']=23,['X']=24,
+        ['Y']=25,['Z']=26,
+        ['a']=27,['b']=28,['c']=29,['d']=30,['e']=31,['f']=32,['g']=33,['h']=34,
+        ['i']=35,['j']=36,['k']=37,['l']=38,['m']=39,['n']=40,['o']=41,['p']=42,
+        ['q']=43,['r']=44,['s']=45,['t']=46,['u']=47,['v']=48,['w']=49,['x']=50,
+        ['y']=51,['z']=52,
+        ['0']=53,['1']=54,['2']=55,['3']=56,['4']=57,['5']=58,['6']=59,['7']=60,
+        ['8']=61,['9']=62,['+']=63,['/']=64,
+    };
+    size_t in_len = strlen(in);
+    uint32_t buf = 0;
+    int bits = 0;
+    size_t out_len = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=') break;
+        if (c >= 128 || tab[c] == 0) return -1;
+        buf = (buf << 6) | (uint32_t)(tab[c] - 1);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (out_len >= out_max) return -1;
+            out[out_len++] = (uint8_t)((buf >> bits) & 0xFF);
+        }
+    }
+    return (int)out_len;
+}
+
+/* Minimal RFC 4648 base64 encoder for test use only.
+ * `out` must have room for ((in_len + 2) / 3) * 4 + 1 bytes. */
+static void test_b64_encode(const uint8_t* in, size_t in_len, char* out) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    size_t i;
+    for (i = 0; i + 2 < in_len; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[o++] = b64[(v >> 18) & 0x3F];
+        out[o++] = b64[(v >> 12) & 0x3F];
+        out[o++] = b64[(v >> 6) & 0x3F];
+        out[o++] = b64[v & 0x3F];
+    }
+    size_t rem = in_len - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        out[o++] = b64[(v >> 18) & 0x3F];
+        out[o++] = b64[(v >> 12) & 0x3F];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8);
+        out[o++] = b64[(v >> 18) & 0x3F];
+        out[o++] = b64[(v >> 12) & 0x3F];
+        out[o++] = b64[(v >> 6) & 0x3F];
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+}
+
+/* Replicate the PostgreSQL client MD5 computation:
+ *   inner = md5(password + user)        → hex
+ *   outer = md5(inner_hex + salt)       → hex
+ *   result = "md5" + outer_hex
+ * Returns a keel_malloc'd string (caller frees) or NULL. */
+static char* test_compute_md5_response(const char* user,
+                                       const char* password,
+                                       const uint8_t salt[4]) {
+    static const char hex[] = "0123456789abcdef";
+
+    unsigned char inner[16];
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    if (!md) return NULL;
+
+    if (EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1 ||
+        EVP_DigestUpdate(md, password, strlen(password)) != 1 ||
+        EVP_DigestUpdate(md, user, strlen(user)) != 1 ||
+        EVP_DigestFinal_ex(md, inner, NULL) != 1) {
+        EVP_MD_CTX_free(md);
+        return NULL;
+    }
+
+    char inner_hex[33];
+    for (int i = 0; i < 16; i++) {
+        inner_hex[i*2]   = hex[inner[i] >> 4];
+        inner_hex[i*2+1] = hex[inner[i] & 0x0f];
+    }
+    inner_hex[32] = '\0';
+
+    unsigned char outer[16];
+    if (EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1 ||
+        EVP_DigestUpdate(md, inner_hex, 32) != 1 ||
+        EVP_DigestUpdate(md, salt, 4) != 1 ||
+        EVP_DigestFinal_ex(md, outer, NULL) != 1) {
+        EVP_MD_CTX_free(md);
+        return NULL;
+    }
+    EVP_MD_CTX_free(md);
+
+    char* result = keel_malloc(36);
+    if (!result) return NULL;
+    result[0] = 'm'; result[1] = 'd'; result[2] = '5';
+    for (int i = 0; i < 16; i++) {
+        result[3 + i*2]   = hex[outer[i] >> 4];
+        result[3 + i*2+1] = hex[outer[i] & 0x0f];
+    }
+    result[35] = '\0';
+    return result;
+}
+
+/* ---- A4: MD5 constant-time comparison ---------------------------------- */
+
+/* Helper: drive a full MD5 exchange and return the final auth state.
+ * `response` is the raw bytes the "client" sends as its MD5 reply; the
+ * caller controls whether this is the correct hash, a wrong hash, or a
+ * malformed-length payload. */
+static keel_auth_state_t test_md5_drive(const char* username,
+                                        const char* stored_password,
+                                        const void* response,
+                                        size_t response_len) {
+    keel_auth_manager_config_t cfg = {
+        .default_method = KEEL_AUTH_MD5,
+        .allow_clear_password = false,
+    };
+    keel_auth_manager_t* mgr = keel_auth_manager_create(&cfg);
+    if (!mgr) return KEEL_AUTH_STATE_ERROR;
+
+    keel_auth_user_t user = {
+        .username = (char*)username,
+        .password_hash = (char*)stored_password,
+        .can_login = true,
+    };
+    keel_auth_add_user(mgr, &user);
+
+    keel_auth_context_t* ctx = NULL;
+    keel_error_t err = keel_auth_manager_start(mgr, username, &ctx);
+    if (err != KEEL_OK || !ctx) {
+        keel_auth_manager_destroy(mgr);
+        return KEEL_AUTH_STATE_ERROR;
+    }
+
+    /* Drain the challenge message so the provider is in the right state */
+    void* msg = NULL;
+    size_t msg_len = 0;
+    int msg_type = 0;
+    err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+    if (err == KEEL_OK && msg) keel_free(msg);
+
+    /* The salt lives at bytes 4..7 of the MD5 challenge; pull it out so
+     * the caller can compute the matching response.  We expose it via a
+     * side channel for the correct-password test.  For the wrong-password
+     * and wrong-length tests the caller already has the response bytes. */
+    keel_auth_state_t state = keel_auth_process(ctx, response, response_len);
+
+    keel_auth_context_free(ctx);
+    keel_auth_manager_destroy(mgr);
+    return state;
+}
+
+static void test_md5_constant_time_correct(void) {
+    TEST_BEGIN("A4: MD5 correct password → SUCCESS (CRYPTO_memcmp equal branch)");
+
+    const char* username = "alice";
+    const char* password = "correct-horse-battery-staple";
+
+    /* We need the salt to compute the right response, so start once to
+     * harvest it, then drive the actual exchange. */
+    keel_auth_manager_config_t cfg = {
+        .default_method = KEEL_AUTH_MD5,
+        .allow_clear_password = false,
+    };
+    keel_auth_manager_t* mgr = keel_auth_manager_create(&cfg);
+    TEST_ASSERT_NOT_NULL(mgr);
+    if (!mgr) { TEST_END(); return; }
+
+    keel_auth_user_t user = {
+        .username = (char*)username,
+        .password_hash = (char*)password,
+        .can_login = true,
+    };
+    keel_auth_add_user(mgr, &user);
+
+    keel_auth_context_t* ctx = NULL;
+    keel_error_t err = keel_auth_manager_start(mgr, username, &ctx);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    if (ctx) {
+        void* msg = NULL;
+        size_t msg_len = 0;
+        int msg_type = 0;
+        err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+        TEST_ASSERT_EQ(err, KEEL_OK);
+        TEST_ASSERT_NOT_NULL(msg);
+
+        if (msg && msg_len >= 8) {
+            /* Salt is at offset 4..7 of the AuthenticationMD5Password body */
+            uint8_t salt[4];
+            memcpy(salt, (uint8_t*)msg + 4, 4);
+            keel_free(msg);
+
+            char* response = test_compute_md5_response(username, password, salt);
+            TEST_ASSERT_NOT_NULL(response);
+
+            if (response) {
+                keel_auth_state_t state =
+                    keel_auth_process(ctx, response, 35);
+                TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_SUCCESS);
+                keel_free(response);
+            }
+        } else if (msg) {
+            keel_free(msg);
+        }
+
+        keel_auth_context_free(ctx);
+    }
+    keel_auth_manager_destroy(mgr);
+    TEST_END();
+}
+
+static void test_md5_constant_time_wrong(void) {
+    TEST_BEGIN("A4: MD5 wrong password → FAILED (CRYPTO_memcmp unequal branch)");
+    /* Feed a syntactically-valid (35-byte "md5"+hex) but cryptographically
+     * wrong response. The constant-time compare must still return not-equal
+     * and the auth must fail. */
+    const char* wrong_response = "md5deadbeefdeadbeefdeadbeefdeadbeef";
+    /* "md5" + 32 hex chars = 35 bytes total */
+    TEST_ASSERT_EQ((int)strlen(wrong_response), 35);
+
+    keel_auth_state_t state = test_md5_drive(
+        "bob", "the-real-password", wrong_response, 35);
+    TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_FAILED);
+    TEST_END();
+}
+
+static void test_md5_rejects_wrong_length(void) {
+    TEST_BEGIN("A4/M10: MD5 wrong-length response → FAILED (tightened len != 35)");
+    /* Previously the check was `len < 35`, so a 4000-byte response starting
+     * with "md5" would be accepted past the format gate and then fed to
+     * strcmp. Now `len != 35` rejects at the door. Verify both shorter
+     * and longer malformed payloads. */
+    const char* too_short = "md5tooshort";
+    const char* too_long  = "md5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxxxxxx";
+
+    keel_auth_state_t s_short = test_md5_drive(
+        "carol", "pw", too_short, strlen(too_short));
+    TEST_ASSERT_EQ((int)s_short, (int)KEEL_AUTH_STATE_FAILED);
+
+    keel_auth_state_t s_long = test_md5_drive(
+        "carol", "pw", too_long, strlen(too_long));
+    TEST_ASSERT_EQ((int)s_long, (int)KEEL_AUTH_STATE_FAILED);
+    TEST_END();
+}
+
+/* ---- A3: SCRAM constant-time comparison -------------------------------- */
+
+/* Drive a full SCRAM-SHA-256 exchange with an honest client and verify
+ * SUCCESS. Exercises the CRYPTO_memcmp equal branch at line 800. */
+static void test_scram_constant_time_correct(void) {
+    TEST_BEGIN("A3: SCRAM correct ClientProof → SUCCESS (CRYPTO_memcmp equal branch)");
+
+    const char* password = "scram-test-password";
+
+    keel_auth_manager_t* mgr = keel_auth_manager_create(NULL);
+    TEST_ASSERT_NOT_NULL(mgr);
+    if (!mgr) { TEST_END(); return; }
+
+    /* Hash the password and parse out the verifier fields */
+    char* hash = NULL;
+    int rc_hash = keel_auth_scram_hash_password(password, 4096, &hash);
+    TEST_ASSERT_EQ(rc_hash, (int)KEEL_OK);
+    if (!hash) { keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    char* salt_b64 = NULL;
+    int iterations = 0;
+    uint8_t stored_key[32];
+    uint8_t server_key[32];
+    keel_error_t err = keel_auth_scram_parse_hash(hash, &salt_b64,
+                                                  &iterations, stored_key, server_key);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    if (err != KEEL_OK) { keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    /* Decode the base64 salt to raw bytes for PBKDF2 */
+    uint8_t salt_raw[64];
+    int salt_raw_len = test_b64_decode(salt_b64, salt_raw, sizeof(salt_raw));
+    TEST_ASSERT(salt_raw_len > 0);
+    if (salt_raw_len <= 0) {
+        keel_free(salt_b64); keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return;
+    }
+
+    /* Register the user */
+    keel_auth_user_t user = {
+        .username = "scramuser",
+        .password_hash = hash,
+        .password_salt = salt_b64,
+        .iterations = iterations,
+        .has_scram_keys = true,
+        .can_login = true,
+    };
+    memcpy(user.stored_key, stored_key, 32);
+    memcpy(user.server_key, server_key, 32);
+    keel_auth_add_user(mgr, &user);
+
+    /* --- SCRAM step 0: send client-first, receive server-first --- */
+    keel_auth_context_t* ctx = NULL;
+    err = keel_auth_manager_start(mgr, "scramuser", &ctx);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    if (!ctx) {
+        keel_free(salt_b64); keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return;
+    }
+
+    /* Drain the initial SASL mechanism advertisement */
+    void* msg = NULL; size_t msg_len = 0; int msg_type = 0;
+    err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+    if (err == KEEL_OK && msg) keel_free(msg);
+
+    /* client-first-message: gs2-header n,, + bare n=user,r=nonce */
+    const char* client_nonce = "clientnonce12345";
+    char client_first[256];
+    char client_first_bare[256];
+    snprintf(client_first_bare, sizeof(client_first_bare), "n=scramuser,r=%s", client_nonce);
+    snprintf(client_first, sizeof(client_first), "n,,%s", client_first_bare);
+
+    keel_auth_state_t state = keel_auth_process(ctx, client_first, strlen(client_first));
+    TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_CHALLENGE);
+
+    /* Harvest server-first: r=<combined_nonce>,s=<salt_b64>,i=<iter> */
+    err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_NOT_NULL(msg);
+    if (!msg) { keel_auth_context_free(ctx); keel_free(salt_b64); keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    /* The server-first body starts after the 4-byte auth-type prefix.
+     * The buffer from keel_auth_get_message is NOT NUL-terminated (it's
+     * a binary auth message: 4-byte type + text body), so we must use
+     * msg_len to bound the copy rather than relying on %s/strstr.
+     * Copy the full server-first text into a local buffer before freeing
+     * `msg` — the auth_message computation below needs it, and
+     * keel_auth_get_message returns a caller-owned heap buffer (not an
+     * internal alias), so the pointer is dangling after keel_free(msg). */
+    char server_first_buf[512];
+    size_t body_len = msg_len >= 4 ? msg_len - 4 : 0;
+    if (body_len >= sizeof(server_first_buf)) body_len = sizeof(server_first_buf) - 1;
+    memcpy(server_first_buf, (const char*)msg + 4, body_len);
+    server_first_buf[body_len] = '\0';
+    const char* server_first = server_first_buf;
+
+    /* Extract combined nonce: r=... up to next comma */
+    const char* r_eq = strstr(server_first, "r=");
+    TEST_ASSERT_NOT_NULL(r_eq);
+    const char* comma_after_r = strchr(r_eq, ',');
+    TEST_ASSERT_NOT_NULL(comma_after_r);
+    char combined_nonce[256];
+    size_t nonce_len = (size_t)(comma_after_r - r_eq - 2);
+    memcpy(combined_nonce, r_eq + 2, nonce_len);
+    combined_nonce[nonce_len] = '\0';
+    keel_free(msg);
+
+    /* --- Compute the honest SCRAM ClientProof --- */
+    /* SaltedPassword = PBKDF2(password, salt, iterations) */
+    uint8_t salted_pw[32];
+    int pbkdf2_rc = PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
+                                      salt_raw, salt_raw_len,
+                                      iterations, EVP_sha256(),
+                                      32, salted_pw);
+    TEST_ASSERT_EQ(pbkdf2_rc, 1);
+    if (pbkdf2_rc != 1) {
+        keel_auth_context_free(ctx); keel_free(salt_b64); keel_free(hash);
+        keel_auth_manager_destroy(mgr); TEST_END(); return;
+    }
+
+    /* ClientKey = HMAC(SaltedPassword, "Client Key") */
+    uint8_t client_key[32];
+    unsigned int ck_len = 32;
+    HMAC(EVP_sha256(), salted_pw, 32,
+         (const unsigned char*)"Client Key", 10, client_key, &ck_len);
+
+    /* StoredKey = SHA256(ClientKey) — should match the stored_key from parse */
+    uint8_t computed_stored[32];
+    SHA256(client_key, 32, computed_stored);
+
+    /* AuthMessage = client_first_bare + "," + server_first + "," + client_final_without_proof */
+    char client_final_without_proof[512];
+    snprintf(client_final_without_proof, sizeof(client_final_without_proof),
+             "c=biws,r=%s", combined_nonce);
+
+    char auth_message[1024];
+    snprintf(auth_message, sizeof(auth_message), "%s,%s,%s",
+             client_first_bare, server_first, client_final_without_proof);
+
+    /* ClientSignature = HMAC(StoredKey, AuthMessage) */
+    uint8_t client_sig[32];
+    unsigned int cs_len = 32;
+    HMAC(EVP_sha256(), computed_stored, 32,
+         (const unsigned char*)auth_message, strlen(auth_message),
+         client_sig, &cs_len);
+
+    /* ClientProof = ClientKey XOR ClientSignature */
+    uint8_t client_proof[32];
+    for (int i = 0; i < 32; i++) client_proof[i] = client_key[i] ^ client_sig[i];
+
+    /* Base64-encode the proof and build client-final-message */
+    char proof_b64[64];
+    test_b64_encode(client_proof, 32, proof_b64);
+
+    char client_final[1024];
+    snprintf(client_final, sizeof(client_final), "%s,p=%s",
+             client_final_without_proof, proof_b64);
+
+    /* --- SCRAM step 1: send client-final, expect SUCCESS --- */
+    state = keel_auth_process(ctx, client_final, strlen(client_final));
+    TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_SUCCESS);
+
+    keel_auth_context_free(ctx);
+    keel_free(salt_b64);
+    keel_free(hash);
+    keel_auth_manager_destroy(mgr);
+    TEST_END();
+}
+
+/* Drive a SCRAM exchange with a syntactically valid but cryptographically
+ * wrong ClientProof. Exercises the CRYPTO_memcmp unequal branch. */
+static void test_scram_constant_time_wrong(void) {
+    TEST_BEGIN("A3: SCRAM wrong ClientProof → FAILED (CRYPTO_memcmp unequal branch)");
+
+    keel_auth_manager_t* mgr = keel_auth_manager_create(NULL);
+    TEST_ASSERT_NOT_NULL(mgr);
+    if (!mgr) { TEST_END(); return; }
+
+    const char* password = "another-password";
+    char* hash = NULL;
+    int rc_hash = keel_auth_scram_hash_password(password, 4096, &hash);
+    TEST_ASSERT_EQ(rc_hash, (int)KEEL_OK);
+    if (!hash) { keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    char* salt_b64 = NULL;
+    int iterations = 0;
+    uint8_t stored_key[32];
+    uint8_t server_key[32];
+    keel_error_t err = keel_auth_scram_parse_hash(hash, &salt_b64,
+                                                  &iterations, stored_key, server_key);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    if (err != KEEL_OK) { keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    keel_auth_user_t user = {
+        .username = "wronguser",
+        .password_hash = hash,
+        .password_salt = salt_b64,
+        .iterations = iterations,
+        .has_scram_keys = true,
+        .can_login = true,
+    };
+    memcpy(user.stored_key, stored_key, 32);
+    memcpy(user.server_key, server_key, 32);
+    keel_auth_add_user(mgr, &user);
+
+    keel_auth_context_t* ctx = NULL;
+    err = keel_auth_manager_start(mgr, "wronguser", &ctx);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    TEST_ASSERT_NOT_NULL(ctx);
+    if (!ctx) { keel_free(salt_b64); keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return; }
+
+    /* Drain SASL advertisement */
+    void* msg = NULL; size_t msg_len = 0; int msg_type = 0;
+    err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+    if (err == KEEL_OK && msg) keel_free(msg);
+
+    /* step 0: client-first */
+    const char* client_first = "n,,n=wronguser,r=fakenonce000";
+    keel_auth_state_t state = keel_auth_process(ctx, client_first, strlen(client_first));
+    TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_CHALLENGE);
+
+    /* harvest combined nonce. The buffer from keel_auth_get_message is
+     * NOT NUL-terminated, so bound the copy with msg_len before strstr. */
+    err = keel_auth_get_message(ctx, &msg, &msg_len, &msg_type);
+    TEST_ASSERT_EQ(err, KEEL_OK);
+    if (!msg) { keel_auth_context_free(ctx); keel_free(salt_b64); keel_free(hash); keel_auth_manager_destroy(mgr); TEST_END(); return; }
+    char server_first_buf[512];
+    size_t body_len = msg_len >= 4 ? msg_len - 4 : 0;
+    if (body_len >= sizeof(server_first_buf)) body_len = sizeof(server_first_buf) - 1;
+    memcpy(server_first_buf, (const char*)msg + 4, body_len);
+    server_first_buf[body_len] = '\0';
+    const char* r_eq = strstr(server_first_buf, "r=");
+    const char* comma = r_eq ? strchr(r_eq, ',') : NULL;
+    char combined_nonce[256];
+    if (r_eq && comma) {
+        size_t nlen = (size_t)(comma - r_eq - 2);
+        memcpy(combined_nonce, r_eq + 2, nlen);
+        combined_nonce[nlen] = '\0';
+    } else {
+        combined_nonce[0] = '\0';
+    }
+    keel_free(msg);
+
+    /* step 1: send a wrong proof (32 zero bytes base64-encoded) */
+    uint8_t zero_proof[32];
+    memset(zero_proof, 0, 32);
+    char proof_b64[64];
+    test_b64_encode(zero_proof, 32, proof_b64);
+
+    char client_final[512];
+    snprintf(client_final, sizeof(client_final), "c=biws,r=%s,p=%s",
+             combined_nonce, proof_b64);
+    state = keel_auth_process(ctx, client_final, strlen(client_final));
+    TEST_ASSERT_EQ((int)state, (int)KEEL_AUTH_STATE_FAILED);
+
+    keel_auth_context_free(ctx);
+    keel_free(salt_b64);
+    keel_free(hash);
+    keel_auth_manager_destroy(mgr);
+    TEST_END();
+}
+
+#endif /* KEEL_HAS_OPENSSL */
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -952,6 +1496,15 @@ int main(void) {
     test_ldap_ops_api();
     test_pam_ops_api();
     test_auth_query_ops_api();
+
+    /* A3/A4 regression: constant-time comparison coverage */
+#ifdef KEEL_HAS_OPENSSL
+    test_md5_constant_time_correct();
+    test_md5_constant_time_wrong();
+    test_md5_rejects_wrong_length();
+    test_scram_constant_time_correct();
+    test_scram_constant_time_wrong();
+#endif
     
     printf("\n");
     return test_summary();
