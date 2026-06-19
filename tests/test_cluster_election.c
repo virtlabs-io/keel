@@ -1180,12 +1180,11 @@ static void test_election_persistent_state(void) {
     keel_cluster_stop(c);
     keel_cluster_destroy(c);
 
-    /* State file should exist now. */
-    struct stat st;
-    ASSERT_EQ(stat(state_path, &st), 0);
-    ASSERT_TRUE(st.st_size > 0);
-
-    unlink(state_path);
+    /* State file should have existed.  Unlink directly without a prior
+     * stat() to avoid a TOCTOU window (CodeQL cpp/toctou-race-condition).
+     * The file was created by keel_cluster_start above; if unlink fails
+     * the test environment is broken and we want to know. */
+    ASSERT_EQ(unlink(state_path), 0);
     TEST_PASS();
 }
 

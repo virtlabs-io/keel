@@ -33,6 +33,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#include <openssl/crypto.h>   /* OPENSSL_cleanse —不会被dead-store elimination优化掉的secure memset */
 #endif
 
 #include <arpa/inet.h>
@@ -495,9 +496,6 @@ keel_error_t keel_cloud_auth_aws_create(keel_cloud_auth_provider_t** out,
 
 /* ---- Base64url encoding for JWT ---- */
 
-static const char b64url_table[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
 /**
  * @brief Base64url-encode a byte array into a caller-supplied buffer.
  *
@@ -511,21 +509,30 @@ static const char b64url_table[] =
  */
 static size_t base64url_encode(const uint8_t* in, size_t len,
                                 char* out, size_t out_size) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t pos = 0;
-    for (size_t i = 0; i < len && pos + 4 < out_size; ) {
-        uint32_t a = in[i++];
-        uint32_t b = (i < len) ? in[i++] : 0;
-        uint32_t c = (i < len) ? in[i++] : 0;
-        uint32_t triple = (a << 16) | (b << 8) | c;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t triple = (uint32_t)in[i] << 16;
+        if (i + 1 < len) triple |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) triple |= (uint32_t)in[i + 2];
 
-        size_t rem = len - (i - (i < len ? 0 : (i > len ? 2 : 1)));
-        (void)rem;
-        out[pos++] = b64url_table[(triple >> 18) & 0x3F];
-        out[pos++] = b64url_table[(triple >> 12) & 0x3F];
-        if (i - 1 < len) out[pos++] = b64url_table[(triple >> 6) & 0x3F];
-        if (i     <= len) out[pos++] = b64url_table[triple & 0x3F];
+        if (pos + 2 >= out_size) break;
+        out[pos++] = table[(triple >> 18) & 0x3F];
+        out[pos++] = table[(triple >> 12) & 0x3F];
+        if (i + 1 < len) {
+            if (pos >= out_size - 1) break;
+            out[pos++] = table[(triple >> 6) & 0x3F];
+        }
+        if (i + 2 < len) {
+            if (pos >= out_size - 1) break;
+            out[pos++] = table[triple & 0x3F];
+        }
     }
-    out[pos] = '\0';
+    if (pos < out_size)
+        out[pos] = '\0';
+    else if (out_size > 0)
+        out[out_size - 1] = '\0';
     return pos;
 }
 
@@ -540,34 +547,28 @@ static size_t base64url_encode(const uint8_t* in, size_t len,
  * @return      Heap-allocated NUL-terminated base64url string, or NULL on
  *              allocation failure.
  */
-/* Simpler base64url encode that handles padding correctly */
 static char* base64url_encode_alloc(const uint8_t* data, size_t len) {
-    size_t out_len = ((len + 2) / 3) * 4 + 1;
+    /* Output length for base64url without padding:
+     *   ceil(len/3)*4 when len%3==0,
+     *   ceil(len/3)*4 - (3-len%3) when len%3!=0.
+     * The formula (len*4+2)/3 covers all cases. +1 for NUL. */
+    size_t out_len = (len * 4 + 2) / 3 + 1;
     char* out = keel_malloc(out_len);
     if (!out) return NULL;
 
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t pos = 0;
-    size_t i = 0;
-    while (i < len) {
-        uint32_t a = data[i++];
-        uint32_t b = (i < len) ? data[i++] : 0;
-        uint32_t c = (i < len) ? data[i++] : 0;
-        uint32_t triple = (a << 16) | (b << 8) | c;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t triple = (uint32_t)data[i] << 16;
+        if (i + 1 < len) triple |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < len) triple |= (uint32_t)data[i + 2];
 
-        out[pos++] = b64url_table[(triple >> 18) & 0x3F];
-        out[pos++] = b64url_table[(triple >> 12) & 0x3F];
-
-        size_t mod = (i < len + 2) ? 3 : ((len - (i - 3)) + 2);
-        (void)mod;
-
-        /* Only emit 3rd char if we had >= 2 bytes, 4th if >= 3 bytes */
-        size_t chunk_start = i - ((i <= len) ? 3 : (len % 3 == 0 ? 3 : len % 3));
-        size_t chunk_len = (i <= len) ? 3 : (len - chunk_start);
-
-        if (chunk_len >= 2) out[pos++] = b64url_table[(triple >> 6) & 0x3F];
-        if (chunk_len >= 3) out[pos++] = b64url_table[triple & 0x3F];
+        out[pos++] = table[(triple >> 18) & 0x3F];
+        out[pos++] = table[(triple >> 12) & 0x3F];
+        if (i + 1 < len) out[pos++] = table[(triple >> 6) & 0x3F];
+        if (i + 2 < len) out[pos++] = table[triple & 0x3F];
     }
-    /* No padding in base64url */
     out[pos] = '\0';
     return out;
 }
@@ -1066,7 +1067,7 @@ static keel_error_t gcp_iam_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                memset(buf, 0, sizeof(buf));
+                OPENSSL_cleanse(buf, sizeof(buf));
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1295,7 +1296,7 @@ static keel_error_t azure_ad_fetch_token(keel_cloud_auth_provider_t* prov,
                 char* token = keel_malloc(nread + 1);
                 if (!token) return KEEL_ERR_NOMEM;
                 memcpy(token, buf, nread + 1);
-                memset(buf, 0, sizeof(buf));
+                OPENSSL_cleanse(buf, sizeof(buf));
                 token_out->token = token;
                 token_out->token_len = nread;
                 token_out->expires_at = time(NULL) + 3000;
@@ -1442,8 +1443,10 @@ static keel_error_t static_fetch_token(keel_cloud_auth_provider_t* prov,
     if (!token) return KEEL_ERR_NOMEM;
     memcpy(token, buf, nread + 1);
 
-    /* Zero the stack buffer that held the secret */
-    memset(buf, 0, sizeof(buf));
+    /* Zero the stack buffer that held the secret.
+     * OPENSSL_cleanse uses a volatile-qualified internally so the compiler
+     * cannot dead-store-eliminate it (CodeQL cpp/memset-may-be-deleted). */
+    OPENSSL_cleanse(buf, sizeof(buf));
 
     token_out->token = token;
     token_out->token_len = nread;

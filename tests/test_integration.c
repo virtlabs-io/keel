@@ -790,6 +790,9 @@ static ssize_t pg_recv(integ_pg_conn_t* conn, void* buf, size_t len) {
 }
 
 static ssize_t pg_send(integ_pg_conn_t* conn, const void* buf, size_t len) {
+    /* Intentional plaintext send: this is test code that speaks raw
+     * PostgreSQL wire protocol to validate the proxy's behavior.
+     * NOLINT(cpp/cleartext-transmission) */
     return send(conn->fd, buf, len, 0);
 }
 
