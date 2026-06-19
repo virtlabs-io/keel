@@ -374,6 +374,9 @@ endif()
 # Required:
 #   Threads (pthreads) — worker threads, mutexes, condition variables
 #   OpenSSL            — TLS termination, SCRAM-SHA-256 auth, MD5
+#   zlib               — gzip codec in compress.c (always required; used by
+#                        cluster wire compression, HTTP gzip responses, and
+#                        the Prometheus admin endpoint)
 #
 # Optional:
 #   liburing — io_uring backend for zero-copy I/O on Linux 5.6+.
@@ -381,6 +384,8 @@ endif()
 #              fallback for systems without a .pc file.
 # ============================================================================
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
+message(STATUS "KEEL: Found zlib ${ZLIB_VERSION_STRING} at ${ZLIB_INCLUDE_DIR}")
 
 # io_uring
 if(KEEL_USE_IOURING)

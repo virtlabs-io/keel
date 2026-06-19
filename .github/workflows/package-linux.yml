@@ -75,6 +75,7 @@ jobs:
             gnupg \
             libssl-dev \
             liburing-dev \
+            zlib1g-dev \
             lua5.4 \
             liblua5.4-dev \
             python3 \
@@ -135,6 +136,7 @@ jobs:
                 libssl-dev \
                 liburing-dev \
                 libyaml-dev \
+                zlib1g-dev \
                 lua5.4 \
                 liblua5.4-dev \
                 python3 \
@@ -157,6 +159,7 @@ jobs:
                 libssl-dev \
                 liburing-dev \
                 libyaml-dev \
+                zlib1g-dev \
                 lua5.4 \
                 liblua5.4-dev \
                 python3 \
@@ -183,6 +186,7 @@ jobs:
                 openssl-devel \
                 liburing-devel \
                 libyaml-devel \
+                zlib-devel \
                 lua \
                 lua-devel \
                 python3 \
