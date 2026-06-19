@@ -48,6 +48,9 @@ concurrency:
   group: hub-publish-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Build and push — one job per distro (runs in parallel)

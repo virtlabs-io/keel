@@ -25,6 +25,9 @@ concurrency:
   group: soak-test
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   soak:
     name: 30-minute soak test
