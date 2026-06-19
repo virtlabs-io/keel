@@ -1908,7 +1908,7 @@ keel_error_t keel_auth_scram_hash_password(
         return KEEL_ERR_NOMEM;
     }
     
-    snprintf(hash, len, "SCRAM-SHA-256$%d:%s:%s:%s",
+    snprintf(hash, len, "SCRAM-SHA-256$%d:%s$%s:%s",
              iterations, salt_b64, stored_b64, server_b64);
     
     keel_free(salt_b64);
@@ -1960,8 +1960,12 @@ keel_error_t keel_auth_scram_parse_hash(
     *iterations = atoi(p);
     p = colon + 1;
     
-    /* Parse salt */
-    colon = strchr(p, ':');
+    /* Parse salt.  The salt/stored_key separator is '$' in the
+     * PostgreSQL-standard format (SCRAM-SHA-256$iter:salt$stored:server)
+     * but was ':' in older Keel builds.  Accept either so existing
+     * userlist files keep working while new hashes match PostgreSQL. */
+    colon = strchr(p, '$');
+    if (!colon) colon = strchr(p, ':');
     if (!colon) return KEEL_ERR_INVALID_ARG;
     
     *salt_out = keel_strndup(p, (size_t)(colon - p));
