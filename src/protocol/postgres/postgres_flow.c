@@ -183,6 +183,7 @@ static void pg_stmt_clear_all(pg_flow_ctx_t* ctx)
     ctx->stmt_discard_plans_before_execute = false;
     ctx->stmt_discard_plans_absorb_pending = false;
     ctx->named_stmt_count = 0;
+    ctx->unnamed_stmt_valid = false;  /* review_20260620_01.md RC-5 */
 
     for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
         if (ctx->stmt_cache[i].wire_msg) {
@@ -2799,15 +2800,35 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             ctx->stmt_last_tx_end_was_rollback = true;
         }
 
-        /* Conservative semantic invalidation:
-         * - Unknown/unmodellable utility semantics => never reuse stmt set.
-         * - DDL or DISCARD PLANS/ALL => invalidate prepared-stmt set and
-         *   bump schema epoch so semantic compatibility changes deterministically.
+        /* Conservative semantic invalidation (review_20260620_01.md RC-3):
+         *
+         * Vanilla PostgreSQL does NOT drop named prepared statements on DDL
+         * or DISCARD PLANS — only on DISCARD ALL or explicit DEALLOCATE.
+         * The proxy must mirror this so a client that issues DDL between
+         * two EXECUTEs of a previously-prepared statement still finds the
+         * named statement available on the next borrowed backend.
+         *
+         * Strategy:
+         *   - UNKNOWN utility: set semantic_unknown (force DISCARD ALL on
+         *     release) but KEEP the cache.  The client-visible named-PS set
+         *     is preserved so future Bind calls can replay on a fresh
+         *     backend.  The dirty-orphan flag forces backend cleanup so any
+         *     unmodellable state is swept before reuse.
+         *   - DDL (CREATE/ALTER/DROP, non-temp): bump schema_epoch so plans
+         *     are invalidated downstream; KEEP the cache.  Set dirty-orphan
+         *     so the current backend's cached plans are discarded via
+         *     DISCARD PLANS at the next EXECUTE (see stmt_discard_plans_*).
+         *   - DISCARD PLANS: bump schema_epoch; KEEP the cache.  Named PS
+         *     survive per vanilla PG.  dirty-orphan triggers plan flush.
+         *   - DISCARD ALL: clear the cache (the backend really did drop
+         *     every named statement).  This is the only branch that wipes
+         *     client-visible state — and it is correct because the client
+         *     requested it.
          */
         if (qtype == KEEL_QUERY_UNKNOWN || (eff & KEEL_QE_UNKNOWN_STATE)) {
             ctx->stmt_semantic_unknown = true;
-            pg_stmt_clear_all(ctx);
-            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
+            if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                ctx->stmt_backend_dirty_orphan_ps = true;
             pg_stmt_restamp_context(ctx);
         } else if ((qtype == KEEL_QUERY_CREATE ||
                     qtype == KEEL_QUERY_ALTER ||
@@ -2815,36 +2836,40 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                    !pg_stmt_is_temp_context_change(ctx, sql, sl, qtype)) {
             ctx->stmt_schema_epoch++;
             ctx->stmt_semantic_unknown = false;
-            /* The DDL may have been issued via Parse(name,...)+Bind+Execute,
-             * leaving an orphan named PS on the backend that KEEL no longer
-             * tracks after clear_all.  Flag the backend dirty so release
-             * forces DISCARD ALL. */
+            /* Bump dirty-orphan so the release path forces DISCARD ALL on
+             * the current backend before reuse: DDL may have invalidated
+             * cached plans whose lifetime the proxy cannot otherwise track
+             * precisely.  The named-PS cache is preserved so future Bind
+             * calls in the SAME session replay correctly on a new backend. */
             if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
                 ctx->stmt_backend_dirty_orphan_ps = true;
-            pg_stmt_clear_all(ctx);
-            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
             pg_stmt_restamp_context(ctx);
         } else if ((qtype == KEEL_QUERY_DISCARD ||
                     (qtype == KEEL_QUERY_RESET &&
                      pg_sql_contains_word_ci(sql, sl, "discard"))) &&
                    (pg_sql_contains_word_ci(sql, sl, "all") ||
                     pg_sql_contains_word_ci(sql, sl, "plans"))) {
+            bool is_discard_all = pg_sql_contains_word_ci(sql, sl, "all");
             ctx->stmt_schema_epoch++;
             ctx->stmt_semantic_unknown = false;
-            /* DISCARD PLANS does not deallocate named PS — mark orphan.
-             * DISCARD ALL does deallocate — no orphan flag needed. */
-            if (pg_sql_contains_word_ci(sql, sl, "plans") &&
-                !pg_sql_contains_word_ci(sql, sl, "all") &&
-                (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0))
-                ctx->stmt_backend_dirty_orphan_ps = true;
-            pg_stmt_clear_all(ctx);
-            act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
-            /* DISCARD ALL resets all GUC settings and role back to session
-             * defaults (equivalent to RESET ALL + SET SESSION AUTHORIZATION
-             * DEFAULT).  DISCARD PLANS only drops cached plans; GUC values
-             * are unaffected.  Reset the context fields so the compatibility
-             * signature and replay buffer reflect the cleaned-up state. */
-            if (pg_sql_contains_word_ci(sql, sl, "all")) {
+            if (!is_discard_all) {
+                /* DISCARD PLANS: invalidate cached plans only.  Named PS
+                 * survive per vanilla PG.  Flag dirty-orphan so the current
+                 * backend gets DISCARD PLANS at next EXECUTE / DISCARD ALL
+                 * on release.  Explicitly mask out any PREPARED_STMT
+                 * pin_clear that classify_sql may have set (the analyzer
+                 * treats DISCARD as plan-invalidating which is correct,
+                 * but the pin must stay so future Bind calls can replay
+                 * the still-existing named PS on a new backend). */
+                if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                    ctx->stmt_backend_dirty_orphan_ps = true;
+                act->pin_clear &= ~(keel_flow_pin_reason_t)KEEL_FPIN_PREPARED_STMT;
+            } else {
+                /* DISCARD ALL: backend truly dropped every named PS — drop
+                 * the cache too so future Bind calls match backend reality.
+                 * Also reset GUCs and role per vanilla PG semantics. */
+                pg_stmt_clear_all(ctx);
+                act->pin_clear |= KEEL_FPIN_PREPARED_STMT;
                 pg_stmt_guc_change_t reset_all = {
                     .valid = true, .is_reset_all = true
                 };
@@ -2868,8 +2893,21 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             ctx->xid_probe_result  = 0;
             KEEL_LOG_TRACE(KEEL_LOG_CAT_PROTO, "[XID-PROBE] SET active ctx=%p (Simple Query COMMIT)", (void*)ctx);
         }
-        /* DEALLOCATE / DISCARD wipes all named stmts on the backend */
-        if (pc & KEEL_FPIN_PREPARED_STMT) {
+        /* DEALLOCATE / DISCARD wipes all named stmts on the backend.
+         *
+         * review_20260620_01.md RC-3: DISCARD PLANS does NOT wipe named
+         * PS on the backend (only cached plans).  Skip this block for
+         * DISCARD PLANS so the cache and pin_clear stay intact; the
+         * schema_epoch bump in the Simple Query semantic-invalidation
+         * block above handles plan invalidation via the existing
+         * stmt_discard_plans_* mechanism. */
+        bool is_discard_plans_only =
+            (qtype == (uint32_t)KEEL_QUERY_DISCARD ||
+             (qtype == (uint32_t)KEEL_QUERY_RESET &&
+              pg_sql_contains_word_ci(sql, sl, "discard"))) &&
+            pg_sql_contains_word_ci(sql, sl, "plans") &&
+            !pg_sql_contains_word_ci(sql, sl, "all");
+        if ((pc & KEEL_FPIN_PREPARED_STMT) && !is_discard_plans_only) {
             /* Clear any in-flight pending tracking PREPARE — the DISCARD/DEALLOCATE
              * supersedes it.  Free the saved prior wire_msg to avoid a leak. */
             if (ctx->pending_track_valid) {
@@ -3023,11 +3061,31 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
          * that match PostgreSQL behaviour exactly.
          */
         if ((ps & KEEL_FPIN_PREPARED_STMT)
-            && ctx->ps_mode == KEEL_PS_MODE_TRACKING
-            && qtype == (uint32_t)KEEL_QUERY_PREPARE) {
-            /* Strip HARD_PIN: TRACKING mode virtualises PREPARE via the
-             * session-hash replay path; the backend is not hard-pinned. */
-            act->effect &= ~(keel_query_effect_flags_t)KEEL_QE_HARD_PIN;
+            && qtype == (uint32_t)KEEL_QUERY_PREPARE
+            && ctx->ps_mode != KEEL_PS_MODE_OFF
+            && ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
+            /* Intercept simple-query PREPARE in every mode except OFF and
+             * ANONYMOUS.  OFF bypasses all tracking (hard-pin only); ANONYMOUS
+             * rewrites at Bind time and never accumulates named state on the
+             * backend.
+             *
+             * Promoting this intercept from TRACKING-only to all virtualizable
+             * modes (VIRTUALIZE, TRACKING, PINNING) closes the silent-pool-
+             * corruption class where a default-configured (virtualize) Keel
+             * forwards simple-query PREPARE verbatim, fails to track the
+             * resulting named PS, and lets the next borrower hit a dirty
+             * backend (review_20260620_01.md RC-1).
+             *
+             * In PINNING mode the backend is already hard-pinned by the
+             * PREPARE classification; the cache entry is still useful so
+             * pgf_get_stmt_compat_profile can populate the hash vector for
+             * correct release-path stamping.
+             *
+             * Strip HARD_PIN in virtualizable modes: the entry is replayed
+             * via the session-hash path; the backend is not hard-pinned.
+             * PINNING keeps HARD_PIN (the mode's defining behaviour). */
+            if (ctx->ps_mode != KEEL_PS_MODE_PINNING)
+                act->effect &= ~(keel_query_effect_flags_t)KEEL_QE_HARD_PIN;
             char  trk_name[64];   trk_name[0]  = '\0';
             char  trk_body[2048]; trk_body[0]  = '\0';
             size_t trk_body_len = 0;
@@ -3346,6 +3404,37 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                      * follow without a Bind for simple pipelines. */
                     if (stmt_name[0] == '\0') {
                         pg_stmt_activate(ctx, entry);
+                        /* Store wire for re-Parse on Bind after error
+                         * (review_20260620_01.md RC-5).  Free any prior
+                         * wire first. */
+                        if (entry->wire_msg) {
+                            keel_free(entry->wire_msg);
+                            entry->wire_msg = NULL;
+                            entry->wire_msg_len = 0;
+                        }
+                        if (len <= PG_STMT_MAX_WIRE) {
+                            entry->wire_msg = (uint8_t*)keel_malloc(len);
+                            if (entry->wire_msg) {
+                                memcpy(entry->wire_msg, data, len);
+                                entry->wire_msg_len = len;
+                            }
+                        }
+                        /* Do NOT push to pending_parse queue: the queue is
+                         * reserved for NAMED parses (which need
+                         * confirmation to enter session_stmt_hash).  The
+                         * unnamed-stmt validity is tracked via the
+                         * dedicated unnamed_stmt_valid flag; its
+                         * ParseComplete is detected by an empty queue in
+                         * pgf_on_be_msg case '1'.  This keeps
+                         * pg_stmt_recompute_session_hash and the replay
+                         * vector free of unnamed entries (which must
+                         * never contribute to session_stmt_hash). */
+                        /* Reset unnamed validity: a fresh Parse('') is now
+                         * in flight; confirmation happens on ParseComplete
+                         * (sets true) or rollback on ErrorResponse (stays
+                         * false).  review_20260620_01.md RC-5. */
+                        ctx->unnamed_stmt_valid = false;
+                        ctx->unnamed_parse_in_flight = true;
                     }
                 }
             }
@@ -3373,6 +3462,63 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                     (unsigned long long)ctx->session_stmt_hash);
                 if (entry) {
                     pg_stmt_activate(ctx, entry);
+                }
+
+                /* Unnamed-statement recovery (review_20260620_01.md RC-5 /
+                 * v0.2-alpha Gap 3).
+                 *
+                 * If the most recent Parse('') failed, the unnamed slot on
+                 * the backend is in an undefined state.  Some backend
+                 * versions silently keep the prior unnamed stmt; others
+                 * surface "unnamed prepared statement does not exist" on
+                 * the next Bind('').  To make the proxy's behaviour
+                 * deterministic across backend versions, when the cached
+                 * unnamed entry has wire_msg available we transparently
+                 * re-Parse before forwarding the Bind.  If the original
+                 * SQL was bad the re-Parse will error and the Bind will
+                 * not run — the client receives the same error it would
+                 * have seen with no proxy.  If the SQL was good but
+                 * failed for an environmental reason (temp table gone,
+                 * dropped column, etc.) the re-Parse may succeed and the
+                 * Bind proceeds. */
+                if (stmt_name[0] == '\0'
+                    && !ctx->unnamed_stmt_valid
+                    && ctx->ps_mode != KEEL_PS_MODE_OFF
+                    && ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
+                    pg_stmt_entry_t* un = pg_stmt_find(ctx, "");
+                    if (un && un->valid && un->wire_msg && un->wire_msg_len > 0) {
+                        /* Grow the anon_rewrite_buf to hold Parse + Bind.
+                         * This buffer is already used for the anonymous-mode
+                         * rewrite below and is owned by the ctx. */
+                        size_t total = un->wire_msg_len + len;
+                        if (ctx->anon_rewrite_cap < total) {
+                            uint8_t* nb = (uint8_t*)keel_malloc(total);
+                            if (nb) {
+                                keel_free(ctx->anon_rewrite_buf);
+                                ctx->anon_rewrite_buf  = nb;
+                                ctx->anon_rewrite_cap  = total;
+                            }
+                        }
+                        if (ctx->anon_rewrite_buf &&
+                            ctx->anon_rewrite_cap >= total) {
+                            memcpy(ctx->anon_rewrite_buf,
+                                   un->wire_msg, un->wire_msg_len);
+                            memcpy(ctx->anon_rewrite_buf + un->wire_msg_len,
+                                   data, len);
+                            act->be_payload     = ctx->anon_rewrite_buf;
+                            act->be_payload_len = total;
+                            /* The re-Parse produces a ParseComplete that
+                             * pgf_on_be_msg '1' handler will pop from the
+                             * pending_parse queue (which is empty here, so
+                             * the pop is a no-op).  The Bind's BindComplete
+                             * is still counted by ext_response_count=1.
+                             * Mark unnamed valid again on optimistic
+                             * assumption; the '1' handler will reconfirm. */
+                            ctx->unnamed_stmt_valid = true;
+                            KEEL_DIAG_PS("UNNAMED-REPARSE ctx=%p wire_len=%zu",
+                                         (void*)ctx, un->wire_msg_len);
+                        }
+                    }
                 }
 
                 /* Anonymous mode: JIT-rewrite named Bind → anonymous Parse+Bind.
@@ -3492,7 +3638,12 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             /* Semantic invalidation for DDL, DISCARD ALL/PLANS, and unknown
              * utility — mirrors the Simple Query path so protocol context
              * stays consistent regardless of whether extended protocol is
-             * used.  Must run before the temp-epoch and GUC blocks below. */
+             * used.  Must run before the temp-epoch and GUC blocks below.
+             *
+             * review_20260620_01.md RC-3: do NOT call pg_stmt_clear_all on
+             * UNKNOWN, DDL, or DISCARD PLANS — vanilla PostgreSQL keeps the
+             * named-PS registry across these statements.  Only DISCARD ALL
+             * truly drops named PS on the backend and is mirrored here. */
             if (ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
                 uint32_t cqt  = ctx->cached_query_type;
                 const char* csql = ctx->cached_sql;
@@ -3501,7 +3652,8 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
 
                 if (cqt == KEEL_QUERY_UNKNOWN || (ceff & KEEL_QE_UNKNOWN_STATE)) {
                     ctx->stmt_semantic_unknown = true;
-                    pg_stmt_clear_all(ctx);
+                    if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                        ctx->stmt_backend_dirty_orphan_ps = true;
                     pg_stmt_restamp_context(ctx);
                 } else if ((cqt == KEEL_QUERY_CREATE ||
                             cqt == KEEL_QUERY_ALTER  ||
@@ -3509,27 +3661,24 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                            !pg_stmt_is_temp_context_change(ctx, csql, csl, cqt)) {
                     ctx->stmt_schema_epoch++;
                     ctx->stmt_semantic_unknown = false;
-                    /* Extended-protocol DDL via named Parse leaves an orphan
-                     * named PS on the backend (KEEL forgets the name after
-                     * clear_all but PG still has it).  Flag so release forces
-                     * DISCARD ALL. */
                     if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
                         ctx->stmt_backend_dirty_orphan_ps = true;
-                    pg_stmt_clear_all(ctx);
                     pg_stmt_restamp_context(ctx);
                 } else if ((cqt == KEEL_QUERY_DISCARD ||
                             (cqt == KEEL_QUERY_RESET &&
                              pg_sql_contains_word_ci(csql, csl, "discard"))) &&
                            (pg_sql_contains_word_ci(csql, csl, "all") ||
                             pg_sql_contains_word_ci(csql, csl, "plans"))) {
+                    bool c_is_all = pg_sql_contains_word_ci(csql, csl, "all");
                     ctx->stmt_schema_epoch++;
                     ctx->stmt_semantic_unknown = false;
-                    if (pg_sql_contains_word_ci(csql, csl, "plans") &&
-                        !pg_sql_contains_word_ci(csql, csl, "all") &&
-                        (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0))
-                        ctx->stmt_backend_dirty_orphan_ps = true;
-                    pg_stmt_clear_all(ctx);
-                    if (pg_sql_contains_word_ci(csql, csl, "all")) {
+                    if (!c_is_all) {
+                        if (pg_stmt_has_confirmed_entries(ctx) || ctx->named_stmt_count > 0)
+                            ctx->stmt_backend_dirty_orphan_ps = true;
+                        /* Keep PREPARED_STMT pin — DISCARD PLANS preserves
+                         * named PS per vanilla PG semantics (RC-3). */
+                    } else {
+                        pg_stmt_clear_all(ctx);
                         pg_stmt_guc_change_t reset_all = {
                             .valid = true, .is_reset_all = true
                         };
@@ -3957,8 +4106,15 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
                     (void*)ctx, pending_name,
                     (unsigned long long)pending_hash,
                     (unsigned long long)ctx->session_stmt_hash);
-            } else {
-                KEEL_DIAG_PS("PCOMP ctx=%p (no pending — unnamed or empty queue)", (void*)ctx);
+            } else if (ctx->unnamed_parse_in_flight) {
+                /* Empty queue + an unnamed Parse in flight ⇒ this
+                 * ParseComplete is for the unnamed Parse.  Mark the slot
+                 * valid (review_20260620_01.md RC-5).  The unnamed entry
+                 * is intentionally not marked confirmed and does not
+                 * contribute to session_stmt_hash. */
+                ctx->unnamed_stmt_valid       = true;
+                ctx->unnamed_parse_in_flight  = false;
+                KEEL_DIAG_PS("PCOMP ctx=%p (unnamed) valid=true", (void*)ctx);
             }
         }
         return 0;
@@ -4021,6 +4177,13 @@ static int pgf_on_be_msg(void* vctx, const uint8_t* data, size_t len,
     case 'E': /* ErrorResponse */
         act->is_error_response = true;
         ctx->stmt_discard_plans_absorb_pending = false;
+        /* review_20260620_01.md RC-5: if an unnamed Parse was in flight,
+         * its ErrorResponse means the unnamed slot is undefined.  Clear
+         * the validity flag so the next Bind('') triggers a re-Parse. */
+        if (ctx->unnamed_parse_in_flight) {
+            ctx->unnamed_stmt_valid       = false;
+            ctx->unnamed_parse_in_flight  = false;
+        }
         pg_pending_parse_clear(ctx);
         if (keel_diag_ps_enabled()) {
             const uint8_t* dp  = data + 5;
@@ -5222,6 +5385,49 @@ static int pgf_get_stmt_compat_profile(void* vctx,
     out->search_path_hash = ctx->stmt_search_path_hash;
     out->guc_hash = ctx->stmt_guc_hash;
     out->semantic_unknown = ctx->stmt_semantic_unknown;
+
+    /* Populate the per-statement hash vector (review_20260620_01.md RC-4).
+     *
+     * The vector backs `stmt_set_hash` (XOR fold).  The borrow path now
+     * requires full-array equality after the XOR pre-filter matches, which
+     * closes the silent collision class where two materially different
+     * statement sets XOR to the same value.
+     *
+     * If the live statement set exceeds KEEL_STMT_HASH_VECTOR_MAX, flag
+     * semantic_unknown and skip vector population: the borrow path will
+     * refuse the false match and force full cleanup before reuse
+     * (correctness over reuse). */
+    uint32_t count = 0;
+    for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
+        const pg_stmt_entry_t* e = &ctx->stmt_cache[i];
+        if (!e->valid || !e->confirmed || e->name[0] == '\0')
+            continue;
+        if (e->hash == 0)
+            continue;
+        if (count >= KEEL_STMT_HASH_VECTOR_MAX) {
+            out->semantic_unknown = true;
+            out->stmt_hash_count  = 0;
+            count = 0;
+            break;
+        }
+        out->stmt_hashes[count++] = e->hash;
+    }
+    if (count > 0) {
+        /* Insertion sort — vector is small (≤ 512) and mostly sorted in
+         * practice (stmts are usually added in name order).  Worst case
+         * O(N²) is acceptable per correctness-first policy. */
+        for (uint32_t i = 1; i < count; i++) {
+            uint64_t key = out->stmt_hashes[i];
+            int32_t  j   = (int32_t)i - 1;
+            while (j >= 0 && out->stmt_hashes[j] > key) {
+                out->stmt_hashes[j + 1] = out->stmt_hashes[j];
+                j--;
+            }
+            out->stmt_hashes[j + 1] = key;
+        }
+        out->stmt_hash_count = count;
+    }
+
     /* One-shot orphan flag: a prior DDL or DISCARD PLANS cleared KEEL's
      * stmt cache but left named prepared statements alive on the backend.
      * Force semantic_unknown so the release path issues DISCARD ALL.  The

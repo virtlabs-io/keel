@@ -325,11 +325,32 @@ typedef enum keel_commit_doubt_reason {
 } keel_commit_doubt_reason_t;
 
 /**
+ * @brief Maximum number of per-statement hashes stored in a compatibility
+ *        profile.
+ *
+ * Set equal to the per-session prepared-statement cache size so every
+ * cached statement can contribute its own hash slot.  When the live
+ * statement set exceeds this size the profile is flagged
+ * `semantic_unknown` and the borrow path falls back to forced full
+ * cleanup before reuse (correctness over reuse).  The previous value
+ * (64) was too small for ORM-generated workloads (Hibernate, EclipseLink,
+ * SQLAlchemy) that can prepare hundreds of named statements per session
+ * and caused silent stmt_set_hash collisions (see review_20260620_01.md
+ * RC-4 / v0.2-alpha Gap 2). */
+#define KEEL_STMT_HASH_VECTOR_MAX 512
+
+/**
  * @brief Prepared-statement semantic compatibility profile.
  *
  * This profile separates statement identity (stmt_set_hash) from semantic
  * execution context (search_path, role/auth, GUCs, schema epoch). Core code
  * uses it to decide whether backend statement reuse is safe.
+ *
+ * `stmt_hashes` is a sorted vector of per-statement hashes that backs
+ * `stmt_set_hash`.  Two profiles are only considered compatible when both
+ * the XOR hash and the full vector contents match (count + each element).
+ * This closes the silent collision class where two materially different
+ * statement sets XOR to the same value (review_20260620_01.md RC-4).
  */
 typedef struct keel_stmt_compat_profile {
     uint64_t stmt_set_hash;          /**< Hash of confirmed named statement set */
@@ -339,6 +360,10 @@ typedef struct keel_stmt_compat_profile {
     uint64_t search_path_hash;       /**< search_path hash */
     uint64_t guc_hash;               /**< Replay-relevant GUC hash */
     bool     semantic_unknown;       /**< Conservative "do not reuse" marker */
+    uint32_t stmt_hash_count;        /**< Number of valid entries in stmt_hashes[] */
+    /** Per-statement hashes, ascending order.  Only the first
+     *  `stmt_hash_count` entries are meaningful; the rest are zero. */
+    uint64_t stmt_hashes[KEEL_STMT_HASH_VECTOR_MAX];
 } keel_stmt_compat_profile_t;
 
 /* ============================================================================

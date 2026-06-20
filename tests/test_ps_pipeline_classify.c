@@ -22,6 +22,7 @@
 #include "test_utils.h"
 
 #include "keel/engine/engine_flow.h"
+#include "keel/engine/backend_pool.h"
 #include "keel/protocol/protocol_flow.h"
 #include "keel/protocol/postgres/postgres_flow_internal.h"
 #include "keel/session/session.h"
@@ -128,6 +129,44 @@ static size_t build_rfq(uint8_t* buf, char status)
     wr32(buf + 1, 5);
     buf[5] = (uint8_t)status;
     return 6;
+}
+
+/* Build a Simple Query ('Q') message: 'Q' + len(4) + sql + NUL. */
+static size_t build_query(uint8_t* buf, const char* sql)
+{
+    size_t sl = strlen(sql);
+    buf[0] = 'Q';
+    wr32(buf + 1, (uint32_t)(4 + sl + 1));
+    memcpy(buf + 5, sql, sl + 1);
+    return 1 + 4 + sl + 1;
+}
+
+/* Build a backend CommandComplete ('C') message with a tag. */
+static size_t build_command_complete(uint8_t* buf, const char* tag)
+{
+    size_t tl = strlen(tag);
+    buf[0] = 'C';
+    wr32(buf + 1, (uint32_t)(4 + tl + 1));
+    memcpy(buf + 5, tag, tl + 1);
+    return 1 + 4 + tl + 1;
+}
+
+/* Build a backend ErrorResponse ('E') with SQLSTATE 42601 (syntax_error)
+ * and a human-readable message.  Used to simulate a failed Parse. */
+static size_t build_error_response(uint8_t* buf, const char* msg)
+{
+    buf[0] = 'E';
+    uint8_t* p = buf + 5;
+    *p++ = 'S'; const char* sev = "ERROR"; size_t sl = strlen(sev);
+    memcpy(p, sev, sl + 1); p += sl + 1;
+    *p++ = 'C'; const char* code = "42601"; size_t cl = strlen(code);
+    memcpy(p, code, cl + 1); p += cl + 1;
+    *p++ = 'M'; size_t ml = strlen(msg);
+    memcpy(p, msg, ml + 1); p += ml + 1;
+    *p++ = '\0';
+    size_t body = (size_t)(p - buf) - 1;
+    wr32(buf + 1, (uint32_t)body);
+    return 1 + body;
 }
 
 /* Return true if @p ctx has any cache entry (valid, any confirmed state)
@@ -282,24 +321,25 @@ static void test_prefetch_stops_on_truncated_frame(void)
 }
 
 /* -------------------------------------------------------------------------
- * Test 4: stmt-replay snapshot taken BEFORE prefetch survives a DDL
- *         classification inside the follow buffer.
+ * Test 4: stmt-replay snapshot taken BEFORE prefetch survives a
+ *         cache-clearing classification inside the follow buffer.
  *
  * Engine contract: when state_sync / stmt_replay / deferred BEGIN /
  * full cleanup is about to stash the follow buffer, the engine MUST
  * capture get_stmt_replay() before invoking the pre-classify helper.
- * Otherwise a DDL message inside the tail (CREATE/ALTER/DROP) clears
- * the per-session stmt cache via pg_stmt_clear_all() and the later
- * replay would be empty — even though the borrowed backend still needs
+ * Otherwise a DISCARD ALL message inside the tail clears the per-
+ * session stmt cache via pg_stmt_clear_all() and the later replay
+ * would be empty — even though the borrowed backend still needs
  * Parse(S_N) so the tail's Bind(S_N) can succeed.
  *
- * This test pins the snapshot semantics: a buffer captured pre-DDL
- * contains S_1, and re-querying post-DDL returns no entries — so the
- * fix is materially required and the snapshot is materially useful.
+ * review_20260620_01.md RC-3 changed DDL/DISCARD-PLANS to preserve
+ * the cache (matching vanilla PostgreSQL semantics); DISCARD ALL is
+ * now the only statement that wipes the named-PS set in the proxy
+ * cache.  This test was updated to use DISCARD ALL as the trigger.
  * ------------------------------------------------------------------------- */
 static void test_replay_snapshot_survives_ddl_prefetch(void)
 {
-    TEST_BEGIN("ps pipeline: stmt-replay snapshot taken pre-prefetch survives DDL clear");
+    TEST_BEGIN("ps pipeline: stmt-replay snapshot taken pre-prefetch survives cache clear");
 
     void* ctx = startup_pg_ctx();
 
@@ -322,7 +362,7 @@ static void test_replay_snapshot_survives_ddl_prefetch(void)
     pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
     TEST_ASSERT(stmt_cache_has(c, "S_1"));
 
-    /* Snapshot replay BEFORE any DDL classification. */
+    /* Snapshot replay BEFORE any cache-clearing classification. */
     uint8_t* snap_buf   = NULL;
     size_t   snap_len   = 0;
     uint32_t snap_count = 0;
@@ -333,9 +373,9 @@ static void test_replay_snapshot_survives_ddl_prefetch(void)
     TEST_ASSERT(snap_len > 0);
     TEST_ASSERT_EQ(snap_count, 1u);
 
-    /* Now prefetch a follow buffer that contains a DDL Parse.  The DDL
-     * path inside the protocol plugin invokes pg_stmt_clear_all(),
-     * wiping S_1 from the cache. */
+    /* Now prefetch a follow buffer that contains a DISCARD ALL Parse.
+     * The DISCARD ALL path inside the protocol plugin invokes
+     * pg_stmt_clear_all(), wiping S_1 from the cache. */
     keel_session_flow_t sf;
     memset(&sf, 0, sizeof(sf));
     sf.flow = VT;
@@ -345,11 +385,11 @@ static void test_replay_snapshot_survives_ddl_prefetch(void)
     size_t   off = 0;
     size_t   trigger_len = build_parse(pipe + off, "", "SELECT 1");
     off += trigger_len;
-    /* DDL pipeline must be Parse + Bind + Execute — the cache clear
+    /* DISCARD ALL must be Parse + Bind + Execute — the cache clear
      * fires on Execute (mirrors Simple Query semantics), not on Parse
      * alone. */
     off += build_parse  (pipe + off, "",
-                         "CREATE TABLE IF NOT EXISTS t (a int)");
+                         "DISCARD ALL");
     off += build_bind   (pipe + off, "", "");
     off += build_execute(pipe + off, "");
     off += build_bind   (pipe + off, "", "S_1");
@@ -362,7 +402,7 @@ static void test_replay_snapshot_survives_ddl_prefetch(void)
 
     keel_engine_flow_prefetch_classify_follow_buf(&sf, pipe, off, trigger_len);
 
-    /* DDL must have cleared the cache. */
+    /* DISCARD ALL must have cleared the cache. */
     TEST_ASSERT(!stmt_cache_has(c, "S_1"));
 
     /* Re-querying replay post-prefetch yields nothing — proves that
@@ -389,11 +429,257 @@ static void test_replay_snapshot_survives_ddl_prefetch(void)
     TEST_END();
 }
 
+/* -------------------------------------------------------------------------
+ * Test 5 (review_20260620_01.md RC-1 / TG-8): a default-configured
+ * VIRTUALIZE session that issues a simple-query PREPARE must have the
+ * statement entered into the per-session cache.  Before the fix, only
+ * TRACKING mode intercepted Q-PREPARE; VIRTUALIZE forwarded it verbatim
+ * and silently lost track of the named PS, corrupting the pool.
+ * ------------------------------------------------------------------------- */
+static void test_virtualize_intercepts_q_prepare(void)
+{
+    TEST_BEGIN("ps pipeline: virtualize intercepts simple-query PREPARE (RC-1)");
+
+    void* ctx = startup_pg_ctx();
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+
+    /* Confirm default mode is VIRTUALIZE. */
+    TEST_ASSERT_EQ(c->ps_mode, KEEL_PS_MODE_VIRTUALIZE);
+
+    /* Issue Q("PREPARE myq AS SELECT $1::int"). */
+    uint8_t buf[256];
+    keel_fe_action_t fa = keel_fe_action_default();
+    size_t n = build_query(buf, "PREPARE myq AS SELECT $1::int");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+
+    /* The session cache must contain an entry for "myq" (unconfirmed
+     * until backend CommandComplete("PREPARE") arrives). */
+    TEST_ASSERT(stmt_cache_has(c, "myq"));
+
+    /* HARD_PIN must be stripped in VIRTUALIZE so the backend stays
+     * pool-reusable. */
+    TEST_ASSERT(!(fa.effect & KEEL_QE_HARD_PIN));
+
+    /* Backend confirms the PREPARE. */
+    keel_be_action_t ba;
+    memset(&ba, 0, sizeof(ba));
+    n = build_command_complete(buf, "PREPARE");
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, buf, n, &ba), 0);
+
+    /* RFQ to settle. */
+    memset(&ba, 0, sizeof(ba));
+    n = build_rfq(buf, 'I');
+    (void)VT->on_be_msg(ctx, buf, n, &ba);
+
+    /* Session hash must be non-zero (the confirmed entry contributes). */
+    TEST_ASSERT(c->session_stmt_hash != 0);
+
+    /* get_stmt_replay must yield a single statement (the Q-PREPARE
+     * wire bytes are stored and replayable). */
+    uint8_t* rbuf = NULL;
+    size_t   rlen = 0;
+    uint32_t rcount = 0;
+    uint64_t rhash = 0;
+    TEST_ASSERT_EQ(VT->get_stmt_replay(ctx, &rbuf, &rlen, &rcount, &rhash), 0);
+    TEST_ASSERT_EQ(rcount, 1u);
+    TEST_ASSERT(rhash != 0);
+    if (rbuf) keel_free(rbuf);
+
+    if (VT->destroy_context) VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* -------------------------------------------------------------------------
+ * Test 6 (review_20260620_01.md RC-3 / TG-3): a session that has a
+ * confirmed named PS, then issues DDL, must STILL have the named PS in
+ * cache afterwards.  Vanilla PostgreSQL keeps named PS across DDL; the
+ * proxy must match that so a subsequent Bind on a freshly-borrowed
+ * backend can replay the Parse and succeed.
+ * ------------------------------------------------------------------------- */
+static void test_ddl_preserves_named_ps_cache(void)
+{
+    TEST_BEGIN("ps pipeline: DDL preserves named-PS cache (RC-3)");
+
+    void* ctx = startup_pg_ctx();
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+
+    /* Prime the cache. */
+    uint8_t buf[256];
+    keel_fe_action_t fa = keel_fe_action_default();
+    keel_be_action_t ba;
+    size_t n;
+
+    n = build_parse(buf, "p1", "SELECT $1::int");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+    memset(&ba, 0, sizeof(ba));
+    n = build_parse_complete(buf);
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, buf, n, &ba), 0);
+    memset(&ba, 0, sizeof(ba));
+    n = build_rfq(buf, 'I');
+    (void)VT->on_be_msg(ctx, buf, n, &ba);
+
+    TEST_ASSERT(stmt_cache_has(c, "p1"));
+    uint64_t hash_before = c->session_stmt_hash;
+    TEST_ASSERT(hash_before != 0);
+    uint32_t epoch_before = c->stmt_schema_epoch;
+
+    /* Issue DDL via Simple Query. */
+    fa = keel_fe_action_default();
+    n = build_query(buf, "ALTER TABLE t ADD COLUMN x int");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+
+    /* The cache entry must still be present (RC-3).  The session hash
+     * may change because pg_stmt_restamp_context incorporates
+     * stmt_schema_epoch into every entry's per-stmt hash, but the
+     * NUMBER of confirmed entries must be unchanged. */
+    TEST_ASSERT(stmt_cache_has(c, "p1"));
+    /* Schema epoch must bump. */
+    TEST_ASSERT(c->stmt_schema_epoch > epoch_before);
+
+    uint64_t hash_after_ddl = c->session_stmt_hash;
+    uint32_t epoch_after_ddl = c->stmt_schema_epoch;
+
+    /* Same for DISCARD PLANS — cache preserved. */
+    fa = keel_fe_action_default();
+    n = build_query(buf, "DISCARD PLANS");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+    TEST_ASSERT(stmt_cache_has(c, "p1"));
+    TEST_ASSERT(c->stmt_schema_epoch > epoch_after_ddl);
+
+    /* DISCARD ALL must clear the cache (true backend-side drop). */
+    fa = keel_fe_action_default();
+    n = build_query(buf, "DISCARD ALL");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+    TEST_ASSERT(!stmt_cache_has(c, "p1"));
+    TEST_ASSERT_EQ(c->session_stmt_hash, 0ULL);
+
+    if (VT->destroy_context) VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* -------------------------------------------------------------------------
+ * Test 7 (review_20260620_01.md RC-5 / TG-5): after a failed unnamed
+ * Parse(''), the unnamed_stmt_valid flag must be false, and the next
+ * Bind('') must trigger a re-Parse using the cached wire bytes.  After
+ * a successful Parse(''), unnamed_stmt_valid must be true.
+ * ------------------------------------------------------------------------- */
+static void test_unnamed_parse_validity_tracking(void)
+{
+    TEST_BEGIN("ps pipeline: unnamed Parse validity tracking (RC-5)");
+
+    void* ctx = startup_pg_ctx();
+    pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
+
+    /* Initial state: unnamed slot is invalid until first successful Parse. */
+    TEST_ASSERT(!c->unnamed_stmt_valid);
+    TEST_ASSERT(!c->unnamed_parse_in_flight);
+
+    /* Issue Parse("") → sets in_flight, clears valid. */
+    uint8_t buf[256];
+    keel_fe_action_t fa = keel_fe_action_default();
+    size_t n = build_parse(buf, "", "SELECT $1::int");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+    TEST_ASSERT(!c->unnamed_stmt_valid);
+    TEST_ASSERT(c->unnamed_parse_in_flight);
+
+    /* Backend returns ParseComplete → valid=true, in_flight=false. */
+    keel_be_action_t ba;
+    memset(&ba, 0, sizeof(ba));
+    n = build_parse_complete(buf);
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, buf, n, &ba), 0);
+    TEST_ASSERT(c->unnamed_stmt_valid);
+    TEST_ASSERT(!c->unnamed_parse_in_flight);
+
+    /* Issue another Parse("") → in_flight=true, valid=false. */
+    fa = keel_fe_action_default();
+    n = build_parse(buf, "", "SELECT broken syntax {{{");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, buf, n, &fa), 0);
+    TEST_ASSERT(!c->unnamed_stmt_valid);
+    TEST_ASSERT(c->unnamed_parse_in_flight);
+
+    /* Backend returns ErrorResponse → valid=false, in_flight=false. */
+    memset(&ba, 0, sizeof(ba));
+    n = build_error_response(buf, "syntax error in SQL");
+    TEST_ASSERT_EQ(VT->on_be_msg(ctx, buf, n, &ba), 0);
+    TEST_ASSERT(!c->unnamed_stmt_valid);
+    TEST_ASSERT(!c->unnamed_parse_in_flight);
+
+    /* Now issue Bind("").  Because unnamed_stmt_valid is false and the
+     * cached wire_msg exists, the proxy must rewrite the payload to
+     * Parse("") + Bind("") (act.be_payload points to a heap buffer). */
+    fa = keel_fe_action_default();
+    uint8_t bind_buf[64];
+    size_t bn = build_bind(bind_buf, "", "");
+    TEST_ASSERT_EQ(VT->on_fe_msg(ctx, bind_buf, bn, &fa), 0);
+
+    /* The act.be_payload must be different from the original bind_buf
+     * (rewritten to Parse+Bind) — i.e., be_payload_len exceeds the
+     * original bind length. */
+    TEST_ASSERT(fa.be_payload != NULL);
+    TEST_ASSERT(fa.be_payload_len > bn);
+    /* First byte of rewritten payload must be 'P' (Parse). */
+    TEST_ASSERT_EQ(fa.be_payload[0], (uint8_t)'P');
+
+    if (VT->destroy_context) VT->destroy_context(ctx);
+    TEST_END();
+}
+
+/* -------------------------------------------------------------------------
+ * Test 8 (review_20260620_01.md RC-4 / TG-4): two sessions whose
+ * stmt_set_hash XOR folds collide but whose underlying statement sets
+ * differ must NOT be considered compatible.  The hash vector equality
+ * in backend_pool_stmt_compatible must reject the false match.
+ *
+ * Constructing a true fnv1a XOR collision is non-trivial; instead we
+ * verify the mechanism directly: build two profiles with matching
+ * stmt_set_hash but differing stmt_hashes[] arrays, and confirm
+ * backend_pool_stmt_compatible returns false.
+ * ------------------------------------------------------------------------- */
+static void test_hash_vector_rejects_collision(void)
+{
+    TEST_BEGIN("ps pipeline: hash vector rejects XOR collision (RC-4)");
+
+    backend_conn_t be;
+    memset(&be, 0, sizeof(be));
+    be.stmt_set_hash = 0xABCD1234;
+    be.stmt_profile.stmt_set_hash = 0xABCD1234;
+    be.stmt_profile.stmt_hash_count = 2;
+    be.stmt_profile.stmt_hashes[0] = 0x1111;
+    be.stmt_profile.stmt_hashes[1] = 0xBABC2123; /* XOR = 0xABCD1234 */
+
+    keel_stmt_compat_profile_t req;
+    memset(&req, 0, sizeof(req));
+    req.stmt_set_hash = 0xABCD1234;  /* same XOR */
+    req.stmt_hash_count = 2;
+    req.stmt_hashes[0] = 0x2222;
+    req.stmt_hashes[1] = 0x99EF33E6; /* XOR = 0xABCD1234, but different set */
+
+    /* stmt_set_hash matches but the vectors differ — must reject. */
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req, &be));
+
+    /* Sanity: identical vectors must accept. */
+    keel_stmt_compat_profile_t req2 = req;
+    req2.stmt_hashes[0] = be.stmt_profile.stmt_hashes[0];
+    req2.stmt_hashes[1] = be.stmt_profile.stmt_hashes[1];
+    TEST_ASSERT(backend_pool_stmt_compatible(&req2, &be));
+
+    /* Sanity: different counts must reject even if first hash matches. */
+    keel_stmt_compat_profile_t req3 = req2;
+    req3.stmt_hash_count = 1;
+    TEST_ASSERT(!backend_pool_stmt_compatible(&req3, &be));
+
+    TEST_END();
+}
+
 int main(void)
 {
     test_prefetch_classifies_all_named_parses();
     test_prefetch_noop_on_empty_or_fully_skipped();
     test_prefetch_stops_on_truncated_frame();
     test_replay_snapshot_survives_ddl_prefetch();
+    test_virtualize_intercepts_q_prepare();
+    test_ddl_preserves_named_ps_cache();
+    test_unnamed_parse_validity_tracking();
+    test_hash_vector_rejects_collision();
     return test_summary();
 }

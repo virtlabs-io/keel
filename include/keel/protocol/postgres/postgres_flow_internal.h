@@ -32,8 +32,17 @@
 #define PG_STMT_CACHE_SIZE 512
 
 /** Maximum Parse wire message length stored for replay (§17).
- *  Messages larger than this cause the session to fall back to hard-pin. */
-#define PG_STMT_MAX_WIRE 4096
+ *
+ *  Set to 1 MB so the proxy transparently caches every realistic
+ *  application / ORM / HammerDB prepared statement.  Wire messages above
+ *  this cap are still cached by name but are flagged `semantic_unknown`
+ *  so the release path forces a DISCARD ALL before the backend is
+ *  returned to the pool — failing closed rather than silently
+ *  half-tracking a statement that the replay builder would later skip
+ *  (see review_20260620_01.md RC-2).  Worst-case per-session memory cost
+ *  is PG_STMT_CACHE_SIZE * PG_STMT_MAX_WIRE = 512 MB; this is
+ *  intentional per the correctness-first policy. */
+#define PG_STMT_MAX_WIRE 1048576
 
 typedef struct pg_stmt_entry {
     char     name[64];           /**< Statement name (empty for unnamed) */
@@ -89,6 +98,24 @@ typedef struct pg_flow_ctx {
     uint32_t backend_pid;
     uint32_t backend_secret;
     uint32_t named_stmt_count;    /**< Named prepared statements on backend. */
+
+    /** Unnamed (anonymous) prepared-statement slot validity.
+     *
+     *  PostgreSQL's extended query protocol uses the empty name "" to
+     *  refer to the unnamed prepared statement.  The unnamed slot's
+     *  validity depends on the most recent Parse('') outcome:
+     *    - true  after a successful Parse('') confirmation.
+     *    - false after a Parse('') ErrorResponse (slot is undefined).
+     *  When this is false and the next Bind('') arrives, the proxy must
+     *  force a fresh anonymous Parse before the Bind to avoid surfacing
+     *  "unnamed prepared statement does not exist" on backends whose
+     *  prior unnamed slot was discarded (review_20260620_01.md RC-5 /
+     *  v0.2-alpha Gap 3). */
+    bool     unnamed_stmt_valid;
+    /** True between a Parse('') FE message and its backend response.
+     *  Used to disambiguate ParseComplete / ErrorResponse arrival: only
+     *  when this is true do we update unnamed_stmt_valid. */
+    bool     unnamed_parse_in_flight;
     char     stmt_search_path[256]; /**< Current stmt-relevant search_path. */
     char     stmt_search_path_session[256]; /**< Session-level search_path baseline. */
     char     stmt_search_path_local[256]; /**< Transaction-local search_path override. */

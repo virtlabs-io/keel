@@ -306,6 +306,19 @@ bool backend_pool_stmt_compatible(const keel_stmt_compat_profile_t* required,
         return false;
     if (conn->stmt_profile.guc_hash != required->guc_hash)
         return false;
+
+    /* Full-array equality on per-statement hashes (review_20260620_01.md
+     * RC-4 / v0.2-alpha Gap 2).  The XOR `stmt_set_hash` above is only a
+     * fast pre-filter; two materially different statement sets can XOR to
+     * the same value.  Require the full sorted vector to match. */
+    if (conn->stmt_profile.stmt_hash_count != required->stmt_hash_count)
+        return false;
+    if (required->stmt_hash_count > 0) {
+        if (memcmp(conn->stmt_profile.stmt_hashes,
+                   required->stmt_hashes,
+                   sizeof(uint64_t) * required->stmt_hash_count) != 0)
+            return false;
+    }
     return true;
 }
 

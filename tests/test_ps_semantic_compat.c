@@ -157,13 +157,16 @@ static void test_virt_ddl_invalidates_stmt_set(void) {
     len = build_query(buf, "ALTER TABLE users ADD COLUMN created_at timestamptz");
     rc = VT->on_fe_msg(ctx, buf, len, &act);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+    /* review_20260620_01.md RC-3: DDL no longer clears the named-PS
+     * cache (vanilla PG semantics).  PREPARED_STMT pin stays set so
+     * future Bind calls can replay onto a new backend. */
+    TEST_ASSERT(!(act.pin_clear & KEEL_FPIN_PREPARED_STMT));
 
     keel_stmt_compat_profile_t after;
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
     /* DDL with previously-tracked named PS marks semantic_unknown so the
      * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
@@ -208,7 +211,8 @@ static void test_virt_drop_create_same_name_invalidates(void) {
     memset(&p1, 0, sizeof(p1));
     rc = VT->get_stmt_compat_profile(ctx, &p1);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(p1.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: DDL preserves named-PS cache. */
+    TEST_ASSERT(p1.stmt_set_hash != 0ULL);
     TEST_ASSERT(p1.schema_epoch > p0.schema_epoch);
 
     /* CREATE TABLE — another DDL on the same name */
@@ -222,7 +226,7 @@ static void test_virt_drop_create_same_name_invalidates(void) {
     TEST_ASSERT_EQ(rc, 0);
     /* CREATE is also DDL — schema_epoch must advance again */
     TEST_ASSERT(p2.schema_epoch > p1.schema_epoch);
-    TEST_ASSERT_EQ(p2.stmt_set_hash, 0ULL);
+    TEST_ASSERT(p2.stmt_set_hash != 0ULL);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -361,7 +365,9 @@ static void test_virt_discard_plans_clears_stmt_hash(void) {
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: DISCARD PLANS preserves named-PS
+     * cache (vanilla PG semantics). */
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
     /* DISCARD PLANS with previously-tracked named PS marks semantic_unknown so the
      * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
@@ -408,7 +414,8 @@ static void test_virt_unknown_utility_marks_semantic_unknown(void) {
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT(after.semantic_unknown);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: UNKNOWN utility preserves cache. */
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
 
     VT->destroy_context(ctx);
     TEST_END();

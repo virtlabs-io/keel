@@ -101,9 +101,20 @@ the client's Bind, transparently re-establishing the server-side state.
   simultaneously.  If a client creates more than 512 named statements, the
   oldest one is evicted (LRU).  Applications that maintain thousands of named
   statements simultaneously are not well-suited to this mode.
-- Only intercepts `Parse` messages in the **extended query protocol**.  If the
-  application uses `PREPARE stmt AS ...` via **simple query** (`Q` message),
-  use `tracking` mode instead.
+- Per-statement Parse wire messages up to `PG_STMT_MAX_WIRE` (1 MB) are
+  cached for replay.  Larger messages are flagged `semantic_unknown` and
+  force `DISCARD ALL` on pool return so the proxy fails closed rather
+  than silently half-tracking a statement the replay builder would
+  later skip.  1 MB covers every realistic application / ORM / HammerDB
+  pattern; raise the cap in `postgres_flow_internal.h` if a workload
+  legitimately requires larger.
+- As of review_20260620_01.md RC-1, `virtualize` ALSO intercepts
+  `PREPARE stmt AS ...` issued via **simple query** (`Q` message), so
+  applications that mix simple-query `PREPARE` with extended-query
+  `Bind`/`Execute` no longer need to switch to `tracking` mode for
+  correctness.  `tracking` mode remains useful for callers that want
+  the additional SQL-level interception guarantees or the by-name
+  `DEALLOCATE` virtualization path.
 
 **Who should use this**
 
@@ -558,6 +569,36 @@ The SSV engine extends the basic PS replay mechanism with a richer consistency m
 - **XOR hash cancellation fix:** A bug was fixed where `DEALLOCATE` followed by re-`PREPARE`
   of the same statement name could cancel out in the XOR hash, causing silent state divergence
   between session and backend.
+- **Hash-vector equality (review_20260620_01.md RC-4):** In addition to the
+  XOR `stmt_set_hash` pre-filter, every per-statement hash is now stored
+  in a sorted vector (`stmt_hashes[]`, capacity `KEEL_STMT_HASH_VECTOR_MAX`
+  = 512).  Two statement sets are only considered compatible when both
+  the XOR hash AND the full sorted vector contents match.  This closes
+  the silent collision class where two materially different statement
+  sets XOR to the same value, which previously caused the borrow path to
+  skip replay and surface `prepared statement "X" does not exist`.
+- **DDL / DISCARD PLANS continuity (review_20260620_01.md RC-3):**
+  Vanilla PostgreSQL keeps named prepared statements across DDL and
+  `DISCARD PLANS` (only `DISCARD ALL` and explicit `DEALLOCATE` drop
+  them).  Keel now mirrors this: DDL bumps the schema epoch (so cached
+  plans are invalidated downstream via `DISCARD PLANS` at the next
+  EXECUTE) but no longer wipes the per-session PS cache, so a session
+  that issues DDL between two EXECUTEs of a previously-prepared
+  statement can still replay the Parse on a freshly-borrowed backend
+  and succeed.
+- **Unnamed-statement recovery (review_20260620_01.md RC-5):** When a
+  `Parse('')` fails, the unnamed slot on the backend is undefined.
+  Keel tracks `unnamed_stmt_valid` per session and transparently
+  re-Parses (from the cached wire bytes) before the next `Bind('')`,
+  so callers no longer surface "unnamed prepared statement does not
+  exist" depending on backend version.
+- **Centralized stash prefetch (review_20260620_01.md RC-7):** The
+  pre-query enqueue path (state_sync / stmt_replay / deferred BEGIN /
+  full cleanup) is now the single chokepoint that calls
+  `keel_engine_flow_prefetch_classify_follow_buf` on the tail before
+  stashing.  Any future code path that adds a deferred trigger
+  automatically gets the prefetch, making the original regression
+  (commit `72d50d0`) impossible to re-introduce.
 
 See [SSV_POSTGRES_IMPLEMENTATION.md](SSV_POSTGRES_IMPLEMENTATION.md) for the full SSV
 architecture and implementation details.
@@ -619,3 +660,39 @@ Does your application use prepared statements?
 └── Yes — also via simple-query PREPARE stmt AS ...
     └── ✅ tracking
 ```
+
+---
+
+## HammerDB and other TPCC-class workloads
+
+HammerDB's PostgreSQL driver (libpq-based TPCC, ~23 named prepared
+statements per virtual user, heavy transaction churn, concurrent virtual
+users sharing a connection pool) is fully supported on the default
+`virtualize` mode as of `review_20260620_01.md`.  The fixes that make
+this safe:
+
+- **RC-1:** `virtualize` now intercepts simple-query `PREPARE` as well
+  as extended-query `Parse`, so driver configurations that use
+  simple-query PREPARE no longer silently corrupt the pool.
+- **RC-2:** `PG_STMT_MAX_WIRE` is 1 MB, covering every realistic TPCC
+  prepared statement (INSERTs with parameter type annotations against
+  wide tables, multi-column SELECTs, etc.).
+- **RC-3:** DDL between two EXECUTEs of a previously-prepared statement
+  no longer breaks PS continuity (matches vanilla PostgreSQL).
+- **RC-4:** Hash-vector equality on borrow prevents silent statement-set
+  collisions across concurrent virtual users.
+- **RC-5:** Unnamed-statement recovery handles drivers that issue
+  unnamed `Parse` followed by `Bind`/`Execute` cycles.
+
+If you encounter `prepared statement "X" does not exist` under
+HammerDB, verify:
+
+1. You are running a build that includes the `review_20260620_01.md`
+   fixes (check `PG_STMT_MAX_WIRE` in `postgres_flow_internal.h` is
+   1048576).
+2. `prepared_statement = virtualize` (the default) is configured.
+3. The workload does not exceed 512 simultaneously-prepared statements
+   per session (raise `PG_STMT_CACHE_SIZE` if it does).
+4. Enable `KEEL_DIAG_PS=1` and grep the diag trace for `INVARIANT
+   (Bug B)` or `REPLAY_DONE` lines that indicate proxy-side state
+   divergence.
