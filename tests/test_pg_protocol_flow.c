@@ -1332,7 +1332,7 @@ static void test_discard_all(void) {
 }
 
 static void test_prepare_statement(void) {
-    TEST_BEGIN("corner: PREPARE → HARD_PIN + PREPARED_STMT + QUARANTINE");
+    TEST_BEGIN("corner: PREPARE → PREPARED_STMT + QUARANTINE (HARD_PIN only in PINNING)");
 
     void* ctx = create_and_startup();
     uint8_t buf[256];
@@ -1340,7 +1340,12 @@ static void test_prepare_statement(void) {
     keel_fe_action_t act;
     VT->on_fe_msg(ctx, buf, len, &act);
 
-    TEST_ASSERT(act.effect & KEEL_QE_HARD_PIN);
+    /* In VIRTUALIZE (default), PREPARE is intercepted and replayed — the
+     * backend is NOT hard-pinned.  review_20260620_01.md RC-1 promoted
+     * the Q-PREPARE intercept from TRACKING-only to all virtualizable
+     * modes, so the default no longer pins.  HARD_PIN still applies in
+     * PINNING and OFF modes. */
+    TEST_ASSERT(!(act.effect & KEEL_QE_HARD_PIN));
     TEST_ASSERT(act.pin_update & KEEL_FPIN_PREPARED_STMT);
     /* PREPARE triggers quarantine via hardpin scanner */
     TEST_ASSERT(act.effect & KEEL_QE_POTENTIALLY_STATEFUL);
@@ -2079,16 +2084,21 @@ static void test_ps_tracking_ddl_invalidates_stmt_set(void) {
     len = build_query(buf, "ALTER TABLE t ADD COLUMN c int");
     rc = VT->on_fe_msg(ctx, buf, len, &act);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+    /* review_20260620_01.md RC-3: DDL no longer clears the named-PS
+     * cache (vanilla PostgreSQL keeps named PS across DDL).  The pin
+     * is NOT cleared so the session continues to use stmt-aware
+     * borrow on subsequent transactions. */
+    TEST_ASSERT(!(act.pin_clear & KEEL_FPIN_PREPARED_STMT));
 
     keel_stmt_compat_profile_t after;
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    /* Cache preserved; only schema_epoch bumps. */
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
-    /* DDL with previously-tracked named PS marks semantic_unknown so the
-     * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */
+    /* dirty_orphan_ps flag forces semantic_unknown on the one-shot
+     * profile read so release path issues DISCARD ALL. */
     TEST_ASSERT(after.semantic_unknown);
 
     VT->destroy_context(ctx);
@@ -2117,13 +2127,16 @@ static void test_ps_tracking_discard_plans_invalidates_stmt_set(void) {
     len = build_query(buf, "DISCARD PLANS");
     rc = VT->on_fe_msg(ctx, buf, len, &act);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT(act.pin_clear & KEEL_FPIN_PREPARED_STMT);
+    /* review_20260620_01.md RC-3: DISCARD PLANS does NOT clear the
+     * named-PS cache.  Vanilla PostgreSQL semantics: only DISCARD ALL
+     * and DEALLOCATE drop named PS. */
+    TEST_ASSERT(!(act.pin_clear & KEEL_FPIN_PREPARED_STMT));
 
     keel_stmt_compat_profile_t after;
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
 
     VT->destroy_context(ctx);
@@ -2211,7 +2224,9 @@ static void test_ps_tracking_unknown_semantic_marks_incompatible(void) {
     rc = VT->get_stmt_compat_profile(ctx, &p);
     TEST_ASSERT_EQ(rc, 0);
     TEST_ASSERT(p.semantic_unknown);
-    TEST_ASSERT_EQ(p.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: UNKNOWN utility no longer clears the
+     * named-PS cache; stmt_set_hash preserved. */
+    TEST_ASSERT(p.stmt_set_hash != 0ULL);
 
     VT->destroy_context(ctx);
     TEST_END();
@@ -3095,7 +3110,10 @@ static void test_ps_tracking_extended_discard_plans_invalidates_stmt_set(void) {
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: extended Execute DISCARD PLANS no longer
+     * clears the named-PS cache.  Stmt_set_hash is preserved; only schema
+     * epoch bumps. */
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
 
     VT->destroy_context(ctx);
@@ -3193,7 +3211,9 @@ static void test_ps_tracking_extended_ddl_invalidates_stmt_set(void) {
     memset(&after, 0, sizeof(after));
     rc = VT->get_stmt_compat_profile(ctx, &after);
     TEST_ASSERT_EQ(rc, 0);
-    TEST_ASSERT_EQ(after.stmt_set_hash, 0ULL);
+    /* review_20260620_01.md RC-3: extended Execute DDL no longer clears
+     * the named-PS cache.  Stmt_set_hash preserved; schema epoch bumps. */
+    TEST_ASSERT(after.stmt_set_hash != 0ULL);
     TEST_ASSERT(after.schema_epoch > before.schema_epoch);
     /* DDL with previously-tracked named PS marks semantic_unknown so the
      * next backend borrow forces DISCARD ALL (orphan-PS prevention, 427f020). */

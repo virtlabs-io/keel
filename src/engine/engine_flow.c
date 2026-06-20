@@ -505,7 +505,8 @@ void keel_engine_flow_prefetch_classify_follow_buf(keel_session_flow_t* sf,
                                                    size_t buf_len,
                                                    size_t skip_bytes)
 {
-    if (!sf || !sf->flow || !sf->flow->on_fe_msg || !sf->flow->frame_len ||
+    if (!sf || !sf->ctx || !sf->flow || !sf->flow->on_fe_msg ||
+        !sf->flow->frame_len ||
         !buf || buf_len <= skip_bytes)
         return;
 
@@ -819,6 +820,18 @@ static keel_flow_result_t pre_query_enqueue(keel_session_flow_t* sf,
 
     if (follow_len > 0 && follow_buf) {
         if (sf->pending_pre_query_len == 0) {
+            /* review_20260620_01.md RC-7: classify every frame in the
+             * follow buffer BEFORE stashing.  This is the single
+             * centralized chokepoint — every pre-query op (state_sync,
+             * stmt_replay, deferred BEGIN, full cleanup, etc.) funnels
+             * through here, so every named Parse in the tail is now
+             * guaranteed to be inserted into the per-session stmt cache
+             * before the tail is stashed.  Without this, the original
+             * commit 72d50d0 regression (Bind to S_N → 26000) can be
+             * re-introduced by any new code path that calls
+             * pre_query_enqueue with a tail containing a named Parse. */
+            keel_engine_flow_prefetch_classify_follow_buf(sf, follow_buf,
+                                                          follow_len, 0);
             memcpy(sf->pending_pre_query_buf, follow_buf, follow_len);
             sf->pending_pre_query_len = follow_len;
             sf->pending_pre_query_resume = resume;
