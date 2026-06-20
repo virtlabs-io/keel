@@ -505,6 +505,23 @@ void backend_pool_release_session(backend_pool_t* pool, void* session);
 int backend_pool_queue_wait(backend_pool_t* pool, void* session, void* userdata);
 
 /**
+ * @brief Wake the next waiter on the pool's wait queue.
+ *
+ * Used by the wait_callback (pool_wait_resume_cb in worker.c) when the
+ * woken session could not use the available backend (e.g. stmt_set_hash
+ * mismatch without a Step-4 cleanup match).  Without this chained wake,
+ * a single returned backend that the head waiter refuses leaves every
+ * other waiter stranded until the NEXT backend return — which under
+ * heavy oversubscription produces pool_wait_timeout storms even when
+ * backends are actually available (review_20260620_01.md follow-up:
+ * HammerDB vu=200 vs max_pool_size=50 pool starvation).
+ *
+ * Safe to call from any thread; takes pool->lock internally.
+ *
+ * @param pool Pool to wake the next waiter on. */
+void backend_pool_wake_next_waiter(backend_pool_t* pool);
+
+/**
  * @brief Cancel queued waits for a session.
  *
  * Used when a client disconnects while sitting in the bounded pool wait queue.

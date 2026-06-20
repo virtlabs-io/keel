@@ -2187,10 +2187,16 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
         /* No suitable backend available — re-queue the session.
          * A returning backend (or the refill timer) will wake it.
          *
-         * This is NORMAL behaviour under pool oversubscription (more
-         * clients than backends).  Logged at INFO rather than WARN to
-         * avoid log spam under legitimate load; a WARN would imply an
-         * operator-actionable condition when the pool is simply full. */
+         * Chained wake (review_20260620_01.md HammerDB follow-up):
+         * if there are MORE waiters behind us, immediately wake the
+         * next one.  Without this, a single returned backend that the
+         * head waiter refuses (e.g. hash mismatch with no Step-4
+         * eligibility) strands every other waiter until the NEXT
+         * backend return.  Under oversubscription (vu=200 vs
+         * max_pool_size=50) this is the difference between a working
+         * pooler and pool_wait_timeout storms.  The chain terminates
+         * naturally: each woken waiter either succeeds (no further
+         * wake needed) or re-queues + wakes the next. */
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pool_wait_resume_requeues);
         KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
@@ -2201,6 +2207,9 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
             pool->wait_queue_size);
         if (recv_ctx->flow.pending_msg) {
             backend_pool_queue_wait(pool, session, pool);
+            /* Wake the next waiter so an available backend doesn't
+             * sit idle while this session waits at the tail. */
+            backend_pool_wake_next_waiter(pool);
         } else {
             /* No pending message — session is stale, close it */
             close_session(worker, session, recv_ctx);
