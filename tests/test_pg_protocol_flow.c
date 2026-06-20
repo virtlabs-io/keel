@@ -1722,19 +1722,22 @@ static void test_ps_tracking_prepare_stored_in_cache(void) {
     int rc = VT->on_fe_msg(ctx, buf, len, &act);
     TEST_ASSERT_EQ(rc, 0);
 
-    /* The query is forwarded normally */
-    TEST_ASSERT_EQ(act.type, KEEL_FE_ACT_QUERY);
-    TEST_ASSERT_NOT_NULL(act.be_payload);
+    /* review_20260620_01.md RC-1 + HammerDB follow-up: TRACKING mode now
+     * ABSORBS simple-query PREPARE (does not forward to backend) to
+     * avoid transaction-pool corruption where each PREPARE lands on a
+     * different backend.  The proxy synthesises CC("PREPARE")+RFQ to
+     * the client and marks the entry confirmed immediately. */
+    TEST_ASSERT_EQ(act.type, KEEL_FE_ACT_SEND_FE);
+    TEST_ASSERT(act.be_payload == NULL || act.be_payload_len == 0);
 
-    /* After on_fe_msg: entry is staged (valid=true, confirmed=false) pending
-     * CommandComplete("PREPARE") from the backend. */
+    /* Entry is confirmed immediately (no backend round-trip). */
     pg_flow_ctx_t* c = (pg_flow_ctx_t*)ctx;
     bool found = false;
     for (int i = 0; i < PG_STMT_CACHE_SIZE; i++) {
         if (c->stmt_cache[i].valid &&
             strcmp(c->stmt_cache[i].name, "trackstmt") == 0) {
             found = true;
-            TEST_ASSERT(!c->stmt_cache[i].confirmed);  /* staged, not yet confirmed */
+            TEST_ASSERT(c->stmt_cache[i].confirmed);  /* absorb path confirms immediately */
             TEST_ASSERT_NOT_NULL(c->stmt_cache[i].wire_msg);
             break;
         }
