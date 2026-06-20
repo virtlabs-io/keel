@@ -2033,7 +2033,11 @@ static void session_idle_timeout_cb(void* userdata)
         }
     }
 
-    KEEL_LOG_WARN(KEEL_LOG_CAT_CONN, "Worker %u: zombie reaper — session %lu idle for >%u ms, closing",
+    /* Normal idle-timeout expiry is expected operational behaviour (clients
+     * that disconnect ungracefully, hammerdb think-times longer than the
+     * configured idle timeout, etc.).  Logged at INFO rather than WARN so
+     * the message does not drown the log under high client churn. */
+    KEEL_LOG_INFO(KEEL_LOG_CAT_CONN, "Worker %u: zombie reaper — session %lu idle for >%u ms, closing",
                 worker->id, (unsigned long)session->id, worker->idle_timeout_ms);
 
     /* If an idle timeout catches an open transaction, do not issue cleanup SQL
@@ -2181,10 +2185,15 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
 
     if (!be_conn) {
         /* No suitable backend available — re-queue the session.
-         * A returning backend (or the refill timer) will wake it. */
+         * A returning backend (or the refill timer) will wake it.
+         *
+         * This is NORMAL behaviour under pool oversubscription (more
+         * clients than backends).  Logged at INFO rather than WARN to
+         * avoid log spam under legitimate load; a WARN would imply an
+         * operator-actionable condition when the pool is simply full. */
         if (worker->stats_ctx)
             KEEL_STAT_INC(worker->stats_ctx, pool_wait_resume_requeues);
-            KEEL_LOG_WARN(KEEL_LOG_CAT_POOL,
+        KEEL_LOG_INFO(KEEL_LOG_CAT_POOL,
             "W%u: pool_wait_resume: no backend for stmt_hash=0x%016llx "
             "(active=%zu clean=%zu wait=%zu) re-queuing",
             worker->id, (unsigned long long)stmt_profile.stmt_set_hash,
@@ -2809,8 +2818,23 @@ static void on_client_recv_complete(void* userdata, int result)
             KEEL_DEBUG_LOG("Worker %u: client closed connection %lu\n",
                         worker->id, (unsigned long)session->id);
         } else {
-            KEEL_LOG_WARN(KEEL_LOG_CAT_CONN, "Worker %u: recv error on session %lu: %s",
-                        worker->id, (unsigned long)session->id, strerror(-result));
+            /* ECONNRESET / EPIPE / EAGAIN on the client socket is routine
+             * under busy workloads — clients disconnect abruptly when they
+             * time out, when the load generator tears down a virtual user,
+             * or when an upstream NAT rewrites a connection.  Demote to
+             * DEBUG to avoid log spam.  Genuine I/O errors (anything other
+             * than ECONNRESET/EPIPE/ETIMEDOUT) stay at WARN. */
+            int err = -result;
+            if (err == ECONNRESET || err == EPIPE || err == ETIMEDOUT ||
+                err == ECONNABORTED) {
+                KEEL_DEBUG_LOG("Worker %u: client recv %s on session %lu",
+                            worker->id, strerror(err),
+                            (unsigned long)session->id);
+            } else {
+                KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
+                    "Worker %u: recv error on session %lu: %s",
+                    worker->id, (unsigned long)session->id, strerror(err));
+            }
         }
         close_session(worker, session, recv_ctx);
         return;
