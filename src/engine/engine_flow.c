@@ -5832,21 +5832,49 @@ fe_forward_done: ;
                         stmt_profile.semantic_unknown = true;
 
                     if (stmt_profile.semantic_unknown) {
+                        /* Unknown semantic state: backend may have stale
+                         * plans / partial PS state.  Force DISCARD ALL. */
                         be->stmt_set_hash = 0;
                         memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                         be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
                     } else if (be->stmt_set_hash != 0 &&
                                !backend_pool_stmt_compatible(&stmt_profile, be)) {
+                        /* Backend had a DIFFERENT non-zero hash than the
+                         * session wants — its PS set is stale.  Force
+                         * cleanup before reuse. */
                         be->stmt_set_hash = 0;
                         memset(&be->stmt_profile, 0, sizeof(be->stmt_profile));
                         be->current_state_hash = 0xFFFFFFFFFFFFFFFFULL;
-                    } else {
-                        be->stmt_set_hash = stmt_profile.stmt_set_hash;
+                    } else if (be->stmt_set_hash == stmt_profile.stmt_set_hash &&
+                               be->stmt_set_hash != 0) {
+                        /* Hashes match AND non-zero: backend's PS set was
+                         * verified at borrow time (Step 1 exact match, or
+                         * the engine stamped it after replay).  The
+                         * stmt_profile is already accurate; refresh it
+                         * from the session in case semantic fields
+                         * (search_path, role, epoch) shifted during the
+                         * borrow.  This is the only safe update — the
+                         * stmt_set_hash itself must NOT be overwritten
+                         * because the engine has already established it
+                         * via replay or hash-match. */
                         be->stmt_profile = stmt_profile;
-                        KEEL_DIAG_PS("RELEASE sess=%lu be_fd=%d stamp_hash=0x%016llx",
+                        KEEL_DIAG_PS("RELEASE sess=%lu be_fd=%d preserve_hash=0x%016llx",
                             (unsigned long)session->id, be->fd,
-                            (unsigned long long)stmt_profile.stmt_set_hash);
+                            (unsigned long long)be->stmt_set_hash);
                     }
+                    /* else: backend was clean (hash=0) at borrow time and
+                     * the session did not run a Bind on it during this
+                     * borrow cycle (e.g. only a SELECT ran).  The backend
+                     * has NOT received the session's PS replay, so we
+                     * must NOT stamp it with the session hash — that
+                     * would advertise stmts the backend does not have
+                     * and cause the next borrower's hash-match to skip
+                     * replay, surfacing 26000 'prepared statement "X"
+                     * does not exist' (review_20260620_01.md RC-1
+                     * transaction-pooling follow-up).  Leave the backend
+                     * hash at 0; the next borrow with a non-zero required
+                     * hash will trigger replay via Step 2/3 of the
+                     * borrow path. */
                 } else if (sf->ps_mode == KEEL_PS_MODE_PINNING
                            && (sf->pins & KEEL_FPIN_PREPARED_STMT)) {
                     /* PINNING: force cleanup — backend carried real PS state.
