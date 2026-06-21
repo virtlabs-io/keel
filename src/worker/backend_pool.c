@@ -1401,7 +1401,19 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
              * before forwarding the client's query.  Skip the case where
              * the backend's hash equals required_stmt_hash — Step 1
              * already handled that, and re-grabbing would skip cleanup
-             * and surface "already exists" errors. */
+             * and surface "already exists" errors.
+             *
+             * Performance note: for required_stmt_hash == 0 the proxy's
+             * PS intercept (VIRTUALIZE/TRACKING/ANONYMOUS) guarantees
+             * the client's Parse messages are absorbed and never reach
+             * the backend, so the backend's existing PS state cannot
+             * collide with anything the session sends.  The query just
+             * runs alongside the existing PS state harmlessly.  We mark
+             * needs_full_cleanup only when required_stmt_hash != 0
+             * (where a future Bind could trigger replay that conflicts
+             * with the backend's existing stmts).  This eliminates the
+             * cleanup storms that previously saturated the pool under
+             * HammerDB-class oversubscription (vu=200 vs pool=50). */
             if (conn->stmt_set_hash != 0 &&
                 conn->stmt_set_hash != required_stmt_hash) {
                 backend_conn_state_t expected = BACKEND_CONN_IDLE;
@@ -1417,11 +1429,20 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                     }
                     pool->active_count++;
                     backend_pool_mark_borrowed(conn);
-                    /* Clear stale stmt hash; engine will clean before replay */
-                    conn->stmt_set_hash      = 0;
-                    backend_pool_reset_stmt_profile(conn);
-                    conn->needs_full_cleanup  = true;
-                    POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                    /* Only stomp the cached stmt hash if we're going to
+                     * clean it.  For hash=0 sessions we deliberately
+                     * keep the backend's existing PS state intact and
+                     * leave stmt_set_hash untouched so the next borrower
+                     * that wants this hash finds a ready backend in the
+                     * idle_list (skipping replay entirely).  Stomping
+                     * the hash to 0 here would force every subsequent
+                     * hash=H session to replay, killing multiplexing. */
+                    if (required_stmt_hash != 0) {
+                        conn->stmt_set_hash      = 0;
+                        backend_pool_reset_stmt_profile(conn);
+                        conn->needs_full_cleanup  = true;
+                        POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                    }
                     *out_needs_replay        = (required_stmt_hash != 0);
                     if (*out_needs_replay)
                         POOL_STAT_INC(pool, pool_borrow_stmt_replay);
