@@ -2256,38 +2256,40 @@ static void pool_wait_resume_cb(void* session_ptr, void* userdata)
                         : WAIT_BACKEND_KIND_REPLAY;
         stats_mark_wait_backend_begin(recv_ctx, wait_kind);
 
-        ssize_t imm = recv(session->server_fd, recv_ctx->be_buf,
-                           recv_ctx->be_cap, MSG_DONTWAIT);
-        KEEL_DEBUG_LOG("W%u: pool_resume imm_recv fd=%d imm=%zd\n",
-            worker->id, session->server_fd, imm);
-        if (imm > 0) {
-            /* Data was already available — process immediately. */
-            on_backend_recv_complete(be_ctx, (int)imm);
-            return;
+        /* Arm reactor_recv WITHOUT an inline recv attempt.
+         *
+         * The previous code tried an immediate non-blocking recv() and
+         * called on_backend_recv_complete() inline when data was already
+         * available.  Under oversubscription (e.g. HammerDB vu=200 vs
+         * max_pool_size=50) this created a recursive wake chain:
+         *   wake_one → pool_wait_resume_cb → resume_from_pool →
+         *   inline recv → on_be_data → backend_pool_return →
+         *   wake_one → (recurse)
+         * Each recursion frame held the pool lock and the worker
+         * thread, preventing new TCP accepts and starving other
+         * sessions.  With 50+ waiters per worker the chain grew to
+         * hundreds of frames, blocking the reactor for seconds.
+         *
+         * The reactor recv itself handles the race correctly: when
+         * the recv SQE is submitted and data is already in the socket
+         * buffer (because the backend responded between send and SQE
+         * submit), the kernel completes the SQE immediately — both
+         * with io_uring and with epoll (level-triggered).  No data is
+         * lost.  Processing happens in the next reactor iteration,
+         * giving the worker thread a chance to accept new connections
+         * and service other sessions between iterations. */
+        if (wait_kind == WAIT_BACKEND_KIND_QUERY)
+            stats_mark_wait_backend_query_recv_armed(recv_ctx);
+        recv_ctx->be_pending = true;
+        int rc = keel_reactor_recv(worker->reactor, session->server_fd,
+                                   recv_ctx->be_buf, recv_ctx->be_cap,
+                                   0, be_ctx, on_backend_recv_complete);
+        if (rc < 0) {
+            recv_ctx->be_pending = false;
+            KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
+                "W%u: failed to queue BE recv after pool resume", worker->id);
+            close_session(worker, session, recv_ctx);
         }
-        if (imm < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* Nothing yet — arm reactor_recv; will fire when data arrives. */
-            if (wait_kind == WAIT_BACKEND_KIND_QUERY)
-                stats_mark_wait_backend_query_recv_armed(recv_ctx);
-            recv_ctx->be_pending = true;
-            KEEL_DEBUG_LOG("W%u: pool_resume EAGAIN → reactor_recv fd=%d\n",
-                         worker->id, session->server_fd);
-            int rc = keel_reactor_recv(worker->reactor, session->server_fd,
-                                       recv_ctx->be_buf, recv_ctx->be_cap,
-                                       0, be_ctx, on_backend_recv_complete);
-            if (rc < 0) {
-                recv_ctx->be_pending = false;
-                KEEL_LOG_ERROR(KEEL_LOG_CAT_IO,
-                    "W%u: failed to queue BE recv after pool resume", worker->id);
-                close_session(worker, session, recv_ctx);
-            }
-            return;
-        }
-        /* Backend closed or error */
-        KEEL_LOG_WARN(KEEL_LOG_CAT_CONN,
-            "W%u: pool_resume BE recv error: imm=%zd errno=%d",
-            worker->id, imm, errno);
-        close_session(worker, session, recv_ctx);
     } else if (fr == KEEL_FLOW_OK) {
         /* Replay any FE bytes saved while the session waited for a backend.
          * Pool resume may send one non-terminal extended-protocol message
