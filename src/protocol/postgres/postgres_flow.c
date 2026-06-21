@@ -3041,48 +3041,40 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
             }
         }
 
-        /* Tracking mode: intercept "PREPARE name AS body" Simple Query.
+        /* Simple-query PREPARE intercept.
          *
-         * When ps_mode == KEEL_PS_MODE_TRACKING we shadow the named prepared
-         * statement in the local stmt_cache (same as the extended-protocol
-         * Parse path) and strip the KEEL_QE_HARD_PIN flag so the engine
-         * uses the KEEL_FPIN_PREPARED_STMT replay path instead of hard-pin.
-         * This keeps backends poolable while transparently replaying Parse
-         * messages on new connections.
+         * Closes the silent pool-corruption class discovered under
+         * HammerDB-class workloads (review_20260620_01.md RC-1 + the
+         * transaction-pooling follow-up): in transaction pooling every
+         * Q("PREPARE name AS ...") landed on a different backend, so each
+         * backend carried only a SUBSET of the session's prepared
+         * statements while the release path stamped it with the
+         * cumulative session hash.  The next borrower's hash match then
+         * skipped replay and the subsequent Bind hit
+         * `prepared statement "X" does not exist` (SQLSTATE 26000).
          *
-         * The query is still forwarded to the backend as-is (act->be_payload
-         * is unchanged); we only add the replay entry.
+         * Fix: mirror extended-protocol virtualize semantics.  In
+         * virtualizable modes (VIRTUALIZE, TRACKING) the Q-PREPARE is
+         * ABSORBED — never forwarded to the backend.  The proxy caches
+         * the wire bytes, marks the entry confirmed, and synthesises
+         * CommandComplete("PREPARE") + ReadyForQuery directly to the
+         * client.  Backends stay clean until the next Bind triggers the
+         * standard replay path (which now includes the cached Q-PREPARE
+         * wire message, re-emitted as a Simple Query so the new backend
+         * recreates the named statement).
          *
-         * IMPORTANT: the entry is staged with confirmed=false and a pending
-         * state is recorded.  Confirmation (confirmed=true, hash XOR'd into
-         * session_stmt_hash) only happens when the backend sends
-         * CommandComplete("PREPARE").  On ErrorResponse the staged entry is
-         * rolled back to the prior state, preserving duplicate-PREPARE semantics
-         * that match PostgreSQL behaviour exactly.
-         */
+         * PINNING preserves the existing forward-and-track behaviour
+         * because the backend is hard-pinned for the session lifetime
+         * (every PREPARE lands on the same backend, so the subset
+         * problem does not arise).
+         *
+         * OFF and ANONYMOUS bypass entirely. */
         if ((ps & KEEL_FPIN_PREPARED_STMT)
             && qtype == (uint32_t)KEEL_QUERY_PREPARE
             && ctx->ps_mode != KEEL_PS_MODE_OFF
             && ctx->ps_mode != KEEL_PS_MODE_ANONYMOUS) {
-            /* Intercept simple-query PREPARE in every mode except OFF and
-             * ANONYMOUS.  OFF bypasses all tracking (hard-pin only); ANONYMOUS
-             * rewrites at Bind time and never accumulates named state on the
-             * backend.
-             *
-             * Promoting this intercept from TRACKING-only to all virtualizable
-             * modes (VIRTUALIZE, TRACKING, PINNING) closes the silent-pool-
-             * corruption class where a default-configured (virtualize) Keel
-             * forwards simple-query PREPARE verbatim, fails to track the
-             * resulting named PS, and lets the next borrower hit a dirty
-             * backend (review_20260620_01.md RC-1).
-             *
-             * In PINNING mode the backend is already hard-pinned by the
-             * PREPARE classification; the cache entry is still useful so
-             * pgf_get_stmt_compat_profile can populate the hash vector for
-             * correct release-path stamping.
-             *
-             * Strip HARD_PIN in virtualizable modes: the entry is replayed
-             * via the session-hash path; the backend is not hard-pinned.
+            /* Strip HARD_PIN in virtualizable modes so the engine uses
+             * the replay path instead of hard-pinning the backend.
              * PINNING keeps HARD_PIN (the mode's defining behaviour). */
             if (ctx->ps_mode != KEEL_PS_MODE_PINNING)
                 act->effect &= ~(keel_query_effect_flags_t)KEEL_QE_HARD_PIN;
@@ -3145,24 +3137,65 @@ static int pgf_on_fe_msg(void* vctx, const uint8_t* data, size_t len,
                             e->wire_msg = wire;
                             e->wire_msg_len = wire_len;
                             e->valid = true;
-                            /* Stage as unconfirmed: confirmation happens in on_be_msg
-                             * when CommandComplete("PREPARE") arrives. */
-                            e->confirmed = false;
                             e->context_sig = ctx->stmt_context_sig;
                             e->hash = pg_stmt_entry_hash(e, e->context_sig);
 
-                            /* Record pending state for rollback */
-                            strncpy(ctx->pending_track_name, trk_name,
-                                    sizeof(ctx->pending_track_name) - 1);
-                            ctx->pending_track_name[sizeof(ctx->pending_track_name)-1] = '\0';
-                            ctx->pending_track_valid     = true;
-                            ctx->pending_track_had_prior = had_prior;
-                            if (had_prior)
-                                ctx->pending_track_prior = prior_entry;
+                            if (ctx->ps_mode == KEEL_PS_MODE_VIRTUALIZE
+                                || ctx->ps_mode == KEEL_PS_MODE_TRACKING) {
+                                /* Absorb path: do NOT forward to the
+                                 * backend.  Mark the entry confirmed
+                                 * immediately (no backend response will
+                                 * arrive to confirm it).  Clean up any
+                                 * pending_track state so a later
+                                 * unrelated PREPARE does not roll us
+                                 * back.  Synthesise CommandComplete +
+                                 * RFQ directly to the client. */
+                                e->confirmed = true;
+                                ctx->pending_track_valid     = false;
+                                ctx->pending_track_had_prior = false;
+                                if (had_prior && prior_entry.wire_msg)
+                                    keel_free(prior_entry.wire_msg);
 
-                            /* Recompute session hash: the prior confirmed entry (if
-                             * any) is no longer included since it is now unconfirmed. */
-                            pg_stmt_recompute_session_hash(ctx);
+                                pg_stmt_recompute_session_hash(ctx);
+
+                                /* Build CC("PREPARE") + RFQ('I') into
+                                 * the ryw_resp_buf (512 B, plenty). */
+                                uint8_t* p = ctx->ryw_resp_buf;
+                                *p++ = 'C';
+                                wr32(p, 4 + 7 + 1); p += 4; /* len = 12 */
+                                memcpy(p, "PREPARE", 7); p += 7;
+                                *p++ = '\0';                  /* tag NUL */
+                                *p++ = 'Z';
+                                wr32(p, 5); p += 4;
+                                *p++ = 'I';
+                                ctx->ryw_resp_len = (size_t)(p - ctx->ryw_resp_buf);
+
+                                act->type          = KEEL_FE_ACT_SEND_FE;
+                                act->be_payload    = NULL;
+                                act->be_payload_len = 0;
+                                act->fe_response     = ctx->ryw_resp_buf;
+                                act->fe_response_len = ctx->ryw_resp_len;
+                                KEEL_DIAG_PS("PREPARE-ABSORB ctx=%p name='%s' hash=0x%016llx sess_hash=0x%016llx",
+                                    (void*)ctx, trk_name,
+                                    (unsigned long long)e->hash,
+                                    (unsigned long long)ctx->session_stmt_hash);
+                            } else {
+                                /* PINNING forward-and-track path: stage
+                                 * as unconfirmed; the backend will
+                                 * confirm via CommandComplete("PREPARE")
+                                 * and on_be_msg will mark the entry
+                                 * confirmed.  Rollback on ErrorResponse
+                                 * preserves duplicate-PREPARE semantics. */
+                                e->confirmed = false;
+                                strncpy(ctx->pending_track_name, trk_name,
+                                        sizeof(ctx->pending_track_name) - 1);
+                                ctx->pending_track_name[sizeof(ctx->pending_track_name)-1] = '\0';
+                                ctx->pending_track_valid     = true;
+                                ctx->pending_track_had_prior = had_prior;
+                                if (had_prior)
+                                    ctx->pending_track_prior = prior_entry;
+                                pg_stmt_recompute_session_hash(ctx);
+                            }
                         } else {
                             /* Upsert failed (OOM): restore prior state if needed */
                             if (had_prior && prior_entry.wire_msg)

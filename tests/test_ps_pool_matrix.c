@@ -486,7 +486,10 @@ static void test_tracking_simple_query_prepare(void) {
         if (c->stmt_cache[i].valid &&
             strcmp(c->stmt_cache[i].name, "myfoo") == 0) {
             found = true;
-            TEST_ASSERT(!c->stmt_cache[i].confirmed); /* staged, not yet confirmed */
+            /* review_20260620_01.md RC-1 + HammerDB follow-up: TRACKING
+             * absorbs Q-PREPARE without forwarding; entry is confirmed
+             * immediately by the proxy (no backend round-trip). */
+            TEST_ASSERT(c->stmt_cache[i].confirmed);
             TEST_ASSERT_NOT_NULL(c->stmt_cache[i].wire_msg);
             break;
         }

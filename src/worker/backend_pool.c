@@ -449,6 +449,14 @@ static void backend_pool_wake_one_locked(backend_pool_t* pool)
     }
 }
 
+void backend_pool_wake_next_waiter(backend_pool_t* pool)
+{
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    backend_pool_wake_one_locked(pool);
+    pthread_mutex_unlock(&pool->lock);
+}
+
 static void backend_pool_close_cleaning_locked(backend_pool_t* pool,
                                                backend_conn_t* conn,
                                                backend_close_reason_t reason,
@@ -1343,7 +1351,7 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
 
     /* Step 4: Last resort — grab any idle backend with a non-zero stmt hash.
      *
-     * Two cases:
+     * Cases:
      *
      * (a) required_stmt_hash != 0: session has stmts but NO idle backend
      *     matches exactly and there are no clean backends.  Grab a backend
@@ -1353,12 +1361,26 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
      *     already handles those, and replaying onto a backend that already
      *     has the right set would produce "already exists" errors.
      *
-     * Sessions with required_stmt_hash == 0 are usually still in their first
-     * extended-protocol Parse cycle: the statement has not been confirmed by
-     * ParseComplete yet, so the session has no stable replay profile.  Do not
-     * reclaim a stmt-bearing backend for that case.  The caller should queue
-     * and let refill/returns provide a clean backend instead of forcing cleanup
-     * in the middle of a split Parse/Bind/Flush sequence. */
+     * (b) required_stmt_hash == 0: session has no tracked prepared statements
+     *     (e.g. it just connected, or it only issues non-PS queries like
+     *     HammerDB's "SELECT max(w_id) FROM warehouse").  Such a session
+     *     does not care which PS set the backend carries — it just needs
+     *     a working backend, and the engine will DISCARD ALL before
+     *     forwarding.  Allow grabbing any dirty backend and mark
+     *     needs_full_cleanup.
+     *
+     * Without (b), hash=0 sessions starve whenever the pool fills up with
+     * PS-bearing backends released by hash!=0 sessions.  Under HammerDB-style
+     * load (vu=200 against max_pool_size=50) this is the difference between
+     * a working pooler and pool_wait_timeout storms.  A connection pooler
+     * MUST multiplex arbitrary clients onto arbitrary backends; restricting
+     * hash=0 sessions to only clean backends defeats that goal.
+     *
+     * The earlier rationale ("do not reclaim for hash=0 sessions because
+     * they may be mid-Parse cycle") was too conservative: a session in the
+     * middle of an extended-protocol Parse/Bind/Flush sequence holds the
+     * EXTENDED_PROTO pin and does not release its backend between frames,
+     * so it never reaches the borrow path with hash=0 mid-parse. */
 
     {
         backend_conn_t** prev = &pool->idle_list;
@@ -1373,8 +1395,26 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                 conn = conn->next;
                 continue;
             }
-            if (required_stmt_hash != 0 &&
-                conn->stmt_set_hash != 0 &&
+            /* Grab any idle backend that carries a non-zero stmt hash
+             * different from what we want (or any non-zero hash when we
+             * want zero).  In both cases the engine issues DISCARD ALL
+             * before forwarding the client's query.  Skip the case where
+             * the backend's hash equals required_stmt_hash — Step 1
+             * already handled that, and re-grabbing would skip cleanup
+             * and surface "already exists" errors.
+             *
+             * Performance note: for required_stmt_hash == 0 the proxy's
+             * PS intercept (VIRTUALIZE/TRACKING/ANONYMOUS) guarantees
+             * the client's Parse messages are absorbed and never reach
+             * the backend, so the backend's existing PS state cannot
+             * collide with anything the session sends.  The query just
+             * runs alongside the existing PS state harmlessly.  We mark
+             * needs_full_cleanup only when required_stmt_hash != 0
+             * (where a future Bind could trigger replay that conflicts
+             * with the backend's existing stmts).  This eliminates the
+             * cleanup storms that previously saturated the pool under
+             * HammerDB-class oversubscription (vu=200 vs pool=50). */
+            if (conn->stmt_set_hash != 0 &&
                 conn->stmt_set_hash != required_stmt_hash) {
                 backend_conn_state_t expected = BACKEND_CONN_IDLE;
                 if (atomic_compare_exchange_strong(&conn->state, &expected, BACKEND_CONN_ACTIVE)) {
@@ -1389,11 +1429,20 @@ backend_conn_t* backend_pool_borrow_with_stmts(backend_pool_t* pool,
                     }
                     pool->active_count++;
                     backend_pool_mark_borrowed(conn);
-                    /* Clear stale stmt hash; engine will clean before replay */
-                    conn->stmt_set_hash      = 0;
-                    backend_pool_reset_stmt_profile(conn);
-                    conn->needs_full_cleanup  = true;
-                    POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                    /* Only stomp the cached stmt hash if we're going to
+                     * clean it.  For hash=0 sessions we deliberately
+                     * keep the backend's existing PS state intact and
+                     * leave stmt_set_hash untouched so the next borrower
+                     * that wants this hash finds a ready backend in the
+                     * idle_list (skipping replay entirely).  Stomping
+                     * the hash to 0 here would force every subsequent
+                     * hash=H session to replay, killing multiplexing. */
+                    if (required_stmt_hash != 0) {
+                        conn->stmt_set_hash      = 0;
+                        backend_pool_reset_stmt_profile(conn);
+                        conn->needs_full_cleanup  = true;
+                        POOL_STAT_INC(pool, pool_borrow_cleanup_required);
+                    }
                     *out_needs_replay        = (required_stmt_hash != 0);
                     if (*out_needs_replay)
                         POOL_STAT_INC(pool, pool_borrow_stmt_replay);
