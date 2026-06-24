@@ -1,7 +1,7 @@
 dbset db pg
 dbset bm tproc-c
 
-diset connection pg_host "127.0.0.1"
+diset connection pg_host "192.168.15.2"
 diset connection pg_port "7432"
 
 diset tpcc pg_user "keel_usr_cli"

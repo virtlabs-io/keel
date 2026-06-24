@@ -537,6 +537,9 @@ set(KEEL_INCLUDE_DIRS
 # the new reactor-based pipeline that replaced the legacy libuv layer.
 # ============================================================================
 
+# Third-party allocator: dlmalloc mspace (ONLY_MSPACES build, MIT-0 license)
+add_subdirectory(third_party/dlmalloc)
+
 # Memory management library
 add_subdirectory(src/mem)
 

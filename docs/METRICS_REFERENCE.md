@@ -456,6 +456,32 @@ Conventions:
 | `keel_sessions_pinned_prepared_stmt` | gauge | Sessions pinned by prepared statements |
 | `keel_sessions_pinned_transaction` | gauge | Sessions pinned by transaction state |
 
+### keel_mem_*
+
+| Metric | Type | Description |
+|---|---|---|
+| `keel_mem_allocation_count` | gauge | Live keel_malloc allocations |
+| `keel_mem_allocations_peak` | gauge | Peak live allocation count since process start |
+| `keel_mem_allocations_total` | counter | Total keel_malloc calls since process start |
+| `keel_mem_arena_bytes` | gauge | Bytes currently held by all arena instances |
+| `keel_mem_arena_count` | gauge | Active keel_arena instances |
+| `keel_mem_bytes_allocated` | gauge | Bytes currently allocated via keel_malloc |
+| `keel_mem_bytes_committed` | gauge | Bytes committed from backing store (pool footprint or allocated) |
+| `keel_mem_bytes_peak` | gauge | Peak bytes allocated since process start |
+| `keel_mem_bytes_total` | counter | Total bytes requested via keel_malloc since process start |
+| `keel_mem_frees_total` | counter | Total keel_free calls since process start |
+| `keel_mem_pool_bytes` | gauge | Bytes currently held by all object pool instances |
+| `keel_mem_pool_count` | gauge | Active keel_pool instances |
+
+### keel_shared_pool_*
+
+| Metric | Type | Description |
+|---|---|---|
+| `keel_shared_pool_free_bytes` | gauge | Bytes available in the shared-buffers pool (total − used) |
+| `keel_shared_pool_peak_bytes` | gauge | Historical peak footprint of the shared-buffers pool |
+| `keel_shared_pool_total_bytes` | gauge | Total bytes reserved for the shared-buffers pool |
+| `keel_shared_pool_used_bytes` | gauge | Bytes currently allocated from the shared-buffers pool |
+
 ### keel_queries_*
 
 | Metric | Type | Description |

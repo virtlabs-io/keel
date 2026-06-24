@@ -3133,6 +3133,32 @@ int main(int argc, char** argv) {
             g_config.experimental_features = config_bool_enabled(
                 config, "keel", "experimental_features", false);
             g_experimental_features_enabled = g_config.experimental_features;
+
+            /* ----------------------------------------------------------------
+             * Shared-buffers pool (Phase 2 memory init).
+             *
+             * Must be attached before any worker/arena/pool allocations so the
+             * hot path uses the pool. Bootstrap allocations (config parsing,
+             * misc_arena) remain in libc memory — they are process-lifetime
+             * singletons and amount to a few MB at most.
+             * ---------------------------------------------------------------- */
+            {
+                int64_t sb = keel_config_get_bytes(config, "keel", "shared_buffers", 0);
+                if (sb > 0) {
+                    bool do_mlock = config_bool_enabled(config, "keel", "mlock_pool", false);
+                    bool do_huge  = config_bool_enabled(config, "keel", "use_huge_pages", false);
+                    keel_error_t perr = keel_mem_pool_attach((size_t)sb, do_mlock, do_huge);
+                    if (perr != KEEL_OK) {
+                        fprintf(stderr,
+                            "keel: shared_buffers=%lld: pool attach failed (%d). "
+                            "Ensure the system has enough virtual address space "
+                            "and, if mlock_pool=1, sufficient RLIMIT_MEMLOCK.\n",
+                            (long long)sb, (int)perr);
+                        keel_config_free(config);
+                        return 1;
+                    }
+                }
+            }
             
             /* Graceful shutdown drain timeout */
             {

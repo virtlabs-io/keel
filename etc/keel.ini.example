@@ -42,6 +42,51 @@ experimental_features = 0
 # Default: 30000 (30 seconds)
 # shutdown_timeout_ms = 30000
 
+# =============================================================================
+# Memory pool (shared_buffers)
+# =============================================================================
+#
+# Pre-allocate a single contiguous memory region at startup.  All internal
+# allocations (arenas, pools, ring-buffers, sessions) draw from this pool
+# through the keel_malloc family.  This replaces the default libc malloc with
+# a deterministic, bounded heap that:
+#
+#   * Hard-caps total memory usage (OOM is explicit, not a kernel surprise).
+#   * Eliminates fragmentation at the OS level (one mmap, not thousands).
+#   * Enables mlock to prevent swap-induced latency spikes.
+#   * Reduces syscall rate — no per-allocation mmap/brk after startup.
+#
+# Bootstrap allocations that happen before this pool is set up (config parsing,
+# the misc_arena, etc.) remain in libc memory.  They are a few MiB at most and
+# are process-lifetime singletons, so no migration is needed.
+#
+# Accepts human-friendly sizes: 256MB, 512MB, 1GB, 2GiB, etc.
+# 0 or absent = use libc malloc (backward-compatible default).
+#
+# Sizing rule of thumb:
+#   shared_buffers ≥  (max_pool_size × avg_backend_buf)
+#                   + (num_workers × session_pool_size × sizeof(session))
+#                   + (num_workers × scratch_arena_size)
+#                   + 20% headroom
+# A starting point for most deployments is 256 MB.
+#
+# Default: 0 (disabled)
+# shared_buffers = 256MB
+
+# Lock pool pages into RAM to prevent the OS from swapping them out.
+# Guarantees sub-millisecond allocation latency independent of memory pressure.
+# Requires CAP_IPC_LOCK or a sufficiently large RLIMIT_MEMLOCK.
+# (ulimit -l unlimited  or  LimitMEMLOCK=infinity in the systemd unit)
+# Default: 0
+# mlock_pool = 0
+
+# Request Linux huge pages (2 MiB) for the pool backing region.
+# Reduces TLB pressure under heavy allocation load.
+# Requires /proc/sys/vm/nr_hugepages > 0 (or transparent huge pages).
+# Falls back to normal 4 KiB pages silently if unavailable.
+# Default: 0
+# use_huge_pages = 0
+
 
 # =============================================================================
 # [logging]  -- Log sink and verbosity

@@ -59,10 +59,15 @@ typedef enum keel_mem_debug_flags {
  * @brief Memory configuration
  */
 typedef struct keel_mem_config {
-    uint32_t debug_flags;       /**< Debug flags (keel_mem_debug_flags_t) */
-    size_t   page_size;         /**< System page size (0 = auto-detect) */
-    size_t   default_arena_size;/**< Default arena size (0 = 64KB) */
-    size_t   max_cached_arenas; /**< Max cached arenas (0 = 16) */
+    uint32_t debug_flags;           /**< Debug flags (keel_mem_debug_flags_t) */
+    size_t   page_size;             /**< System page size (0 = auto-detect) */
+    size_t   default_arena_size;    /**< Default arena size (0 = 64KB) */
+    size_t   max_cached_arenas;     /**< Max cached arenas (0 = 16) */
+
+    /* Shared-buffers pool (Phase 2 — call keel_mem_pool_attach after config load) */
+    size_t   shared_buffers_bytes;  /**< Pool size; 0 = disabled (libc fallback) */
+    bool     mlock_pool;            /**< Lock pool pages into RAM (CAP_IPC_LOCK) */
+    bool     use_huge_pages;        /**< Hint MAP_HUGETLB for TLB savings */
 } keel_mem_config_t;
 
 /**
@@ -107,6 +112,39 @@ void keel_mem_shutdown(void);
  * disable.  Not thread-safe — use only from a single test thread.
  */
 void keel_mem_set_fail_countdown(int n);
+
+/**
+ * @brief Phase-2 memory pool initialisation (call after config is parsed).
+ *
+ * Maps a single contiguous region of @p bytes using MAP_ANONYMOUS and
+ * initialises a dlmalloc mspace over it. After this call, all
+ * `keel_malloc` / `keel_calloc` / `keel_realloc` / `keel_free` calls
+ * draw from this pool instead of libc malloc.
+ *
+ * Allocations made during bootstrap (before this call, e.g. for config
+ * parsing) remain in libc memory and are not migrated — they are
+ * process-lifetime singletons and are not a problem in practice.
+ *
+ * @param bytes         Pool size. Must be at least 4 MiB.
+ * @param mlock_pool    Lock pages into RAM (requires CAP_IPC_LOCK or sufficient
+ *                      RLIMIT_MEMLOCK). Prevents swap latency.
+ * @param use_huge_pages Hint MAP_HUGETLB for 2 MiB pages (Linux, reduces TLB
+ *                      pressure; requires /proc/sys/vm/nr_hugepages > 0).
+ * @return KEEL_OK, KEEL_ERR_INVALID (bad size), or KEEL_ERR_NOMEM.
+ */
+keel_error_t keel_mem_pool_attach(size_t bytes, bool mlock_pool, bool use_huge_pages);
+
+/** @brief Returns true after a successful keel_mem_pool_attach(). */
+bool   keel_mem_pool_active(void);
+
+/** @brief Total bytes reserved by the pool (0 if inactive). */
+size_t keel_mem_pool_total_bytes(void);
+
+/** @brief Bytes currently committed inside the pool (footprint). */
+size_t keel_mem_pool_used_bytes(void);
+
+/** @brief Peak committed bytes since pool creation. */
+size_t keel_mem_pool_peak_bytes(void);
 
 
 
@@ -335,6 +373,29 @@ KEEL_NODISCARD
 char* keel_arena_strdup(keel_arena_t* arena, const char* str);
 
 /**
+ * @brief Duplicate at most max characters of a string into the arena
+ */
+KEEL_NODISCARD
+char* keel_arena_strndup(keel_arena_t* arena, const char* str, size_t max);
+
+/**
+ * @brief Duplicate a memory region into the arena
+ */
+KEEL_NODISCARD
+
+/**
+ * @brief Return the global process-lifetime misc arena.
+ *
+ * Allocations from this arena are never individually freed; they are released
+ * in bulk at keel_mem_shutdown(). Use for singletons, config strings, and any
+ * process-lifetime data that does not have a natural request-scoped owner.
+ *
+ * @return Pointer to the global misc arena, or NULL if not initialised.
+ */
+KEEL_NODISCARD
+keel_arena_t* keel_misc_arena(void);
+
+/**
  * @brief Printf into arena
  */
 KEEL_NODISCARD KEEL_PRINTF_FMT(2, 3)
@@ -469,23 +530,28 @@ typedef struct keel_mem_stats {
     size_t bytes_allocated;     /**< Currently allocated bytes */
     size_t bytes_committed;     /**< Memory committed from OS */
     size_t allocation_count;    /**< Current number of allocations */
-    
+
     /* Lifetime totals */
     size_t total_allocations;   /**< Total allocations made */
     size_t total_frees;         /**< Total frees made */
     size_t total_bytes;         /**< Total bytes allocated (lifetime) */
-    
+
     /* Peak usage */
     size_t peak_bytes;          /**< Peak bytes allocated */
     size_t peak_allocations;    /**< Peak allocation count */
-    
+
     /* Arenas */
     size_t arena_count;         /**< Active arenas */
     size_t arena_bytes;         /**< Arena memory usage */
-    
-    /* Pools */
+
+    /* Object pools */
     size_t pool_count;          /**< Active pools */
     size_t pool_bytes;          /**< Pool memory usage */
+
+    /* Shared-buffers pool (populated when keel_mem_pool_active()) */
+    size_t shared_pool_total;   /**< Total bytes reserved by the mmap pool */
+    size_t shared_pool_used;    /**< Bytes committed (footprint) inside the pool */
+    size_t shared_pool_peak;    /**< Peak footprint since pool creation */
 } keel_mem_stats_t;
 
 /**
@@ -500,6 +566,14 @@ void keel_mem_stats_get(keel_mem_stats_t* stats);
  * @brief Print memory statistics to log
  */
 void keel_mem_stats_log(void);
+
+/**
+ * @brief Reset all lifetime statistics counters to zero.
+ *
+ * Useful for measuring deltas between operations. Does not affect
+ * currently-allocated bytes or allocation-count gauges.
+ */
+void keel_mem_reset_stats(void);
 
 /**
  * @brief Dump all allocations (debug mode only)
