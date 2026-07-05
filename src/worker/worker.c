@@ -2394,6 +2394,24 @@ static void pool_refill_timer_cb(void* userdata)
         }
     }
 
+    /* Proactively pre-clean idle backends with stale stmt hashes when sessions
+     * are waiting.  This moves DISCARD ALL from the inline borrow path (where
+     * the backend stays ACTIVE for the full round-trip) to background CLEANING
+     * before any session borrows it — so the next waiter gets a clean backend
+     * with zero inline overhead.  Limit to 4 per tick to avoid saturating the
+     * reactor with simultaneous cleanup I/O. */
+    for (size_t si = 0; si < worker->server_pool_count; si++) {
+        if (worker->server_pools[si]) {
+            size_t preempted = backend_pool_preempt_idle_mismatches(
+                                   worker->server_pools[si], 4);
+            if (preempted > 0) {
+                urgent_pool_work = true;
+                if (worker->stats_ctx)
+                    KEEL_STAT_ADD(worker->stats_ctx, pool_preempt_cleans, preempted);
+            }
+        }
+    }
+
     /* Expire sessions that have been waiting too long for a backend connection.
      * This prevents clients from hanging forever when all backends are down. */
     for (size_t si = 0; si < worker->server_pool_count; si++) {

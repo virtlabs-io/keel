@@ -18,7 +18,7 @@ diset tpcc pg_timeprofile false
 diset tpcc pg_raiseerror true
 
 vuset logtot stderr
-vuset vu 200
+vuset vu 50
 
 vucreate
 vurun
