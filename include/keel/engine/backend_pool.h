@@ -478,6 +478,17 @@ void backend_pool_set_quarantine(backend_conn_t* conn,
 size_t backend_pool_drain_cleaning(backend_pool_t* pool);
 
 /**
+ * @brief Proactively start background CLEANING for idle backends with stale
+ *        stmt_set_hash values when sessions are waiting in the queue.
+ *
+ * @param pool         Pool to operate on.
+ * @param max_to_clean Upper bound on new CLEANING ops started this call.
+ * @return Number of CLEANING operations started.
+ */
+size_t backend_pool_preempt_idle_mismatches(backend_pool_t* pool,
+                                            size_t max_to_clean);
+
+/**
  * @brief Release all connections for a session
  *
  * Called when a client disconnects. Unsafe pinned connections are closed and

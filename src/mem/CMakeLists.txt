@@ -28,7 +28,8 @@ target_include_directories(keelmem PUBLIC
 )
 
 # keelmem uses keel_log_enabled/keel_log_internal from keellog
-target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads)
+# dlmalloc provides the mspace heap manager for the shared_buffers pool
+target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads PUBLIC dlmalloc)
 
 target_compile_options(keelmem PRIVATE
     ${KEEL_WARNING_FLAGS}

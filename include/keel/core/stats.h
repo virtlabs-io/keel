@@ -234,6 +234,7 @@ typedef struct keel_stats_basic {
     keel_counter_t   pool_returns;       /**< Backend returned to pool */
     keel_counter_t   pool_creates;       /**< Backend connections opened */
     keel_counter_t   pool_destroys;      /**< Backend connections closed */
+    keel_counter_t   pool_preempt_cleans;/**< Idle hash-mismatch backends pre-cleaned proactively */
     keel_counter_t   pool_hits;          /**< Pool had a clean conn ready */
     keel_counter_t   pool_misses;        /**< Pool empty, had to create */
     keel_counter_t   pool_borrow_attempts;            /**< Borrow decisions attempted */

@@ -519,16 +519,42 @@ static bool backend_pool_prepare_cleanup_locked(backend_pool_t* pool,
     if (!pool || !conn || !pool->flow_vt)
         return false;
 
+    /* Choose the cheapest cleanup mode:
+     *   SELECTIVE — backend only has GUC state (SET param changes), no PS mismatch.
+     *               Generates "RESET p1; RESET p2; ..." — cheaper than DISCARD ALL
+     *               because it preserves named PS and temp-table state.
+     *   FULL      — PS mismatch or unknown state requires DISCARD ALL. */
+    keel_cleanup_mode_t mode = KEEL_CLEANUP_FULL;
+    const struct state_profile* profile_for_reset = NULL;
+    if (!conn->needs_full_cleanup &&
+        conn->profile && conn->profile->count > 0 &&
+        pool->flow_vt->cleanup_slot) {
+        mode = KEEL_CLEANUP_SELECTIVE;
+        profile_for_reset = conn->profile;
+    }
+
     keel_cleanup_opts_t opts = {
-        .mode = KEEL_CLEANUP_FULL,
+        .mode = mode,
         .timeout_ms = BACKEND_CLEANUP_TIMEOUT_MS,
     };
 
     ssize_t n = -1;
     if (pool->flow_vt->cleanup_slot) {
-        n = pool->flow_vt->cleanup_slot(NULL, conn->fd, NULL, opts,
+        n = pool->flow_vt->cleanup_slot(NULL, conn->fd, profile_for_reset, opts,
                                         conn->cleanup_send_buf,
                                         sizeof(conn->cleanup_send_buf));
+        /* Selective RESET returned 0 (empty profile) — nothing to clean. */
+        if (mode == KEEL_CLEANUP_SELECTIVE && n == 0) {
+            conn->cleanup_send_len = 0;
+            return true;
+        }
+        /* Fall back to FULL if selective build failed. */
+        if (n <= 0 && mode == KEEL_CLEANUP_SELECTIVE) {
+            opts.mode = KEEL_CLEANUP_FULL;
+            n = pool->flow_vt->cleanup_slot(NULL, conn->fd, NULL, opts,
+                                            conn->cleanup_send_buf,
+                                            sizeof(conn->cleanup_send_buf));
+        }
     } else if (pool->flow_vt->build_cleanup) {
         n = pool->flow_vt->build_cleanup(NULL, KEEL_CLEANUP_UNKNOWN_STATE,
                                          conn->cleanup_send_buf,
@@ -612,6 +638,25 @@ static void backend_pool_enter_cleanup_locked(backend_pool_t* pool,
         backend_pool_close_cleaning_locked(pool, conn,
                                            BACKEND_CLOSE_REASON_CLEANUP_ERROR,
                                            BACKEND_CLEANUP_RESULT_SEND_FAILURE);
+        KEEL_CHECK_POOL_INVARIANTS(pool);
+        return;
+    }
+    /* Selective cleanup with an empty profile (nothing to reset) — skip the
+     * network round-trip and go straight to the clean path. */
+    if (conn->cleanup_send_len == 0) {
+        conn->needs_full_cleanup = false;
+        conn->needs_sync         = false;
+        conn->syncing            = false;
+        conn->replay_active      = false;
+        conn->quarantine         = BACKEND_QUARANTINE_NONE;
+        if (conn->profile)
+            state_profile_clear(conn->profile);
+        conn->current_state_hash = 0;
+        atomic_store(&conn->state, BACKEND_CONN_IDLE);
+        conn->next = pool->clean_list;
+        pool->clean_list = conn;
+        pool->clean_count++;
+        backend_pool_wake_one_locked(pool);
         KEEL_CHECK_POOL_INVARIANTS(pool);
         return;
     }
@@ -2453,6 +2498,79 @@ size_t backend_pool_prune_idle(backend_pool_t* pool)
 /* ============================================================================
  * Pool Target Update (for failover)
  * ============================================================================ */
+
+/**
+ * @brief Proactively start background CLEANING for idle backends with a
+ *        stale stmt_set_hash when there are sessions waiting in the queue.
+ *
+ * Without this, a backend with hash H sitting in idle_list is only cleaned
+ * when a session with a different hash actually borrows it — which forces
+ * DISCARD ALL inline (holding the backend ACTIVE, unavailable).  By starting
+ * the CLEANING here in the timer callback, the backend transitions to
+ * clean_list BEFORE it is borrowed, so the next waiter gets a clean backend
+ * without any inline round-trip overhead.
+ *
+ * Only kicks at most `max_to_clean` cleanups per timer tick to avoid
+ * saturating the reactor with cleanup I/O all at once.
+ *
+ * @param pool Pool to operate on.
+ * @param max_to_clean Maximum new CLEANING operations to start this tick.
+ * @return Number of CLEANING operations started.
+ */
+size_t backend_pool_preempt_idle_mismatches(backend_pool_t* pool,
+                                            size_t max_to_clean)
+{
+    if (!pool || max_to_clean == 0) return 0;
+
+    pthread_mutex_lock(&pool->lock);
+
+    /* Only worth doing when there are waiters and idle mismatched backends. */
+    if (pool->wait_queue_size == 0 || pool->clean_count > 0) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
+    size_t kicked = 0;
+    backend_conn_t** prev = &pool->idle_list;
+    backend_conn_t*  conn = pool->idle_list;
+
+    while (conn && kicked < max_to_clean) {
+        backend_conn_t* next = conn->next;
+
+        /* Only target idle backends that carry PS state (stmt_set_hash != 0).
+         * Backends with hash == 0 are already functionally clean and would be
+         * on clean_list — they shouldn't appear here, but guard anyway. */
+        if (conn->stmt_set_hash == 0) {
+            prev = &conn->next;
+            conn = next;
+            continue;
+        }
+
+        backend_conn_state_t expected = BACKEND_CONN_IDLE;
+        if (atomic_compare_exchange_strong(&conn->state, &expected,
+                                           BACKEND_CONN_CLEANING)) {
+            /* Remove from idle_list */
+            *prev = next;
+            conn->needs_full_cleanup = true;   /* force DISCARD ALL */
+            backend_pool_enter_cleanup_locked(pool, conn);
+            kicked++;
+            conn = *prev;
+            continue;
+        }
+        prev = &conn->next;
+        conn = next;
+    }
+
+    KEEL_CHECK_POOL_INVARIANTS(pool);
+    pthread_mutex_unlock(&pool->lock);
+
+    if (kicked > 0)
+        KEEL_LOG_DEBUG(KEEL_LOG_CAT_POOL,
+            "preempt_idle_mismatches: kicked %zu CLEANING ops for %s:%u",
+            kicked, pool->config.host, pool->config.port);
+
+    return kicked;
+}
 
 /**
  * @brief Expire waiters that have been queued longer than `wait_timeout_ms`.

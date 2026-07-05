@@ -1151,6 +1151,44 @@ static void show_stats(keel_admin_t *admin, pgbuf_t *b) {
         pg_data_row(b, row, 2); nrows++;
     }
 
+    /* Memory subsystem — full keel_mem_stats_t snapshot */
+    {
+        keel_mem_stats_t ms;
+        keel_mem_stats_get(&ms);
+
+        /* Current allocation state */
+        { const char *r[] = { "mem_bytes_allocated",  fmt_u64(vbuf, sizeof(vbuf), ms.bytes_allocated) };  pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_bytes_committed",  fmt_u64(vbuf, sizeof(vbuf), ms.bytes_committed) };  pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_allocation_count", fmt_u64(vbuf, sizeof(vbuf), ms.allocation_count) }; pg_data_row(b, r, 2); nrows++; }
+
+        /* Peak */
+        { const char *r[] = { "mem_bytes_peak",       fmt_u64(vbuf, sizeof(vbuf), ms.peak_bytes) };       pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_allocations_peak", fmt_u64(vbuf, sizeof(vbuf), ms.peak_allocations) }; pg_data_row(b, r, 2); nrows++; }
+
+        /* Lifetime totals */
+        { const char *r[] = { "mem_allocations_total", fmt_u64(vbuf, sizeof(vbuf), ms.total_allocations) }; pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_frees_total",       fmt_u64(vbuf, sizeof(vbuf), ms.total_frees) };       pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_bytes_total",       fmt_u64(vbuf, sizeof(vbuf), ms.total_bytes) };       pg_data_row(b, r, 2); nrows++; }
+
+        /* Arena allocator */
+        { const char *r[] = { "mem_arena_count", fmt_u64(vbuf, sizeof(vbuf), ms.arena_count) }; pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_arena_bytes", fmt_u64(vbuf, sizeof(vbuf), ms.arena_bytes) }; pg_data_row(b, r, 2); nrows++; }
+
+        /* Object pools */
+        { const char *r[] = { "mem_pool_count", fmt_u64(vbuf, sizeof(vbuf), ms.pool_count) }; pg_data_row(b, r, 2); nrows++; }
+        { const char *r[] = { "mem_pool_bytes", fmt_u64(vbuf, sizeof(vbuf), ms.pool_bytes) }; pg_data_row(b, r, 2); nrows++; }
+
+        /* Shared-buffers pool (only when active) */
+        if (ms.shared_pool_total > 0) {
+            size_t sp_free = ms.shared_pool_total > ms.shared_pool_used
+                             ? ms.shared_pool_total - ms.shared_pool_used : 0;
+            { const char *r[] = { "mem_shared_pool_total_bytes", fmt_u64(vbuf, sizeof(vbuf), ms.shared_pool_total) }; pg_data_row(b, r, 2); nrows++; }
+            { const char *r[] = { "mem_shared_pool_used_bytes",  fmt_u64(vbuf, sizeof(vbuf), ms.shared_pool_used) };  pg_data_row(b, r, 2); nrows++; }
+            { const char *r[] = { "mem_shared_pool_free_bytes",  fmt_u64(vbuf, sizeof(vbuf), sp_free) };             pg_data_row(b, r, 2); nrows++; }
+            { const char *r[] = { "mem_shared_pool_peak_bytes",  fmt_u64(vbuf, sizeof(vbuf), ms.shared_pool_peak) };  pg_data_row(b, r, 2); nrows++; }
+        }
+    }
+
 #undef ROW_COUNTER
 #undef ROW_GAUGE
 
@@ -5181,6 +5219,87 @@ static void prom_write_metrics(keel_admin_t *admin, int fd, bool accept_gzip) {
         fprintf(f, "keel_uptime_seconds %.1f\n", (double)snap.uptime_ns / 1.0e9);
     }
 
+    /* Memory subsystem metrics — always emitted. */
+    {
+        keel_mem_stats_t ms;
+        keel_mem_stats_get(&ms);
+
+        /* Current allocation state */
+        fprintf(f, "# HELP keel_mem_bytes_allocated Bytes currently allocated via keel_malloc\n");
+        fprintf(f, "# TYPE keel_mem_bytes_allocated gauge\n");
+        fprintf(f, "keel_mem_bytes_allocated %zu\n", ms.bytes_allocated);
+
+        fprintf(f, "# HELP keel_mem_bytes_committed Bytes committed from backing store (pool footprint or allocated)\n");
+        fprintf(f, "# TYPE keel_mem_bytes_committed gauge\n");
+        fprintf(f, "keel_mem_bytes_committed %zu\n", ms.bytes_committed);
+
+        fprintf(f, "# HELP keel_mem_allocation_count Number of live keel_malloc allocations\n");
+        fprintf(f, "# TYPE keel_mem_allocation_count gauge\n");
+        fprintf(f, "keel_mem_allocation_count %zu\n", ms.allocation_count);
+
+        /* Peak */
+        fprintf(f, "# HELP keel_mem_bytes_peak Peak bytes allocated since process start\n");
+        fprintf(f, "# TYPE keel_mem_bytes_peak gauge\n");
+        fprintf(f, "keel_mem_bytes_peak %zu\n", ms.peak_bytes);
+
+        fprintf(f, "# HELP keel_mem_allocations_peak Peak live allocation count since process start\n");
+        fprintf(f, "# TYPE keel_mem_allocations_peak gauge\n");
+        fprintf(f, "keel_mem_allocations_peak %zu\n", ms.peak_allocations);
+
+        /* Lifetime counters */
+        fprintf(f, "# HELP keel_mem_allocations_total Total keel_malloc calls since process start\n");
+        fprintf(f, "# TYPE keel_mem_allocations_total counter\n");
+        fprintf(f, "keel_mem_allocations_total %zu\n", ms.total_allocations);
+
+        fprintf(f, "# HELP keel_mem_frees_total Total keel_free calls since process start\n");
+        fprintf(f, "# TYPE keel_mem_frees_total counter\n");
+        fprintf(f, "keel_mem_frees_total %zu\n", ms.total_frees);
+
+        fprintf(f, "# HELP keel_mem_bytes_total Total bytes requested via keel_malloc since process start\n");
+        fprintf(f, "# TYPE keel_mem_bytes_total counter\n");
+        fprintf(f, "keel_mem_bytes_total %zu\n", ms.total_bytes);
+
+        /* Arena allocator */
+        fprintf(f, "# HELP keel_mem_arena_count Active keel_arena instances\n");
+        fprintf(f, "# TYPE keel_mem_arena_count gauge\n");
+        fprintf(f, "keel_mem_arena_count %zu\n", ms.arena_count);
+
+        fprintf(f, "# HELP keel_mem_arena_bytes Bytes currently held by all arenas\n");
+        fprintf(f, "# TYPE keel_mem_arena_bytes gauge\n");
+        fprintf(f, "keel_mem_arena_bytes %zu\n", ms.arena_bytes);
+
+        /* Object pools */
+        fprintf(f, "# HELP keel_mem_pool_count Active keel_pool instances\n");
+        fprintf(f, "# TYPE keel_mem_pool_count gauge\n");
+        fprintf(f, "keel_mem_pool_count %zu\n", ms.pool_count);
+
+        fprintf(f, "# HELP keel_mem_pool_bytes Bytes currently held by all object pools\n");
+        fprintf(f, "# TYPE keel_mem_pool_bytes gauge\n");
+        fprintf(f, "keel_mem_pool_bytes %zu\n", ms.pool_bytes);
+
+        /* Shared-buffers pool (only when active) */
+        if (ms.shared_pool_total > 0) {
+            size_t free_bytes = ms.shared_pool_total > ms.shared_pool_used
+                                ? ms.shared_pool_total - ms.shared_pool_used : 0;
+
+            fprintf(f, "# HELP keel_shared_pool_total_bytes Pre-allocated shared memory pool size\n");
+            fprintf(f, "# TYPE keel_shared_pool_total_bytes gauge\n");
+            fprintf(f, "keel_shared_pool_total_bytes %zu\n", ms.shared_pool_total);
+
+            fprintf(f, "# HELP keel_shared_pool_used_bytes Current heap footprint inside shared pool\n");
+            fprintf(f, "# TYPE keel_shared_pool_used_bytes gauge\n");
+            fprintf(f, "keel_shared_pool_used_bytes %zu\n", ms.shared_pool_used);
+
+            fprintf(f, "# HELP keel_shared_pool_peak_bytes Historical peak heap footprint inside shared pool\n");
+            fprintf(f, "# TYPE keel_shared_pool_peak_bytes gauge\n");
+            fprintf(f, "keel_shared_pool_peak_bytes %zu\n", ms.shared_pool_peak);
+
+            fprintf(f, "# HELP keel_shared_pool_free_bytes Unused bytes remaining in shared pool\n");
+            fprintf(f, "# TYPE keel_shared_pool_free_bytes gauge\n");
+            fprintf(f, "keel_shared_pool_free_bytes %zu\n", free_bytes);
+        }
+    }
+
     /* Connection pool utilization gauges — aggregated across all workers. */
     {
         size_t pool_active = 0, pool_idle = 0, pool_total = 0;
@@ -5518,7 +5637,8 @@ static void write_status_json(keel_admin_t *admin, int fd) {
         "  \"pool\": {\"active\":%zu,\"idle\":%zu,\"cleaning\":%zu,\"pinned\":%zu,\"dirty\":%zu,\"closed\":%zu,\"total\":%zu,\"waiting\":%zu},\n"
         "  \"queries\": {\"total\":%llu,\"read\":%llu,\"write\":%llu,\"tx\":%llu},\n"
         "  \"errors\": {\"total\":%llu,\"auth\":%llu,\"timeout\":%llu},\n"
-        "  \"cluster\": {\"role\":\"%s\",\"term\":%llu,\"leader\":\"%s\"}\n"
+        "  \"cluster\": {\"role\":\"%s\",\"term\":%llu,\"leader\":\"%s\"},\n"
+        "  \"memory\": {\"pool_total\":%zu,\"pool_used\":%zu,\"pool_peak\":%zu,\"pool_free\":%zu}\n"
         "}\n",
         state_str, nw, uptime_seconds,
         (unsigned long long)sessions_active,
@@ -5535,7 +5655,12 @@ static void write_status_json(keel_admin_t *admin, int fd) {
         (unsigned long long)errors_timeout,
         cluster_role_str,
         (unsigned long long)cluster_term,
-        cluster_leader);
+        cluster_leader,
+        keel_mem_pool_total_bytes(),
+        keel_mem_pool_used_bytes(),
+        keel_mem_pool_peak_bytes(),
+        keel_mem_pool_total_bytes() > keel_mem_pool_used_bytes()
+            ? keel_mem_pool_total_bytes() - keel_mem_pool_used_bytes() : (size_t)0);
     fclose(f);
 
     char hdr[256];
@@ -5737,6 +5862,27 @@ static void serve_metrics_json(keel_admin_t *admin, int fd) {
         (unsigned long long)keel_counter_get(&b->discard_all_count),
         (unsigned long long)keel_counter_get(&b->state_sync_count),
         (long long)keel_gauge_get(&b->backends_cleaning));
+
+    /* Memory subsystem — separate fprintf to avoid an unwieldy format string. */
+    {
+        keel_mem_stats_t ms;
+        keel_mem_stats_get(&ms);
+        fprintf(f,
+            "  \"memory\": {"
+            "\"bytes_allocated\":%zu,\"bytes_committed\":%zu,\"allocation_count\":%zu,"
+            "\"bytes_peak\":%zu,\"allocations_peak\":%zu,"
+            "\"allocations_total\":%zu,\"frees_total\":%zu,\"bytes_total\":%zu,"
+            "\"arena_count\":%zu,\"arena_bytes\":%zu,"
+            "\"pool_count\":%zu,\"pool_bytes\":%zu,"
+            "\"shared_pool_total\":%zu,\"shared_pool_used\":%zu,\"shared_pool_peak\":%zu"
+            "},\n",
+            ms.bytes_allocated, ms.bytes_committed, ms.allocation_count,
+            ms.peak_bytes, ms.peak_allocations,
+            ms.total_allocations, ms.total_frees, ms.total_bytes,
+            ms.arena_count, ms.arena_bytes,
+            ms.pool_count, ms.pool_bytes,
+            ms.shared_pool_total, ms.shared_pool_used, ms.shared_pool_peak);
+    }
 
 #ifdef KEEL_HAS_OTLP
     if (admin->otlp_exporter) {

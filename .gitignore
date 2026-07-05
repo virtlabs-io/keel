@@ -81,6 +81,7 @@ Thumbs.db
 third_party/*
 !third_party/nanopb
 !third_party/otel-proto
+!third_party/dlmalloc
 vendor/
 
 # Documentation build
