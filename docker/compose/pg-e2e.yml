@@ -214,17 +214,17 @@ services:
         
         echo ""
         echo "[pgbench] Waiting for streaming replicas to apply init WAL..."
-        INIT_LSN=$(psql -h pgsql-01 -p 5432 -U postgres -d testdb -tAc "SELECT pg_current_wal_lsn()")
-        for _i in $(seq 1 60); do
-          r2=$(psql -h pgsql-02 -p 5432 -U postgres -d testdb -tAc \
-               "SELECT pg_last_wal_replay_lsn() >= '$INIT_LSN'" 2>/dev/null || echo f)
-          r3=$(psql -h pgsql-03 -p 5432 -U postgres -d testdb -tAc \
-               "SELECT pg_last_wal_replay_lsn() >= '$INIT_LSN'" 2>/dev/null || echo f)
-          if [ "$r2" = "t" ] && [ "$r3" = "t" ]; then
-            echo "[pgbench] Replicas caught up to LSN $INIT_LSN"
+        INIT_LSN=$$(psql -h pgsql-01 -p 5432 -U postgres -d testdb -tAc "SELECT pg_current_wal_lsn()")
+        for _i in $$(seq 1 60); do
+          r2=$$(psql -h pgsql-02 -p 5432 -U postgres -d testdb -tAc \
+               "SELECT pg_last_wal_replay_lsn() >= '$$INIT_LSN'" 2>/dev/null || echo f)
+          r3=$$(psql -h pgsql-03 -p 5432 -U postgres -d testdb -tAc \
+               "SELECT pg_last_wal_replay_lsn() >= '$$INIT_LSN'" 2>/dev/null || echo f)
+          if [ "$$r2" = "t" ] && [ "$$r3" = "t" ]; then
+            echo "[pgbench] Replicas caught up to LSN $$INIT_LSN"
             break
           fi
-          echo "[pgbench] Replica lag: r2=$r2 r3=$r3 — waiting... ($_i/60)"
+          echo "[pgbench] Replica lag: r2=$$r2 r3=$$r3 — waiting... ($$_i/60)"
           sleep 2
         done
         
