@@ -107,7 +107,7 @@ services:
         condition: service_healthy
     volumes:
       - ../keel/keel-torture.ini:/etc/keel/keel.ini:ro
-    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    command: ["--config", "/etc/keel/keel.ini"]
     networks:
       - torture-net
     ports:

@@ -119,7 +119,7 @@ services:
         condition: service_healthy
     volumes:
       - ../keel/keel-e2e-suite.ini:/etc/keel/keel.ini:ro
-    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    command: ["--config", "/etc/keel/keel.ini"]
     ports:
       - "26432:6432"   # PostgreSQL proxy (virtualize default + sharding)
       - "26433:6433"   # Admin SQL interface

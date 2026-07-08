@@ -75,7 +75,7 @@ services:
         condition: service_healthy
     volumes:
       - ../keel/keel-sharding.ini:/etc/keel/keel.ini:ro
-    command: ["/usr/local/bin/keel", "--config", "/etc/keel/keel.ini"]
+    command: ["--config", "/etc/keel/keel.ini"]
     ports:
       - "16432:6432"   # proxy port — host access for test client
       - "19101:9101"   # prometheus port
