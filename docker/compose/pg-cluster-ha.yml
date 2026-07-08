@@ -127,11 +127,15 @@ services:
   # KEEL Node 1
   # ==========================================================================
   keel-1:
-    image: keel:linux
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: keel-ha-node-1
     hostname: keel-1
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     volumes:
       - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
     environment:
@@ -162,11 +166,15 @@ services:
   # KEEL Node 2
   # ==========================================================================
   keel-2:
-    image: keel:linux
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: keel-ha-node-2
     hostname: keel-2
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     volumes:
       - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
     environment:
@@ -197,11 +205,15 @@ services:
   # KEEL Node 3
   # ==========================================================================
   keel-3:
-    image: keel:linux
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: keel-ha-node-3
     hostname: keel-3
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     volumes:
       - ../keel/keel-cluster.ini:/etc/keel/keel.ini:ro
     environment:

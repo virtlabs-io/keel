@@ -2869,16 +2869,22 @@ add_test(NAME test_numa COMMAND test_numa)
 set_tests_properties(test_numa PROPERTIES LABELS "util" TIMEOUT 60)
 
 # Memory safety layer (canaries, double-free, leak detection)
-add_executable(test_mem_safety test_mem_safety.c)
-target_link_libraries(test_mem_safety PRIVATE
-    test_utils
-    keelmem
-    keelutil
-    Threads::Threads
-)
-target_link_options(test_mem_safety PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
-add_test(NAME test_mem_safety COMMAND test_mem_safety)
-set_tests_properties(test_mem_safety PROPERTIES LABELS "hardening" TIMEOUT 60)
+# Only built when KEEL_ENABLE_MEM_SAFETY is ON (the default).
+if(KEEL_ENABLE_MEM_SAFETY)
+    add_executable(test_mem_safety test_mem_safety.c)
+    target_link_libraries(test_mem_safety PRIVATE
+        test_utils
+        keelmem
+        keelutil
+        Threads::Threads
+    )
+    target_link_options(test_mem_safety PRIVATE ${TEST_COVERAGE_LINK_FLAGS})
+    add_test(NAME test_mem_safety COMMAND test_mem_safety)
+    set_tests_properties(test_mem_safety PROPERTIES LABELS "hardening" TIMEOUT 60)
+    set(_mem_safety_target test_mem_safety)
+else()
+    set(_mem_safety_target "")
+endif()
 
 # I/O reactor (epoll/io_uring backend)
 add_executable(test_reactor test_reactor.c)
@@ -3020,7 +3026,7 @@ add_custom_target(test-hardening
             test_tls_splice_matrix test_session_hooks_matrix
             test_crash_recovery_matrix test_pre_query_replay
             test_dual_protocol_matrix test_invariant_model
-            test_mem_safety test_replay_log
+            ${_mem_safety_target} test_replay_log
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running production-hardening tests (Spec §1-§5 Phase A/B)"
     USES_TERMINAL
@@ -3252,7 +3258,7 @@ add_custom_target(build_tests DEPENDS
     test_log
     test_log_plugins
     test_mem
-    test_mem_safety
+    ${_mem_safety_target}
     test_migration
     test_mysql_protocol_flow
     test_ndjson_log

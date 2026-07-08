@@ -62,7 +62,8 @@ trap cleanup EXIT
 echo -e "\n${BOLD}${CYAN}=== KEEL Sharding Integration Test ===${NC}\n"
 
 info "Starting compose stack..."
-docker compose -f "$COMPOSE_FILE" up -d --build --wait 2>&1 | tail -5
+bash "$PROJECT_ROOT/scripts/build_test_image.sh"
+docker compose -f "$COMPOSE_FILE" up -d --wait 2>&1 | tail -5
 
 KEEL_HOST="127.0.0.1"
 KEEL_PORT="16432"

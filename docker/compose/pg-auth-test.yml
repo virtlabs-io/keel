@@ -17,7 +17,11 @@
 name: keel-auth-test
 
 x-keel-base: &keel-base
-  image: keel:linux
+  image: ${KEEL_IMAGE:-keel:test}
+  ulimits:
+    core:
+      soft: -1
+      hard: -1
   depends_on:
     postgres:
       condition: service_healthy

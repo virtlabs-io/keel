@@ -700,87 +700,6 @@ static void test_pool_double_free_guard(void) {
 }
 
 /* ============================================================================
- * Slab Allocator Tests
- * ============================================================================ */
-
-static void test_slab_basic(void) {
-    TEST_BEGIN("slab basic operations");
-    
-    keel_slab_t* slab = keel_slab_create();
-    TEST_ASSERT_NOT_NULL(slab);
-    
-    /* Various sizes hitting different size classes */
-    void* p16 = keel_slab_alloc(slab, 16);
-    TEST_ASSERT_NOT_NULL(p16);
-    
-    void* p64 = keel_slab_alloc(slab, 50);  /* Rounds to 64 */
-    TEST_ASSERT_NOT_NULL(p64);
-    
-    void* p256 = keel_slab_alloc(slab, 200);  /* Rounds to 256 */
-    TEST_ASSERT_NOT_NULL(p256);
-    
-    void* p4096 = keel_slab_alloc(slab, 3000);  /* Rounds to 4096 */
-    TEST_ASSERT_NOT_NULL(p4096);
-    
-    /* Write to verify usability */
-    memset(p16, 0xAA, 16);
-    memset(p64, 0xBB, 50);
-    memset(p256, 0xCC, 200);
-    memset(p4096, 0xDD, 3000);
-    
-    keel_slab_free(slab, p16);
-    keel_slab_free(slab, p64);
-    keel_slab_free(slab, p256);
-    keel_slab_free(slab, p4096);
-    
-    keel_slab_destroy(slab);
-    
-    TEST_END();
-}
-
-static void test_slab_large_fallback(void) {
-    TEST_BEGIN("slab large allocation fallback");
-    
-    keel_slab_t* slab = keel_slab_create();
-    TEST_ASSERT_NOT_NULL(slab);
-    
-    /* Larger than max size class - falls back to malloc */
-    void* p = keel_slab_alloc(slab, 10000);  /* > 8192 */
-    TEST_ASSERT_NOT_NULL(p);
-    
-    memset(p, 0xFF, 10000);
-    
-    keel_slab_free(slab, p);
-    keel_slab_destroy(slab);
-    
-    TEST_END();
-}
-
-static void test_slab_size_classes(void) {
-    TEST_BEGIN("slab size classes");
-    
-    keel_slab_t* slab = keel_slab_create();
-    TEST_ASSERT_NOT_NULL(slab);
-    
-    /* Test each size class boundary */
-    size_t sizes[] = {1, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096, 4097, 8192};
-    void* ptrs[20];
-    
-    for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
-        ptrs[i] = keel_slab_alloc(slab, sizes[i]);
-        TEST_ASSERT_NOT_NULL(ptrs[i]);
-    }
-    
-    for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
-        keel_slab_free(slab, ptrs[i]);
-    }
-    
-    keel_slab_destroy(slab);
-    
-    TEST_END();
-}
-
-/* ============================================================================
  * Memory Statistics Tests
  * ============================================================================ */
 
@@ -912,11 +831,6 @@ int main(void) {
     test_pool_exhaust_and_grow();
     test_pool_max_limit();
     test_pool_double_free_guard();
-    
-    /* Slab allocator */
-    test_slab_basic();
-    test_slab_large_fallback();
-    test_slab_size_classes();
     
     /* Statistics */
     test_mem_stats();

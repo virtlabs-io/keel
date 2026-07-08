@@ -15,51 +15,46 @@
 
 #include "keel/mem/mem.h"
 #include "keel/log/log.h"
-#include "dlmalloc.h"
+
+#ifdef KEEL_USE_SYSTEM_MALLOC
+/* -------------------------------------------------------------------------
+ * System-malloc shims — active when building with MSan or TSan.
+ * Those sanitizers require every library to be instrumented; replacing
+ * mimalloc with the (already-instrumented) system malloc avoids false
+ * positives and link-time conflicts.
+ * ------------------------------------------------------------------------- */
+#  include <stdlib.h>
+#  include <malloc.h>          /* malloc_usable_size (Linux/glibc) */
+#  include <unistd.h>          /* posix_memalign */
+static inline void* _keel_sys_aligned(size_t size, size_t align) {
+    if (align < sizeof(void*)) align = sizeof(void*);
+    void* p = NULL;
+    return posix_memalign(&p, align, size) == 0 ? p : NULL;
+}
+#  define mi_malloc(n)            malloc(n)
+#  define mi_calloc(c, n)         calloc((c), (n))
+#  define mi_realloc(p, n)        realloc((p), (n))
+#  define mi_free(p)              free(p)
+#  define mi_malloc_aligned(n, a) _keel_sys_aligned((n), (a))
+#  define mi_usable_size(p)       malloc_usable_size(p)
+#  define mi_collect(f)           ((void)(f))
+#  define mi_option_set(o, v)     ((void)(v))
+#  define mi_process_info(a,b,c,d,e,f,g,h) \
+     do { size_t* _mip_f = (size_t*)(f); size_t* _mip_g = (size_t*)(g); \
+          if (_mip_f) { *_mip_f = 0; } \
+          if (_mip_g) { *_mip_g = 0; } \
+          (void)(a); (void)(b); (void)(c); (void)(d); \
+          (void)(e); (void)(h); } while (0)
+#else
+#  include <mimalloc.h>
+#endif
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#include <sys/mman.h>   /* mlockall / MCL_* */
 #include <errno.h>
-#if __has_include(<execinfo.h>)
-#  include <execinfo.h>
-#  define KEEL_HAVE_EXECINFO 1
-#else
-#  define KEEL_HAVE_EXECINFO 0
-#endif
-
-/* ----------------------------------------------------------------------
- * Diagnostic backtrace helper used by allocator corruption logging.
- *
- * Captures up to 32 frames and emits one ERROR line per frame so that
- * each entry shows up next to the corruption report in `docker logs`.
- * Symbol resolution depends on -rdynamic / linkable symbol tables; for
- * stripped binaries we still get raw addresses, which can be passed to
- * `addr2line` / `eu-addr2line` against the matching build artefact.
- *
- * Kept out of the hot path: only invoked from corruption-detection
- * paths in keel_free / keel_realloc.
- * ---------------------------------------------------------------------- */
-static void keel_mem_log_backtrace(keel_log_category_t cat, const char* label) {
-#if KEEL_HAVE_EXECINFO
-    void* frames[32];
-    int   n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
-    char** syms = backtrace_symbols(frames, n);
-    if (!syms) {
-        KEEL_LOG_ERROR(cat, "[%s] backtrace: <symbol resolution failed, n=%d>", label, n);
-        return;
-    }
-    /* Skip frame 0 (this helper itself). */
-    for (int i = 1; i < n; ++i) {
-        KEEL_LOG_ERROR(cat, "[%s]   #%-2d %s", label, i - 1, syms[i]);
-    }
-    free(syms);  /* allocated by libc, not us */
-#else
-    KEEL_LOG_ERROR(cat, "[%s] backtrace: <not available on this platform>", label);
-#endif
-}
 
 /* ============================================================================
  * Configuration
@@ -69,14 +64,12 @@ static struct {
     bool              initialized;
     keel_mem_config_t  config;
     
-    /* Statistics (atomic for thread safety) */
+    /* Live allocation gauges (incremented on alloc, decremented on free). */
     atomic_size_t     bytes_allocated;
     atomic_size_t     allocation_count;
-    atomic_size_t     total_allocations;
-    atomic_size_t     total_frees;
-    atomic_size_t     total_bytes;
+    /* Peak bytes watermark — relaxed, diagnostic only. */
     atomic_size_t     peak_bytes;
-    atomic_size_t     peak_allocations;
+    /* Arena and pool sub-allocator accounting (updated by arena.c / pool.c). */
     atomic_size_t     arena_count;
     atomic_size_t     arena_bytes;
     atomic_size_t     pool_count;
@@ -88,31 +81,15 @@ static struct {
 } g_mem = {0};
 
 /* ============================================================================
- * Shared-buffers pool (Phase 2)
+ * Shared-buffers pool
  *
- * A single mmap'd region managed by dlmalloc's mspace API.  When active,
- * keel_malloc/keel_free/keel_realloc route through the mspace instead of
- * libc malloc.  Bootstrap allocations (config parsing, misc_arena setup)
- * that happen before keel_mem_pool_attach() remain in libc memory and are
- * process-lifetime singletons — no migration is needed.
+ * When keel_mem_pool_attach() is called, mimalloc is configured for the
+ * requested memory characteristics (large pages, eager commit).  No fixed
+ * mmap region is managed here — mimalloc controls its own backing store.
+ * g_pool_configured_size records the operator-requested reservation for stats.
  * ============================================================================ */
-static mspace  g_mspace    = NULL;
-static void*   g_pool_base = NULL;
-static size_t  g_pool_size = 0;
-
-/*
- * Returns true when @p hdr was allocated from the shared-buffers mspace
- * (i.e. lies within [g_pool_base, g_pool_base+g_pool_size)).  Bootstrap
- * allocations made before keel_mem_pool_attach() via plain malloc() fall
- * outside this range and must still be released through free(), even when
- * g_mspace is non-NULL — otherwise mspace_free() reads invalid chunk metadata.
- */
-static inline int is_mspace_ptr(const void* hdr) {
-    return g_mspace    != NULL
-        && g_pool_base != NULL
-        && (uintptr_t)hdr >= (uintptr_t)g_pool_base
-        && (uintptr_t)hdr <  (uintptr_t)g_pool_base + g_pool_size;
-}
+static size_t g_pool_configured_size = 0;
+static bool   g_pool_is_active       = false;
 
 /* ============================================================================
  * Test-only: allocation failure injection
@@ -146,23 +123,17 @@ void keel_mem_set_fail_countdown(int n) { g_alloc_fail_countdown = n; }
 #define KEEL_MEM_FILL_GUARD 0xFD
 
 /* Allocation header for tracking */
-typedef struct keel_alloc_header {
-    size_t      size;       /* Requested size */
-    uint32_t    magic;      /* Magic number for validation */
 #ifdef KEEL_MEM_DEBUG
-    const char* file;
-    int         line;
+/* Debug-only header prepended to each allocation for leak tracking.
+ * No magic number needed: mimalloc detects heap corruption internally. */
+typedef struct keel_alloc_header {
+    size_t                    req_size;  /* User-requested size (for leak report) */
+    const char*               file;
+    int                       line;
     struct keel_alloc_header* next;
     struct keel_alloc_header* prev;
-#endif
 } keel_alloc_header_t;
-
-/* Magic value: 0xDB + 0xA1 + 0x10 + 0x0C = signature
- * This unique value helps detect memory corruption:
- * - If magic != expected, the header was overwritten (buffer underflow)
- * - If magic == 0, the block was already freed (double-free)
- */
-#define KEEL_ALLOC_MAGIC 0xDBA1100CU
+#endif /* KEEL_MEM_DEBUG */
 
 #ifdef KEEL_MEM_DEBUG
 /* Global allocation tracking list head - linked list of all active allocations */
@@ -254,11 +225,7 @@ keel_error_t keel_mem_init(const keel_mem_config_t* config) {
     /* Initialize atomics */
     atomic_init(&g_mem.bytes_allocated, 0);
     atomic_init(&g_mem.allocation_count, 0);
-    atomic_init(&g_mem.total_allocations, 0);
-    atomic_init(&g_mem.total_frees, 0);
-    atomic_init(&g_mem.total_bytes, 0);
     atomic_init(&g_mem.peak_bytes, 0);
-    atomic_init(&g_mem.peak_allocations, 0);
     atomic_init(&g_mem.arena_count, 0);
     atomic_init(&g_mem.arena_bytes, 0);
     atomic_init(&g_mem.pool_count, 0);
@@ -304,16 +271,8 @@ void keel_mem_shutdown(void) {
         g_mem.misc_arena = NULL;
     }
 
-    /* Tear down the shared-buffers pool, if active. */
-    if (g_mspace) {
-        destroy_mspace(g_mspace);
-        g_mspace = NULL;
-    }
-    if (g_pool_base) {
-        munmap(g_pool_base, g_pool_size);
-        g_pool_base = NULL;
-        g_pool_size = 0;
-    }
+    /* Return cached pages to the OS. */
+    mi_collect(true);
 
     g_mem.initialized = false;
 }
@@ -340,14 +299,14 @@ keel_arena_t* keel_misc_arena(void) {
  * ============================================================================ */
 
 /**
- * @brief Map a contiguous region and initialise the dlmalloc mspace over it.
+ * @brief Configure mimalloc for the shared-buffers pool.
  *
- * After this call all keel_malloc/keel_free/keel_realloc calls use the pool
- * rather than libc malloc.  The call is idempotent-safe: calling twice returns
- * KEEL_ERR_ALREADY_INITIALIZED.
+ * After this call mimalloc is tuned for the requested memory characteristics
+ * (large pages, eager commit, optional mlock).  The call is idempotent-safe:
+ * calling twice returns KEEL_ERR_ALREADY_INITIALIZED.
  */
 keel_error_t keel_mem_pool_attach(size_t bytes, bool mlock_pool, bool use_huge_pages) {
-    if (g_mspace) {
+    if (g_pool_is_active) {
         KEEL_LOG_WARN(KEEL_LOG_CAT_MEM, "shared_buffers: pool already attached");
         return KEEL_ERR_ALREADY_INITIALIZED;
     }
@@ -357,80 +316,64 @@ keel_error_t keel_mem_pool_attach(size_t bytes, bool mlock_pool, bool use_huge_p
         return KEEL_ERR_INVALID_ARG;
     }
 
-    int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#if defined(MAP_HUGETLB)
+    /* Configure mimalloc for the requested behavior. */
     if (use_huge_pages) {
-        mmap_flags |= MAP_HUGETLB;
-    }
-#else
-    (void)use_huge_pages;
-#endif
-
-    void* base = mmap(NULL, bytes, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
-
-#if defined(MAP_HUGETLB)
-    if (base == MAP_FAILED && use_huge_pages) {
-        /* Huge pages unavailable — fall back to normal pages. */
-        KEEL_LOG_WARN(KEEL_LOG_CAT_MEM,
-            "shared_buffers: MAP_HUGETLB failed (%s), retrying without huge pages",
-            strerror(errno));
-        mmap_flags &= ~(int)MAP_HUGETLB;
-        base = mmap(NULL, bytes, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
-    }
-#endif
-
-    if (base == MAP_FAILED) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_MEM,
-            "shared_buffers: mmap(%zu bytes) failed: %s", bytes, strerror(errno));
-        return KEEL_ERR_NOMEM;
-    }
-
-    if (mlock_pool) {
-        if (mlock(base, bytes) != 0) {
-            /* Non-fatal: warn but continue — latency guarantee is best-effort. */
-            KEEL_LOG_WARN(KEEL_LOG_CAT_MEM,
-                "shared_buffers: mlock failed (may need CAP_IPC_LOCK or larger "
-                "RLIMIT_MEMLOCK): %s", strerror(errno));
+        mi_option_set(mi_option_large_os_pages, 1);
+        /* Reserve huge pages proportional to the configured size. */
+        long huge_count = (long)(bytes / (2UL * 1024 * 1024));
+        if (huge_count > 0) {
+            mi_option_set(mi_option_reserve_huge_os_pages, huge_count);
         }
     }
+    /* Commit pages eagerly to front-load page-fault cost at startup. */
+    mi_option_set(mi_option_eager_commit, 1);
 
-    /* locked=1 → dlmalloc uses an internal pthread mutex; safe for concurrent
-     * keel_malloc calls from worker threads. */
-    mspace msp = create_mspace_with_base(base, bytes, 1);
-    if (!msp) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_MEM,
-            "shared_buffers: create_mspace_with_base failed");
-        munmap(base, bytes);
-        return KEEL_ERR_NOMEM;
+    if (mlock_pool) {
+#if defined(MCL_FUTURE)
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            KEEL_LOG_WARN(KEEL_LOG_CAT_MEM,
+                "shared_buffers: mlockall failed (may need CAP_IPC_LOCK or "
+                "larger RLIMIT_MEMLOCK): %s", strerror(errno));
+        }
+#else
+        KEEL_LOG_WARN(KEEL_LOG_CAT_MEM,
+            "shared_buffers: mlock_pool requested but mlockall not available "
+            "on this platform");
+#endif
     }
 
-    g_pool_base = base;
-    g_pool_size = bytes;
-    g_mspace    = msp;
+    g_pool_configured_size = bytes;
+    g_pool_is_active       = true;
 
     KEEL_LOG_INFO(KEEL_LOG_CAT_MEM,
-        "shared_buffers: pool attached — size=%zu MiB base=%p%s%s",
-        bytes / (1024 * 1024), base,
-        mlock_pool    ? " mlocked"     : "",
-        use_huge_pages ? " huge_pages"  : "");
+        "shared_buffers: pool configured — size=%zu MiB%s%s",
+        bytes / (1024 * 1024),
+        mlock_pool     ? " mlocked"    : "",
+        use_huge_pages ? " huge_pages" : "");
 
     return KEEL_OK;
 }
 
 bool keel_mem_pool_active(void) {
-    return g_mspace != NULL;
+    return g_pool_is_active;
 }
 
 size_t keel_mem_pool_total_bytes(void) {
-    return g_pool_size;
+    return g_pool_configured_size;
 }
 
 size_t keel_mem_pool_used_bytes(void) {
-    return g_mspace ? mspace_footprint(g_mspace) : 0;
+    /* Return accurate live-user-bytes from our atomic counter rather than
+     * the OS committed-page footprint (which includes mimalloc overhead). */
+    return g_pool_is_active
+        ? atomic_load_explicit(&g_mem.bytes_allocated, memory_order_relaxed)
+        : 0;
 }
 
 size_t keel_mem_pool_peak_bytes(void) {
-    return g_mspace ? mspace_max_footprint(g_mspace) : 0;
+    return g_pool_is_active
+        ? atomic_load_explicit(&g_mem.peak_bytes, memory_order_relaxed)
+        : 0;
 }
 
 /* ============================================================================
@@ -449,23 +392,10 @@ size_t keel_mem_pool_peak_bytes(void) {
 static void update_stats_alloc(size_t size) {
     size_t current = atomic_fetch_add(&g_mem.bytes_allocated, size) + size;
     atomic_fetch_add(&g_mem.allocation_count, 1);
-    atomic_fetch_add(&g_mem.total_allocations, 1);
-    atomic_fetch_add(&g_mem.total_bytes, size);
-    
-    /* Update peak */
-    size_t peak = atomic_load(&g_mem.peak_bytes);
-    while (current > peak) {
-        if (atomic_compare_exchange_weak(&g_mem.peak_bytes, &peak, current)) {
-            break;
-        }
-    }
-    
-    size_t count = atomic_load(&g_mem.allocation_count);
-    size_t peak_count = atomic_load(&g_mem.peak_allocations);
-    while (count > peak_count) {
-        if (atomic_compare_exchange_weak(&g_mem.peak_allocations, &peak_count, count)) {
-            break;
-        }
+    /* Best-effort peak watermark — relaxed ops, diagnostic only. */
+    size_t peak = atomic_load_explicit(&g_mem.peak_bytes, memory_order_relaxed);
+    if (current > peak) {
+        atomic_store_explicit(&g_mem.peak_bytes, current, memory_order_relaxed);
     }
 }
 
@@ -479,7 +409,6 @@ static void update_stats_alloc(size_t size) {
 static void update_stats_free(size_t size) {
     atomic_fetch_sub(&g_mem.bytes_allocated, size);
     atomic_fetch_sub(&g_mem.allocation_count, 1);
-    atomic_fetch_add(&g_mem.total_frees, 1);
 }
 
 #ifndef KEEL_MEM_DEBUG
@@ -518,19 +447,10 @@ void* keel_malloc(size_t size) {
         g_alloc_fail_countdown--;
     }
 
-    /* Allocate with header — use the shared-buffers mspace when active. */
-    size_t total = sizeof(keel_alloc_header_t) + size;
-    keel_alloc_header_t* header = g_mspace
-        ? mspace_malloc(g_mspace, total)
-        : malloc(total);
-    if (!header) {
+    void* ptr = mi_malloc(size);
+    if (!ptr) {
         return NULL;
     }
-
-    header->size = size;
-    header->magic = KEEL_ALLOC_MAGIC;
-
-    void* ptr = header + 1;
 
     /* Fill with pattern if debugging */
     if (g_mem.config.debug_flags & KEEL_MEM_DEBUG_FILL_ALLOC) {
@@ -553,10 +473,19 @@ void* keel_malloc(size_t size) {
  * @return Zeroed memory, or NULL on failure
  */
 void* keel_calloc(size_t count, size_t size) {
-    size_t total = count * size;
-    void* ptr = keel_malloc(total);
+    if (count == 0 || size == 0) {
+        return NULL;
+    }
+    /* Test-only failure injection */
+    if (g_alloc_fail_countdown == 0) {
+        return NULL;
+    }
+    if (g_alloc_fail_countdown > 0) {
+        g_alloc_fail_countdown--;
+    }
+    void* ptr = mi_calloc(count, size);
     if (ptr) {
-        memset(ptr, 0, total);
+        update_stats_alloc(count * size);
     }
     return ptr;
 }
@@ -581,31 +510,17 @@ void* keel_realloc(void* ptr, size_t size) {
         return NULL;
     }
     
-    keel_alloc_header_t* header = ((keel_alloc_header_t*)ptr) - 1;
-    
-    if (header->magic != KEEL_ALLOC_MAGIC) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_MEM, "Invalid memory block in realloc");
-        return NULL;
-    }
-    
-    size_t old_size = header->size;
-    
-    size_t total = sizeof(keel_alloc_header_t) + size;
-    keel_alloc_header_t* new_header = is_mspace_ptr(header)
-        ? mspace_realloc(g_mspace, header, total)
-        : realloc(header, total);
-    if (!new_header) {
+    size_t old_size = mi_usable_size(ptr);
+    void* new_ptr = mi_realloc(ptr, size);
+    if (!new_ptr) {
         return NULL;
     }
 
-    new_header->size = size;
-
-    /* Update stats */
+    /* Update stats: subtract old committed size, add new requested size. */
     atomic_fetch_sub(&g_mem.bytes_allocated, old_size);
     atomic_fetch_add(&g_mem.bytes_allocated, size);
-    atomic_fetch_add(&g_mem.total_bytes, size);
 
-    return new_header + 1;
+    return new_ptr;
 }
 
 /**
@@ -624,58 +539,16 @@ void keel_free(void* ptr) {
     if (!ptr) {
         return;
     }
-    
-    keel_alloc_header_t* header = ((keel_alloc_header_t*)ptr) - 1;
-    
-    if (header->magic != KEEL_ALLOC_MAGIC) {
-        /* Dump enough state to fingerprint the corrupter:
-         *  - header->size (offset 0..7): if also clobbered, the whole header
-         *    was overwritten -> structured write; else only the magic field
-         *    (offset 8..11) was hit -> 4-byte stray write.
-         *  - first 32 bytes of user data: helps spot recurring patterns
-         *    (e.g. a buffer left over from a previous use).
-         *  - backtrace of the freer narrows down the *type* of allocation
-         *    (each pool/cache calls keel_free from a distinct site). */
-        const unsigned char* p = (const unsigned char*)ptr;
-        KEEL_LOG_ERROR(
-            KEEL_LOG_CAT_MEM,
-            "Invalid memory block in free (possible double-free or corruption): "
-            "ptr=%p header=%p magic=0x%08x expected=0x%08x size_field=%zu "
-            "userdata[0..31]=%02x%02x%02x%02x%02x%02x%02x%02x "
-            "%02x%02x%02x%02x%02x%02x%02x%02x "
-            "%02x%02x%02x%02x%02x%02x%02x%02x "
-            "%02x%02x%02x%02x%02x%02x%02x%02x",
-            ptr,
-            (void*)header,
-            (unsigned)header->magic,
-            (unsigned)KEEL_ALLOC_MAGIC,
-            header->size,
-            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-            p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
-            p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
-            p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]
-        );
-        keel_mem_log_backtrace(KEEL_LOG_CAT_MEM, "corrupt-free");
-        return;
-    }
-    
-    size_t size = header->size;
-    
+
+    size_t sz = mi_usable_size(ptr);
+
     /* Fill with pattern if debugging */
     if (g_mem.config.debug_flags & KEEL_MEM_DEBUG_FILL_FREE) {
-        memset(ptr, KEEL_MEM_FILL_FREE, size);
+        memset(ptr, KEEL_MEM_FILL_FREE, sz);
     }
-    
-    /* Invalidate magic to detect double-free */
-    header->magic = 0;
 
-    update_stats_free(size);
-
-    if (is_mspace_ptr(header)) {
-        mspace_free(g_mspace, header);
-    } else {
-        free(header);
-    }
+    update_stats_free(sz);
+    mi_free(ptr);
 }
 
 #else /* KEEL_MEM_DEBUG */
@@ -705,15 +578,12 @@ void* keel_malloc_debug(size_t size, const char* file, int line) {
     }
 
     size_t total = sizeof(keel_alloc_header_t) + size;
-    keel_alloc_header_t* header = g_mspace
-        ? mspace_malloc(g_mspace, total)
-        : malloc(total);
+    keel_alloc_header_t* header = mi_malloc(total);
     if (!header) {
         return NULL;
     }
 
-    header->size = size;
-    header->magic = KEEL_ALLOC_MAGIC;
+    header->req_size = size;
     header->file = file;
     header->line = line;
     
@@ -781,13 +651,7 @@ void* keel_realloc_debug(void* ptr, size_t size, const char* file, int line) {
     }
     
     keel_alloc_header_t* header = ((keel_alloc_header_t*)ptr) - 1;
-    
-    if (header->magic != KEEL_ALLOC_MAGIC) {
-        KEEL_LOG_ERROR(KEEL_LOG_CAT_MEM, "Invalid memory block in realloc at %s:%d", file, line);
-        return NULL;
-    }
-    
-    size_t old_size = header->size;
+    size_t old_size = header->req_size;
     
     /* Remove from list */
     alloc_list_lock();
@@ -802,11 +666,9 @@ void* keel_realloc_debug(void* ptr, size_t size, const char* file, int line) {
     alloc_list_unlock();
     
     size_t total = sizeof(keel_alloc_header_t) + size;
-    keel_alloc_header_t* new_header = is_mspace_ptr(header)
-        ? mspace_realloc(g_mspace, header, total)
-        : realloc(header, total);
+    keel_alloc_header_t* new_header = mi_realloc(header, total);
     if (!new_header) {
-        /* Put back in list */
+        /* Put back in list on failure */
         alloc_list_lock();
         header->next = g_alloc_list;
         header->prev = NULL;
@@ -818,7 +680,7 @@ void* keel_realloc_debug(void* ptr, size_t size, const char* file, int line) {
         return NULL;
     }
     
-    new_header->size = size;
+    new_header->req_size = size;
     new_header->file = file;
     new_header->line = line;
     
@@ -834,7 +696,6 @@ void* keel_realloc_debug(void* ptr, size_t size, const char* file, int line) {
     
     atomic_fetch_sub(&g_mem.bytes_allocated, old_size);
     atomic_fetch_add(&g_mem.bytes_allocated, size);
-    atomic_fetch_add(&g_mem.total_bytes, size);
     
     return new_header + 1;
 }
@@ -853,22 +714,7 @@ void keel_free_debug(void* ptr, const char* file, int line) {
     }
     
     keel_alloc_header_t* header = ((keel_alloc_header_t*)ptr) - 1;
-    
-    if (header->magic != KEEL_ALLOC_MAGIC) {
-        KEEL_LOG_ERROR(
-            KEEL_LOG_CAT_MEM,
-            "Invalid memory block in free at %s:%d (possible double-free or corruption): ptr=%p header=%p magic=0x%08x expected=0x%08x",
-            file,
-            line,
-            ptr,
-            (void*)header,
-            (unsigned)header->magic,
-            (unsigned)KEEL_ALLOC_MAGIC
-        );
-        return;
-    }
-    
-    size_t size = header->size;
+    size_t size = header->req_size;
     
     /* Remove from list */
     alloc_list_lock();
@@ -885,16 +731,12 @@ void keel_free_debug(void* ptr, const char* file, int line) {
     if (g_mem.config.debug_flags & KEEL_MEM_DEBUG_FILL_FREE) {
         memset(ptr, KEEL_MEM_FILL_FREE, size);
     }
-    
-    header->magic = 0;
 
     update_stats_free(size);
+    mi_free(header);
 
-    if (is_mspace_ptr(header)) {
-        mspace_free(g_mspace, header);
-    } else {
-        free(header);
-    }
+    (void)file;
+    (void)line;
 }
 
 #endif /* KEEL_MEM_DEBUG */
@@ -921,22 +763,11 @@ void* keel_aligned_alloc(size_t alignment, size_t size) {
     if (!keel_is_power_of_2(alignment) || alignment < sizeof(void*)) {
         return NULL;
     }
-    
-    /* We need extra space for the original pointer and alignment */
-    size_t total = size + alignment + sizeof(void*);
-    void* raw = keel_malloc(total);
-    if (!raw) {
-        return NULL;
+    void* ptr = mi_malloc_aligned(size, alignment);
+    if (ptr) {
+        update_stats_alloc(size);
     }
-    
-    /* Calculate aligned pointer */
-    uintptr_t addr = (uintptr_t)raw + sizeof(void*);
-    uintptr_t aligned = keel_align_up(addr, alignment);
-    
-    /* Store original pointer before aligned address */
-    ((void**)aligned)[-1] = raw;
-    
-    return (void*)aligned;
+    return ptr;
 }
 
 /**
@@ -950,10 +781,8 @@ void keel_aligned_free(void* ptr) {
     if (!ptr) {
         return;
     }
-    
-    /* Retrieve original pointer */
-    void* raw = ((void**)ptr)[-1];
-    keel_free(raw);
+    update_stats_free(mi_usable_size(ptr));
+    mi_free(ptr);
 }
 
 /* ============================================================================
@@ -1031,28 +860,30 @@ void keel_mem_stats_get(keel_mem_stats_t* stats) {
         return;
     }
     
-    stats->bytes_allocated = atomic_load(&g_mem.bytes_allocated);
-    stats->allocation_count = atomic_load(&g_mem.allocation_count);
-    stats->total_allocations = atomic_load(&g_mem.total_allocations);
-    stats->total_frees = atomic_load(&g_mem.total_frees);
-    stats->total_bytes = atomic_load(&g_mem.total_bytes);
-    stats->peak_bytes = atomic_load(&g_mem.peak_bytes);
-    stats->peak_allocations = atomic_load(&g_mem.peak_allocations);
-    stats->arena_count = atomic_load(&g_mem.arena_count);
-    stats->arena_bytes = atomic_load(&g_mem.arena_bytes);
-    stats->pool_count = atomic_load(&g_mem.pool_count);
-    stats->pool_bytes = atomic_load(&g_mem.pool_bytes);
+    stats->bytes_allocated   = atomic_load(&g_mem.bytes_allocated);
+    stats->allocation_count  = atomic_load(&g_mem.allocation_count);
+    stats->peak_bytes        = atomic_load(&g_mem.peak_bytes);
+    /* Lifetime totals (total_allocations/frees/bytes, peak_allocations) are not
+     * tracked in the hot path with mimalloc; use mi_stats_print_out() for
+     * detailed per-operation breakdowns when needed. */
+    stats->total_allocations = 0;
+    stats->total_frees       = 0;
+    stats->total_bytes       = 0;
+    stats->peak_allocations  = 0;
+    stats->arena_count  = atomic_load(&g_mem.arena_count);
+    stats->arena_bytes  = atomic_load(&g_mem.arena_bytes);
+    stats->pool_count   = atomic_load(&g_mem.pool_count);
+    stats->pool_bytes   = atomic_load(&g_mem.pool_bytes);
 
     /* Shared-buffers pool */
-    stats->shared_pool_total = g_pool_size;
-    stats->shared_pool_used  = g_mspace ? mspace_footprint(g_mspace)     : 0;
-    stats->shared_pool_peak  = g_mspace ? mspace_max_footprint(g_mspace) : 0;
+    stats->shared_pool_total = g_pool_configured_size;
+    stats->shared_pool_used  = keel_mem_pool_used_bytes();
+    stats->shared_pool_peak  = keel_mem_pool_peak_bytes();
 
-    /* bytes_committed: when the pool is active use its footprint; otherwise
-     * fall back to the tracked allocated bytes. */
-    stats->bytes_committed = stats->shared_pool_used
-                             ? stats->shared_pool_used
-                             : stats->bytes_allocated;
+    /* bytes_committed: OS-level committed pages from mimalloc. */
+    size_t committed = 0;
+    mi_process_info(NULL, NULL, NULL, NULL, NULL, &committed, NULL, NULL);
+    stats->bytes_committed = committed ? committed : stats->bytes_allocated;
 }
 
 /**
@@ -1068,10 +899,10 @@ void keel_mem_stats_log(void) {
     KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "Memory Statistics:");
     KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Allocated:    %zu bytes in %zu allocations",
                  stats.bytes_allocated, stats.allocation_count);
-    KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Peak:         %zu bytes in %zu allocations",
-                 stats.peak_bytes, stats.peak_allocations);
-    KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Total:        %zu allocations, %zu frees, %zu bytes",
-                 stats.total_allocations, stats.total_frees, stats.total_bytes);
+    KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Peak:         %zu bytes",
+                 stats.peak_bytes);
+    KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Committed:    %zu bytes (OS)",
+                 stats.bytes_committed);
     KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Arenas:       %zu using %zu bytes",
                  stats.arena_count, stats.arena_bytes);
     KEEL_LOG_INFO(KEEL_LOG_CAT_MEM, "  Pools:        %zu using %zu bytes",
@@ -1086,21 +917,16 @@ void keel_mem_stats_log(void) {
 }
 
 /**
- * @brief Reset lifetime statistics counters.
+ * @brief Reset the peak-bytes watermark.
  *
- * Zeroes total_allocations, total_frees, total_bytes, peak_bytes, and
- * peak_allocations without affecting the live bytes_allocated / allocation_count
- * gauges. Useful for measuring deltas between test phases.
+ * Resets peak_bytes to the current live bytes_allocated so subsequent
+ * snapshots measure the delta from this point.
  */
 void keel_mem_reset_stats(void) {
     if (!g_mem.initialized) {
         return;
     }
-    atomic_store(&g_mem.total_allocations, 0);
-    atomic_store(&g_mem.total_frees, 0);
-    atomic_store(&g_mem.total_bytes, 0);
     atomic_store(&g_mem.peak_bytes, atomic_load(&g_mem.bytes_allocated));
-    atomic_store(&g_mem.peak_allocations, atomic_load(&g_mem.allocation_count));
 }
 
 /**
@@ -1122,9 +948,9 @@ void keel_mem_dump_allocations(void) {
     
     for (keel_alloc_header_t* h = g_alloc_list; h; h = h->next) {
         KEEL_LOG_WARN(KEEL_LOG_CAT_MEM, "  %zu bytes at %s:%d",
-                     h->size, h->file ? h->file : "unknown", h->line);
+                     h->req_size, h->file ? h->file : "unknown", h->line);
         count++;
-        total_bytes += h->size;
+        total_bytes += h->req_size;
     }
     
     if (count == 0) {

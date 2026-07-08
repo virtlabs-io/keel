@@ -129,14 +129,15 @@ services:
   # KEEL Proxy
   # ============================================================================
   keel:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.linux
-      target: runner
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: chaos-keel
     hostname: keel
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     command: ["-c", "/etc/keel/keel-chaos.ini"]
     environment:
       KEEL_LOG_LEVEL: 2

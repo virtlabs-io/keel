@@ -1317,7 +1317,7 @@ static void test_scram_constant_time_correct(void) {
 
     /* client-first-message: gs2-header n,, + bare n=user,r=nonce */
     const char* client_nonce = "clientnonce12345";
-    char client_first[256];
+    char client_first[512];
     char client_first_bare[256];
     snprintf(client_first_bare, sizeof(client_first_bare), "n=scramuser,r=%s", client_nonce);
     snprintf(client_first, sizeof(client_first), "n,,%s", client_first_bare);
@@ -1385,7 +1385,7 @@ static void test_scram_constant_time_correct(void) {
     snprintf(client_final_without_proof, sizeof(client_final_without_proof),
              "c=biws,r=%s", combined_nonce);
 
-    char auth_message[1024];
+    char auth_message[2048];
     snprintf(auth_message, sizeof(auth_message), "%s,%s,%s",
              client_first_bare, server_first, client_final_without_proof);
 

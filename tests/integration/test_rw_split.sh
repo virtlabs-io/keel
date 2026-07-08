@@ -57,9 +57,11 @@ REPLICA_HOSTS="$REPLICA1_HOST $REPLICA2_HOST"
 # Auto-stack management: set MANAGE_STACK=0 to require a pre-running proxy
 MANAGE_STACK="${MANAGE_STACK:-1}"
 E2E_COMPOSE_FILE="${E2E_COMPOSE_FILE:-$ROOT_DIR/docker/compose/pg-e2e.yml}"
-# Prefer build-test binary (ASAN/debug), fall back to release build
+# Prefer build-test binary (ASAN/debug), fall back to debug/release builds
 KEEL_BIN="${KEEL_BIN:-$ROOT_DIR/build-test/src/main/keel}"
 [[ -x "$KEEL_BIN" ]] || KEEL_BIN="$ROOT_DIR/build/src/main/keel"
+[[ -x "$KEEL_BIN" ]] || KEEL_BIN="$ROOT_DIR/build-debug/src/main/keel"
+[[ -x "$KEEL_BIN" ]] || KEEL_BIN="$ROOT_DIR/build-asan/src/main/keel"
 
 _STACK_STARTED_BY_US=0
 _MANAGED_KEEL_PID=""

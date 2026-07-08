@@ -86,6 +86,7 @@ option(KEEL_ENABLE_PYTHON "Enable embedded Python interpreter for hooks" OFF)
 # 'full' (both ON). Distributors should ship the 'core' package by default and
 # offer 'full' as a separately-installed superset. See docs/BUILD_VARIANTS.md.
 option(KEEL_ENABLE_OTLP "Build OTLP metrics exporter (requires nanopb; off by default)" OFF)
+option(KEEL_ENABLE_MEM_SAFETY "Build memory-safety allocator layer (canaries, double-free, leak detection); ON for tests, may be disabled for production" ON)
 
 # Inline buffer size (bytes) used to stash the post-deferred-BEGIN FE payload
 # while the BEGIN's ReadyForQuery is being absorbed asynchronously.  Sessions
@@ -537,8 +538,27 @@ set(KEEL_INCLUDE_DIRS
 # the new reactor-based pipeline that replaced the legacy libuv layer.
 # ============================================================================
 
-# Third-party allocator: dlmalloc mspace (ONLY_MSPACES build, MIT-0 license)
-add_subdirectory(third_party/dlmalloc)
+# Third-party allocator: mimalloc v2.1.7 (MIT license, vendored at third_party/mimalloc)
+# Vendored to keep Docker builds self-contained — no network access required.
+# To upgrade: replace third_party/mimalloc/ with the new release and update the
+# commit reference below.
+# Pinned commit: 8c532c32c3c96e5ba1f2283e032f69ead8add00f (v2.1.7)
+#
+# MSan and TSan require every library in the process to be instrumented with
+# the same sanitizer.  Building mimalloc with full MSan/TSan instrumentation
+# is non-trivial; use system malloc for those sanitizer builds instead.
+if(KEEL_ENABLE_MSAN OR KEEL_ENABLE_TSAN)
+    set(KEEL_ALLOC_BACKEND "system" CACHE INTERNAL "Allocator backend (mimalloc|system)")
+    message(STATUS "Allocator backend: system malloc (sanitizer=${CMAKE_C_FLAGS})")
+else()
+    set(KEEL_ALLOC_BACKEND "mimalloc" CACHE INTERNAL "Allocator backend (mimalloc|system)")
+    set(MI_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT  OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
+    set(MI_OVERRIDE      OFF CACHE BOOL "" FORCE)  # do not replace malloc/free globally
+    add_subdirectory(third_party/mimalloc)
+    message(STATUS "Allocator backend: mimalloc v2.1.7")
+endif()
 
 # Memory management library
 add_subdirectory(src/mem)

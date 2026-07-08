@@ -121,8 +121,8 @@ log_step "Previous containers removed"
 
 log_header "Building KEEL Proxy"
 
-log_info "Building KEEL with io_uring support..."
-docker compose -f "$COMPOSE_FILE" build keel
+log_info "Building KEEL image (keel:test) via build_test_image.sh..."
+bash "$PROJECT_ROOT/scripts/build_test_image.sh"
 
 log_step "KEEL build complete"
 

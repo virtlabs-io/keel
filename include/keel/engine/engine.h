@@ -148,7 +148,7 @@ typedef enum keel_server_role {
 #define KEEL_SERVER_ROLE_PRIMARY  KEEL_SERVER_ROLE_RW
 #define KEEL_SERVER_ROLE_REPLICA  KEEL_SERVER_ROLE_RO
 
-#define KEEL_MAX_SERVERS 16          /* Maximum servers per pool */
+#define KEEL_MAX_SERVERS 64          /* Maximum servers per pool */
 
 typedef struct keel_backend_server {
     const char*         host;
