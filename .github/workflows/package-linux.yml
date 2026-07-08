@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # ── Version consistency gate ──────────────────────────────────────────
       # Fail fast if the tag semver does not match CMakeLists.txt VERSION.
@@ -205,6 +207,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # ── Build distributable packages ─────────────────────────────────────
       - name: Build Linux packages
@@ -232,6 +236,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Download package artifacts
         uses: actions/download-artifact@v4
