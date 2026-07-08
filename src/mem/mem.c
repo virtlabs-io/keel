@@ -40,9 +40,11 @@ static inline void* _keel_sys_aligned(size_t size, size_t align) {
 #  define mi_collect(f)           ((void)(f))
 #  define mi_option_set(o, v)     ((void)(v))
 #  define mi_process_info(a,b,c,d,e,f,g,h) \
-     do { size_t* _f=(size_t*)(f); size_t* _g=(size_t*)(g); \
-          if(_f)*_f=0; if(_g)*_g=0; \
-          (void)(a);(void)(b);(void)(c);(void)(d);(void)(e);(void)(h); } while(0)
+     do { size_t* _mip_f = (size_t*)(f); size_t* _mip_g = (size_t*)(g); \
+          if (_mip_f) { *_mip_f = 0; } \
+          if (_mip_g) { *_mip_g = 0; } \
+          (void)(a); (void)(b); (void)(c); (void)(d); \
+          (void)(e); (void)(h); } while (0)
 #else
 #  include <mimalloc.h>
 #endif
