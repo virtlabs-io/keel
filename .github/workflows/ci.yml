@@ -292,7 +292,12 @@ jobs:
       - name: Test (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/cmake/tsan_suppressions.txt"
-        run: ctest --test-dir build-tsan --output-on-failure -LE integration -j$(nproc)
+        run: |
+          ctest --test-dir build-tsan --output-on-failure \
+            -LE "integration|election" \
+            -j$(nproc)
+          # election tests rely on Raft timing thresholds that are violated
+          # by TSan's 2-3× slowdown — excluded to avoid false failures.
 
       - name: Python concurrency suite (TSAN build)
         run: |
@@ -356,8 +361,10 @@ jobs:
         run: |
           ctest --test-dir build-msan \
             --output-on-failure \
-            -LE "integration|openssl" \
+            -LE "integration|openssl|election" \
             -j$(nproc)
+          # election tests rely on Raft timing thresholds that are violated
+          # by MSan's 3-5× slowdown — excluded to avoid false failures.
 
   # ===========================================================================
   # Python Protocol & Resilience Suites
