@@ -30,9 +30,16 @@ target_include_directories(keelmem PUBLIC
     ${CMAKE_BINARY_DIR}/include
 )
 
-# keelmem uses keel_log_enabled/keel_log_internal from keellog
-# dlmalloc provides the mspace heap manager for the shared_buffers pool
-target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads PUBLIC mimalloc-static)
+# keelmem uses keel_log_enabled/keel_log_internal from keellog.
+# When building with MSan or TSan, fall back to system malloc — those sanitizers
+# require every library to be instrumented, which is non-trivial for the
+# mimalloc submodule.  KEEL_USE_SYSTEM_MALLOC activates shims in mem.c.
+if(KEEL_ALLOC_BACKEND STREQUAL "system")
+    target_compile_definitions(keelmem PRIVATE KEEL_USE_SYSTEM_MALLOC=1)
+    target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads)
+else()
+    target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads PUBLIC mimalloc-static)
+endif()
 
 target_compile_options(keelmem PRIVATE
     ${KEEL_WARNING_FLAGS}

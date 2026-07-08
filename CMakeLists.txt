@@ -543,11 +543,22 @@ set(KEEL_INCLUDE_DIRS
 # To upgrade: replace third_party/mimalloc/ with the new release and update the
 # commit reference below.
 # Pinned commit: 8c532c32c3c96e5ba1f2283e032f69ead8add00f (v2.1.7)
-set(MI_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_OBJECT  OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
-set(MI_OVERRIDE      OFF CACHE BOOL "" FORCE)  # do not replace malloc/free globally
-add_subdirectory(third_party/mimalloc)
+#
+# MSan and TSan require every library in the process to be instrumented with
+# the same sanitizer.  Building mimalloc with full MSan/TSan instrumentation
+# is non-trivial; use system malloc for those sanitizer builds instead.
+if(KEEL_ENABLE_MSAN OR KEEL_ENABLE_TSAN)
+    set(KEEL_ALLOC_BACKEND "system" CACHE INTERNAL "Allocator backend (mimalloc|system)")
+    message(STATUS "Allocator backend: system malloc (sanitizer=${CMAKE_C_FLAGS})")
+else()
+    set(KEEL_ALLOC_BACKEND "mimalloc" CACHE INTERNAL "Allocator backend (mimalloc|system)")
+    set(MI_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT  OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
+    set(MI_OVERRIDE      OFF CACHE BOOL "" FORCE)  # do not replace malloc/free globally
+    add_subdirectory(third_party/mimalloc)
+    message(STATUS "Allocator backend: mimalloc v2.1.7")
+endif()
 
 # Memory management library
 add_subdirectory(src/mem)

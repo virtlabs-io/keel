@@ -15,7 +15,37 @@
 
 #include "keel/mem/mem.h"
 #include "keel/log/log.h"
-#include <mimalloc.h>
+
+#ifdef KEEL_USE_SYSTEM_MALLOC
+/* -------------------------------------------------------------------------
+ * System-malloc shims — active when building with MSan or TSan.
+ * Those sanitizers require every library to be instrumented; replacing
+ * mimalloc with the (already-instrumented) system malloc avoids false
+ * positives and link-time conflicts.
+ * ------------------------------------------------------------------------- */
+#  include <stdlib.h>
+#  include <malloc.h>          /* malloc_usable_size (Linux/glibc) */
+#  include <unistd.h>          /* posix_memalign */
+static inline void* _keel_sys_aligned(size_t size, size_t align) {
+    if (align < sizeof(void*)) align = sizeof(void*);
+    void* p = NULL;
+    return posix_memalign(&p, align, size) == 0 ? p : NULL;
+}
+#  define mi_malloc(n)            malloc(n)
+#  define mi_calloc(c, n)         calloc((c), (n))
+#  define mi_realloc(p, n)        realloc((p), (n))
+#  define mi_free(p)              free(p)
+#  define mi_malloc_aligned(n, a) _keel_sys_aligned((n), (a))
+#  define mi_usable_size(p)       malloc_usable_size(p)
+#  define mi_collect(f)           ((void)(f))
+#  define mi_option_set(o, v)     ((void)(v))
+#  define mi_process_info(a,b,c,d,e,f,g,h) \
+     do { size_t* _f=(size_t*)(f); size_t* _g=(size_t*)(g); \
+          if(_f)*_f=0; if(_g)*_g=0; \
+          (void)(a);(void)(b);(void)(c);(void)(d);(void)(e);(void)(h); } while(0)
+#else
+#  include <mimalloc.h>
+#endif
 
 #include <stdlib.h>
 #include <string.h>
