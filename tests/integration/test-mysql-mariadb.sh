@@ -31,6 +31,10 @@ dexec() {
 start_cluster() {
     log_info "Starting MariaDB Galera Cluster..."
 
+    # Tear down any stale state from a previous run (prevents network-pool
+    # overlap errors when the previous invocation didn't clean up cleanly).
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans -v 2>/dev/null || true
+
     # Bootstrap node1 first (it has --wsrep-new-cluster)
     docker compose -f "$COMPOSE_FILE" up -d "$NODE1_CTR" --remove-orphans
 

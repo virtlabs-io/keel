@@ -59,13 +59,15 @@ services:
   # KEEL proxy
   # --------------------------------------------------------------------------
   keel:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.linux
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: shard-keel
     hostname: keel
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     depends_on:
       pg-shard0:
         condition: service_healthy

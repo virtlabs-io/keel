@@ -161,13 +161,15 @@ ok "Python dependencies ready"
 # Build the KEEL Docker image (unless skipped)
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_BUILD" != "1" ]]; then
-    info "Building KEEL Docker image from source …"
-    docker compose -f "$COMPOSE_FILE" build --progress=plain 2>&1 \
-        | grep -E "^#[0-9]|Successfully|error|ERRO" | tail -20
+    info "Building KEEL Docker image via scripts/build_test_image.sh …"
+    bash "$REPO_ROOT/scripts/build_test_image.sh"
     ok "KEEL image built"
 else
     info "Skipping KEEL image build (KEEL_E2E_SKIP_BUILD=1)"
 fi
+
+# Ensure all compose files pick up the canonical test image.
+export KEEL_IMAGE="${KEEL_IMAGE:-keel:test}"
 
 # ---------------------------------------------------------------------------
 # Prepare report directory

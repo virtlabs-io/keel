@@ -23,6 +23,12 @@
 
 add_executable(keel
     main.c
+    cli.c
+    process.c
+    security.c
+    stats_display.c
+    worker_group.c
+    config_load.c
 )
 
 # Export dynamic symbols so that diagnostic backtraces (e.g. allocator

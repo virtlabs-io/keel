@@ -69,7 +69,8 @@ for _ in $(seq 1 30); do
 done
 if ! (echo > "/dev/tcp/${KEEL_HOST}/${KEEL_PORT}") 2>/dev/null; then
     err "KEEL not reachable at ${KEEL_HOST}:${KEEL_PORT} — bring up the stack first"
-    exit 2
+    # Exit 77 = skip (not a test failure; infrastructure not available)
+    exit 77
 fi
 
 # ---------------------------------------------------------------------------

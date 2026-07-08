@@ -81,7 +81,7 @@ Thumbs.db
 third_party/*
 !third_party/nanopb
 !third_party/otel-proto
-!third_party/dlmalloc
+!third_party/mimalloc
 vendor/
 
 # Documentation build
@@ -124,9 +124,9 @@ coverage.css
 coverage.json
 coverage.html
 coverage.functions.html
-proposals/
+proposals/*
 
-artifacts/
+artifacts/*
 
 reports/
 

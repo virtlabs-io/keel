@@ -374,6 +374,22 @@ def run_unit(result: SuiteResult, build_dir: Optional[Path], dry_run: bool,
     result.status     = "passed" if rc == 0 else "skipped" if rc == 77 else "failed"
 
 
+def _build_test_image(dry_run: bool, force: bool = False) -> int:
+    """Build keel:test via scripts/build_test_image.sh.
+
+    Skips automatically when the image is already up-to-date unless
+    *force* is True.  Returns the subprocess exit code.
+    """
+    script = REPO_ROOT / "scripts" / "build_test_image.sh"
+    if not script.exists():
+        error(f"build_test_image.sh not found at {script}")
+        return 1
+    cmd = ["bash", str(script)]
+    if force:
+        cmd.append("--force")
+    return _run(cmd, dry_run=dry_run)
+
+
 def run_e2e(result: SuiteResult, dry_run: bool, no_build: bool,
             keep_stack: bool, marker: str = "", parallel: bool = False,
             report_dir: Optional[Path] = None) -> None:
@@ -1186,6 +1202,23 @@ def main() -> int:
     print()
 
     results: list[SuiteResult] = []
+
+    # ── Docker test image ───────────────────────────────────────────────────
+    # Build keel:test once before any suite that needs Docker.  Suites that
+    # use Docker (e2e, integration, hardening, chaos, torture) all consume
+    # the same image via KEEL_IMAGE=keel:test.
+    _docker_suites = {"e2e", "integration", "hardening", "chaos", "torture"}
+    if not args.no_build and _docker_suites.intersection(selected_suites):
+        info("Building keel:test Docker image (shared by all Docker suites) …")
+        rc = _build_test_image(args.dry_run)
+        if rc != 0:
+            error("Docker image build failed — aborting Docker suites.")
+            # Remove Docker-dependent suites from the run to avoid cascade failures.
+            selected_suites = [s for s in selected_suites if s not in _docker_suites]
+        else:
+            ok("keel:test image ready")
+            import os as _os
+            _os.environ.setdefault("KEEL_IMAGE", "keel:test")
 
     # ── Unit (CTest) ────────────────────────────────────────────────────────
     if "unit" in selected_suites:

@@ -1517,7 +1517,7 @@ static void test_group_null_key_forms_own_group(void)
 
     /* Find NULL group */
     int null_idx = -1, a_idx = -1;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && i < 4; i++) {
         if (out[i].null_key) null_idx = i;
         else if (strcmp(out[i].key, "A") == 0) a_idx = i;
     }

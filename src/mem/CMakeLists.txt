@@ -12,15 +12,18 @@
  while the actual process entry point remains separate in `src/main`.
 ]]
 
-add_library(keelmem STATIC
+set(_keelmem_sources
     mem.c
     arena.c
     pool.c
-    slab.c
     ringbuf.c
-    mem_safety.c
     numa.c
 )
+if(KEEL_ENABLE_MEM_SAFETY)
+    list(APPEND _keelmem_sources mem_safety.c)
+endif()
+
+add_library(keelmem STATIC ${_keelmem_sources})
 
 target_include_directories(keelmem PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -29,7 +32,7 @@ target_include_directories(keelmem PUBLIC
 
 # keelmem uses keel_log_enabled/keel_log_internal from keellog
 # dlmalloc provides the mspace heap manager for the shared_buffers pool
-target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads PUBLIC dlmalloc)
+target_link_libraries(keelmem PUBLIC keellog PUBLIC Threads::Threads PUBLIC mimalloc-static)
 
 target_compile_options(keelmem PRIVATE
     ${KEEL_WARNING_FLAGS}

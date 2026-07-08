@@ -139,14 +139,15 @@ services:
   # KEEL Connection Pooler
   # ==========================================================================
   keel:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.linux
-      target: runner
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: e2e-keel-proxy
     hostname: keel
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     command: ["-c", "/etc/keel/keel-e2e.ini"]
     environment:
       KEEL_LOG_LEVEL: 2

@@ -36,6 +36,10 @@
 # =============================================================================
 set -e
 
+# Enable core dumps for crash analysis.  Requires the container hard limit
+# to be set (compose ulimits / --ulimit core=-1); this raises the soft limit.
+ulimit -c unlimited 2>/dev/null || true
+
 KEEL_CONFIG="${KEEL_CONFIG:-/etc/keel/keel.ini}"
 OVERRIDE_FILE="/run/keel/env-overrides.ini"
 

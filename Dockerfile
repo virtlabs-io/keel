@@ -96,6 +96,9 @@ COPY tests/           tests/
 COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/          docker/
+# mimalloc submodule — must be initialized on the host before building:
+#   git submodule update --init third_party/mimalloc
+COPY third_party/mimalloc  third_party/mimalloc/
 # docs/ is required by tests/lint scripts (e.g. check_metrics_reference.sh,
 # check_metrics_reference CTest entry) that enforce parity between
 # registered metrics and docs/METRICS_REFERENCE.md.

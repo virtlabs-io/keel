@@ -92,14 +92,16 @@ services:
   # KEEL proxy
   # ---------------------------------------------------------------------------
   keel:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.linux
-    image: ${KEEL_IMAGE:-keel:torture}
+
+    image: ${KEEL_IMAGE:-keel:test}
     container_name: torture-keel
     hostname: keel
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
     depends_on:
       postgres:
         condition: service_healthy

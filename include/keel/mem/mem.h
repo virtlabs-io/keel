@@ -480,45 +480,6 @@ void keel_pool_free(keel_pool_t* pool, void* ptr);
 void keel_pool_stats(const keel_pool_t* pool, size_t* allocated, size_t* available, size_t* total);
 
 /* ============================================================================
- * Slab Allocator
- *
- * Size-class based allocator combining benefits of pool and general allocator.
- * ============================================================================ */
-
-/**
- * @brief Slab allocator handle
- */
-typedef struct keel_slab keel_slab_t;
-
-/**
- * @brief Create a slab allocator
- *
- * @return Slab handle, or NULL on failure
- */
-KEEL_NODISCARD
-keel_slab_t* keel_slab_create(void);
-
-/**
- * @brief Destroy a slab allocator
- */
-void keel_slab_destroy(keel_slab_t* slab);
-
-/**
- * @brief Allocate from slab
- *
- * @param slab Slab allocator
- * @param size Number of bytes
- * @return Pointer to allocated memory, or NULL on failure
- */
-KEEL_NODISCARD
-void* keel_slab_alloc(keel_slab_t* slab, size_t size);
-
-/**
- * @brief Free to slab
- */
-void keel_slab_free(keel_slab_t* slab, void* ptr);
-
-/* ============================================================================
  * Memory Statistics
  * ============================================================================ */
 

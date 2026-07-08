@@ -321,7 +321,6 @@ static void test_apply_backoff_escalation(void)
         TEST_ASSERT_EQ(snap.probes_failed_total, (uint64_t)(i + 1));
 
         /* Inspect the backoff state via the internal header. */
-        extern struct keel_catchup_manager;  /* opaque already typedef'd */
         keel_catchup_probe_socket_t* slot = &m->sockets[2];
         TEST_ASSERT_EQ(slot->backoff_current_ms, expected_ms[i]);
         TEST_ASSERT_EQ(slot->backoff_until_ns,

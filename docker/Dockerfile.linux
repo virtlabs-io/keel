@@ -229,6 +229,9 @@ COPY tests/           tests/
 COPY scripts/         scripts/
 COPY etc/             etc/
 COPY docker/keel/     docker/keel/
+# mimalloc submodule — must be initialized on the host before building:
+#   git submodule update --init third_party/mimalloc
+COPY third_party/mimalloc  third_party/mimalloc/
 # docs/ is required by lint scripts (e.g. check_metrics_reference) that
 # enforce parity between registered metrics and docs/METRICS_REFERENCE.md.
 COPY docs/            docs/
@@ -237,6 +240,9 @@ COPY docs/            docs/
 # Lua/Python scripting hooks; KEEL_VARIANT=full enables both. Override with:
 #   docker build --build-arg KEEL_VARIANT=full ...
 ARG KEEL_VARIANT=core
+# RelWithDebInfo keeps full debug symbols at -O2.  Override for maximum
+# debuggability:  docker build --build-arg KEEL_BUILD_TYPE=Debug ...
+ARG KEEL_BUILD_TYPE=RelWithDebInfo
 
 # Configure and build
 RUN if [ "$KEEL_VARIANT" = "full" ]; then \
@@ -244,9 +250,9 @@ RUN if [ "$KEEL_VARIANT" = "full" ]; then \
     else \
         KEEL_SCRIPTING_FLAGS="-DKEEL_ENABLE_LUA=OFF -DKEEL_ENABLE_PYTHON=OFF"; \
     fi && \
-    echo "[KEEL] Build variant: $KEEL_VARIANT  ($KEEL_SCRIPTING_FLAGS)" && \
+    echo "[KEEL] Build variant: $KEEL_VARIANT  type: $KEEL_BUILD_TYPE  ($KEEL_SCRIPTING_FLAGS)" && \
     cmake -B build-linux -G Ninja \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_BUILD_TYPE=${KEEL_BUILD_TYPE} \
         -DKEEL_USE_IOURING=ON \
         -DKEEL_USE_EPOLL=ON \
         -DKEEL_ENABLE_TESTS=ON \
@@ -291,23 +297,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Scripting language runtimes (must match builder versions)
     liblua5.4-0 \
     libpython3.12 \
+    # Crash analysis
+    gdb \
+    binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Dedicated non-root user
 RUN groupadd -r keel && useradd -r -g keel -s /sbin/nologin keel
 
-# Binary from builder stage
-COPY --from=builder /keel/build-linux/src/main/keel /usr/local/bin/keel
-RUN chmod 0755 /usr/local/bin/keel
+# Binary from builder stage.
+# Kept as keel.bin; the wrapper below raises the core-dump ulimit before exec.
+COPY --from=builder /keel/build-linux/src/main/keel /usr/local/bin/keel.bin
+RUN chmod 0755 /usr/local/bin/keel.bin
 
-# Config and runtime directories
-RUN mkdir -p /etc/keel /var/log/keel \
-    && chown keel:keel /etc/keel /var/log/keel
+# Thin ulimit wrapper — transparent to all callers, no argument changes needed.
+# Raises the soft core-dump limit to the container hard limit (set via compose
+# ulimits or --ulimit core=-1) so crashes always produce a core file.
+RUN printf '#!/bin/sh\nulimit -c unlimited 2>/dev/null || true\nexec /usr/local/bin/keel.bin "$@"\n' \
+    > /usr/local/bin/keel && chmod 0755 /usr/local/bin/keel
+
+# Config and runtime directories.
+# /var/log/keel/cores is the default CWD so relative core patterns land here.
+RUN mkdir -p /etc/keel /var/log/keel/cores \
+    && chown -R keel:keel /etc/keel /var/log/keel
 
 # Default config (override at runtime with -v or environment)
 COPY --from=builder /keel/etc/keel.ini.example /etc/keel/keel.ini.example
 COPY docker/keel/keel-cluster.ini /etc/keel/keel-cluster.ini.example
 
+# Default working directory: core dumps with a relative pattern land here.
+# Mount this path (-v /host/cores:/var/log/keel/cores) to retrieve core files.
+WORKDIR /var/log/keel/cores
 USER keel
 
 # PostgreSQL proxy, MySQL proxy, admin console, cluster peer, Prometheus metrics
